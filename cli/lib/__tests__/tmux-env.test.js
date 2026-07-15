@@ -200,6 +200,12 @@ describe('buildCleanEnv', () => {
     }
   });
 
+  it('normalizes dumb TERM to xterm-256color', () => {
+    const processEnv = { ...baseProcessEnv, TERM: 'dumb' };
+    const { env } = buildCleanEnv({ processEnv, dotenvVars: {}, platform: 'linux' });
+    assert.equal(env.TERM, 'xterm-256color');
+  });
+
   it('excludes ambient variables not in allowlist', () => {
     const processEnv = { ...baseProcessEnv, AWS_SECRET_KEY: 'secret123', RANDOM_VAR: 'xyz' };
     const { env } = buildCleanEnv({ processEnv, dotenvVars: {}, platform: 'linux' });

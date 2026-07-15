@@ -219,7 +219,9 @@ export function buildCleanEnv({ processEnv, dotenvVars, manifest, platform, uid,
   env.LOGNAME = processEnv.LOGNAME || env.USER;
   env.LANG = processEnv.LANG || 'en_US.UTF-8';
   env.LC_ALL = processEnv.LC_ALL || 'en_US.UTF-8';
-  env.TERM = processEnv.TERM || 'xterm-256color';
+  env.TERM = processEnv.TERM && processEnv.TERM !== 'dumb'
+    ? processEnv.TERM
+    : 'xterm-256color';
   env.SHELL = processEnv.SHELL || '/bin/bash';
 
   // 2. Agent automation defaults
