@@ -39,7 +39,22 @@ import { deployManifestTemplate } from './runtime/tmux-env.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
 
-const REPO = 'zylos-ai/zylos-core';
+// Patch #6 (3AI fork layer): allow self-upgrade to target an alternate repo
+// (e.g. the 3AI fork) via the ZYLOS_SELF_UPGRADE_REPO env var. Value is an
+// `owner/repo` slug (e.g. `HeXiaobo/zylos-core`). Default stays canonical, so
+// normal upgrades on machines that do not set it are unaffected, and it makes
+// fork-based upgrades ratifiable without hand-editing installed code on every
+// machine.
+//   NOTE — deliberately NOT named ZYLOS_REPO: scripts/install.sh already uses
+//   ZYLOS_REPO with a DIFFERENT meaning (a full URL, for fresh installs). Same
+//   name + two meanings (URL vs slug) would silently mis-resolve here, so the
+//   self-upgrade override gets its own name.
+//   OPEN (registered, see fork-based-upgrade-process doc): this override covers
+//   the self-upgrade DOWNLOAD source only. The version-CHECK sources
+//   (upgrade-check.js, doctor.js, install.sh's latest-check) remain hardcoded
+//   to canonical; pointing those at the fork needs a fork release/tag strategy.
+// Actual maker: Mylos (COO).
+const REPO = process.env.ZYLOS_SELF_UPGRADE_REPO || 'zylos-ai/zylos-core';
 
 // ---------------------------------------------------------------------------
 // Version helpers
