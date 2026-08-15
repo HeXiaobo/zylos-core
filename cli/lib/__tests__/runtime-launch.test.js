@@ -342,16 +342,38 @@ describe('Codex launch — new session', () => {
     assert.ok(!joined.includes('sk-ant-'), 'tmux cmdline must not contain API key value');
   });
 
-  it('launch spec does not contain the retired text bootstrap prompt', async () => {
+  it('launch spec carries the internal kick sentinel, not a human-looking prompt', async () => {
     tmuxSessionExists = false;
     await makeAdapter(CodexAdapter).launch({ bypassPermissions: false });
 
     const spec = readLaunchSpec();
     assert.ok(spec, 'spec should be written');
     // Since #681 the only launch arg is the kick prompt that triggers the
-    // SessionStart hook — never the retired text bootstrap payload.
-    assert.deepEqual(spec.args, ['hello']);
+    // SessionStart hook — never the retired text bootstrap payload. Since
+    // #743/#745 that prompt is a stateless internal lifecycle sentinel,
+    // never a human-looking greeting that could be mistaken for a user turn.
+    assert.equal(spec.args.length, 1);
+    // Exact-string lock: the full contract text, not a prefix — a mutated
+    // second sentence must fail here.
+    assert.equal(spec.args[0],
+      'System startup trigger, not a user message. Continue with startup context.');
+    assert.doesNotMatch(spec.args[0], /\bhello\b/i);
+    assert.doesNotMatch(spec.args[0], /welcome back/i);
     assert.ok(!JSON.stringify(spec).includes('session-start-inject.js'));
+  });
+
+  it('kick sentinel is stateless — identical argv on every launch, no marker files (#743)', async () => {
+    tmuxSessionExists = false;
+    await makeAdapter(CodexAdapter).launch({ bypassPermissions: false });
+    const first = readLaunchSpec().args[0];
+
+    calls.execFileSync.length = 0;
+    await makeAdapter(CodexAdapter).launch({ bypassPermissions: false });
+    const second = readLaunchSpec().args[0];
+
+    assert.equal(first, second, 'kick must not vary across launches');
+    assert.ok(!fs.existsSync(path.join(fakeZylosDir, '.zylos', 'first-start-done')),
+      'stateless sentinel must not persist launch state');
   });
 });
 
@@ -376,6 +398,11 @@ describe('Codex launch — existing session', () => {
 
     assert.ok(sent.length > 0, 'sendMessage should be called');
     assert.ok(sent.includes('codex'), 'sent command should reference codex');
+    // Exact-string lock for the paste path: the kick must ride as one
+    // double-quoted argv carrying the full contract text.
+    assert.ok(sent.includes(
+      '"System startup trigger, not a user message. Continue with startup context."'),
+    'existing-session command must carry the exact kick as one quoted argv');
     assert.ok(!sent.includes('_p=$(cat'), 'existing-session command should not load bootstrap prompt');
     assert.ok(!sent.includes('session-start-inject.js'), 'existing-session command should not run text bootstrap');
   });
