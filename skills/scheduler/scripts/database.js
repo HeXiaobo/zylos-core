@@ -188,7 +188,7 @@ function migrateRunOutcomeState() {
         lastError = null;
         recovered++;
       } else if (task.last_error != null) {
-        failedAt = task.updated_at;
+        failedAt = task.failed_at ?? task.updated_at;
         if (task.status === 'failed' && !latest) failed++;
         else uncertain++;
       }

@@ -279,13 +279,23 @@ describe('cli done', () => {
           INSERT INTO task_history (task_id, executed_at, status)
           VALUES (?, ?, 'started')
         `).run(task.id, currentTime);
+        const before = {
+          task: db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id),
+          history: db.prepare('SELECT * FROM task_history WHERE task_id = ? ORDER BY id').all(task.id)
+        };
 
         const result = cliRaw(['done', task.id], env);
 
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, /run ID/i);
-        assert.equal(db.prepare('SELECT status FROM tasks WHERE id = ?').get(task.id).status, 'running');
-        assert.equal(db.prepare('SELECT status FROM task_history WHERE id = ?').get(run.lastInsertRowid).status, 'started');
+        assert.deepEqual(
+          {
+            task: db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id),
+            history: db.prepare('SELECT * FROM task_history WHERE task_id = ? ORDER BY id').all(task.id)
+          },
+          before
+        );
+        assert.equal(before.history[0].id, run.lastInsertRowid);
       } finally {
         db.close();
       }
