@@ -28,6 +28,9 @@ describe('run-id cutover check', () => {
       insert.run('task-recurring-cli', 'recurring', 'Afterward run cli.js done task-recurring-cli');
       insert.run('task-interval-oral', 'interval', '完成后 scheduler done task-interval-oral');
       insert.run('task-one-time-cli', 'one-time', 'Run /scheduler/scripts/cli.js done task-one-time-cli');
+      insert.run('task-cjk-tight', 'recurring', '完成后cli.js done本任务。');
+      insert.run('task-middle-dot-tight', 'interval', '·cli.js done 本次。');
+      insert.run('task-cjk-scheduler-tight', 'one-time', '完成后scheduler done。');
       insert.run(
         'task-mixed-same-line',
         'recurring',
@@ -41,10 +44,13 @@ describe('run-id cutover check', () => {
       const after = fs.readFileSync(dbPath);
 
       assert.deepEqual(result, {
-        legacy_prompt_count: 4,
-        recurring_interval_count: 3,
+        legacy_prompt_count: 7,
+        recurring_interval_count: 5,
         tasks: [
+          { id: 'task-cjk-scheduler-tight', type: 'one-time' },
+          { id: 'task-cjk-tight', type: 'recurring' },
           { id: 'task-interval-oral', type: 'interval' },
+          { id: 'task-middle-dot-tight', type: 'interval' },
           { id: 'task-mixed-same-line', type: 'recurring' },
           { id: 'task-one-time-cli', type: 'one-time' },
           { id: 'task-recurring-cli', type: 'recurring' }
