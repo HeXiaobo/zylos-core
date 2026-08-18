@@ -91,13 +91,13 @@ describe('getDb', () => {
 
       const seed = new Database(dbPath);
       const currentTime = Math.floor(Date.now() / 1000);
-      const addTask = (id, status, lastError, updatedAt = currentTime) => {
+      const addTask = (id, status, lastError, updatedAt = currentTime, failedAt = null) => {
         seed.prepare(`
           INSERT INTO tasks (
             id, name, prompt, type, next_run_at, status,
             created_at, updated_at, last_error, failed_at
-          ) VALUES (?, ?, 'test', 'recurring', ?, ?, ?, ?, ?, NULL)
-        `).run(id, id, currentTime + 3600, status, currentTime, updatedAt, lastError);
+          ) VALUES (?, ?, 'test', 'recurring', ?, ?, ?, ?, ?, ?)
+        `).run(id, id, currentTime + 3600, status, currentTime, updatedAt, lastError, failedAt);
       };
       addTask('task-recovered', 'pending', 'stale error');
       addTask('task-timeout', 'pending', 'Task timed out');
@@ -110,6 +110,13 @@ describe('getDb', () => {
       addTask('task-retrying-after-failure', 'running', 'newer unproven error', currentTime);
       addTask('task-retrying-after-success', 'running', 'stale recovered error', currentTime);
       addTask('task-pending-started-after-success', 'pending', 'unproven current error', currentTime - 10);
+      addTask(
+        'task-existing-failure-timestamp',
+        'pending',
+        'legacy uncertain',
+        currentTime,
+        currentTime - 500
+      );
       seed.prepare(`
         INSERT INTO task_history (task_id, executed_at, completed_at, status)
         VALUES ('task-recovered', ?, ?, 'success')
@@ -214,6 +221,10 @@ describe('getDb', () => {
       assert.deepEqual(
         db.prepare('SELECT failed_at, last_error FROM tasks WHERE id = ?').get('task-pending-started-after-success'),
         { failed_at: currentTime - 10, last_error: 'unproven current error' }
+      );
+      assert.deepEqual(
+        db.prepare('SELECT failed_at, last_error FROM tasks WHERE id = ?').get('task-existing-failure-timestamp'),
+        { failed_at: currentTime - 500, last_error: 'legacy uncertain' }
       );
       assert.deepEqual(
         db.prepare(`
