@@ -16,7 +16,7 @@ import { pathToFileURL } from 'node:url';
 
 import Database from 'better-sqlite3';
 
-const LEGACY_DONE_RE = /(?:^|[\s`'"(])(?:(?:[^\s`'"]*\/)?cli\.js|scheduler)\s+done\b(?![^\r\n;；。,.，`]*--run-id(?:\s|=))/im;
+const LEGACY_DONE_RE = /(?<![\w./-])(?:(?:[^\s`'"]*\/)?cli\.js|scheduler)\s+done\b(?![^\r\n;；。,.，`]*--run-id(?:\s|=))/im;
 
 function hasLegacyDoneInstruction(prompt) {
   return LEGACY_DONE_RE.test(String(prompt || ''));
