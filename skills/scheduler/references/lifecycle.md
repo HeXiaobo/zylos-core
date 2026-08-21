@@ -15,7 +15,7 @@ node scripts/run-id-cutover-check.js
 cli.js running
 ```
 
-The read-only cutover check exits non-zero when that machine's stored task prompts contain an unbound `cli.js done` or `scheduler done` instruction. Remove or rewrite those prompt instructions before installation; do not reuse counts from another machine. Then wait until `cli.js running` reports no active tasks. An old in-flight prompt cannot be completed safely after the new CLI is installed because it has no exact run identity.
+The read-only cutover check exits non-zero when that machine's stored task prompts contain any static `cli.js done` or `scheduler done` instruction, even if it already contains `--run-id`. Remove those stored completion instructions before installation; never rewrite one with a fixed run ID, because run IDs are created per dispatch and a stored value will become stale. Do not reuse counts from another machine. Then wait until `cli.js running` reports no active tasks. An old in-flight prompt cannot be completed safely after the new CLI is installed because it has no exact run identity.
 
 ## remove
 
