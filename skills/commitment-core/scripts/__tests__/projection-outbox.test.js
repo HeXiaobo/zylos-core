@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { Worker } from 'node:worker_threads';
 
 import Database from 'better-sqlite3';
 
@@ -19,6 +20,14 @@ function createHarness() {
     idGenerator: () => 'task-001',
     eventIdGenerator: () => `event-${++eventIndex}`,
   });
+  for (const projection of ['feishu', 'openmax']) {
+    core.outbox.register({
+      projection,
+      bootstrapPolicy: 'from_beginning',
+      actorId: 'test-operator',
+      idempotencyKey: `register:${projection}`,
+    });
+  }
 
   return {
     core,
@@ -55,6 +64,74 @@ function claim(core, projection, workerId, idempotencyKey) {
   });
 }
 
+function registerFromWorker({ dbPath, barrier, actorId, idempotencyKey }) {
+  const source = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    (async () => {
+      const { openCommitmentCore } = await import(workerData.coreUrl);
+      const core = openCommitmentCore({
+        dbPath: workerData.dbPath,
+        clock: () => '2026-08-25T10:00:00.000Z',
+      });
+      const state = new Int32Array(workerData.barrier);
+      Atomics.add(state, 0, 1);
+      parentPort.postMessage({ type: 'ready' });
+      Atomics.wait(state, 1, 0);
+      try {
+        const result = core.outbox.register({
+          projection: 'concurrent',
+          bootstrapPolicy: 'from_now',
+          actorId: workerData.actorId,
+          idempotencyKey: workerData.idempotencyKey,
+        });
+        parentPort.postMessage({ type: 'result', result });
+      } catch (error) {
+        parentPort.postMessage({
+          type: 'error',
+          error: { message: error.message, code: error.code },
+        });
+      } finally {
+        core.close();
+      }
+    })().catch((error) => {
+      parentPort.postMessage({
+        type: 'error',
+        error: { message: error.message, code: error.code },
+      });
+    });
+  `;
+  const worker = new Worker(source, {
+    eval: true,
+    workerData: {
+      dbPath,
+      barrier,
+      actorId,
+      idempotencyKey,
+      coreUrl: new URL('../core.js', import.meta.url).href,
+    },
+  });
+  return new Promise((resolve, reject) => {
+    worker.on('message', (message) => {
+      if (message.type === 'result') resolve(message.result);
+      if (message.type === 'error') {
+        const error = new Error(message.error.message);
+        error.code = message.error.code;
+        reject(error);
+      }
+    });
+    worker.on('error', reject);
+    worker.on('exit', (code) => {
+      if (code !== 0) reject(new Error(`registration worker exited with code ${code}`));
+    });
+  });
+}
+
+async function waitForReadyWorkers(state, count) {
+  while (Atomics.load(state, 0) < count) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 test('Task events become independently claimable projection deliveries', () => {
   const harness = createHarness();
   try {
@@ -76,6 +153,269 @@ test('Task events become independently claimable projection deliveries', () => {
     assert.equal(openmax[0].projection, 'openmax');
   } finally {
     harness.cleanup();
+  }
+});
+
+test('an operator explicitly registers a projection before replaying existing events', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+
+    const registration = harness.core.outbox.register({
+      projection: 'audit-log',
+      bootstrapPolicy: 'from_beginning',
+      actorId: 'operator-1',
+      idempotencyKey: 'register:audit-log',
+    });
+
+    assert.equal(registration.created, true);
+    assert.deepEqual(registration.registration, {
+      projection: 'audit-log',
+      bootstrapPolicy: 'from_beginning',
+      enabled: true,
+      baselineOutboxRowId: 0,
+      createdAt: '2026-08-25T10:00:00.000Z',
+      createdBy: 'operator-1',
+    });
+    assert.equal(
+      claim(harness.core, 'audit-log', 'worker-audit', 'claim:audit-log:1').length,
+      1,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('workers cannot claim, query, acknowledge, or fail an unregistered projection', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const assertUnknownProjection = (operation) => assert.throws(
+      operation,
+      (error) => error?.code === 'UNKNOWN_PROJECTION',
+    );
+
+    assertUnknownProjection(() => claim(
+      harness.core,
+      'feishuu',
+      'worker-typo',
+      'claim:typo',
+    ));
+    assertUnknownProjection(() => harness.core.outbox.query({
+      projection: 'random-name',
+      limit: 10,
+    }));
+    assertUnknownProjection(() => harness.core.outbox.ack({
+      projection: 'random-name',
+      eventId: 'event-1',
+      workerId: 'worker-1',
+      idempotencyKey: 'ack:unknown',
+    }, 1));
+    assertUnknownProjection(() => harness.core.outbox.fail({
+      projection: 'random-name',
+      eventId: 'event-1',
+      workerId: 'worker-1',
+      error: 'must not be recorded',
+      idempotencyKey: 'fail:unknown',
+    }, 1));
+    for (let index = 0; index < 25; index += 1) {
+      assertUnknownProjection(() => claim(
+        harness.core,
+        `random-${index}`,
+        'worker-random',
+        `claim:random:${index}`,
+      ));
+    }
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('migration backfills legacy delivery and receipt projections without losing work', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const [leased] = claim(harness.core, 'feishu', 'worker-legacy', 'claim:legacy');
+    harness.core.close();
+
+    const legacy = new Database(harness.dbPath);
+    legacy.exec(`
+      DELETE FROM commitment_projection_receipts WHERE operation = 'register';
+      DROP TABLE commitment_projection_registry;
+    `);
+    legacy.prepare(`
+      INSERT INTO commitment_projection_receipts (
+        idempotency_key, operation, projection, request_fingerprint,
+        result_json, created_at
+      ) VALUES (?, 'claim', ?, ?, '[]', ?)
+    `).run(
+      'legacy:receipt-only',
+      'receipt-only',
+      'legacy-fingerprint',
+      '2026-08-24T00:00:00.000Z',
+    );
+    legacy.close();
+
+    const migrated = openCommitmentCore({
+      dbPath: harness.dbPath,
+      clock: () => '2026-08-25T10:00:01.000Z',
+    });
+    try {
+      const feishu = migrated.outbox.register({
+        projection: 'feishu',
+        bootstrapPolicy: 'from_beginning',
+        actorId: 'migration-operator',
+        idempotencyKey: 'migration:register:feishu',
+      });
+      assert.equal(feishu.created, false);
+      assert.equal(feishu.registration.createdBy, null);
+      assert.equal(
+        migrated.outbox.query({ projection: 'feishu', eventId: leased.eventId }).status,
+        'leased',
+      );
+
+      const receiptOnly = migrated.outbox.register({
+        projection: 'receipt-only',
+        bootstrapPolicy: 'from_beginning',
+        actorId: 'migration-operator',
+        idempotencyKey: 'migration:register:receipt-only',
+      });
+      assert.equal(receiptOnly.created, false);
+      assert.equal(
+        claim(migrated, 'receipt-only', 'worker-receipt', 'claim:receipt-after-migration')
+          .length,
+        1,
+      );
+      assert.throws(
+        () => claim(migrated, 'never-seen', 'worker-unknown', 'claim:never-seen'),
+        (error) => error?.code === 'UNKNOWN_PROJECTION',
+      );
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    try {
+      harness.core.close();
+    } catch {
+      // The migration path intentionally closes and reopens this connection.
+    }
+    rmSync(path.dirname(harness.dbPath), { recursive: true, force: true });
+  }
+});
+
+test('from_now excludes existing events and includes later events at the same timestamp', () => {
+  const harness = createHarness();
+  try {
+    const task = createTask(harness.core);
+    const registered = harness.core.outbox.register({
+      projection: 'webhook',
+      bootstrapPolicy: 'from_now',
+      actorId: 'operator-1',
+      idempotencyKey: 'register:webhook',
+    });
+    assert.equal(registered.registration.baselineOutboxRowId, 1);
+    assert.deepEqual(claim(harness.core, 'webhook', 'worker-1', 'claim:webhook:1'), []);
+    assert.equal(
+      harness.core.outbox.query({ projection: 'webhook', eventId: 'event-1' }),
+      null,
+    );
+
+    harness.core.command({
+      type: 'StartTask',
+      taskId: task.id,
+      actorId: 'agent-1',
+      idempotencyKey: 'command:start:webhook-test',
+    }, task.version);
+    const [delivery] = claim(
+      harness.core,
+      'webhook',
+      'worker-1',
+      'claim:webhook:2',
+    );
+    assert.equal(delivery.eventId, 'event-2');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('registration is idempotent and fails closed on bootstrap conflicts', () => {
+  const harness = createHarness();
+  try {
+    const request = {
+      projection: 'analytics',
+      bootstrapPolicy: 'from_now',
+      actorId: 'operator-1',
+      idempotencyKey: 'register:analytics:1',
+    };
+    const created = harness.core.outbox.register(request);
+    assert.deepEqual(harness.core.outbox.register(request), created);
+
+    const repeated = harness.core.outbox.register({
+      ...request,
+      actorId: 'operator-2',
+      idempotencyKey: 'register:analytics:2',
+    });
+    assert.equal(repeated.created, false);
+    assert.deepEqual(repeated.registration, created.registration);
+
+    assert.throws(
+      () => harness.core.outbox.register({
+        ...request,
+        bootstrapPolicy: 'from_beginning',
+        idempotencyKey: 'register:analytics:conflict',
+      }),
+      (error) => error?.code === 'PROJECTION_REGISTRATION_CONFLICT',
+    );
+    assert.throws(
+      () => harness.core.outbox.register({
+        ...request,
+        projection: 'changed-name',
+      }),
+      (error) => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    assert.throws(
+      () => harness.core.outbox.register({
+        projection: 'implicit-history-is-forbidden',
+        actorId: 'operator-1',
+        idempotencyKey: 'register:missing-policy',
+      }),
+      /bootstrapPolicy must be a non-empty string/,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('two connections serialize concurrent registration without duplicating the registry', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-outbox-registry-race-'));
+  const dbPath = path.join(directory, 'commitments.db');
+  const bootstrap = openCommitmentCore({ dbPath });
+  bootstrap.close();
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const state = new Int32Array(barrier);
+
+  try {
+    const first = registerFromWorker({
+      dbPath,
+      barrier,
+      actorId: 'operator-a',
+      idempotencyKey: 'register:concurrent:a',
+    });
+    const second = registerFromWorker({
+      dbPath,
+      barrier,
+      actorId: 'operator-b',
+      idempotencyKey: 'register:concurrent:b',
+    });
+    await waitForReadyWorkers(state, 2);
+    Atomics.store(state, 1, 1);
+    Atomics.notify(state, 1, 2);
+
+    const results = await Promise.all([first, second]);
+    assert.deepEqual(results.map((result) => result.created).sort(), [false, true]);
+    assert.deepEqual(results[0].registration, results[1].registration);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

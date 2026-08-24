@@ -161,11 +161,23 @@ Outbox persistence failure therefore rolls the whole local mutation back. Once
 the local transaction commits, an Adapter failure changes only its delivery
 state; it cannot roll the Task back.
 
-The logical Outbox row is keyed by the existing immutable Task Event. Delivery
-rows are materialized lazily per normalized `projection`, so `feishu`,
-`openmax`, and any later projection each claim and acknowledge the same Event
-independently instead of competing for one shared delivery.
+The logical Outbox row is keyed by the existing immutable Task Event. An
+operator must explicitly register each normalized `projection`; claim, query,
+acknowledge, and fail never create one. Delivery rows are then materialized
+lazily for registered projections, so `feishu`, `openmax`, and any later
+projection each claim and acknowledge the same Event independently instead of
+competing for one shared delivery.
 
+- `outbox.register({ projection, bootstrapPolicy, actorId?, idempotencyKey })`
+  persists an enabled projection registry entry. `bootstrapPolicy` is required:
+  `from_beginning` includes all existing logical Outbox rows, while `from_now`
+  persists the current monotonic Outbox row baseline and includes only later
+  rows. There is no implicit default to historical replay.
+- Exact registration replay returns the same result. Re-registering the same
+  projection and policy with a new key returns `{ created: false,
+  registration }`; changing its policy fails with
+  `PROJECTION_REGISTRATION_CONFLICT`. Registration views include `enabled`,
+  `createdAt`, `createdBy`, and `baselineOutboxRowId`.
 - `outbox.claim({ projection, workerId, idempotencyKey, leaseMs, limit? })`
   leases up to 50 pending deliveries by default, with a hard maximum of 100.
   `leaseMs` is an integer from 1 through 86,400,000. Results are ordered by
@@ -190,15 +202,21 @@ Claim, acknowledge, and fail mutations have durable exact-replay receipts.
 Changing normalized content under a used key returns `IDEMPOTENCY_CONFLICT`.
 Other stable errors include `DELIVERY_NOT_FOUND`, `DELIVERY_NOT_LEASED`,
 `DELIVERY_FORBIDDEN`, `DELIVERY_LEASE_EXPIRED`, and
-`DELIVERY_VERSION_CONFLICT`.
+`DELIVERY_VERSION_CONFLICT`. Every worker operation against a projection that
+is not registered and enabled fails with `UNKNOWN_PROJECTION` before scanning
+Outbox history.
 
 Existing Task Events are backfilled into the logical Outbox when the schema is
 first installed; this is a migration path, not a claim that their original
-historical transactions contained Outbox rows. Task Run operations that change
-Task state already create a Task Event and therefore an Outbox row. Run-only
-Events, Evidence, and ExternalLink writes deliberately do not create projection
-records in this slice. Dead-letter inspection is included; operator redrive and
-external platform projection Adapters remain later slices.
+historical transactions contained Outbox rows. A pre-registry database safely
+backfills every projection found in an existing delivery or idempotency receipt
+as `from_beginning`, preserving existing and pending work; arbitrary new names
+are never inferred from Event history. Task Run operations that change Task
+state already create a Task Event and therefore an Outbox row. Run-only Events,
+Evidence, and ExternalLink writes deliberately do not create projection records
+in this slice. Dead-letter inspection is included; operator redrive,
+disable/enable lifecycle, and external platform projection Adapters remain
+later slices.
 
 ## Projection Worker
 

@@ -13,6 +13,7 @@ const DELIVERY_STATUSES = new Set([
   'acknowledged',
   'dead_letter',
 ]);
+const BOOTSTRAP_POLICIES = new Set(['from_beginning', 'from_now']);
 
 function requireObject(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -73,6 +74,34 @@ function normalizeClaim(rawRequest) {
     idempotencyKey: requireText(request.idempotencyKey, 'claim.idempotencyKey'),
     leaseMs: normalizeLeaseMs(request.leaseMs),
     limit: normalizeLimit(request.limit),
+  };
+}
+
+function normalizeRegistration(rawRequest) {
+  const request = requireObject(rawRequest, 'outbox registration request');
+  rejectUnknownFields(
+    request,
+    new Set(['projection', 'bootstrapPolicy', 'actorId', 'idempotencyKey']),
+    'outbox registration request',
+  );
+  const bootstrapPolicy = requireText(
+    request.bootstrapPolicy,
+    'registration.bootstrapPolicy',
+    32,
+  );
+  if (!BOOTSTRAP_POLICIES.has(bootstrapPolicy)) {
+    throw new TypeError('bootstrapPolicy must be from_beginning or from_now');
+  }
+  return {
+    projection: requireProjection(request.projection),
+    bootstrapPolicy,
+    actorId: request.actorId === undefined
+      ? null
+      : requireText(request.actorId, 'registration.actorId'),
+    idempotencyKey: requireText(
+      request.idempotencyKey,
+      'registration.idempotencyKey',
+    ),
   };
 }
 
@@ -211,6 +240,17 @@ function toDeliveryView(row) {
   };
 }
 
+function toRegistrationView(row) {
+  return {
+    projection: row.projection,
+    bootstrapPolicy: row.bootstrap_policy,
+    enabled: row.enabled === 1,
+    baselineOutboxRowId: row.baseline_outbox_rowid,
+    createdAt: row.created_at,
+    createdBy: row.created_by,
+  };
+}
+
 export function initializeProjectionOutboxSchema(database) {
   database.exec(`
     CREATE TABLE IF NOT EXISTS commitment_projection_outbox (
@@ -256,6 +296,17 @@ export function initializeProjectionOutboxSchema(database) {
       result_json TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS commitment_projection_registry (
+      projection TEXT PRIMARY KEY,
+      bootstrap_policy TEXT NOT NULL CHECK (
+        bootstrap_policy IN ('from_beginning', 'from_now')
+      ),
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      baseline_outbox_rowid INTEGER NOT NULL CHECK (baseline_outbox_rowid >= 0),
+      created_at TEXT NOT NULL,
+      created_by TEXT
+    );
   `);
 
   database.prepare(`
@@ -265,6 +316,24 @@ export function initializeProjectionOutboxSchema(database) {
     SELECT id, task_id, task_version, occurred_at
     FROM commitment_events
   `).run();
+
+  database.exec(`
+    INSERT OR IGNORE INTO commitment_projection_registry (
+      projection, bootstrap_policy, enabled, baseline_outbox_rowid,
+      created_at, created_by
+    )
+    SELECT projection, 'from_beginning', 1, 0, MIN(updated_at), NULL
+    FROM commitment_projection_deliveries
+    GROUP BY projection;
+
+    INSERT OR IGNORE INTO commitment_projection_registry (
+      projection, bootstrap_policy, enabled, baseline_outbox_rowid,
+      created_at, created_by
+    )
+    SELECT projection, 'from_beginning', 1, 0, MIN(created_at), NULL
+    FROM commitment_projection_receipts
+    GROUP BY projection;
+  `);
 }
 
 /**
@@ -330,6 +399,22 @@ export function createProjectionOutboxModule({ database, clock }) {
         acknowledged_at = NULL, dead_lettered_at = ?, updated_at = ?
     WHERE event_id = ? AND projection = ? AND version = ?
   `);
+  const selectRegistration = database.prepare(`
+    SELECT projection, bootstrap_policy, enabled, baseline_outbox_rowid,
+           created_at, created_by
+    FROM commitment_projection_registry
+    WHERE projection = ?
+  `);
+  const insertRegistration = database.prepare(`
+    INSERT INTO commitment_projection_registry (
+      projection, bootstrap_policy, enabled, baseline_outbox_rowid,
+      created_at, created_by
+    ) VALUES (?, ?, 1, ?, ?, ?)
+  `);
+  const selectLastOutboxRowId = database.prepare(`
+    SELECT COALESCE(MAX(rowid), 0) AS row_id
+    FROM commitment_projection_outbox
+  `);
 
   function receiptReplay(idempotencyKey, requestFingerprint) {
     const receipt = selectReceipt.get(idempotencyKey);
@@ -381,8 +466,60 @@ export function createProjectionOutboxModule({ database, clock }) {
     }
   }
 
+  function requireEnabledRegistration(projection) {
+    const row = selectRegistration.get(projection);
+    if (!row || row.enabled !== 1) {
+      throw domainError(
+        'UNKNOWN_PROJECTION',
+        `projection is not registered and enabled: ${projection}`,
+      );
+    }
+    return toRegistrationView(row);
+  }
+
+  const registerTransaction = database.transaction((rawRequest) => {
+    const request = normalizeRegistration(rawRequest);
+    const requestFingerprint = fingerprint({ operation: 'register', request });
+    const replay = receiptReplay(request.idempotencyKey, requestFingerprint);
+    if (replay) return replay;
+
+    const existingRow = selectRegistration.get(request.projection);
+    if (existingRow) {
+      const registration = toRegistrationView(existingRow);
+      if (registration.bootstrapPolicy !== request.bootstrapPolicy) {
+        throw domainError(
+          'PROJECTION_REGISTRATION_CONFLICT',
+          `${request.projection} is already registered with ${registration.bootstrapPolicy}`,
+        );
+      }
+      const now = currentInstant(clock);
+      const result = { created: false, registration };
+      saveReceipt('register', request, requestFingerprint, result, now.timestamp);
+      return result;
+    }
+
+    const now = currentInstant(clock);
+    const baselineOutboxRowId = request.bootstrapPolicy === 'from_now'
+      ? selectLastOutboxRowId.get().row_id
+      : 0;
+    insertRegistration.run(
+      request.projection,
+      request.bootstrapPolicy,
+      baselineOutboxRowId,
+      now.timestamp,
+      request.actorId,
+    );
+    const result = {
+      created: true,
+      registration: toRegistrationView(selectRegistration.get(request.projection)),
+    };
+    saveReceipt('register', request, requestFingerprint, result, now.timestamp);
+    return result;
+  });
+
   const claimTransaction = database.transaction((rawRequest) => {
     const request = normalizeClaim(rawRequest);
+    const registration = requireEnabledRegistration(request.projection);
     const requestFingerprint = fingerprint({ operation: 'claim', request });
     const replay = receiptReplay(request.idempotencyKey, requestFingerprint);
     if (replay) return replay;
@@ -393,12 +530,21 @@ export function createProjectionOutboxModule({ database, clock }) {
       FROM commitment_projection_outbox o
       LEFT JOIN commitment_projection_deliveries d
         ON d.event_id = o.event_id AND d.projection = ?
-      WHERE d.event_id IS NULL
-         OR (d.status = 'retry_wait' AND d.next_attempt_at <= ?)
-         OR (d.status = 'leased' AND d.lease_expires_at <= ?)
+      WHERE o.rowid > ?
+        AND (
+          d.event_id IS NULL
+          OR (d.status = 'retry_wait' AND d.next_attempt_at <= ?)
+          OR (d.status = 'leased' AND d.lease_expires_at <= ?)
+        )
       ORDER BY o.created_at, o.task_id, o.task_version, o.event_id
       LIMIT ?
-    `).all(request.projection, now.timestamp, now.timestamp, request.limit);
+    `).all(
+      request.projection,
+      registration.baselineOutboxRowId,
+      now.timestamp,
+      now.timestamp,
+      request.limit,
+    );
     const leaseExpiresAt = new Date(now.milliseconds + request.leaseMs).toISOString();
     const results = [];
     for (const candidate of candidates) {
@@ -434,6 +580,7 @@ export function createProjectionOutboxModule({ database, clock }) {
 
   const ackTransaction = database.transaction((rawRequest, rawExpectedVersion) => {
     const request = normalizeAck(rawRequest);
+    requireEnabledRegistration(request.projection);
     const expectedVersion = normalizeVersion(rawExpectedVersion);
     const requestFingerprint = fingerprint({ operation: 'ack', request, expectedVersion });
     const replay = receiptReplay(request.idempotencyKey, requestFingerprint);
@@ -463,6 +610,7 @@ export function createProjectionOutboxModule({ database, clock }) {
 
   const failTransaction = database.transaction((rawRequest, rawExpectedVersion) => {
     const request = normalizeFail(rawRequest);
+    requireEnabledRegistration(request.projection);
     const expectedVersion = normalizeVersion(rawExpectedVersion);
     const requestFingerprint = fingerprint({ operation: 'fail', request, expectedVersion });
     const replay = receiptReplay(request.idempotencyKey, requestFingerprint);
@@ -505,6 +653,9 @@ export function createProjectionOutboxModule({ database, clock }) {
       appendRecord.run(event.id, event.taskId, event.version, event.occurredAt);
     },
     publicInterface: Object.freeze({
+      register(request) {
+        return registerTransaction.immediate(request);
+      },
       claim(request) {
         return claimTransaction.immediate(request);
       },
@@ -516,6 +667,7 @@ export function createProjectionOutboxModule({ database, clock }) {
       },
       query(query) {
         const normalized = normalizeQuery(query);
+        const registration = requireEnabledRegistration(normalized.projection);
         if (normalized.mode === 'event') {
           const row = database.prepare(`
             SELECT o.event_id, o.task_id, o.task_version, o.created_at,
@@ -530,11 +682,21 @@ export function createProjectionOutboxModule({ database, clock }) {
             LEFT JOIN commitment_projection_deliveries d
               ON d.event_id = o.event_id AND d.projection = ?
             WHERE o.event_id = ?
-          `).get(normalized.projection, normalized.projection, normalized.eventId);
+              AND o.rowid > ?
+          `).get(
+            normalized.projection,
+            normalized.projection,
+            normalized.eventId,
+            registration.baselineOutboxRowId,
+          );
           return row ? toDeliveryView(row) : null;
         }
 
-        const values = [normalized.projection, normalized.projection];
+        const values = [
+          normalized.projection,
+          normalized.projection,
+          registration.baselineOutboxRowId,
+        ];
         let stateClause = '';
         if (normalized.statuses) {
           stateClause = `AND COALESCE(d.status, 'pending') IN (${normalized.statuses
@@ -554,7 +716,7 @@ export function createProjectionOutboxModule({ database, clock }) {
           JOIN commitment_events e ON e.id = o.event_id
           LEFT JOIN commitment_projection_deliveries d
             ON d.event_id = o.event_id AND d.projection = ?
-          WHERE 1 = 1 ${stateClause}
+          WHERE o.rowid > ? ${stateClause}
           ORDER BY o.created_at, o.task_id, o.task_version, o.event_id
           LIMIT ?
         `).all(...values).map(toDeliveryView);
