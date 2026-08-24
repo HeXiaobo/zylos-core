@@ -147,6 +147,33 @@ for review, never acceptance: this Adapter never produces `AcceptTask`, and
 unknown or human-acceptance event types fail closed. Only an explicit,
 authorized acceptor action may move a reviewed Task to `done`.
 
+## Derived attention view
+
+`scripts/render-attention-view.js` rebuilds `$ZYLOS_DIR/memory/state.md` from the
+Core list-query Interface. This file is a disposable, read-only attention
+view: never parse it to create or update Tasks, and never treat edits to it as
+authoritative state.
+
+Run it directly with:
+
+```sh
+node scripts/render-attention-view.js --json
+```
+
+`--output <path>` selects another destination for inspection or migration;
+`--max-bytes <512..16384>` may lower, but never raise, the 16KB hard limit.
+Arguments are strict, and `--json` returns the publish result for automation.
+The publisher queries only `review`, `in_progress`, and `ready` Tasks, then
+orders them by attention state in that order, oldest `updatedAt`, and Task ID.
+`done` and `cancelled` Tasks never appear.
+
+The document declares view version 1 and its generation timestamp. Core text
+is Markdown-escaped and bounded before rendering; the whole result is also
+byte-bounded. Truncation markers distinguish known byte-budget omissions from
+an unknown count when Core's 100-Task query limit is reached. Publication uses
+a same-directory temporary file, fsync, and atomic rename, so a failed publish
+does not replace the previous view.
+
 ## Command policy
 
 | Command | Transition | Authorized actor |
