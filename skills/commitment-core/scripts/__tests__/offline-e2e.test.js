@@ -6,12 +6,12 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { runCommitmentIntakeWorkerOnce } from '../skills/comm-bridge/scripts/c4-intake-worker.js';
-import { openCommitmentIntakeQueue } from '../skills/comm-bridge/scripts/c4-db.js';
-import { openCommitmentCore } from '../skills/commitment-core/scripts/core.js';
+import { runCommitmentIntakeWorkerOnce } from '../../../comm-bridge/scripts/c4-intake-worker.js';
+import { openCommitmentIntakeQueue } from '../../../comm-bridge/scripts/c4-db.js';
+import { openCommitmentCore } from '../core.js';
 
 const C4_RECEIVE = fileURLToPath(new URL(
-  '../skills/comm-bridge/scripts/c4-receive.js',
+  '../../../comm-bridge/scripts/c4-receive.js',
   import.meta.url,
 ));
 
