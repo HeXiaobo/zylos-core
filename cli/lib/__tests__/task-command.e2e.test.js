@@ -30,6 +30,10 @@ function installTaskCore(zylosDir) {
     path.join(SOURCE_TASK_CORE, 'scripts', 'core.js'),
     path.join(destination, 'scripts', 'core.js'),
   );
+  copyFileSync(
+    path.join(SOURCE_TASK_CORE, 'scripts', 'task-runs.js'),
+    path.join(destination, 'scripts', 'task-runs.js'),
+  );
   symlinkSync(
     path.join(SOURCE_TASK_CORE, 'node_modules'),
     path.join(destination, 'node_modules'),

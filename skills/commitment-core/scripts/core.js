@@ -5,6 +5,8 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { createTaskRunModule, initializeTaskRunSchema } from './task-runs.js';
+
 function defaultDbPath() {
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
   return path.join(zylosDir, 'commitments', 'commitments.db');
@@ -412,15 +414,17 @@ function initializeSchema(database) {
 /**
  * Open the durable Commitment Core Module.
  *
- * Callers interact only through ingest/command/query. SQLite transactions,
- * schema migration, deduplication, events, and persistence remain inside the
- * Module.
+ * Callers interact only through ingest/command/query and the nested runs
+ * Interface. SQLite transactions, schema migration, deduplication, events,
+ * leases, and persistence remain inside the Module.
  */
 export function openCommitmentCore({
   dbPath = defaultDbPath(),
   clock = () => new Date().toISOString(),
   idGenerator = () => `task-${randomUUID()}`,
   eventIdGenerator = () => `event-${randomUUID()}`,
+  runIdGenerator = () => `run-${randomUUID()}`,
+  runEventIdGenerator = () => `run-event-${randomUUID()}`,
 } = {}) {
   if (dbPath !== ':memory:') mkdirSync(path.dirname(dbPath), { recursive: true });
 
@@ -431,6 +435,7 @@ export function openCommitmentCore({
   migrateLegacyEventSchema(database);
   database.pragma('foreign_keys = ON');
   initializeSchema(database);
+  initializeTaskRunSchema(database);
   backfillCreationEvents(database, eventIdGenerator);
 
   const selectTask = database.prepare(`
@@ -484,6 +489,38 @@ export function openCommitmentCore({
       idempotency_key, request_fingerprint, task_id, result_json, created_at
     ) VALUES (?, ?, ?, ?, ?)
   `);
+
+  function transitionTask({ task, toState, eventType, actorId, timestamp }) {
+    const updated = updateTaskState.run(toState, timestamp, task.id, task.version);
+    if (updated.changes !== 1) {
+      throw domainError(
+        'VERSION_CONFLICT',
+        `task changed while applying transition: ${task.id}`,
+      );
+    }
+    const updatedTask = toTaskView(selectTask.get(task.id));
+    const event = {
+      id: requireText(eventIdGenerator(), 'generated event id'),
+      type: eventType,
+      taskId: task.id,
+      actorId,
+      fromState: task.state,
+      toState: updatedTask.state,
+      version: updatedTask.version,
+      occurredAt: timestamp,
+    };
+    insertEvent.run(
+      event.id,
+      event.type,
+      event.taskId,
+      event.actorId,
+      event.fromState,
+      event.toState,
+      event.version,
+      event.occurredAt,
+    );
+    return { task: updatedTask, event };
+  }
 
   const ingestTransaction = database.transaction((rawEnvelope) => {
     const envelope = normalizeEnvelope(rawEnvelope);
@@ -567,29 +604,13 @@ export function openCommitmentCore({
     }
 
     const timestamp = requireText(clock(), 'clock result');
-    updateTaskState.run(definition.toState, timestamp, task.id, expectedVersion);
-    const updatedTask = toTaskView(selectTask.get(task.id));
-    const event = {
-      id: requireText(eventIdGenerator(), 'generated event id'),
-      type: definition.eventType,
-      taskId: task.id,
+    const result = transitionTask({
+      task,
+      toState: definition.toState,
+      eventType: definition.eventType,
       actorId: command.actorId,
-      fromState: task.state,
-      toState: updatedTask.state,
-      version: updatedTask.version,
-      occurredAt: timestamp,
-    };
-    insertEvent.run(
-      event.id,
-      event.type,
-      event.taskId,
-      event.actorId,
-      event.fromState,
-      event.toState,
-      event.version,
-      event.occurredAt,
-    );
-    const result = { task: updatedTask, event };
+      timestamp,
+    });
     insertCommand.run(
       command.idempotencyKey,
       fingerprint,
@@ -600,6 +621,19 @@ export function openCommitmentCore({
     return result;
   });
 
+  const runs = createTaskRunModule({
+    database,
+    clock,
+    runIdGenerator,
+    runEventIdGenerator,
+    taskStore: {
+      get(taskId) {
+        return toTaskView(selectTask.get(taskId));
+      },
+      transition: transitionTask,
+    },
+  });
+
   return Object.freeze({
     ingest(envelope) {
       return ingestTransaction.immediate(envelope);
@@ -607,6 +641,7 @@ export function openCommitmentCore({
     command(command, expectedVersion) {
       return commandTransaction.immediate(command, expectedVersion);
     },
+    runs,
     query(query = {}) {
       const normalized = normalizeQuery(query);
       if (normalized.mode === 'list') {

@@ -15,9 +15,10 @@ fields belong in Adapters, not in this Module.
 ## Interface
 
 Open the Module with
-`openCommitmentCore({ dbPath, clock, idGenerator, eventIdGenerator })` and close
-it when the runtime stops. Production callers normally omit the options; the
-injectable clock and ID generators exist for deterministic tests.
+`openCommitmentCore({ dbPath, clock, idGenerator, eventIdGenerator,
+runIdGenerator, runEventIdGenerator })` and close it when the runtime stops.
+Production callers normally omit the options; the injectable clock and ID
+generators exist for deterministic tests.
 The default database is `$ZYLOS_DIR/commitments/commitments.db`, falling back
 to `~/zylos/commitments/commitments.db` when `ZYLOS_DIR` is unset.
 
@@ -37,6 +38,38 @@ to `~/zylos/commitments/commitments.db` when `ZYLOS_DIR` is unset.
 - `command({ type, taskId, actorId, idempotencyKey }, expectedVersion)` applies
   one state transition and returns `{ task, event }`. `expectedVersion` must be
   a positive integer.
+
+## Task Run leases
+
+`core.runs` is the only Interface for durable execution leases. `actorId` is
+the logical assignee acting on the Task; `workerId` identifies the concrete
+runtime process and may change after lease expiry.
+
+- `runs.claim({ taskId, actorId, workerId, idempotencyKey, leaseMs },
+  expectedTaskVersion)` atomically creates one active Run. Claiming a `ready`
+  Task also moves it to `in_progress`; claiming an `in_progress` Task is used
+  for recovery and does not advance its Task version.
+- Only one `active` Run row may exist for a Task. An unexpired lease returns
+  `LEASE_CONFLICT`; an expired lease is marked `expired` before a new worker is
+  admitted in the same transaction. `leaseMs` is an integer from 1 through
+  86,400,000.
+- `runs.heartbeat({ taskId, runId, workerId, idempotencyKey, leaseMs },
+  expectedRunVersion)` renews an unexpired lease owned by that worker.
+- `runs.complete({ taskId, runId, workerId, idempotencyKey },
+  { runVersion, taskVersion })` ends the Run and submits the Task to `review`.
+  Execution completion never accepts a Task or moves it directly to `done`.
+- `runs.release(...)` takes the same arguments as `complete`, ends the Run,
+  and returns the Task from `in_progress` to `ready`.
+- `runs.query({ runId, includeEvents? })` returns one Run, optionally with its
+  Run Events. `runs.query({ taskId, statuses?, limit? })` returns stable,
+  bounded Run history; the default limit is 50 and the maximum is 100.
+
+Every Run mutation, Run Event, idempotency receipt, and any corresponding Task
+transition/Event commits in one SQLite transaction. Exact receipt replay wins
+even if versions or time have since advanced; changed content with the same key
+returns `IDEMPOTENCY_CONFLICT`. Other stable Run errors include
+`LEASE_CONFLICT`, `LEASE_EXPIRED`, `LEASE_NOT_ACTIVE`, `LEASE_FORBIDDEN`,
+`RUN_NOT_FOUND`, `RUN_TASK_MISMATCH`, and `RUN_VERSION_CONFLICT`.
 
 The envelope owns only channel-neutral task fields. `source.channel` and
 `source.externalId` provide provenance; Adapters are responsible for deriving
