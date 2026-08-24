@@ -16,7 +16,8 @@ fields belong in Adapters, not in this Module.
 
 Open the Module with
 `openCommitmentCore({ dbPath, clock, idGenerator, eventIdGenerator,
-runIdGenerator, runEventIdGenerator })` and close it when the runtime stops.
+runIdGenerator, runEventIdGenerator, evidenceIdGenerator,
+externalLinkIdGenerator })` and close it when the runtime stops.
 Production callers normally omit the options; the injectable clock and ID
 generators exist for deterministic tests.
 The default database is `$ZYLOS_DIR/commitments/commitments.db`, falling back
@@ -84,6 +85,51 @@ The envelope owns only channel-neutral task fields. `source.channel` and
 `source.externalId` provide provenance; Adapters are responsible for deriving
 a stable idempotency key from their native event identity.
 
+## Evidence
+
+`core.evidence` owns immutable proof attached to a Task. It does not expose an
+update or delete operation.
+
+- `evidence.record({ taskId, actorId, kind, uri?, summary?, contentHash?,
+  idempotencyKey })` atomically appends Evidence and its receipt. At least one
+  of `uri`, `summary`, or `contentHash` is required. Inputs are bounded: URI is
+  at most 2,048 characters, summary 10,000, and content hash 256.
+- The owner, acceptor, or assignee may record Evidence. Other actors receive
+  `FORBIDDEN`; a missing Task returns `TASK_NOT_FOUND`.
+- `kind` is normalized to a lowercase identifier containing only letters,
+  digits, `.`, `_`, and `-` (and beginning with a letter).
+- `evidence.query({ evidenceId })` returns one Evidence or `null`.
+  `evidence.query({ taskId, kind?, limit? })` returns immutable Evidence ordered
+  by `createdAt` descending and `id` ascending. The default limit is 50 and
+  maximum is 100.
+- Exact receipt replay returns the original result. Reusing the key for
+  different normalized content returns `IDEMPOTENCY_CONFLICT`.
+
+## External links
+
+`core.externalLinks` owns durable identity mappings, not external task state.
+It never calls or synchronizes Feishu, OpenMax, Paperclip, or another backend.
+
+- `externalLinks.link({ taskId, actorId, backend, externalId,
+  idempotencyKey })` maps one backend object to one Task. The owner, acceptor,
+  or assignee may create a mapping.
+- `backend` is trimmed, lowercased, and restricted to letters, digits, `.`,
+  `_`, and `-`. `externalId` retains the backend's native casing.
+- `(backend, externalId)` is globally unique, and a Task has at most one link
+  per backend. Conflicts return `EXTERNAL_LINK_CONFLICT`.
+- Repeating the same mapping with a new key returns `{ created: false, link }`
+  and still records that key as an idempotency receipt. Exact replay returns
+  the same result; changed content under that key returns
+  `IDEMPOTENCY_CONFLICT`.
+- `externalLinks.query({ taskId, backend?, limit? })` lists mappings for a Task.
+  `externalLinks.query({ backend, externalId })` resolves one external object;
+  omitting `externalId` lists mappings for a backend. Lists have a default
+  limit of 50, maximum of 100, and deterministic identity ordering.
+
+Evidence rows, ExternalLink rows, and their receipts commit in their respective
+single SQLite transactions. Callers must use these Interfaces instead of the
+underlying tables.
+
 ## External execution Adapter seam
 
 `scripts/external-execution-adapter.js` defines the reusable Interface for
@@ -126,8 +172,8 @@ Callers handle stable error codes: `VERSION_CONFLICT`, `INVALID_TRANSITION`,
 `FORBIDDEN`, `IDEMPOTENCY_CONFLICT`, and `TASK_NOT_FOUND`. Malformed Interface
 values throw `TypeError`.
 
-Assignment changes, reconciliation, and channel projection remain later slices
-and must extend this Interface deliberately.
+Assignment changes, reconciliation, external state synchronization, and channel
+projection remain later slices and must extend this Interface deliberately.
 
 The local `zylos task` CLI is an Adapter over this Interface. It must not query
 or mutate the SQLite tables directly. It lazily loads the deployed Module from

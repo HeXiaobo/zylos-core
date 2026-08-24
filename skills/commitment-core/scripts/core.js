@@ -5,6 +5,11 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { createEvidenceModule, initializeEvidenceSchema } from './evidence.js';
+import {
+  createExternalLinkModule,
+  initializeExternalLinkSchema,
+} from './external-links.js';
 import { createTaskRunModule, initializeTaskRunSchema } from './task-runs.js';
 
 function defaultDbPath() {
@@ -414,9 +419,10 @@ function initializeSchema(database) {
 /**
  * Open the durable Commitment Core Module.
  *
- * Callers interact only through ingest/command/query and the nested runs
- * Interface. SQLite transactions, schema migration, deduplication, events,
- * leases, and persistence remain inside the Module.
+ * Callers interact only through ingest/command/query and the nested runs,
+ * evidence, and externalLinks Interfaces. SQLite transactions, schema
+ * migration, deduplication, events, leases, and persistence remain inside the
+ * Module.
  */
 export function openCommitmentCore({
   dbPath = defaultDbPath(),
@@ -425,6 +431,8 @@ export function openCommitmentCore({
   eventIdGenerator = () => `event-${randomUUID()}`,
   runIdGenerator = () => `run-${randomUUID()}`,
   runEventIdGenerator = () => `run-event-${randomUUID()}`,
+  evidenceIdGenerator = () => `evidence-${randomUUID()}`,
+  externalLinkIdGenerator = () => `external-link-${randomUUID()}`,
 } = {}) {
   if (dbPath !== ':memory:') mkdirSync(path.dirname(dbPath), { recursive: true });
 
@@ -436,6 +444,8 @@ export function openCommitmentCore({
   database.pragma('foreign_keys = ON');
   initializeSchema(database);
   initializeTaskRunSchema(database);
+  initializeEvidenceSchema(database);
+  initializeExternalLinkSchema(database);
   backfillCreationEvents(database, eventIdGenerator);
 
   const selectTask = database.prepare(`
@@ -626,17 +636,30 @@ export function openCommitmentCore({
     return result;
   });
 
+  const taskStore = {
+    get(taskId) {
+      return toTaskView(selectTask.get(taskId));
+    },
+    transition: transitionTask,
+  };
   const runModule = createTaskRunModule({
     database,
     clock,
     runIdGenerator,
     runEventIdGenerator,
-    taskStore: {
-      get(taskId) {
-        return toTaskView(selectTask.get(taskId));
-      },
-      transition: transitionTask,
-    },
+    taskStore,
+  });
+  const evidenceModule = createEvidenceModule({
+    database,
+    clock,
+    evidenceIdGenerator,
+    taskStore,
+  });
+  const externalLinkModule = createExternalLinkModule({
+    database,
+    clock,
+    externalLinkIdGenerator,
+    taskStore,
   });
 
   return Object.freeze({
@@ -647,6 +670,8 @@ export function openCommitmentCore({
       return commandTransaction.immediate(command, expectedVersion);
     },
     runs: runModule.publicInterface,
+    evidence: evidenceModule,
+    externalLinks: externalLinkModule,
     query(query = {}) {
       const normalized = normalizeQuery(query);
       if (normalized.mode === 'list') {
