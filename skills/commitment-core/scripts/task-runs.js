@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 const MAX_LEASE_MS = 86_400_000;
 const DEFAULT_QUERY_LIMIT = 50;
 const MAX_QUERY_LIMIT = 100;
+const DEFAULT_SWEEP_LIMIT = 25;
+const MAX_SWEEP_LIMIT = 100;
 const RUN_STATUSES = new Set(['active', 'completed', 'released', 'expired', 'interrupted']);
 
 const RUN_TABLE_COLUMNS = `
@@ -140,6 +142,16 @@ function normalizeRunQuery(rawQuery) {
     throw new TypeError(`limit must be an integer between 1 and ${MAX_QUERY_LIMIT}`);
   }
   return { mode: 'task', taskId, statuses, limit };
+}
+
+function normalizeSweep(rawOptions = {}) {
+  const options = requireObject(rawOptions, 'sweep options');
+  rejectUnknownFields(options, new Set(['limit']), 'sweep options');
+  const limit = options.limit ?? DEFAULT_SWEEP_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SWEEP_LIMIT) {
+    throw new TypeError(`limit must be an integer between 1 and ${MAX_SWEEP_LIMIT}`);
+  }
+  return { limit };
 }
 
 function fingerprint(value) {
@@ -315,6 +327,14 @@ export function createTaskRunModule({
     WHERE run_id = ?
     ORDER BY run_version, id
   `);
+  const selectExpiredRuns = database.prepare(`
+    SELECT id, task_id, actor_id, worker_id, status, version, lease_expires_at,
+           last_heartbeat_at, started_at, ended_at
+    FROM commitment_task_runs
+    WHERE status = 'active' AND lease_expires_at <= ?
+    ORDER BY lease_expires_at, id
+    LIMIT ?
+  `);
   const selectReceipt = database.prepare(`
     SELECT request_fingerprint, result_json
     FROM commitment_run_commands
@@ -406,6 +426,21 @@ export function createTaskRunModule({
     return event;
   }
 
+  function expireAndRecord(run, taskVersion, now) {
+    const expired = expireRun.run(now.timestamp, run.id, run.version);
+    if (expired.changes !== 1) {
+      throw domainError('RUN_VERSION_CONFLICT', `run changed while expiring: ${run.id}`);
+    }
+    const updatedRun = toRunView(selectRun.get(run.id));
+    recordRunEvent({
+      type: 'TaskRunExpired',
+      run: updatedRun,
+      taskVersion,
+      timestamp: now.timestamp,
+    });
+    return updatedRun;
+  }
+
   function assertTaskVersion(task, expectedVersion) {
     if (task.version !== expectedVersion) {
       throw domainError(
@@ -461,17 +496,7 @@ export function createTaskRunModule({
           `Task ${task.id} already has active run ${activeRun.id}`,
         );
       }
-      const expired = expireRun.run(now.timestamp, activeRun.id, activeRun.version);
-      if (expired.changes !== 1) {
-        throw domainError('RUN_VERSION_CONFLICT', `run changed while expiring: ${activeRun.id}`);
-      }
-      recoveredRun = toRunView(selectRun.get(activeRun.id));
-      recordRunEvent({
-        type: 'TaskRunExpired',
-        run: recoveredRun,
-        taskVersion: task.version,
-        timestamp: now.timestamp,
-      });
+      recoveredRun = expireAndRecord(activeRun, task.version, now);
     }
 
     const runId = requireText(runIdGenerator(), 'generated run id');
@@ -626,6 +651,25 @@ export function createTaskRunModule({
     taskEventType: 'TaskRunReleased',
   });
 
+  const sweepExpiredTransaction = database.transaction((rawOptions) => {
+    const options = normalizeSweep(rawOptions);
+    const now = currentInstant(clock);
+    const candidates = selectExpiredRuns
+      .all(now.timestamp, options.limit + 1)
+      .map(toRunView);
+
+    for (const run of candidates.slice(0, options.limit)) {
+      const task = taskStore.get(run.taskId);
+      if (!task) throw domainError('TASK_NOT_FOUND', `task not found: ${run.taskId}`);
+      expireAndRecord(run, task.version, now);
+    }
+
+    return {
+      expiredCount: Math.min(candidates.length, options.limit),
+      hasMore: candidates.length > options.limit,
+    };
+  });
+
   /**
    * Called only from Commitment Core's existing Task command transaction.
    * It owns all Task/Run crossing policy without leaking Run tables to Core.
@@ -671,6 +715,9 @@ export function createTaskRunModule({
     },
     release(request, versions) {
       return releaseTransaction.immediate(request, versions);
+    },
+    sweepExpired(options = {}) {
+      return sweepExpiredTransaction.immediate(options);
     },
     query(query) {
       const normalized = normalizeRunQuery(query);

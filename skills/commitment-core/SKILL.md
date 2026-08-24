@@ -62,6 +62,11 @@ runtime process and may change after lease expiry.
   Execution completion never accepts a Task or moves it directly to `done`.
 - `runs.release(...)` takes the same arguments as `complete`, ends the Run,
   and returns the Task from `in_progress` to `ready`.
+- `runs.sweepExpired({ limit? })` atomically marks at most `limit` expired
+  active Runs as `expired` and appends one immutable `TaskRunExpired` Event per
+  Run. The default limit is 25 and the maximum is 100. It returns
+  `{ expiredCount, hasMore }` and never changes Task state; an `in_progress`
+  Task remains available for a later explicit `runs.claim` takeover.
 - `runs.query({ runId, includeEvents? })` returns one Run, optionally with its
   Run Events. `runs.query({ taskId, statuses?, limit? })` returns stable,
   bounded Run history; the default limit is 50 and the maximum is 100.
@@ -72,6 +77,22 @@ even if versions or time have since advanced; changed content with the same key
 returns `IDEMPOTENCY_CONFLICT`. Other stable Run errors include
 `LEASE_CONFLICT`, `LEASE_EXPIRED`, `LEASE_NOT_ACTIVE`, `LEASE_FORBIDDEN`,
 `RUN_NOT_FOUND`, `RUN_TASK_MISMATCH`, and `RUN_VERSION_CONFLICT`.
+
+Run the opt-in background sweep with
+`node scripts/run-lease-sweep-supervisor.js`, or execute one bounded pass with
+`node scripts/run-lease-sweep-supervisor.js --once`. The supervisor defaults
+to a 2,000 ms interval and batch size 25; set
+`COMMITMENT_RUN_SWEEP_INTERVAL_MS` (250..60,000) and
+`COMMITMENT_RUN_SWEEP_BATCH_SIZE` (1..100) to change them. It drains
+sequentially, logs structured failures and continues with the next cycle,
+uses a process lock under `$ZYLOS_DIR/.zylos`, and releases it on SIGINT or
+SIGTERM. It is intentionally absent from the default PM2 ecosystem and does
+not start unless an operator explicitly invokes it. The sweep never calls an
+external backend, automatically reruns work, or moves a Task to `done`.
+
+After a sweep, new heartbeat, complete, and release requests from the old
+worker fail with `LEASE_NOT_ACTIVE`. Exact receipt replays still return their
+original result without a second mutation or Event.
 
 The legacy Task command Interface coordinates with Run ownership. Direct
 `SubmitForReview` fails with `ACTIVE_RUN_CONFLICT` while a Run is active; the

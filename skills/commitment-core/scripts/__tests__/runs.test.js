@@ -274,6 +274,215 @@ test('an expired lease is recovered atomically by a new worker without advancing
   }
 });
 
+test('bounded lease sweep expires an active Run without advancing its Task', () => {
+  const harness = createHarness({
+    runEventIds: ['run-event-claim', 'run-event-expired'],
+  });
+
+  try {
+    ingestTask(harness.core);
+    claim(harness.core);
+    harness.now.value = '2026-08-25T10:00:02.000Z';
+
+    const result = harness.core.runs.sweepExpired({ limit: 25 });
+
+    assert.deepEqual(result, { expiredCount: 1, hasMore: false });
+    assert.equal(harness.core.query({ taskId: 'task-001' }).state, 'in_progress');
+    assert.equal(harness.core.query({ taskId: 'task-001' }).version, 2);
+    assert.equal(harness.core.runs.query({ runId: 'run-001' }).status, 'expired');
+    assert.equal(harness.core.runs.query({ runId: 'run-001' }).version, 2);
+    assert.deepEqual(
+      harness.core.runs.query({ runId: 'run-001', includeEvents: true }).events
+        .map((event) => event.type),
+      ['TaskRunClaimed', 'TaskRunExpired'],
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('two Core connections cannot sweep the same expired Run twice', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-run-sweep-concurrency-'));
+  const dbPath = path.join(directory, 'commitments.db');
+  const first = createHarness({
+    dbPath,
+    runEventIds: ['run-event-claim', 'run-event-expired'],
+  });
+  let second;
+
+  try {
+    ingestTask(first.core);
+    claim(first.core);
+    first.now.value = '2026-08-25T10:00:02.000Z';
+    second = createHarness({ dbPath, runEventIds: ['run-event-expired-second'] });
+    second.now.value = first.now.value;
+
+    assert.deepEqual(first.core.runs.sweepExpired({ limit: 1 }), {
+      expiredCount: 1,
+      hasMore: false,
+    });
+    assert.deepEqual(second.core.runs.sweepExpired({ limit: 1 }), {
+      expiredCount: 0,
+      hasMore: false,
+    });
+    assert.deepEqual(
+      second.core.runs.query({ runId: 'run-001', includeEvents: true }).events
+        .map((event) => event.type),
+      ['TaskRunClaimed', 'TaskRunExpired'],
+    );
+  } finally {
+    second?.core.close();
+    first.core.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('sweep preserves exact receipts while old worker mutations fail closed', () => {
+  const harness = createHarness({
+    runEventIds: ['run-event-claim', 'run-event-heartbeat', 'run-event-expired'],
+  });
+
+  try {
+    ingestTask(harness.core);
+    const claimed = claim(harness.core);
+    harness.now.value = '2026-08-25T10:00:00.500Z';
+    const heartbeatCommand = {
+      taskId: 'task-001',
+      runId: 'run-001',
+      workerId: 'worker-1',
+      idempotencyKey: 'run-command:heartbeat:before-sweep',
+      leaseMs: 1_000,
+    };
+    const heartbeat = harness.core.runs.heartbeat(heartbeatCommand, 1);
+    harness.now.value = '2026-08-25T10:00:02.000Z';
+    harness.core.runs.sweepExpired({ limit: 25 });
+
+    assert.deepEqual(claim(harness.core), claimed);
+    assert.deepEqual(harness.core.runs.heartbeat(heartbeatCommand, 1), heartbeat);
+    assert.equal(harness.core.runs.query({ runId: 'run-001' }).version, 3);
+
+    const mutations = [
+      () => harness.core.runs.heartbeat({
+        ...heartbeatCommand,
+        idempotencyKey: 'run-command:heartbeat:after-sweep',
+      }, 3),
+      () => harness.core.runs.complete({
+        taskId: 'task-001',
+        runId: 'run-001',
+        workerId: 'worker-1',
+        idempotencyKey: 'run-command:complete:after-sweep',
+      }, { runVersion: 3, taskVersion: 2 }),
+      () => harness.core.runs.release({
+        taskId: 'task-001',
+        runId: 'run-001',
+        workerId: 'worker-1',
+        idempotencyKey: 'run-command:release:after-sweep',
+      }, { runVersion: 3, taskVersion: 2 }),
+    ];
+    for (const mutate of mutations) {
+      assert.throws(mutate, (error) => error?.code === 'LEASE_NOT_ACTIVE');
+    }
+    assert.equal(harness.core.query({ taskId: 'task-001' }).state, 'in_progress');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('lease sweep never processes more than its configured batch', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-run-sweep-bound-'));
+  const now = { value: '2026-08-25T10:00:00.000Z' };
+  const taskIds = ['task-001', 'task-002'];
+  const taskEventIds = [
+    'task-event-create-1', 'task-event-start-1',
+    'task-event-create-2', 'task-event-start-2',
+  ];
+  const runIds = ['run-001', 'run-002'];
+  const runEventIds = [
+    'run-event-claim-1', 'run-event-claim-2',
+    'run-event-expire-1', 'run-event-expire-2',
+  ];
+  const core = openCommitmentCore({
+    dbPath: path.join(directory, 'commitments.db'),
+    clock: () => now.value,
+    idGenerator: () => taskIds.shift(),
+    eventIdGenerator: () => taskEventIds.shift(),
+    runIdGenerator: () => runIds.shift(),
+    runEventIdGenerator: () => runEventIds.shift(),
+  });
+
+  try {
+    for (const suffix of ['001', '002']) {
+      const taskId = `task-${suffix}`;
+      core.ingest({
+        idempotencyKey: `source:${taskId}`,
+        source: { channel: 'test', externalId: taskId, senderId: 'owner-1' },
+        task: { title: taskId, ownerId: 'owner-1', assigneeId: 'agent-1' },
+      });
+      core.runs.claim({
+        taskId,
+        actorId: 'agent-1',
+        workerId: `worker-${suffix}`,
+        idempotencyKey: `run-command:claim:${suffix}`,
+        leaseMs: 1_000,
+      }, 1);
+    }
+    now.value = '2026-08-25T10:00:02.000Z';
+
+    assert.deepEqual(core.runs.sweepExpired({ limit: 1 }), {
+      expiredCount: 1,
+      hasMore: true,
+    });
+    assert.equal(
+      ['task-001', 'task-002']
+        .map((taskId) => core.runs.query({ taskId, statuses: ['expired'] }).length)
+        .reduce((sum, count) => sum + count, 0),
+      1,
+    );
+    assert.deepEqual(core.runs.sweepExpired({ limit: 1 }), {
+      expiredCount: 1,
+      hasMore: false,
+    });
+    assert.deepEqual(core.runs.sweepExpired({ limit: 1 }), {
+      expiredCount: 0,
+      hasMore: false,
+    });
+  } finally {
+    core.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('lease sweep rolls back the Run update when immutable Event persistence fails', () => {
+  const harness = createHarness({
+    runEventIds: ['run-event-claim', 'run-event-claim', 'run-event-expired-retry'],
+  });
+
+  try {
+    ingestTask(harness.core);
+    claim(harness.core);
+    harness.now.value = '2026-08-25T10:00:02.000Z';
+
+    assert.throws(
+      () => harness.core.runs.sweepExpired({ limit: 1 }),
+      /UNIQUE constraint failed/,
+    );
+    assert.equal(harness.core.runs.query({ runId: 'run-001' }).status, 'active');
+    assert.deepEqual(
+      harness.core.runs.query({ runId: 'run-001', includeEvents: true }).events
+        .map((event) => event.type),
+      ['TaskRunClaimed'],
+    );
+
+    assert.deepEqual(harness.core.runs.sweepExpired({ limit: 1 }), {
+      expiredCount: 1,
+      hasMore: false,
+    });
+    assert.equal(harness.core.runs.query({ runId: 'run-001' }).status, 'expired');
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('complete ends the lease and submits for review; release returns work to ready', () => {
   const completeHarness = createHarness();
   const releaseHarness = createHarness();
@@ -454,6 +663,25 @@ test('Run queries keep identity modes mutually exclusive and validate bounded fi
     for (const query of invalidQueries) {
       assert.throws(() => harness.core.runs.query(query), TypeError);
     }
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('lease sweep rejects malformed or unbounded requests before touching Runs', () => {
+  const harness = createHarness();
+
+  try {
+    ingestTask(harness.core);
+    claim(harness.core);
+    harness.now.value = '2026-08-25T10:00:02.000Z';
+
+    for (const options of [null, [], { limit: 0 }, { limit: 101 }, { limit: 1.5 }, {
+      unexpected: true,
+    }]) {
+      assert.throws(() => harness.core.runs.sweepExpired(options), TypeError);
+    }
+    assert.equal(harness.core.runs.query({ runId: 'run-001' }).status, 'active');
   } finally {
     harness.cleanup();
   }
