@@ -29,6 +29,7 @@ test('maps deliverable and backend completion signals to review, never acceptanc
   const cases = [
     ['paperclip', 'deliverable_submitted'],
     ['openmax', 'completed'],
+    ['openmax', 'delivered'],
     ['local', 'done'],
     ['local.worker', 'succeeded'],
   ];

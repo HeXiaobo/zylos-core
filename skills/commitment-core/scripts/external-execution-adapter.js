@@ -1,6 +1,7 @@
 const COMMAND_TYPE_BY_EVENT = Object.freeze({
   work_started: 'StartTask',
   deliverable_submitted: 'SubmitForReview',
+  delivered: 'SubmitForReview',
   completed: 'SubmitForReview',
   done: 'SubmitForReview',
   succeeded: 'SubmitForReview',

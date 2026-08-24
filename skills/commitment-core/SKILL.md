@@ -295,11 +295,58 @@ identifier, and the stable command key is
 `<backend>:<eventId>:task-command`. Raw backend metadata must be normalized
 outside this Adapter; extra or malformed fields fail closed.
 
-Only `work_started` becomes `StartTask`. `deliverable_submitted`, `completed`,
-`done`, and `succeeded` become `SubmitForReview`. Backend completion is evidence
-for review, never acceptance: this Adapter never produces `AcceptTask`, and
-unknown or human-acceptance event types fail closed. Only an explicit,
-authorized acceptor action may move a reviewed Task to `done`.
+Only `work_started` becomes `StartTask`. `deliverable_submitted`, `delivered`,
+`completed`, `done`, and `succeeded` become `SubmitForReview`. Backend
+completion is evidence for review, never acceptance: this Adapter never
+produces `AcceptTask`, and unknown or human-acceptance event types fail closed.
+Only an explicit, authorized acceptor action may move a reviewed Task to `done`.
+
+## Execution control-plane gate
+
+`scripts/execution-control-plane-gate.js` is the runtime-neutral selection
+Interface for optional control planes and a local runtime fallback. Platform
+Adapters first normalize their own authenticated health probes to:
+
+- control plane `ready`, `disabled`, `unreachable`, or `http_error` (a 4xx/5xx
+  status is required for `http_error`); and
+- local runtime `ready` or `unavailable`.
+
+`decideExecutionControlPlane({ controlPlane, localRuntime })` returns one
+machine-readable decision. Its `status` is `available` when the control plane
+is selected, `degraded` when a non-ready control plane falls back to the local
+runtime, and `blocked` only when neither backend can execute. A 403 therefore
+selects local execution when local is ready; it never discards or rolls back a
+Task already committed in Core. Every non-blocked decision has
+`taskAdmission: "allowed"`, and every decision declares
+`completionPolicy: "submit_for_review"`.
+
+This Module deliberately performs no HTTP request, process probe, task claim,
+or dispatch. OpenMax, HXA, Paperclip, and local runtime details stay in their
+Adapters. An execution dispatcher must obtain fresh normalized observations,
+call this gate before selecting a backend, and continue to map backend events
+through `external-execution-adapter.js`. Therefore a selected backend's
+`delivered`, `completed`, `done`, or `succeeded` signal still moves the Task
+only to `review`; it cannot produce `AcceptTask`.
+
+Operators and Adapter acceptance tests can evaluate the exact gate with the
+side-effect-free diagnostic CLI. For example, a control-plane 403 with a ready
+local runtime exits zero and reports `degraded` with `selectedBackend: "local"`:
+
+```sh
+node scripts/execution-control-plane-doctor.js \
+  --control-plane openmax \
+  --control-plane-state http_error \
+  --http-status 403 \
+  --local-runtime local \
+  --local-runtime-state ready \
+  --json
+```
+
+The CLI exits `0` for `available` and `degraded`, `2` for a valid `blocked`
+decision, and `1` for malformed or contradictory observations. It does not
+read credentials, contact a backend, mutate Core, claim a Task, start a
+runtime, or publish a message. A platform Adapter remains responsible for
+authenticated probing and for converting its result into these strict fields.
 
 ## Derived attention view
 
