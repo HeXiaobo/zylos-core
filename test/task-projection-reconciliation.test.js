@@ -3,6 +3,46 @@ import { describe, expect, it } from '@jest/globals';
 import { reconcileProjection } from '../skills/commitment-core/scripts/reconcile-projection.js';
 
 describe('reconcileProjection', () => {
+  it('rejects projection inputs that are not arrays', () => {
+    expect(() => reconcileProjection({ expected: null, actual: [] }))
+      .toThrow(new TypeError('expected must be an array'));
+    expect(() => reconcileProjection({ expected: [], actual: {} }))
+      .toThrow(new TypeError('actual must be an array'));
+  });
+
+  it('rejects projection records that are not objects', () => {
+    expect(() => reconcileProjection({ expected: [null], actual: [] }))
+      .toThrow(new TypeError('expected[0] must be an object'));
+  });
+
+  it('rejects projection records without a string key', () => {
+    expect(() => reconcileProjection({
+      expected: [{}],
+      actual: [],
+    })).toThrow(new TypeError('expected[0].key must be a non-empty string'));
+  });
+
+  it('rejects projection records whose key is empty', () => {
+    expect(() => reconcileProjection({
+      expected: [],
+      actual: [{ key: '   ', state: 'ready' }],
+    })).toThrow(new TypeError('actual[0].key must be a non-empty string'));
+  });
+
+  it('rejects projection records whose state is not a string', () => {
+    expect(() => reconcileProjection({
+      expected: [{ key: 'task-1', state: 1 }],
+      actual: [],
+    })).toThrow(new TypeError('expected[0].state must be a non-empty string'));
+  });
+
+  it('rejects projection records whose state is empty', () => {
+    expect(() => reconcileProjection({
+      expected: [],
+      actual: [{ key: 'task-1', state: '' }],
+    })).toThrow(new TypeError('actual[0].state must be a non-empty string'));
+  });
+
   it('reports matching normalized task projections as consistent', () => {
     const result = reconcileProjection({
       expected: [{ key: 'task-1', state: 'ready' }],

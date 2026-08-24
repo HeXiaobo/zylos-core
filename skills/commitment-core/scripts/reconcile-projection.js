@@ -2,9 +2,10 @@
  * Compare two platform-neutral task projections without performing I/O.
  *
  * The Interface accepts `expected` and `actual` arrays. Each normalized record
- * must provide string `key` and `state` values. Additional fields are ignored
- * so adapters keep platform-specific data outside this module. A key duplicated
- * on either side is reported as ambiguous and excluded from other comparisons.
+ * must provide non-empty string `key` and `state` values. Additional fields are
+ * ignored so adapters keep platform-specific data outside this module. A key
+ * duplicated on either side is reported as ambiguous and excluded from other
+ * comparisons. Invalid input fails closed with TypeError; no diff is returned.
  * The inputs are never mutated.
  *
  * @param {{expected: Array<{key: string, state: string}>, actual: Array<{key: string, state: string}>}} projections
@@ -15,6 +16,7 @@
  *   stateMismatches: Array<{key: string, expectedState: string, actualState: string}>,
  *   duplicateKeys: Array<{side: 'expected'|'actual', key: string, count: number}>
  * }}
+ * @throws {TypeError} When a projection is not an array or a record is not normalized.
  */
 function findDuplicateKeys(records, side) {
   const counts = new Map();
@@ -27,7 +29,32 @@ function findDuplicateKeys(records, side) {
     .map(([key, count]) => ({ side, key, count }));
 }
 
-export function reconcileProjection({ expected, actual }) {
+function assertProjectionArray(records, side) {
+  if (!Array.isArray(records)) {
+    throw new TypeError(`${side} must be an array`);
+  }
+}
+
+function assertProjectionRecords(records, side) {
+  records.forEach((record, index) => {
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+      throw new TypeError(`${side}[${index}] must be an object`);
+    }
+    if (typeof record.key !== 'string' || record.key.trim() === '') {
+      throw new TypeError(`${side}[${index}].key must be a non-empty string`);
+    }
+    if (typeof record.state !== 'string' || record.state.trim() === '') {
+      throw new TypeError(`${side}[${index}].state must be a non-empty string`);
+    }
+  });
+}
+
+export function reconcileProjection({ expected, actual } = {}) {
+  assertProjectionArray(expected, 'expected');
+  assertProjectionArray(actual, 'actual');
+  assertProjectionRecords(expected, 'expected');
+  assertProjectionRecords(actual, 'actual');
+
   const duplicateKeys = [
     ...findDuplicateKeys(expected, 'expected'),
     ...findDuplicateKeys(actual, 'actual'),
