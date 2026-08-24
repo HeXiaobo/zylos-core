@@ -120,6 +120,57 @@ test('requeues ingest failures with delay and fails at the fixed retry limit', (
   }
 });
 
+test('terminal failed intake rejects source replay until an operator explicitly retries it', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-intake-worker-redrive-'));
+  const dbPath = path.join(directory, 'c4.db');
+  const taskEnvelope = envelope('feishu:om_worker_redrive:task-intent');
+  let now = 9_000;
+  seedIntake(dbPath, taskEnvelope, () => now);
+  const failingCore = {
+    ingest() {
+      throw new Error('Commitment Core unavailable until redelivery');
+    },
+  };
+
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = runCommitmentIntakeWorkerOnce({
+        dbPath,
+        core: failingCore,
+        clock: () => now,
+      });
+      now += 5;
+      if (attempt < 2) assert.equal(result.status, 'pending');
+      else assert.equal(result.status, 'failed');
+    }
+
+    const intake = openCommitmentIntakeQueue({ dbPath, clock: () => now });
+    const replay = intake.recordInbound({
+      conversation: { channel: 'feishu', content: 'source redelivered task' },
+      envelope: taskEnvelope,
+    });
+    assert.equal(replay.created, false);
+    assert.equal(replay.intake.status, 'failed');
+    assert.equal(replay.intake.retryCount, 3);
+
+    const retried = intake.retryFailed({ idempotencyKey: taskEnvelope.idempotencyKey });
+    intake.close();
+    assert.equal(retried.status, 'pending');
+    assert.equal(retried.retryCount, 0);
+    assert.equal(retried.retryGeneration, 1);
+    assert.equal(retried.lastError, null);
+
+    const recovered = runCommitmentIntakeWorkerOnce({
+      dbPath,
+      core: { ingest: () => ({ created: true, task: { id: 'task-redriven' } }) },
+      clock: () => now,
+    });
+    assert.equal(recovered.status, 'completed');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('replays a stale post-ingest crash without creating a second task', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-intake-worker-crash-'));
   const dbPath = path.join(directory, 'c4.db');

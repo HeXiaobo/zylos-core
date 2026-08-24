@@ -79,10 +79,14 @@ the task intent. Router handling only updates the already-persisted conversation
 and never creates a second row.
 
 Replaying the same idempotency key with the same normalized JSON returns the
-original intake and conversation. Reusing the key for different content raises
-`IDEMPOTENCY_CONFLICT`. Property order, omitted optional fields versus explicit
-`null`, and omitted acceptor versus acceptor equal to owner do not change
-normalized identity.
+original intake and conversation. While that intake is `pending` or
+`processing`, the response reports the already-accepted state; after
+`completed` it reports a durable replay. A terminal `failed` intake returns
+`TASK_INTAKE_FAILED` and requires explicit local operator retry; source
+redelivery does not silently reset its retry budget. Reusing the key for
+different content raises `IDEMPOTENCY_CONFLICT`. Property order, omitted
+optional fields versus explicit `null`, and omitted acceptor versus acceptor
+equal to owner do not change normalized identity.
 The intake worker and retry lifecycle are documented in
 [c4-intake-worker](c4-intake-worker.md).
 

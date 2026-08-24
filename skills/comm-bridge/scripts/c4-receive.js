@@ -397,7 +397,7 @@ async function main() {
       });
       taskRecord = taskRoute.persisted.conversation;
       if (taskRoute.replayed) {
-        emitSuccess(json, taskRecord.id, 'replayed');
+        emitSuccess(json, taskRecord.id, taskRoute.replayAction);
         close();
         return;
       }
@@ -405,7 +405,9 @@ async function main() {
     } catch (err) {
       const code = err.code === 'IDEMPOTENCY_CONFLICT'
         ? 'IDEMPOTENCY_CONFLICT'
-        : 'INTERNAL_ERROR';
+        : err.code === 'TASK_INTAKE_FAILED'
+          ? 'TASK_INTAKE_FAILED'
+          : 'INTERNAL_ERROR';
       emitError(json, code, `task intake failed: ${err.message}`);
     }
   } else {

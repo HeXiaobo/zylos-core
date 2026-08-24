@@ -57,14 +57,47 @@ export function runCommitmentIntakeWorkerOnce({
   }
 }
 
+export function retryFailedCommitmentIntake({
+  idempotencyKey,
+  dbPath = DB_PATH,
+} = {}) {
+  const queue = openCommitmentIntakeQueue({ dbPath });
+  try {
+    return queue.retryFailed({ idempotencyKey });
+  } finally {
+    queue.close();
+  }
+}
+
+function parseCliArgs(args) {
+  if (args.length === 0) return { operation: 'work' };
+  if (args.length === 2 && args[0] === '--retry-failed') {
+    return { operation: 'retry-failed', idempotencyKey: args[1] };
+  }
+  throw new TypeError('usage: c4-intake-worker.js [--retry-failed <idempotency-key>]');
+}
+
 const isMainModule = process.argv[1]
   && fileURLToPath(import.meta.url) === process.argv[1];
 
 if (isMainModule) {
   try {
-    console.log(JSON.stringify(runCommitmentIntakeWorkerOnce()));
+    const command = parseCliArgs(process.argv.slice(2));
+    const result = command.operation === 'retry-failed'
+      ? {
+        status: 'retried',
+        intake: retryFailedCommitmentIntake({ idempotencyKey: command.idempotencyKey }),
+      }
+      : runCommitmentIntakeWorkerOnce();
+    console.log(JSON.stringify(result));
   } catch (error) {
-    console.error(`[C4-Intake] ${error.stack || error.message}`);
+    console.error(JSON.stringify({
+      status: 'error',
+      error: {
+        code: error.code || 'INTERNAL_ERROR',
+        message: error.message || String(error),
+      },
+    }));
     process.exitCode = 1;
   }
 }

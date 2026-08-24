@@ -322,7 +322,7 @@ describe('c4-receive basic intake', () => {
       const replay = cliRaw(args, env);
       assert.equal(first.status, 0, first.stderr || first.stdout);
       assert.equal(replay.status, 0, replay.stderr || replay.stdout);
-      assert.equal(parseJsonStdout(replay.stdout).action, 'replayed');
+      assert.equal(parseJsonStdout(replay.stdout).action, 'already_pending');
 
       const db = openDb(tmpDir);
       const conversations = db.prepare('SELECT count(*) AS count FROM conversations').get().count;
@@ -330,6 +330,46 @@ describe('c4-receive basic intake', () => {
       db.close();
       assert.equal(conversations, 1);
       assert.equal(intakes, 1);
+    });
+  });
+
+  it('fails closed on terminal intake replay until an operator explicitly retries it', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
+      const envelopeJson = JSON.stringify({
+        idempotencyKey: 'feishu:om_cli_redrive:task-intent',
+        source: { channel: 'feishu', externalId: 'om_cli_redrive' },
+        task: { title: '失败后重投', ownerId: 'ou_owner' },
+      });
+      const args = [
+        '--channel', 'feishu',
+        '--endpoint', 'chat_cli_redrive',
+        '--json',
+        '--content', '重新投递终态失败任务',
+        '--task-envelope-json', envelopeJson,
+      ];
+
+      const first = cliRaw(args, env);
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      const database = openDb(tmpDir);
+      database.prepare(`
+        UPDATE commitment_intake_queue
+        SET status = 'failed', retry_count = 3, last_error = 'injected failure'
+      `).run();
+      database.close();
+
+      const redriven = cliRaw(args, env);
+      assert.equal(redriven.status, 1, redriven.stderr || redriven.stdout);
+      assert.equal(parseJsonStdout(redriven.stdout).error.code, 'TASK_INTAKE_FAILED');
+
+      const reloaded = openDb(tmpDir);
+      const intake = reloaded.prepare(`
+        SELECT status, retry_count, last_error FROM commitment_intake_queue
+      `).get();
+      const conversations = reloaded.prepare('SELECT count(*) AS count FROM conversations').get().count;
+      reloaded.close();
+      assert.deepEqual(intake, { status: 'failed', retry_count: 3, last_error: 'injected failure' });
+      assert.equal(conversations, 1);
     });
   });
 

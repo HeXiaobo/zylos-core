@@ -149,6 +149,7 @@ function ensureCommitmentIntakeSchema(database) {
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
       retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      retry_generation INTEGER NOT NULL DEFAULT 0 CHECK (retry_generation >= 0),
       available_at INTEGER NOT NULL,
       last_error TEXT,
       created_at INTEGER NOT NULL,
@@ -161,6 +162,15 @@ function ensureCommitmentIntakeSchema(database) {
     CREATE INDEX IF NOT EXISTS idx_commitment_intake_queue_stale
       ON commitment_intake_queue(status, updated_at);
   `);
+
+  const columnNames = getColumnNames(database, 'commitment_intake_queue');
+  if (!columnNames.has('retry_generation')) {
+    database.exec(`
+      ALTER TABLE commitment_intake_queue
+      ADD COLUMN retry_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (retry_generation >= 0)
+    `);
+  }
 }
 
 function toCommitmentIntakeView(row) {
@@ -172,6 +182,7 @@ function toCommitmentIntakeView(row) {
     envelope: JSON.parse(row.payload_json),
     status: row.status,
     retryCount: row.retry_count,
+    retryGeneration: row.retry_generation,
     availableAt: row.available_at,
     lastError: row.last_error,
     createdAt: row.created_at,
@@ -213,13 +224,13 @@ export function openCommitmentIntakeQueue({
   }
   const selectByIdempotencyKey = database.prepare(`
     SELECT id, conversation_id, idempotency_key, payload_json, status,
-           retry_count, available_at, last_error, created_at, updated_at
+           retry_count, retry_generation, available_at, last_error, created_at, updated_at
     FROM commitment_intake_queue
     WHERE idempotency_key = ?
   `);
   const selectIntakeById = database.prepare(`
     SELECT id, conversation_id, idempotency_key, payload_json, status,
-           retry_count, available_at, last_error, created_at, updated_at
+           retry_count, retry_generation, available_at, last_error, created_at, updated_at
     FROM commitment_intake_queue
     WHERE id = ?
   `);
@@ -269,9 +280,9 @@ export function openCommitmentIntakeQueue({
 
     const intakeResult = database.prepare(`
       INSERT INTO commitment_intake_queue (
-        conversation_id, idempotency_key, payload_json, status, retry_count,
+        conversation_id, idempotency_key, payload_json, status, retry_count, retry_generation,
         available_at, last_error, created_at, updated_at
-      ) VALUES (?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
+      ) VALUES (?, ?, ?, 'pending', 0, 0, ?, NULL, ?, ?)
     `).run(
       conversationId,
       envelope.idempotencyKey,
@@ -327,6 +338,41 @@ export function openCommitmentIntakeQueue({
     if (claimed.changes !== 1) return null;
     return toCommitmentIntakeView(selectIntakeById.get(candidate.id));
   });
+  const retryFailedTransaction = database.transaction(({ idempotencyKey }) => {
+    if (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') {
+      throw new TypeError('idempotencyKey must be a non-empty string');
+    }
+    const existing = selectByIdempotencyKey.get(idempotencyKey.trim());
+    if (!existing) {
+      const error = new Error(`commitment intake not found: ${idempotencyKey.trim()}`);
+      error.code = 'TASK_INTAKE_NOT_FOUND';
+      throw error;
+    }
+    if (existing.status !== 'failed') {
+      const error = new Error(`commitment intake is ${existing.status}, not failed`);
+      error.code = 'TASK_INTAKE_NOT_FAILED';
+      throw error;
+    }
+    const current = clock();
+    const updated = database.prepare(`
+      UPDATE commitment_intake_queue
+      SET status = 'pending', retry_count = 0,
+          retry_generation = retry_generation + 1,
+          available_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND status = 'failed'
+    `).run(current, current, existing.id);
+    if (updated.changes !== 1) {
+      const error = new Error(`commitment intake changed while retrying: ${existing.id}`);
+      error.code = 'TASK_INTAKE_RETRY_CONFLICT';
+      throw error;
+    }
+    database.prepare(`
+      UPDATE conversations
+      SET delivery_action = NULL
+      WHERE id = ? AND delivery_action = 'task-intake-failed'
+    `).run(existing.conversation_id);
+    return toCommitmentIntakeView(selectIntakeById.get(existing.id));
+  });
 
   return Object.freeze({
     recordInbound(input) {
@@ -337,6 +383,9 @@ export function openCommitmentIntakeQueue({
     },
     claimNext({ staleAfterSeconds = 60 } = {}) {
       return claimNextTransaction.immediate({ staleAfterSeconds });
+    },
+    retryFailed(request) {
+      return retryFailedTransaction.immediate(request || {});
     },
     markCompleted(intakeId) {
       const current = clock();
@@ -372,6 +421,13 @@ export function openCommitmentIntakeQueue({
           current,
           intakeId,
         );
+        if (nextStatus === 'failed') {
+          database.prepare(`
+            UPDATE conversations
+            SET delivery_action = 'task-intake-failed'
+            WHERE id = ?
+          `).run(currentRow.conversation_id);
+        }
         return toCommitmentIntakeView(selectIntakeById.get(intakeId));
       }).immediate();
       return transition;

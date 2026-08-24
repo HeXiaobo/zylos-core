@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS commitment_intake_queue (
     status TEXT NOT NULL DEFAULT 'pending'
       CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
     retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    retry_generation INTEGER NOT NULL DEFAULT 0 CHECK (retry_generation >= 0),
     available_at INTEGER NOT NULL,
     last_error TEXT,
     created_at INTEGER NOT NULL,

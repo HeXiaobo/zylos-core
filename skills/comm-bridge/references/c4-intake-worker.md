@@ -50,6 +50,15 @@ pending → processing → completed
   the same row.
 - A Core ingest failure records `last_error` and becomes available again after
   5 seconds. The third failure is terminal `failed`.
+- Exact source redelivery while a row is `pending` or `processing` returns an
+  explicit already-accepted result; `completed` returns the durable replay
+  result. A `failed` row never masquerades as a successful replay: intake
+  returns `TASK_INTAKE_FAILED` until a local operator explicitly retries it.
+- Retry a terminal row with
+  `node c4-intake-worker.js --retry-failed <idempotency-key>`. This atomically
+  increments `retry_generation`, resets that generation's retry budget, and
+  returns it to `pending`. Webhook redelivery cannot create unlimited retry
+  generations by itself.
 - `processing` rows older than 60 seconds are recovered before the next claim.
 - If Core ingest committed but the worker crashed before marking completion,
   stale recovery replays the same envelope. Commitment Core's
@@ -62,6 +71,7 @@ Tests and host runtimes can call:
 
 ```js
 runCommitmentIntakeWorkerOnce({ dbPath, core, clock, afterIngest })
+retryFailedCommitmentIntake({ dbPath, idempotencyKey })
 drainCommitmentIntake({ maxItems, runOnce })
 await superviseCommitmentIntake({ maxItems, intervalMs, signal, drain, sleep, log })
 ```
