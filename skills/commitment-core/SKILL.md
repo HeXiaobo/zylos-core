@@ -313,7 +313,95 @@ the remaining real-environment proofs: live Feishu card send/callback, a real
 AI employee Runtime claim/completion, and a production restart plus external
 outage drill. Passing this gate is a prerequisite for those drills, not a
 claim that they already succeeded.
+## Feishu Task projection
 
+`createFeishuTaskProjectionAdapter(...)` in
+`scripts/feishu-task-projection.js` is the deep Core-to-Feishu projection
+Module. Its only worker-facing Interface is `publishBatch({ deliveries })`.
+The Module hides current Task snapshot reads, target resolution, create/update
+selection, remote idempotency identities, and durable `ExternalLink` writes.
+Commitment Core remains the fact source; Feishu is a replaceable projection and
+must never drive Task state directly through this Module.
+
+The injected publisher Interface is deliberately SDK-free:
+
+- `createTask({ target, task, idempotencyKey })` must return one stable
+  `{ externalId }`. Its idempotency key is stable for the Core Task, including
+  retries after a remote create succeeds but the local `ExternalLink` write or
+  Outbox acknowledgement does not.
+- `updateTask({ target, externalId, task, idempotencyKey })` receives the current
+  authoritative Task snapshot. Its idempotency key is stable for that Task
+  version.
+- Replaying either operation with the same key must not create another remote
+  object or apply a non-idempotent effect. This remains mandatory when a batch
+  partially publishes before another item fails.
+- A publisher may set `error.retryable = false` for a permanent remote
+  rejection. Other thrown errors are retryable and follow normal Outbox attempt
+  bounds.
+
+An absent `ExternalLink` selects create; a single `backend=feishu` link selects
+update. The create result is linked locally before the delivery is eligible for
+acknowledgement. A missing/malformed target, missing Core Task, malformed remote
+identity, or ExternalLink identity conflict is non-retryable and becomes a
+dead-letter instead of being acknowledged. Operators may fix configuration and
+use the explicit Outbox redrive Interface.
+
+The MVP default target resolver only accepts `task.acceptorId` values shaped as
+a Feishu `open_id` (`ou_...`) and projects to that person's DM. Other actor ID
+formats fail closed. A runtime may inject `resolveTarget({ task })` returning
+`{ receiveId, receiveIdType }` for controlled routing. Group-chat mapping is
+not inferred by Core and remains an explicit later routing configuration.
+
+`scripts/feishu-projection-worker.js` provides registration, one-cycle, and
+continuous worker seams without importing a Feishu SDK or reading Feishu
+credentials. Registration makes history scope explicit:
+
+```sh
+node "$ZYLOS_DIR/.claude/skills/commitment-core/scripts/feishu-projection-worker.js" \
+  register --bootstrap-policy from_now
+```
+
+Use `from_beginning` only after reviewing the existing Task population and the
+resulting messages. Re-registering a different policy is rejected by the
+projection registry.
+
+Production assembly is supplied through an operator-selected local runtime
+Module rather than a hard-coded component path. It must export:
+
+```js
+export async function createFeishuProjectionRuntime() {
+  return {
+    publisher: {
+      async createTask({ target, task, idempotencyKey }) {},
+      async updateTask({ target, externalId, task, idempotencyKey }) {},
+    },
+    // Optional. Omit to use acceptorId/open_id DM canary routing.
+    resolveTarget({ task }) {},
+  };
+}
+```
+
+Run one canary cycle or the continuous supervisor:
+
+```sh
+node "$ZYLOS_DIR/.claude/skills/commitment-core/scripts/feishu-projection-worker.js" \
+  run --runtime-module /absolute/path/to/zylos-feishu-runtime.mjs --once
+
+node "$ZYLOS_DIR/.claude/skills/commitment-core/scripts/feishu-projection-worker.js" \
+  run --runtime-module /absolute/path/to/zylos-feishu-runtime.mjs
+```
+
+The runtime Module owns SDK construction and credential access. Core only sees
+the narrow publisher and optional resolver Interfaces. Worker tuning is bounded
+through `COMMITMENT_FEISHU_PROJECTION_WORKER_ID`,
+`COMMITMENT_FEISHU_PROJECTION_BATCH_SIZE`,
+`COMMITMENT_FEISHU_PROJECTION_LEASE_MS`,
+`COMMITMENT_FEISHU_PROJECTION_RETRY_AFTER_MS`,
+`COMMITMENT_FEISHU_PROJECTION_MAX_ATTEMPTS`, and
+`COMMITMENT_FEISHU_PROJECTION_INTERVAL_MS`. The continuous worker emits one
+JSON record per cycle. Outbox leases make multiple workers safe when the
+publisher honors the replay contract above; no separate projection state
+machine is introduced.
 ## External execution Adapter seam
 
 `scripts/external-execution-adapter.js` defines the reusable Interface for
