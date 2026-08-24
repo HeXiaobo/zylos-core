@@ -26,7 +26,8 @@ Feishu      ───┘
 | Script | Purpose | Reference |
 |--------|---------|-----------|
 | `c4-receive.js` | External → Claude (queue incoming messages) | [c4-receive](references/c4-receive.md) |
-| `c4-intake-worker.js` | Durable task-envelope queue → Commitment Core | [task intake](references/c4-intake-worker.md) |
+| `c4-intake-supervisor.js` | Bounded periodic intake drain (PM2 core service) | [task intake](references/c4-intake-worker.md) |
+| `c4-intake-worker.js` | Claim one durable task envelope → Commitment Core | [task intake](references/c4-intake-worker.md) |
 | `c4-send.js` | Claude → External (route outgoing messages) | [c4-send](references/c4-send.md) |
 | `c4-control.js` | System control plane (heartbeat, maintenance) | [c4-control](references/c4-control.md) |
 | `c4-dispatcher.js` | PM2 daemon: polls pending queue, delivers to tmux | — |
@@ -68,7 +69,9 @@ Explicit task intents are atomically stored as a conversation plus intake row
 before health routing or any later trigger runs. Plain C4 messages keep their
 existing behavior and do not create intake rows.
 
-Run `c4-intake-worker.js` under a supervisor or scheduler to consume the queue.
+The `c4-intake-supervisor` PM2 core service consumes the queue in isolated,
+bounded batches. It does not share a loop or failure domain with
+`c4-dispatcher`, so intake failures cannot interrupt ordinary C4 delivery.
 See [task intake](references/c4-intake-worker.md) for the envelope contract,
 retry lifecycle, and recovery guarantees.
 
@@ -105,4 +108,7 @@ Any process with access to `c4-control.js` can enqueue keystroke controls. This 
 pm2 status c4-dispatcher
 pm2 logs c4-dispatcher
 pm2 restart c4-dispatcher
+
+pm2 status c4-intake-supervisor
+pm2 logs c4-intake-supervisor
 ```

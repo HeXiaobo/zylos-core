@@ -67,7 +67,7 @@ try {
 
 // Core service names — components must not collide with these
 const CORE_SERVICE_NAMES = new Set([
-  'scheduler', 'web-console', 'c4-dispatcher', 'activity-monitor', 'caddy',
+  'scheduler', 'web-console', 'c4-dispatcher', 'c4-intake-supervisor', 'activity-monitor', 'caddy',
 ]);
 
 // Parse SKILL.md YAML frontmatter service block.
@@ -225,6 +225,22 @@ module.exports = {
       autorestart: true,
       max_restarts: 10,
       min_uptime: '10s'
+    },
+    {
+      name: 'c4-intake-supervisor',
+      script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-intake-supervisor.js'),
+      cwd: path.join(SKILLS_DIR, 'comm-bridge', 'scripts'),
+      instances: 1,
+      exec_mode: 'fork',
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+        ZYLOS_DIR,
+      },
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      kill_timeout: 5000,
     },
     {
       name: 'activity-monitor',
