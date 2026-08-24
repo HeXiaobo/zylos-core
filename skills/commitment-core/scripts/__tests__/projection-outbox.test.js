@@ -186,7 +186,7 @@ test('an operator explicitly registers a projection before replaying existing ev
   }
 });
 
-test('workers cannot claim, query, acknowledge, or fail an unregistered projection', () => {
+test('workers and operators cannot use an unregistered projection', () => {
   const harness = createHarness();
   try {
     createTask(harness.core);
@@ -217,6 +217,12 @@ test('workers cannot claim, query, acknowledge, or fail an unregistered projecti
       workerId: 'worker-1',
       error: 'must not be recorded',
       idempotencyKey: 'fail:unknown',
+    }, 1));
+    assertUnknownProjection(() => harness.core.outbox.redrive({
+      projection: 'random-name',
+      eventId: 'event-1',
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:unknown',
     }, 1));
     for (let index = 0; index < 25; index += 1) {
       assertUnknownProjection(() => claim(
@@ -290,6 +296,64 @@ test('migration backfills legacy delivery and receipt projections without losing
         () => claim(migrated, 'never-seen', 'worker-unknown', 'claim:never-seen'),
         (error) => error?.code === 'UNKNOWN_PROJECTION',
       );
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    try {
+      harness.core.close();
+    } catch {
+      // The migration path intentionally closes and reopens this connection.
+    }
+    rmSync(path.dirname(harness.dbPath), { recursive: true, force: true });
+  }
+});
+
+test('migration preserves legacy attempt totals and enables generation-one redrive', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const [leased] = claim(harness.core, 'feishu', 'worker-legacy', 'claim:legacy-redrive');
+    harness.core.close();
+
+    const legacy = new Database(harness.dbPath);
+    legacy.exec(`
+      DROP TABLE commitment_projection_redrives;
+      ALTER TABLE commitment_projection_deliveries DROP COLUMN redrive_generation;
+      ALTER TABLE commitment_projection_deliveries DROP COLUMN total_attempt_count;
+      ALTER TABLE commitment_projection_deliveries DROP COLUMN last_redriven_at;
+      ALTER TABLE commitment_projection_deliveries DROP COLUMN last_redriven_by;
+    `);
+    legacy.close();
+
+    const migrated = openCommitmentCore({
+      dbPath: harness.dbPath,
+      clock: () => '2026-08-25T10:00:01.000Z',
+    });
+    try {
+      const restored = migrated.outbox.query({
+        projection: 'feishu',
+        eventId: leased.eventId,
+      });
+      assert.equal(restored.attempt, 1);
+      assert.equal(restored.totalAttempts, 1);
+      assert.equal(restored.redriveGeneration, 0);
+
+      const dead = migrated.outbox.fail({
+        projection: 'feishu',
+        eventId: leased.eventId,
+        workerId: 'worker-legacy',
+        error: 'legacy delivery failed',
+        idempotencyKey: 'fail:legacy-redrive',
+      }, leased.version);
+      const redriven = migrated.outbox.redrive({
+        projection: 'feishu',
+        eventId: leased.eventId,
+        actorId: 'migration-operator',
+        idempotencyKey: 'redrive:legacy:1',
+      }, dead.version);
+      assert.equal(redriven.delivery.redriveGeneration, 1);
+      assert.equal(redriven.delivery.totalAttempts, 1);
     } finally {
       migrated.close();
     }
@@ -515,6 +579,317 @@ test('failures retry after backoff, recover stale leases, and dead-letter at the
 
     harness.setNow('2026-08-25T11:00:00.000Z');
     assert.deepEqual(claim(harness.core, 'feishu', 'worker-4', 'claim:after-dead'), []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('an operator explicitly redrives one registered dead-letter delivery into a new attempt generation', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const [leased] = claim(harness.core, 'feishu', 'worker-1', 'claim:redrive:1');
+    const dead = harness.core.outbox.fail({
+      projection: 'feishu',
+      eventId: leased.eventId,
+      workerId: 'worker-1',
+      error: 'permanent failure before operator review',
+      idempotencyKey: 'fail:redrive:1',
+    }, leased.version);
+
+    harness.setNow('2026-08-25T10:05:00.000Z');
+    const result = harness.core.outbox.redrive({
+      projection: 'feishu',
+      eventId: leased.eventId,
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:feishu:event-1:1',
+    }, dead.version);
+
+    assert.equal(result.delivery.status, 'retry_wait');
+    assert.equal(result.delivery.attempt, 0);
+    assert.equal(result.delivery.totalAttempts, 1);
+    assert.equal(result.delivery.redriveGeneration, 1);
+    assert.equal(result.delivery.version, 3);
+    assert.equal(result.delivery.deadLetteredAt, null);
+    assert.equal(result.delivery.lastRedrivenAt, '2026-08-25T10:05:00.000Z');
+    assert.equal(result.delivery.lastRedrivenBy, 'operator-1');
+    assert.deepEqual(result.redrive, {
+      projection: 'feishu',
+      eventId: 'event-1',
+      generation: 1,
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:feishu:event-1:1',
+      fromVersion: 2,
+      toVersion: 3,
+      previousAttemptCount: 1,
+      totalAttempts: 1,
+      previousError: 'permanent failure before operator review',
+      previousDeadLetteredAt: '2026-08-25T10:00:00.000Z',
+      redrivenAt: '2026-08-25T10:05:00.000Z',
+    });
+
+    const [reclaimed] = claim(
+      harness.core,
+      'feishu',
+      'worker-2',
+      'claim:redrive:2',
+    );
+    assert.equal(reclaimed.attempt, 1);
+    assert.equal(reclaimed.totalAttempts, 2);
+    assert.equal(reclaimed.redriveGeneration, 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('an exact redrive replay returns its original generation after delivery state advances', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const [leased] = claim(harness.core, 'feishu', 'worker-1', 'claim:redrive-replay:1');
+    const dead = harness.core.outbox.fail({
+      projection: 'feishu',
+      eventId: leased.eventId,
+      workerId: 'worker-1',
+      error: 'dead for replay test',
+      idempotencyKey: 'fail:redrive-replay:1',
+    }, leased.version);
+    const request = {
+      projection: 'feishu',
+      eventId: leased.eventId,
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:replay:1',
+    };
+
+    const first = harness.core.outbox.redrive(request, dead.version);
+    harness.setNow('2026-08-25T10:01:00.000Z');
+    const [reclaimed] = claim(
+      harness.core,
+      'feishu',
+      'worker-2',
+      'claim:redrive-replay:2',
+    );
+    assert.equal(reclaimed.version, 4);
+
+    assert.deepEqual(harness.core.outbox.redrive(request, dead.version), first);
+    assert.equal(
+      harness.core.outbox.query({ projection: 'feishu', eventId: leased.eventId }).version,
+      4,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('redrive requires the current dead-letter delivery version and fails closed otherwise', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const [leased] = claim(harness.core, 'feishu', 'worker-1', 'claim:redrive-fence:1');
+    const request = {
+      projection: 'feishu',
+      eventId: leased.eventId,
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:fence:1',
+    };
+
+    assert.throws(
+      () => harness.core.outbox.redrive(request, leased.version),
+      (error) => error?.code === 'DELIVERY_NOT_DEAD_LETTER',
+    );
+
+    const dead = harness.core.outbox.fail({
+      projection: 'feishu',
+      eventId: leased.eventId,
+      workerId: 'worker-1',
+      error: 'dead for fencing test',
+      idempotencyKey: 'fail:redrive-fence:1',
+    }, leased.version);
+    assert.throws(
+      () => harness.core.outbox.redrive({
+        ...request,
+        idempotencyKey: 'redrive:fence:stale',
+      }, leased.version),
+      (error) => error?.code === 'DELIVERY_VERSION_CONFLICT',
+    );
+    assert.equal(
+      harness.core.outbox.query({ projection: 'feishu', eventId: leased.eventId }).version,
+      dead.version,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('redrive attempt totals remain cumulative across generations', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const [firstLease] = claim(harness.core, 'feishu', 'worker-1', 'claim:generation:1');
+    const firstDead = harness.core.outbox.fail({
+      projection: 'feishu',
+      eventId: firstLease.eventId,
+      workerId: 'worker-1',
+      error: 'generation zero failed',
+      idempotencyKey: 'fail:generation:0',
+    }, firstLease.version);
+    const firstRedrive = harness.core.outbox.redrive({
+      projection: 'feishu',
+      eventId: firstLease.eventId,
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:generation:1',
+    }, firstDead.version);
+    assert.equal(firstRedrive.delivery.redriveGeneration, 1);
+    assert.equal(firstRedrive.delivery.attempt, 0);
+    assert.equal(firstRedrive.delivery.totalAttempts, 1);
+
+    const [secondLease] = claim(
+      harness.core,
+      'feishu',
+      'worker-2',
+      'claim:generation:2',
+    );
+    const secondDead = harness.core.outbox.fail({
+      projection: 'feishu',
+      eventId: secondLease.eventId,
+      workerId: 'worker-2',
+      error: 'generation one failed',
+      idempotencyKey: 'fail:generation:1',
+    }, secondLease.version);
+    const secondRedrive = harness.core.outbox.redrive({
+      projection: 'feishu',
+      eventId: secondLease.eventId,
+      actorId: 'operator-2',
+      idempotencyKey: 'redrive:generation:2',
+    }, secondDead.version);
+
+    assert.equal(secondRedrive.delivery.redriveGeneration, 2);
+    assert.equal(secondRedrive.delivery.attempt, 0);
+    assert.equal(secondRedrive.delivery.totalAttempts, 2);
+    assert.equal(secondRedrive.redrive.generation, 2);
+    assert.equal(secondRedrive.redrive.previousAttemptCount, 1);
+    assert.equal(secondRedrive.redrive.totalAttempts, 2);
+
+    const audited = harness.core.outbox.query({
+      projection: 'feishu',
+      eventId: secondLease.eventId,
+      includeRedrives: true,
+    });
+    assert.equal(audited.delivery.redriveGeneration, 2);
+    assert.deepEqual(
+      audited.redrives.map((redrive) => ({
+        generation: redrive.generation,
+        actorId: redrive.actorId,
+        totalAttempts: redrive.totalAttempts,
+      })),
+      [
+        { generation: 1, actorId: 'operator-1', totalAttempts: 1 },
+        { generation: 2, actorId: 'operator-2', totalAttempts: 2 },
+      ],
+    );
+
+    const [thirdLease] = claim(
+      harness.core,
+      'feishu',
+      'worker-3',
+      'claim:generation:3',
+    );
+    assert.equal(thirdLease.redriveGeneration, 2);
+    assert.equal(thirdLease.attempt, 1);
+    assert.equal(thirdLease.totalAttempts, 3);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('delivery update, redrive audit, and idempotency receipt roll back together', () => {
+  const harness = createHarness();
+  const raw = new Database(harness.dbPath);
+  try {
+    createTask(harness.core);
+    const [leased] = claim(harness.core, 'feishu', 'worker-1', 'claim:redrive-atomic:1');
+    const dead = harness.core.outbox.fail({
+      projection: 'feishu',
+      eventId: leased.eventId,
+      workerId: 'worker-1',
+      error: 'dead for atomicity test',
+      idempotencyKey: 'fail:redrive-atomic:1',
+    }, leased.version);
+    const request = {
+      projection: 'feishu',
+      eventId: leased.eventId,
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:atomic:1',
+    };
+    raw.exec(`
+      CREATE TRIGGER reject_redrive_receipt
+      BEFORE INSERT ON commitment_projection_receipts
+      WHEN NEW.operation = 'redrive'
+      BEGIN
+        SELECT RAISE(ABORT, 'redrive receipt rejected');
+      END;
+    `);
+
+    assert.throws(
+      () => harness.core.outbox.redrive(request, dead.version),
+      /redrive receipt rejected/,
+    );
+    assert.deepEqual(
+      harness.core.outbox.query({ projection: 'feishu', eventId: leased.eventId }),
+      dead,
+    );
+
+    raw.exec('DROP TRIGGER reject_redrive_receipt');
+    const retried = harness.core.outbox.redrive(request, dead.version);
+    assert.equal(retried.redrive.generation, 1);
+    assert.equal(retried.delivery.version, dead.version + 1);
+  } finally {
+    raw.close();
+    harness.cleanup();
+  }
+});
+
+test('redrive requires explicit bounded operator input and protects idempotency keys', () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core);
+    const [leased] = claim(harness.core, 'feishu', 'worker-1', 'claim:redrive-input:1');
+    const dead = harness.core.outbox.fail({
+      projection: 'feishu',
+      eventId: leased.eventId,
+      workerId: 'worker-1',
+      error: 'dead for input test',
+      idempotencyKey: 'fail:redrive-input:1',
+    }, leased.version);
+    const request = {
+      projection: 'feishu',
+      eventId: leased.eventId,
+      actorId: 'operator-1',
+      idempotencyKey: 'redrive:input:1',
+    };
+
+    assert.throws(
+      () => harness.core.outbox.redrive({
+        projection: request.projection,
+        eventId: request.eventId,
+        idempotencyKey: 'redrive:missing-actor',
+      }, dead.version),
+      /redrive.actorId must be a non-empty string/,
+    );
+    assert.throws(
+      () => harness.core.outbox.redrive({ ...request, automatic: true }, dead.version),
+      /unsupported outbox redrive request field: automatic/,
+    );
+    assert.throws(
+      () => harness.core.outbox.redrive(request, 0),
+      /expectedVersion must be a positive integer/,
+    );
+
+    harness.core.outbox.redrive(request, dead.version);
+    assert.throws(
+      () => harness.core.outbox.redrive({ ...request, actorId: 'operator-2' }, dead.version),
+      (error) => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
   } finally {
     harness.cleanup();
   }

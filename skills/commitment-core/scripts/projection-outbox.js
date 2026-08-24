@@ -161,6 +161,21 @@ function normalizeFail(rawRequest) {
   };
 }
 
+function normalizeRedrive(rawRequest) {
+  const request = requireObject(rawRequest, 'outbox redrive request');
+  rejectUnknownFields(
+    request,
+    new Set(['projection', 'eventId', 'actorId', 'idempotencyKey']),
+    'outbox redrive request',
+  );
+  return {
+    projection: requireProjection(request.projection),
+    eventId: requireText(request.eventId, 'redrive.eventId'),
+    actorId: requireText(request.actorId, 'redrive.actorId'),
+    idempotencyKey: requireText(request.idempotencyKey, 'redrive.idempotencyKey'),
+  };
+}
+
 function normalizeVersion(value) {
   if (!Number.isInteger(value) || value < 1) {
     throw new TypeError('expectedVersion must be a positive integer');
@@ -172,11 +187,19 @@ function normalizeQuery(rawQuery) {
   const query = requireObject(rawQuery, 'outbox query');
   const projection = requireProjection(query.projection);
   if (Object.hasOwn(query, 'eventId')) {
-    rejectUnknownFields(query, new Set(['projection', 'eventId']), 'outbox query');
+    rejectUnknownFields(
+      query,
+      new Set(['projection', 'eventId', 'includeRedrives']),
+      'outbox query',
+    );
+    if (query.includeRedrives !== undefined && typeof query.includeRedrives !== 'boolean') {
+      throw new TypeError('includeRedrives must be a boolean');
+    }
     return {
       mode: 'event',
       projection,
       eventId: requireText(query.eventId, 'query.eventId'),
+      includeRedrives: query.includeRedrives ?? false,
     };
   }
 
@@ -229,6 +252,8 @@ function toDeliveryView(row) {
     eventId: row.event_id,
     status: row.delivery_status ?? 'pending',
     attempt: row.attempt_count ?? 0,
+    totalAttempts: row.total_attempt_count ?? 0,
+    redriveGeneration: row.redrive_generation ?? 0,
     version: row.delivery_version ?? 0,
     workerId: row.worker_id ?? null,
     leaseExpiresAt: row.lease_expires_at ?? null,
@@ -236,7 +261,26 @@ function toDeliveryView(row) {
     lastError: row.last_error ?? null,
     acknowledgedAt: row.acknowledged_at ?? null,
     deadLetteredAt: row.dead_lettered_at ?? null,
+    lastRedrivenAt: row.last_redriven_at ?? null,
+    lastRedrivenBy: row.last_redriven_by ?? null,
     event: toEventView(row),
+  };
+}
+
+function toRedriveView(row) {
+  return {
+    projection: row.projection,
+    eventId: row.event_id,
+    generation: row.generation,
+    actorId: row.actor_id,
+    idempotencyKey: row.idempotency_key,
+    fromVersion: row.from_version,
+    toVersion: row.to_version,
+    previousAttemptCount: row.previous_attempt_count,
+    totalAttempts: row.total_attempt_count,
+    previousError: row.previous_error,
+    previousDeadLetteredAt: row.previous_dead_lettered_at,
+    redrivenAt: row.redriven_at,
   };
 }
 
@@ -279,6 +323,10 @@ export function initializeProjectionOutboxSchema(database) {
       last_error TEXT,
       acknowledged_at TEXT,
       dead_lettered_at TEXT,
+      redrive_generation INTEGER NOT NULL DEFAULT 0,
+      total_attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_redriven_at TEXT,
+      last_redriven_by TEXT,
       updated_at TEXT NOT NULL,
       PRIMARY KEY (event_id, projection),
       FOREIGN KEY (event_id) REFERENCES commitment_projection_outbox(event_id)
@@ -308,6 +356,63 @@ export function initializeProjectionOutboxSchema(database) {
       created_by TEXT
     );
   `);
+
+  database.transaction(() => {
+    const deliveryColumns = new Set(
+      database.prepare('PRAGMA table_info(commitment_projection_deliveries)')
+        .all()
+        .map((column) => column.name),
+    );
+    if (!deliveryColumns.has('redrive_generation')) {
+      database.exec(`
+        ALTER TABLE commitment_projection_deliveries
+        ADD COLUMN redrive_generation INTEGER NOT NULL DEFAULT 0
+      `);
+    }
+    if (!deliveryColumns.has('total_attempt_count')) {
+      database.exec(`
+        ALTER TABLE commitment_projection_deliveries
+        ADD COLUMN total_attempt_count INTEGER NOT NULL DEFAULT 0
+      `);
+      database.exec(`
+        UPDATE commitment_projection_deliveries
+        SET total_attempt_count = attempt_count
+      `);
+    }
+    if (!deliveryColumns.has('last_redriven_at')) {
+      database.exec(`
+        ALTER TABLE commitment_projection_deliveries
+        ADD COLUMN last_redriven_at TEXT
+      `);
+    }
+    if (!deliveryColumns.has('last_redriven_by')) {
+      database.exec(`
+        ALTER TABLE commitment_projection_deliveries
+        ADD COLUMN last_redriven_by TEXT
+      `);
+    }
+
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS commitment_projection_redrives (
+        event_id TEXT NOT NULL,
+        projection TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        actor_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        from_version INTEGER NOT NULL,
+        to_version INTEGER NOT NULL,
+        previous_attempt_count INTEGER NOT NULL,
+        total_attempt_count INTEGER NOT NULL,
+        previous_error TEXT,
+        previous_dead_lettered_at TEXT NOT NULL,
+        redriven_at TEXT NOT NULL,
+        PRIMARY KEY (event_id, projection, generation),
+        FOREIGN KEY (event_id, projection)
+          REFERENCES commitment_projection_deliveries(event_id, projection)
+          ON DELETE RESTRICT
+      );
+    `);
+  }).immediate();
 
   database.prepare(`
     INSERT OR IGNORE INTO commitment_projection_outbox (
@@ -362,12 +467,14 @@ export function createProjectionOutboxModule({ database, clock }) {
     INSERT INTO commitment_projection_deliveries (
       event_id, projection, status, attempt_count, version, worker_id,
       lease_expires_at, next_attempt_at, last_error, acknowledged_at,
-      dead_lettered_at, updated_at
-    ) VALUES (?, ?, 'leased', 1, 1, ?, ?, NULL, NULL, NULL, NULL, ?)
+      dead_lettered_at, redrive_generation, total_attempt_count,
+      last_redriven_at, last_redriven_by, updated_at
+    ) VALUES (?, ?, 'leased', 1, 1, ?, ?, NULL, NULL, NULL, NULL, 0, 1, NULL, NULL, ?)
   `);
   const renewLease = database.prepare(`
     UPDATE commitment_projection_deliveries
     SET status = 'leased', attempt_count = attempt_count + 1,
+        total_attempt_count = total_attempt_count + 1,
         version = version + 1, worker_id = ?, lease_expires_at = ?,
         next_attempt_at = NULL, acknowledged_at = NULL,
         dead_lettered_at = NULL, updated_at = ?
@@ -379,7 +486,8 @@ export function createProjectionOutboxModule({ database, clock }) {
            d.projection, d.status AS delivery_status,
            d.attempt_count, d.version AS delivery_version, d.worker_id,
            d.lease_expires_at, d.next_attempt_at, d.last_error,
-           d.acknowledged_at, d.dead_lettered_at
+           d.acknowledged_at, d.dead_lettered_at, d.redrive_generation,
+           d.total_attempt_count, d.last_redriven_at, d.last_redriven_by
     FROM commitment_projection_outbox o
     JOIN commitment_events e ON e.id = o.event_id
     JOIN commitment_projection_deliveries d ON d.event_id = o.event_id
@@ -398,6 +506,39 @@ export function createProjectionOutboxModule({ database, clock }) {
         lease_expires_at = NULL, next_attempt_at = ?, last_error = ?,
         acknowledged_at = NULL, dead_lettered_at = ?, updated_at = ?
     WHERE event_id = ? AND projection = ? AND version = ?
+  `);
+  const updateRedriven = database.prepare(`
+    UPDATE commitment_projection_deliveries
+    SET status = 'retry_wait', attempt_count = 0, version = version + 1,
+        worker_id = NULL, lease_expires_at = NULL, next_attempt_at = ?,
+        last_error = NULL, acknowledged_at = NULL, dead_lettered_at = NULL,
+        redrive_generation = redrive_generation + 1,
+        last_redriven_at = ?, last_redriven_by = ?, updated_at = ?
+    WHERE event_id = ? AND projection = ? AND version = ? AND status = 'dead_letter'
+  `);
+  const insertRedrive = database.prepare(`
+    INSERT INTO commitment_projection_redrives (
+      event_id, projection, generation, actor_id, idempotency_key,
+      from_version, to_version, previous_attempt_count, total_attempt_count,
+      previous_error, previous_dead_lettered_at, redriven_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const selectRedrive = database.prepare(`
+    SELECT event_id, projection, generation, actor_id, idempotency_key,
+           from_version, to_version, previous_attempt_count,
+           total_attempt_count, previous_error, previous_dead_lettered_at,
+           redriven_at
+    FROM commitment_projection_redrives
+    WHERE event_id = ? AND projection = ? AND generation = ?
+  `);
+  const selectRedrives = database.prepare(`
+    SELECT event_id, projection, generation, actor_id, idempotency_key,
+           from_version, to_version, previous_attempt_count,
+           total_attempt_count, previous_error, previous_dead_lettered_at,
+           redriven_at
+    FROM commitment_projection_redrives
+    WHERE event_id = ? AND projection = ?
+    ORDER BY generation
   `);
   const selectRegistration = database.prepare(`
     SELECT projection, bootstrap_policy, enabled, baseline_outbox_rowid,
@@ -648,6 +789,75 @@ export function createProjectionOutboxModule({ database, clock }) {
     return result;
   });
 
+  const redriveTransaction = database.transaction((rawRequest, rawExpectedVersion) => {
+    const request = normalizeRedrive(rawRequest);
+    requireEnabledRegistration(request.projection);
+    const expectedVersion = normalizeVersion(rawExpectedVersion);
+    const requestFingerprint = fingerprint({ operation: 'redrive', request, expectedVersion });
+    const replay = receiptReplay(request.idempotencyKey, requestFingerprint);
+    if (replay) return replay;
+
+    const now = currentInstant(clock);
+    const deliveryRow = selectDelivery.get(request.eventId, request.projection);
+    const delivery = deliveryRow ? toDeliveryView(deliveryRow) : null;
+    if (!delivery) {
+      throw domainError(
+        'DELIVERY_NOT_FOUND',
+        `delivery not found: ${request.projection}/${request.eventId}`,
+      );
+    }
+    if (delivery.version !== expectedVersion) {
+      throw domainError(
+        'DELIVERY_VERSION_CONFLICT',
+        `expected delivery version ${expectedVersion}, found ${delivery.version}`,
+      );
+    }
+    if (delivery.status !== 'dead_letter') {
+      throw domainError('DELIVERY_NOT_DEAD_LETTER', `delivery is ${delivery.status}`);
+    }
+
+    const generation = delivery.redriveGeneration + 1;
+    const updated = updateRedriven.run(
+      now.timestamp,
+      now.timestamp,
+      request.actorId,
+      now.timestamp,
+      request.eventId,
+      request.projection,
+      expectedVersion,
+    );
+    if (updated.changes !== 1) {
+      throw domainError(
+        'DELIVERY_VERSION_CONFLICT',
+        `delivery changed while redriving: ${request.projection}/${request.eventId}`,
+      );
+    }
+    insertRedrive.run(
+      request.eventId,
+      request.projection,
+      generation,
+      request.actorId,
+      request.idempotencyKey,
+      expectedVersion,
+      expectedVersion + 1,
+      delivery.attempt,
+      delivery.totalAttempts,
+      delivery.lastError,
+      delivery.deadLetteredAt,
+      now.timestamp,
+    );
+    const result = {
+      delivery: toDeliveryView(selectDelivery.get(request.eventId, request.projection)),
+      redrive: toRedriveView(selectRedrive.get(
+        request.eventId,
+        request.projection,
+        generation,
+      )),
+    };
+    saveReceipt('redrive', request, requestFingerprint, result, now.timestamp);
+    return result;
+  });
+
   return Object.freeze({
     append(event) {
       appendRecord.run(event.id, event.taskId, event.version, event.occurredAt);
@@ -665,6 +875,9 @@ export function createProjectionOutboxModule({ database, clock }) {
       fail(request, expectedVersion) {
         return failTransaction.immediate(request, expectedVersion);
       },
+      redrive(request, expectedVersion) {
+        return redriveTransaction.immediate(request, expectedVersion);
+      },
       query(query) {
         const normalized = normalizeQuery(query);
         const registration = requireEnabledRegistration(normalized.projection);
@@ -676,7 +889,8 @@ export function createProjectionOutboxModule({ database, clock }) {
                    d.status AS delivery_status, d.attempt_count,
                    d.version AS delivery_version, d.worker_id,
                    d.lease_expires_at, d.next_attempt_at, d.last_error,
-                   d.acknowledged_at, d.dead_lettered_at
+                   d.acknowledged_at, d.dead_lettered_at, d.redrive_generation,
+                   d.total_attempt_count, d.last_redriven_at, d.last_redriven_by
             FROM commitment_projection_outbox o
             JOIN commitment_events e ON e.id = o.event_id
             LEFT JOIN commitment_projection_deliveries d
@@ -689,7 +903,15 @@ export function createProjectionOutboxModule({ database, clock }) {
             normalized.eventId,
             registration.baselineOutboxRowId,
           );
-          return row ? toDeliveryView(row) : null;
+          if (!row) return null;
+          const delivery = toDeliveryView(row);
+          if (!normalized.includeRedrives) return delivery;
+          return {
+            delivery,
+            redrives: selectRedrives
+              .all(normalized.eventId, normalized.projection)
+              .map(toRedriveView),
+          };
         }
 
         const values = [
@@ -711,7 +933,8 @@ export function createProjectionOutboxModule({ database, clock }) {
                  d.status AS delivery_status, d.attempt_count,
                  d.version AS delivery_version, d.worker_id,
                  d.lease_expires_at, d.next_attempt_at, d.last_error,
-                 d.acknowledged_at, d.dead_lettered_at
+                 d.acknowledged_at, d.dead_lettered_at, d.redrive_generation,
+                 d.total_attempt_count, d.last_redriven_at, d.last_redriven_by
           FROM commitment_projection_outbox o
           JOIN commitment_events e ON e.id = o.event_id
           LEFT JOIN commitment_projection_deliveries d

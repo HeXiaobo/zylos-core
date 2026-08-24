@@ -198,19 +198,35 @@ competing for one shared delivery.
   A bounded `retryAfterMs` schedules retry; reaching `maxAttempts` moves the
   delivery to `dead_letter`. Omitting `retryAfterMs` dead-letters a
   non-retryable failure immediately.
+- `outbox.redrive({ projection, eventId, actorId, idempotencyKey },
+  expectedVersion)` is an explicit local operator action. It accepts only a
+  currently `dead_letter` delivery for a registered, enabled projection at the
+  exact delivery version. It creates a new redrive generation in `retry_wait`,
+  resets that generation's `attempt` to zero, and never claims or sends it.
+  `totalAttempts` remains cumulative across generations.
 - `outbox.query({ projection, eventId })` reads one delivery, including a
   synthetic `pending` view before lazy materialization.
+  Set `includeRedrives: true` in event mode to return `{ delivery, redrives }`
+  with the immutable operator audit ordered by generation.
   `outbox.query({ projection, statuses?, limit? })` provides stable bounded
   operational lists across `pending`, `leased`, `retry_wait`, `acknowledged`,
   and `dead_letter`.
 
-Claim, acknowledge, and fail mutations have durable exact-replay receipts.
+Claim, acknowledge, fail, and redrive mutations have durable exact-replay receipts.
 Changing normalized content under a used key returns `IDEMPOTENCY_CONFLICT`.
 Other stable errors include `DELIVERY_NOT_FOUND`, `DELIVERY_NOT_LEASED`,
 `DELIVERY_FORBIDDEN`, `DELIVERY_LEASE_EXPIRED`, and
-`DELIVERY_VERSION_CONFLICT`. Every worker operation against a projection that
-is not registered and enabled fails with `UNKNOWN_PROJECTION` before scanning
-Outbox history.
+`DELIVERY_VERSION_CONFLICT`. Redrive additionally returns
+`DELIVERY_NOT_DEAD_LETTER` for a current non-dead-letter delivery. Every worker
+or operator operation against a projection that is not registered and enabled
+fails with `UNKNOWN_PROJECTION` before scanning Outbox history.
+
+Each redrive stores the actor, caller key, prior and resulting delivery
+versions, prior generation attempt count, cumulative attempt count, prior
+error/dead-letter time, and redrive time in the same transaction as the
+delivery update and exact-replay receipt. A pre-redrive database migrates to
+generation zero and initializes `totalAttempts` from its existing attempt
+count without losing delivery state.
 
 Existing Task Events are backfilled into the logical Outbox when the schema is
 first installed; this is a migration path, not a claim that their original
@@ -220,9 +236,25 @@ as `from_beginning`, preserving existing and pending work; arbitrary new names
 are never inferred from Event history. Task Run operations that change Task
 state already create a Task Event and therefore an Outbox row. Run-only Events,
 Evidence, and ExternalLink writes deliberately do not create projection records
-in this slice. Dead-letter inspection is included; operator redrive,
-disable/enable lifecycle, and external platform projection Adapters remain
-later slices.
+in this slice. Disable/enable lifecycle and external platform projection
+Adapters remain later slices.
+
+After inspecting a dead-letter delivery and recording its current version, an
+operator can run one local redrive explicitly:
+
+```sh
+node "$ZYLOS_DIR/.claude/skills/commitment-core/scripts/outbox-redrive.js" \
+  --projection feishu \
+  --event-id <event-id> \
+  --actor <operator-id> \
+  --idempotency-key <stable-key> \
+  --expected-version <delivery-version> \
+  --json
+```
+
+The command exits non-zero for stale versions, unknown projections,
+non-dead-letter state, or malformed input. It does not run a worker cycle,
+contact an external backend, or automatically retry the delivery.
 
 ## Projection Worker
 
@@ -249,7 +281,8 @@ Adapters with partially successful, non-idempotent effects do not satisfy this
 Interface and must add their own durable per-item seam instead of using this
 batch worker directly. A process exit after publish but before acknowledge is
 recovered by lease expiry; the replacement worker republishes before ack.
-There is intentionally no unauthorized dead-letter redrive operation.
+The worker Interface intentionally has no redrive operation. Only the explicit
+operator Interface above can create a new redrive generation.
 
 ## External execution Adapter seam
 
