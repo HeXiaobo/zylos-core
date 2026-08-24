@@ -73,5 +73,26 @@ CREATE TABLE IF NOT EXISTS status_notice_cooldowns (
 CREATE INDEX IF NOT EXISTS idx_status_notice_cooldowns_expires_at
   ON status_notice_cooldowns(expires_at);
 
+-- Durable handoff from channel intake to Commitment Core
+CREATE TABLE IF NOT EXISTS commitment_intake_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    available_at INTEGER NOT NULL,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_commitment_intake_queue_ready
+  ON commitment_intake_queue(status, available_at, id);
+CREATE INDEX IF NOT EXISTS idx_commitment_intake_queue_stale
+  ON commitment_intake_queue(status, updated_at);
+
 -- Create initial checkpoint
 INSERT INTO checkpoints (summary) VALUES ('initial');

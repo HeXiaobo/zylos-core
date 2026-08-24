@@ -1,7 +1,7 @@
 ---
 name: comm-bridge
 description: >-
-  C4 communication bridge — central gateway for ALL external communication (Telegram, Lark, etc.).
+  C4 communication bridge — central gateway for ALL external communication (Telegram, Feishu, etc.).
   Use when replying to users via the "reply via" path, sending proactive messages to external channels,
   querying recent conversations or checkpoint status (prefer c4-db.js CLI; sqlite3 OK for unsupported queries),
   fetching conversation history for Memory Sync, or creating checkpoints after sync.
@@ -18,7 +18,7 @@ Central message hub - ALL communication with Claude goes through C4.
 ```
 Web Console ──┐
 Telegram    ───┼──► C4 Bridge ◄──► Claude
-Lark        ───┘
+Feishu      ───┘
 ```
 
 ## Components
@@ -26,6 +26,7 @@ Lark        ───┘
 | Script | Purpose | Reference |
 |--------|---------|-----------|
 | `c4-receive.js` | External → Claude (queue incoming messages) | [c4-receive](references/c4-receive.md) |
+| `c4-intake-worker.js` | Durable task-envelope queue → Commitment Core | [task intake](references/c4-intake-worker.md) |
 | `c4-send.js` | Claude → External (route outgoing messages) | [c4-send](references/c4-send.md) |
 | `c4-control.js` | System control plane (heartbeat, maintenance) | [c4-control](references/c4-control.md) |
 | `c4-dispatcher.js` | PM2 daemon: polls pending queue, delivers to tmux | — |
@@ -42,8 +43,8 @@ cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js telegra
 Hello! Quotes, $vars, **markdown** — all safe via stdin.
 EOF
 
-# Send to Lark group thread
-cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js lark "chat_xxx|type:group|root:msg_yyy"
+# Send to Feishu group thread
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js feishu "chat_xxx|type:group|root:msg_yyy"
 Report ready.
 EOF
 ```
@@ -57,6 +58,19 @@ SQLite at `~/zylos/comm-bridge/c4.db`:
 - `conversations`: All messages (in/out) with priority, status, retry tracking
 - `checkpoints`: Recovery points with conversation id ranges
 - `control_queue`: System control messages (heartbeat, maintenance) with priority, ack deadlines, and status lifecycle
+- `commitment_intake_queue`: Durable task envelopes linked 1:1 to inbound conversations, consumed idempotently by Commitment Core
+
+## Commitment Intake
+
+Channel Adapters may add `--task-envelope-json <json>` to `c4-receive.js`.
+Use the canonical channel name `feishu` for Feishu events and idempotency keys.
+Explicit task intents are atomically stored as a conversation plus intake row
+before health routing or any later trigger runs. Plain C4 messages keep their
+existing behavior and do not create intake rows.
+
+Run `c4-intake-worker.js` under a supervisor or scheduler to consume the queue.
+See [task intake](references/c4-intake-worker.md) for the envelope contract,
+retry lifecycle, and recovery guarantees.
 
 ## Health & Status
 

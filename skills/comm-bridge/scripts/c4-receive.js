@@ -12,10 +12,13 @@ import { fileURLToPath } from 'url';
 import {
   clearStatusNoticeCooldownReservation,
   insertConversation,
+  openCommitmentIntakeQueue,
   close,
   reserveStatusNoticeCooldown
 } from './c4-db.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
+import { parseTaskEnvelopeJson } from './c4-task-envelope.js';
+import { persistTaskBeforeRoute } from './c4-task-intake.js';
 import {
   AGENT_STATUS_FILE,
   ACTIVITY_MONITOR_DIR
@@ -28,13 +31,15 @@ const ROUTER_IPC_TIMEOUT_MS = 30000;
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json>] [--json] --content "<message>"');
   console.log('');
   console.log('Options:');
   console.log('  --no-reply       Mark as not needing a reply target (use for system messages)');
   console.log('  --block-queue-until-idle');
   console.log('                   Wait for sustained idle, then block subsequent dispatch until execution settles');
   console.log('                   Legacy alias: --require-idle');
+  console.log('  --task-envelope-json <json>');
+  console.log('                   Atomically persist a normalized task envelope with the message');
   console.log('  --json           Output structured JSON');
   console.log('');
   console.log('Priority levels:');
@@ -51,7 +56,8 @@ function parseArgs(args) {
     priority: 3,
     noReply: false,
     requireIdle: false,
-    json: false
+    json: false,
+    taskEnvelopeJson: null
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -77,6 +83,9 @@ function parseArgs(args) {
         break;
       case '--content':
         result.content = args[++i];
+        break;
+      case '--task-envelope-json':
+        result.taskEnvelopeJson = args[++i];
         break;
       default:
         if (args[i].startsWith('--')) {
@@ -310,8 +319,26 @@ async function main() {
     emitError(asJson, 'INVALID_ARGS', parsed.error);
   }
 
-  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json } = parsed;
+  const {
+    channel: rawChannel,
+    endpoint,
+    content,
+    priority,
+    noReply,
+    requireIdle,
+    json,
+    taskEnvelopeJson,
+  } = parsed;
   let channel = rawChannel;
+  let taskEnvelope = null;
+
+  if (taskEnvelopeJson !== null) {
+    try {
+      taskEnvelope = parseTaskEnvelopeJson(taskEnvelopeJson);
+    } catch (err) {
+      emitError(json, 'INVALID_ARGS', `invalid --task-envelope-json: ${err.message}`);
+    }
+  }
 
   if (!channel && noReply) {
     channel = 'system';
@@ -346,11 +373,68 @@ async function main() {
     }
   }
 
-  const route = await queryRoute(channel, endpoint, noReply);
   const replyEndpoint = noReply ? null : endpoint;
   let dbContent = content;
+  let route;
+  let taskIntake = null;
+  let taskRecord = null;
+
+  if (taskEnvelope) {
+    taskIntake = openCommitmentIntakeQueue();
+    try {
+      const taskRoute = await persistTaskBeforeRoute({
+        intake: taskIntake,
+        conversation: {
+          channel,
+          endpointId: replyEndpoint,
+          content,
+          status: 'pending',
+          priority,
+          requireIdle,
+        },
+        envelope: taskEnvelope,
+        route: () => queryRoute(channel, endpoint, noReply),
+      });
+      taskRecord = taskRoute.persisted.conversation;
+      if (taskRoute.replayed) {
+        emitSuccess(json, taskRecord.id, 'replayed');
+        close();
+        return;
+      }
+      route = taskRoute.routeDecision;
+    } catch (err) {
+      const code = err.code === 'IDEMPOTENCY_CONFLICT'
+        ? 'IDEMPOTENCY_CONFLICT'
+        : 'INTERNAL_ERROR';
+      emitError(json, code, `task intake failed: ${err.message}`);
+    }
+  } else {
+    route = await queryRoute(channel, endpoint, noReply);
+  }
+
   const dbStatus = route.recovered ? 'pending' : 'delivered';
   let cooldown = null;
+  const recordInbound = (storedContent, deliveryAction = null) => {
+    if (taskRecord) {
+      taskRecord = taskIntake.updateConversation({
+        conversationId: taskRecord.id,
+        content: storedContent,
+        status: dbStatus,
+        deliveryAction,
+      });
+      return taskRecord;
+    }
+    return insertConversation(
+      'in',
+      channel,
+      replyEndpoint,
+      storedContent,
+      dbStatus,
+      priority,
+      requireIdle,
+      deliveryAction,
+    );
+  };
 
   if (!route.recovered && !noReply) {
     try {
@@ -361,7 +445,7 @@ async function main() {
     if (cooldown.suppressed) {
       dbContent += `\n\n[C4] Status notification suppressed by cooldown while health=${statusNoticeType(route)} reason=${statusNoticeReason(route)}.`;
       try {
-        const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, 'suppressed');
+        const record = recordInbound(dbContent, 'suppressed');
         emitSuccess(json, record.id, 'suppressed');
         return;
       } catch (err) {
@@ -373,7 +457,7 @@ async function main() {
   }
 
   try {
-    const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle);
+    const record = recordInbound(dbContent);
     if (route.recovered || noReply) {
       emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered');
       return;
