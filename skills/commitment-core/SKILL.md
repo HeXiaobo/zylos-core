@@ -85,10 +85,16 @@ to a 2,000 ms interval and batch size 25; set
 `COMMITMENT_RUN_SWEEP_INTERVAL_MS` (250..60,000) and
 `COMMITMENT_RUN_SWEEP_BATCH_SIZE` (1..100) to change them. It drains
 sequentially, logs structured failures and continues with the next cycle,
-uses a process lock under `$ZYLOS_DIR/.zylos`, and releases it on SIGINT or
-SIGTERM. It is intentionally absent from the default PM2 ecosystem and does
-not start unless an operator explicitly invokes it. The sweep never calls an
-external backend, automatically reruns work, or moves a Task to `done`.
+uses a fenced SQLite singleton lease in
+`$ZYLOS_DIR/.zylos/supervisor-leases.db`, and releases it on SIGINT or SIGTERM.
+Each owner has a random token; acquisition and expired-lease takeover run in an
+immediate transaction and advance a monotonic fencing token. The owner renews
+before each sweep cycle and stops before sweeping again if ownership was lost;
+an old owner cannot renew or release its successor's lease. The lease lasts at
+least 10 seconds and otherwise three sweep intervals. The supervisor is
+intentionally absent from the default PM2 ecosystem and does not start unless
+an operator explicitly invokes it. The sweep never calls an external backend,
+automatically reruns work, or moves a Task to `done`.
 
 After a sweep, new heartbeat, complete, and release requests from the old
 worker fail with `LEASE_NOT_ACTIVE`. Exact receipt replays still return their

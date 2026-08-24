@@ -1,12 +1,9 @@
 #!/usr/bin/env node
 
 import { openCommitmentCore } from './core.js';
-import {
-  mkdirSync,
-  readlinkSync,
-  symlinkSync,
-  unlinkSync,
-} from 'node:fs';
+import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +13,8 @@ export const DEFAULT_RUN_SWEEP_INTERVAL_MS = 2_000;
 export const MAX_RUN_SWEEP_BATCH_SIZE = 100;
 export const MIN_RUN_SWEEP_INTERVAL_MS = 250;
 export const MAX_RUN_SWEEP_INTERVAL_MS = 60_000;
+export const MIN_RUN_SWEEP_INSTANCE_LEASE_MS = 10_000;
+export const MAX_RUN_SWEEP_INSTANCE_LEASE_MS = MAX_RUN_SWEEP_INTERVAL_MS * 3;
 
 function systemClock() {
   return new Date().toISOString();
@@ -75,61 +74,131 @@ function parseMode(argv) {
   throw new TypeError(`usage: run-lease-sweep-supervisor.js [--once]`);
 }
 
-function defaultLockPath() {
+function defaultLeaseDbPath() {
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-  return path.join(zylosDir, '.zylos', 'commitment-run-lease-sweep.lock');
+  return path.join(zylosDir, '.zylos', 'supervisor-leases.db');
 }
 
-function processIsAlive(pid) {
+function requireLeaseClock(clock) {
+  const now = clock();
+  if (!Number.isSafeInteger(now) || now < 0) {
+    throw new TypeError('lease clock must return non-negative epoch milliseconds');
+  }
+  return now;
+}
+
+export function acquireRunSweepLease({
+  dbPath = defaultLeaseDbPath(),
+  ownerToken,
+  clock = () => Date.now(),
+  leaseMs,
+} = {}) {
+  if (typeof ownerToken !== 'string' || ownerToken.trim() === '') {
+    throw new TypeError('ownerToken must be a non-empty string');
+  }
+  if ([...ownerToken].length > 256) {
+    throw new TypeError('ownerToken must be at most 256 characters');
+  }
+  requireBoundedInteger(leaseMs, 'leaseMs', 1, MAX_RUN_SWEEP_INSTANCE_LEASE_MS);
+  if (dbPath !== ':memory:') mkdirSync(path.dirname(dbPath), { recursive: true });
+
+  const database = new Database(dbPath);
+  database.pragma('busy_timeout = 5000');
+  if (dbPath !== ':memory:') database.pragma('journal_mode = WAL');
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS supervisor_leases (
+      name TEXT PRIMARY KEY,
+      owner_token TEXT NOT NULL,
+      fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+      lease_expires_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  const leaseName = 'commitment-run-lease-sweep';
+  let lease;
   try {
-    process.kill(pid, 0);
-    return true;
+    lease = database.transaction(() => {
+      const now = requireLeaseClock(clock);
+      const incumbent = database.prepare(`
+        SELECT owner_token, fencing_token, lease_expires_at
+        FROM supervisor_leases
+        WHERE name = ?
+      `).get(leaseName);
+      if (incumbent && incumbent.lease_expires_at > now) {
+        const error = new Error('commitment Run lease sweep is already running');
+        error.code = 'ALREADY_RUNNING';
+        throw error;
+      }
+
+      const fencingToken = incumbent ? incumbent.fencing_token + 1 : 1;
+      const expiresAt = now + leaseMs;
+      database.prepare(`
+        INSERT INTO supervisor_leases (
+          name, owner_token, fencing_token, lease_expires_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+          owner_token = excluded.owner_token,
+          fencing_token = excluded.fencing_token,
+          lease_expires_at = excluded.lease_expires_at,
+          updated_at = excluded.updated_at
+      `).run(leaseName, ownerToken, fencingToken, expiresAt, now);
+      return { fencingToken, expiresAt };
+    }).immediate();
   } catch (error) {
-    if (error?.code === 'ESRCH') return false;
-    if (error?.code === 'EPERM') return true;
+    database.close();
     throw error;
   }
-}
 
-function acquireSingleInstance(lockPath = defaultLockPath()) {
-  mkdirSync(path.dirname(lockPath), { recursive: true });
-  const token = `pid:${process.pid}`;
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      symlinkSync(token, lockPath);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        try {
-          if (readlinkSync(lockPath) === token) unlinkSync(lockPath);
-        } catch (error) {
-          if (error?.code !== 'ENOENT') throw error;
-        }
-      };
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      let incumbentToken;
+  let closed = false;
+  return Object.freeze({
+    fencingToken: lease.fencingToken,
+    renew() {
+      if (closed) {
+        const error = new Error('commitment Run lease sweep lease is closed');
+        error.code = 'LEASE_LOST';
+        throw error;
+      }
+      const now = requireLeaseClock(clock);
+      const expiresAt = now + leaseMs;
+      const renewed = database.prepare(`
+        UPDATE supervisor_leases
+        SET lease_expires_at = ?, updated_at = ?
+        WHERE name = ? AND owner_token = ? AND fencing_token = ?
+          AND lease_expires_at > ?
+      `).run(
+        expiresAt,
+        now,
+        leaseName,
+        ownerToken,
+        lease.fencingToken,
+        now,
+      );
+      if (renewed.changes !== 1) {
+        const error = new Error('commitment Run lease sweep lease ownership was lost');
+        error.code = 'LEASE_LOST';
+        throw error;
+      }
+      lease.expiresAt = expiresAt;
+      return { fencingToken: lease.fencingToken, expiresAt };
+    },
+    release() {
+      if (closed) return false;
+      closed = true;
       try {
-        incumbentToken = readlinkSync(lockPath);
-      } catch (readError) {
-        if (readError?.code !== 'ENOENT') throw readError;
-        continue;
+        const now = requireLeaseClock(clock);
+        // Retain the row so fencing tokens remain monotonic across releases.
+        const released = database.prepare(`
+          UPDATE supervisor_leases
+          SET lease_expires_at = ?, updated_at = ?
+          WHERE name = ? AND owner_token = ? AND fencing_token = ?
+        `).run(now, now, leaseName, ownerToken, lease.fencingToken);
+        return released.changes === 1;
+      } finally {
+        database.close();
       }
-      const match = /^pid:([1-9]\d*)$/.exec(incumbentToken);
-      if (match && processIsAlive(Number(match[1]))) {
-        const alreadyRunning = new Error(
-          `commitment Run lease sweep is already running as pid ${match[1]}`,
-        );
-        alreadyRunning.code = 'ALREADY_RUNNING';
-        throw alreadyRunning;
-      }
-      unlinkSync(lockPath);
-    }
-  }
-
-  throw new Error('could not acquire commitment Run lease sweep instance lock');
+    },
+  });
 }
 
 export function runLeaseSweepOnce({
@@ -152,6 +221,7 @@ export async function superviseRunLeaseSweep({
   sleep = sleepUntilNextSweep,
   log = writeStructuredLog,
   clock = systemClock,
+  renewLease = null,
 } = {}) {
   requireBoundedInteger(limit, 'limit', 1, MAX_RUN_SWEEP_BATCH_SIZE);
   requireBoundedInteger(
@@ -163,6 +233,7 @@ export async function superviseRunLeaseSweep({
   let cycles = 0;
 
   while (!signal?.aborted) {
+    renewLease?.();
     cycles += 1;
     try {
       const summary = await sweep({ limit });
@@ -195,7 +266,7 @@ export async function superviseRunLeaseSweep({
 async function main() {
   const controller = new AbortController();
   const stop = () => controller.abort();
-  let releaseInstance = null;
+  let instanceLease = null;
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
 
@@ -213,13 +284,17 @@ async function main() {
       DEFAULT_RUN_SWEEP_BATCH_SIZE,
       { max: MAX_RUN_SWEEP_BATCH_SIZE },
     );
-    releaseInstance = acquireSingleInstance();
+    instanceLease = acquireRunSweepLease({
+      ownerToken: `process:${process.pid}:${randomUUID()}`,
+      leaseMs: Math.max(MIN_RUN_SWEEP_INSTANCE_LEASE_MS, intervalMs * 3),
+    });
     writeStructuredLog({
       event: 'commitment_run_lease_sweep_supervisor_started',
       at: systemClock(),
       intervalMs,
       limit,
       once,
+      fencingToken: instanceLease.fencingToken,
     });
     if (once) {
       writeStructuredLog({
@@ -233,6 +308,7 @@ async function main() {
         intervalMs,
         limit,
         signal: controller.signal,
+        renewLease: () => instanceLease.renew(),
       });
     }
   } catch (error) {
@@ -243,7 +319,7 @@ async function main() {
     });
     process.exitCode = 1;
   } finally {
-    releaseInstance?.();
+    instanceLease?.release();
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
   }
