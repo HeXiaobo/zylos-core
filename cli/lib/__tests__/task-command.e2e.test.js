@@ -42,6 +42,10 @@ function installTaskCore(zylosDir) {
     path.join(SOURCE_TASK_CORE, 'scripts', 'external-links.js'),
     path.join(destination, 'scripts', 'external-links.js'),
   );
+  copyFileSync(
+    path.join(SOURCE_TASK_CORE, 'scripts', 'projection-outbox.js'),
+    path.join(destination, 'scripts', 'projection-outbox.js'),
+  );
   symlinkSync(
     path.join(SOURCE_TASK_CORE, 'node_modules'),
     path.join(destination, 'node_modules'),

@@ -130,6 +130,55 @@ Evidence rows, ExternalLink rows, and their receipts commit in their respective
 single SQLite transactions. Callers must use these Interfaces instead of the
 underlying tables.
 
+## Transactional projection Outbox
+
+`core.outbox` is the runtime-neutral delivery Interface for projecting Task
+Events. Commitment Core never calls Feishu, OpenMax, HXA, or another external
+system. A new `TaskCreated` or Task transition Event and its logical Outbox row
+commit in the same SQLite transaction as the Task mutation and receipt. An
+Outbox persistence failure therefore rolls the whole local mutation back. Once
+the local transaction commits, an Adapter failure changes only its delivery
+state; it cannot roll the Task back.
+
+The logical Outbox row is keyed by the existing immutable Task Event. Delivery
+rows are materialized lazily per normalized `projection`, so `feishu`,
+`openmax`, and any later projection each claim and acknowledge the same Event
+independently instead of competing for one shared delivery.
+
+- `outbox.claim({ projection, workerId, idempotencyKey, leaseMs, limit? })`
+  leases up to 50 pending deliveries by default, with a hard maximum of 100.
+  `leaseMs` is an integer from 1 through 86,400,000. Results are ordered by
+  Event occurrence, Task identity and version, and Event identity.
+- A claim returns a stable delivery `version` and `attempt`. An expired lease
+  becomes claimable by another worker and increments both values, fencing the
+  stale worker.
+- `outbox.ack({ projection, eventId, workerId, idempotencyKey },
+  expectedVersion)` acknowledges only an unexpired lease owned by that worker.
+- `outbox.fail({ projection, eventId, workerId, error, retryAfterMs?,
+  maxAttempts?, idempotencyKey }, expectedVersion)` releases an owned lease.
+  A bounded `retryAfterMs` schedules retry; reaching `maxAttempts` moves the
+  delivery to `dead_letter`. Omitting `retryAfterMs` dead-letters a
+  non-retryable failure immediately.
+- `outbox.query({ projection, eventId })` reads one delivery, including a
+  synthetic `pending` view before lazy materialization.
+  `outbox.query({ projection, statuses?, limit? })` provides stable bounded
+  operational lists across `pending`, `leased`, `retry_wait`, `acknowledged`,
+  and `dead_letter`.
+
+Claim, acknowledge, and fail mutations have durable exact-replay receipts.
+Changing normalized content under a used key returns `IDEMPOTENCY_CONFLICT`.
+Other stable errors include `DELIVERY_NOT_FOUND`, `DELIVERY_NOT_LEASED`,
+`DELIVERY_FORBIDDEN`, `DELIVERY_LEASE_EXPIRED`, and
+`DELIVERY_VERSION_CONFLICT`.
+
+Existing Task Events are backfilled into the logical Outbox when the schema is
+first installed; this is a migration path, not a claim that their original
+historical transactions contained Outbox rows. Task Run operations that change
+Task state already create a Task Event and therefore an Outbox row. Run-only
+Events, Evidence, and ExternalLink writes deliberately do not create projection
+records in this slice. Dead-letter inspection is included; operator redrive and
+platform-specific projection Adapters remain later slices.
+
 ## External execution Adapter seam
 
 `scripts/external-execution-adapter.js` defines the reusable Interface for
@@ -199,8 +248,9 @@ Callers handle stable error codes: `VERSION_CONFLICT`, `INVALID_TRANSITION`,
 `FORBIDDEN`, `IDEMPOTENCY_CONFLICT`, and `TASK_NOT_FOUND`. Malformed Interface
 values throw `TypeError`.
 
-Assignment changes, reconciliation, external state synchronization, and channel
-projection remain later slices and must extend this Interface deliberately.
+Assignment changes, reconciliation, external state synchronization, and
+platform-specific projection Adapters remain later slices and must extend this
+Interface deliberately.
 
 The local `zylos task` CLI is an Adapter over this Interface. It must not query
 or mutate the SQLite tables directly. It lazily loads the deployed Module from

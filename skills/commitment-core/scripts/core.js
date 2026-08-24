@@ -10,6 +10,10 @@ import {
   createExternalLinkModule,
   initializeExternalLinkSchema,
 } from './external-links.js';
+import {
+  createProjectionOutboxModule,
+  initializeProjectionOutboxSchema,
+} from './projection-outbox.js';
 import { createTaskRunModule, initializeTaskRunSchema } from './task-runs.js';
 
 function defaultDbPath() {
@@ -337,7 +341,7 @@ function migrateLegacyEventSchema(database) {
   }
 }
 
-function backfillCreationEvents(database, eventIdGenerator) {
+function backfillCreationEvents(database, eventIdGenerator, appendProjectionRecord) {
   const legacyTasks = database.prepare(`
     SELECT t.id, t.owner_id, t.created_at,
            COALESCE(
@@ -368,12 +372,15 @@ function backfillCreationEvents(database, eventIdGenerator) {
   `);
   const backfill = database.transaction(() => {
     for (const task of legacyTasks) {
-      insertCreationEvent.run(
-        requireText(eventIdGenerator(), 'generated event id'),
-        task.id,
-        task.actor_id,
-        task.created_at,
-      );
+      const event = {
+        id: requireText(eventIdGenerator(), 'generated event id'),
+        taskId: task.id,
+        actorId: task.actor_id,
+        version: 1,
+        occurredAt: task.created_at,
+      };
+      insertCreationEvent.run(event.id, event.taskId, event.actorId, event.occurredAt);
+      appendProjectionRecord(event);
     }
   });
   backfill.immediate();
@@ -420,7 +427,7 @@ function initializeSchema(database) {
  * Open the durable Commitment Core Module.
  *
  * Callers interact only through ingest/command/query and the nested runs,
- * evidence, and externalLinks Interfaces. SQLite transactions, schema
+ * evidence, externalLinks, and outbox Interfaces. SQLite transactions, schema
  * migration, deduplication, events, leases, and persistence remain inside the
  * Module.
  */
@@ -443,10 +450,12 @@ export function openCommitmentCore({
   migrateLegacyEventSchema(database);
   database.pragma('foreign_keys = ON');
   initializeSchema(database);
+  initializeProjectionOutboxSchema(database);
   initializeTaskRunSchema(database);
   initializeEvidenceSchema(database);
   initializeExternalLinkSchema(database);
-  backfillCreationEvents(database, eventIdGenerator);
+  const projectionOutboxModule = createProjectionOutboxModule({ database, clock });
+  backfillCreationEvents(database, eventIdGenerator, projectionOutboxModule.append);
 
   const selectTask = database.prepare(`
     SELECT id, title, description, state, owner_id, acceptor_id, assignee_id,
@@ -529,6 +538,7 @@ export function openCommitmentCore({
       event.version,
       event.occurredAt,
     );
+    projectionOutboxModule.append(event);
     return { task: updatedTask, event };
   }
 
@@ -565,16 +575,27 @@ export function openCommitmentCore({
       timestamp,
     );
     const task = toTaskView(selectTask.get(taskId));
+    const event = {
+      id: requireText(eventIdGenerator(), 'generated event id'),
+      type: 'TaskCreated',
+      taskId: task.id,
+      actorId: envelope.source.senderId ?? task.ownerId,
+      fromState: null,
+      toState: task.state,
+      version: task.version,
+      occurredAt: timestamp,
+    };
     insertEvent.run(
-      requireText(eventIdGenerator(), 'generated event id'),
-      'TaskCreated',
-      task.id,
-      envelope.source.senderId ?? task.ownerId,
-      null,
-      task.state,
-      task.version,
-      timestamp,
+      event.id,
+      event.type,
+      event.taskId,
+      event.actorId,
+      event.fromState,
+      event.toState,
+      event.version,
+      event.occurredAt,
     );
+    projectionOutboxModule.append(event);
 
     return { created: true, task };
   });
@@ -672,6 +693,7 @@ export function openCommitmentCore({
     runs: runModule.publicInterface,
     evidence: evidenceModule,
     externalLinks: externalLinkModule,
+    outbox: projectionOutboxModule.publicInterface,
     query(query = {}) {
       const normalized = normalizeQuery(query);
       if (normalized.mode === 'list') {
