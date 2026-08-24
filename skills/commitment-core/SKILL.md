@@ -308,8 +308,10 @@ authorized acceptor action may move a reviewed Task to `done`.
 never writes `memory/state.md`: that file also contains non-task memory and is
 not owned by this Module. The dedicated file is a disposable, read-only
 attention view: never parse it to create or update Tasks, and never treat edits
-to it as authoritative state. A later session injector may load it separately,
-or a separately reviewed merge Module may combine it with session context.
+to it as authoritative state. The zylos-memory
+`task-attention-context.js` provider can load it through an explicit component
+shard declaration. The file's presence alone never enables SessionStart
+injection, and the provider never merges it into or replaces `memory/state.md`.
 
 Run it directly with:
 
