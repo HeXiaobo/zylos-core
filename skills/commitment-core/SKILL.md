@@ -39,6 +39,23 @@ The envelope owns only channel-neutral task fields. `source.channel` and
 `source.externalId` provide provenance; Adapters are responsible for deriving
 a stable idempotency key from their native event identity.
 
+## External execution Adapter seam
+
+`scripts/external-execution-adapter.js` defines the reusable Interface for
+OpenMax, Paperclip, local workers, and later execution backends. Call
+`mapExternalExecutionEvent({ backend, eventId, eventType, taskId, actorId,
+expectedVersion })`; it returns `{ command, expectedVersion }`, ready for
+`command(command, expectedVersion)`. `backend` is a canonical lowercase
+identifier, and the stable command key is
+`<backend>:<eventId>:task-command`. Raw backend metadata must be normalized
+outside this Adapter; extra or malformed fields fail closed.
+
+Only `work_started` becomes `StartTask`. `deliverable_submitted`, `completed`,
+`done`, and `succeeded` become `SubmitForReview`. Backend completion is evidence
+for review, never acceptance: this Adapter never produces `AcceptTask`, and
+unknown or human-acceptance event types fail closed. Only an explicit,
+authorized acceptor action may move a reviewed Task to `done`.
+
 ## Command policy
 
 | Command | Transition | Authorized actor |
