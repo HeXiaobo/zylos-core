@@ -21,7 +21,7 @@ test('selects an available control plane without depending on local runtime heal
       schemaVersion: 1,
       status: 'available',
       selectedBackend: 'openmax',
-      taskAdmission: 'allowed',
+      dispatchAdmission: 'allowed',
       completionPolicy: 'submit_for_review',
       reasonCode: 'CONTROL_PLANE_READY',
       observations: {
@@ -56,7 +56,7 @@ test('degrades to local execution when the control plane returns 403', () => {
     schemaVersion: 1,
     status: 'degraded',
     selectedBackend: 'local',
-    taskAdmission: 'allowed',
+    dispatchAdmission: 'allowed',
     completionPolicy: 'submit_for_review',
     reasonCode: 'CONTROL_PLANE_FORBIDDEN_FALLBACK_LOCAL',
     observations: {
@@ -88,7 +88,8 @@ test('blocks execution only when both the control plane and local runtime are un
 
   assert.equal(decision.status, 'blocked');
   assert.equal(decision.selectedBackend, null);
-  assert.equal(decision.taskAdmission, 'blocked');
+  assert.equal(decision.dispatchAdmission, 'blocked');
+  assert.equal(Object.hasOwn(decision, 'taskAdmission'), false);
   assert.equal(decision.completionPolicy, 'submit_for_review');
   assert.equal(decision.reasonCode, 'NO_EXECUTION_BACKEND');
 });
@@ -145,6 +146,16 @@ test('fails closed for malformed or ambiguous health observations', () => {
   for (const observation of invalid) {
     assert.throws(() => decideExecutionControlPlane(observation), TypeError);
   }
+});
+
+test('fails closed when control plane and fallback identify the same backend', () => {
+  assert.throws(
+    () => decideExecutionControlPlane({
+      controlPlane: { backend: 'same', state: 'http_error', httpStatus: 403 },
+      localRuntime: { backend: 'same', state: 'ready' },
+    }),
+    new TypeError('controlPlane.backend and localRuntime.backend must be different'),
+  );
 });
 
 test('routes completion from either selected backend to review, never acceptance', () => {

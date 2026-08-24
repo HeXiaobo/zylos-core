@@ -55,10 +55,12 @@ function requireLocalRuntime(value) {
 
 function requireDecisionInput(value) {
   const input = requireObject(value, 'execution observation', ['controlPlane', 'localRuntime']);
-  return {
-    controlPlane: requireControlPlane(input.controlPlane),
-    localRuntime: requireLocalRuntime(input.localRuntime),
-  };
+  const controlPlane = requireControlPlane(input.controlPlane);
+  const localRuntime = requireLocalRuntime(input.localRuntime);
+  if (controlPlane.backend === localRuntime.backend) {
+    throw new TypeError('controlPlane.backend and localRuntime.backend must be different');
+  }
+  return { controlPlane, localRuntime };
 }
 
 function fallbackReasonCode(controlPlane) {
@@ -90,7 +92,7 @@ export function decideExecutionControlPlane(input) {
     selectedBackend: blocked
       ? null
       : useLocalFallback ? localRuntime.backend : controlPlane.backend,
-    taskAdmission: blocked ? 'blocked' : 'allowed',
+    dispatchAdmission: blocked ? 'blocked' : 'allowed',
     completionPolicy: COMPLETION_POLICY,
     reasonCode: blocked
       ? 'NO_EXECUTION_BACKEND'

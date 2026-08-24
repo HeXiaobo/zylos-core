@@ -117,6 +117,59 @@ test('an external projection outage cannot roll back Core and recovery applies n
   });
 });
 
+test('the business gate degrades OpenMax 403 to local dispatch and review-only completion', async () => {
+  const report = await runBusinessMvpGate();
+
+  assert.deepEqual(gate(report, 'control_plane_403_falls_back_to_local_review'), {
+    id: 'control_plane_403_falls_back_to_local_review',
+    passed: true,
+    evidence: {
+      decisionStatus: 'degraded',
+      selectedBackend: 'local',
+      dispatchAdmission: 'allowed',
+      completionPolicy: 'submit_for_review',
+      mappedCompletionCommand: 'SubmitForReview',
+      stateAfterExecution: 'review',
+    },
+  });
+});
+
+test('the business gate blocks dispatch without rejecting an already ingested Core Task', async () => {
+  const report = await runBusinessMvpGate();
+
+  assert.deepEqual(gate(report, 'unavailable_backends_block_dispatch_not_intake'), {
+    id: 'unavailable_backends_block_dispatch_not_intake',
+    passed: true,
+    evidence: {
+      decisionStatus: 'blocked',
+      selectedBackend: null,
+      dispatchAdmission: 'blocked',
+      completionPolicy: 'submit_for_review',
+      authoritativeTaskCount: 1,
+      taskStateAtDecision: 'ready',
+    },
+  });
+});
+
+test('publish-before-ack crash replay applies the external event exactly once', async () => {
+  const report = await runBusinessMvpGate();
+
+  assert.deepEqual(gate(report, 'publish_before_ack_replays_without_duplicate_effect'), {
+    id: 'publish_before_ack_replays_without_duplicate_effect',
+    passed: true,
+    evidence: {
+      publishedBeforeCrash: 1,
+      settlementFailedBeforeCrash: 1,
+      deliveryStatusAfterCrash: 'leased',
+      recoveredDeliveryStatus: 'acknowledged',
+      publishAttempts: 2,
+      uniqueExternalEvents: 1,
+      duplicatePublishAttempts: 1,
+      externalTaskCount: 1,
+    },
+  });
+});
+
 test('Agent completion stops at review instead of closing the business Task', async () => {
   const report = await runBusinessMvpGate();
 
@@ -167,12 +220,15 @@ test('a deleted derived projection rebuilds from Core events and reconciles clea
 });
 
 test('the gate report is machine-readable and does not claim live-environment proof', async () => {
-  const report = await runBusinessMvpGate();
+  const report = await runBusinessMvpGate({
+    executionClock: () => '2026-08-25T06:30:00.000Z',
+    sourceRevision: 'revision-under-test',
+  });
 
-  assert.equal(report.schemaVersion, 'zylos.task-management.business-mvp-gate/v1');
+  assert.equal(report.schemaVersion, 'zylos.task-management.business-mvp-gate/v2');
   assert.equal(report.mode, 'offline_injected_adapters');
   assert.equal(report.passed, true);
-  assert.deepEqual(report.summary, { total: 6, passed: 6, failed: 0 });
+  assert.deepEqual(report.summary, { total: 9, passed: 9, failed: 0 });
   assert.deepEqual(report.liveEnvironmentProof, {
     feishuNetwork: false,
     aiEmployeeFleet: false,
@@ -183,13 +239,17 @@ test('the gate report is machine-readable and does not claim live-environment pr
     'real_agent_runtime_claim_and_completion',
     'production_restart_and_external_outage_drill',
   ]);
-  assert.match(report.generatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(report.executedAt, '2026-08-25T06:30:00.000Z');
+  assert.equal(report.scenarioTime, '2026-08-25T02:02:02.001Z');
+  assert.equal(report.sourceRevision, 'revision-under-test');
+  assert.equal(Object.hasOwn(report, 'generatedAt'), false);
   assert.doesNotThrow(() => JSON.parse(JSON.stringify(report)));
 });
 
 test('the CLI emits and optionally persists the same machine-readable gate report', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-mvp-gate-cli-'));
   const outputPath = path.join(directory, 'gate-report.json');
+  fs.writeFileSync(outputPath, 'stale report', { mode: 0o644 });
   try {
     const result = spawnSync(process.execPath, [GATE_CLI, '--output', outputPath], {
       encoding: 'utf8',
@@ -201,6 +261,30 @@ test('the CLI emits and optionally persists the same machine-readable gate repor
     assert.deepEqual(persistedReport, stdoutReport);
     assert.equal(stdoutReport.passed, true);
     assert.equal(stdoutReport.mode, 'offline_injected_adapters');
+    assert.equal(fs.statSync(outputPath).mode & 0o777, 0o600);
+    assert.deepEqual(fs.readdirSync(directory), ['gate-report.json']);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('the CLI rejects a symlink output without modifying its target', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-mvp-gate-symlink-'));
+  const victimPath = path.join(directory, 'victim.txt');
+  const outputPath = path.join(directory, 'gate-report.json');
+  fs.writeFileSync(victimPath, 'keep this content', { mode: 0o600 });
+  fs.symlinkSync(victimPath, outputPath);
+  try {
+    const result = spawnSync(process.execPath, [GATE_CLI, '--output', outputPath], {
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(fs.readFileSync(victimPath, 'utf8'), 'keep this content');
+    assert.equal(fs.lstatSync(outputPath).isSymbolicLink(), true);
+    const failure = JSON.parse(result.stderr);
+    assert.equal(failure.error.code, 'OUTPUT_PATH_UNSAFE');
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

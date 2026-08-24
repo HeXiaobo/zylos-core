@@ -29,7 +29,8 @@ test('prints a machine-readable local fallback decision for control-plane 403', 
   const decision = JSON.parse(result.stdout);
   assert.equal(decision.status, 'degraded');
   assert.equal(decision.selectedBackend, 'local');
-  assert.equal(decision.taskAdmission, 'allowed');
+  assert.equal(decision.dispatchAdmission, 'allowed');
+  assert.equal(Object.hasOwn(decision, 'taskAdmission'), false);
   assert.equal(decision.reasonCode, 'CONTROL_PLANE_FORBIDDEN_FALLBACK_LOCAL');
   assert.equal(decision.completionPolicy, 'submit_for_review');
 });
@@ -48,7 +49,7 @@ test('returns a distinct exit code when neither execution backend is available',
   const decision = JSON.parse(result.stdout);
   assert.equal(decision.status, 'blocked');
   assert.equal(decision.selectedBackend, null);
-  assert.equal(decision.taskAdmission, 'blocked');
+  assert.equal(decision.dispatchAdmission, 'blocked');
 });
 
 test('fails closed on incomplete, duplicate, or contradictory CLI observations', () => {

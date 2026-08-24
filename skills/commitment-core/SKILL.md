@@ -294,13 +294,18 @@ npm --prefix skills/commitment-core run gate:business-mvp -- \
 ```
 
 The command always writes the same JSON report to stdout and optionally to the
-explicit `--output` path. Exit status is zero only when all six local gates
+explicit `--output` path. Exit status is zero only when all nine local gates
 pass. The report uses schema
-`zylos.task-management.business-mvp-gate/v1` and covers:
+`zylos.task-management.business-mvp-gate/v2` and covers:
 
 - ten replays of one Feishu-shaped source creating one intake and one Task;
 - replay after a simulated process exit between Core ingest and intake ack;
 - external projection outage isolation, retry, and idempotent recovery;
+- OpenMax 403 fallback to local dispatch with review-only completion;
+- both execution backends unavailable blocking dispatch after, never before,
+  durable Core intake;
+- publish success followed by an ack-window failure and lease-expiry replay
+  with one external effect;
 - Agent execution completion stopping at `review`;
 - unauthorized acceptance rejection and authorized Acceptor transition to
   `done`;
@@ -308,7 +313,12 @@ pass. The report uses schema
 
 The gate opens only temporary local SQLite databases and uses injected clock,
 process, and projection Adapter seams. It performs no network operation. Its
-report therefore sets every `liveEnvironmentProof` field to `false` and lists
+report separates the real, injectable `executedAt` audit timestamp from the
+deterministic `scenarioTime`; `sourceRevision` may be supplied through the
+Interface or `ZYLOS_SOURCE_REVISION`. The optional output is written through a
+same-directory atomic replace with mode `0600`; an existing symbolic-link or
+non-regular target is rejected. The report sets every `liveEnvironmentProof`
+field to `false` and lists
 the remaining real-environment proofs: live Feishu card send/callback, a real
 AI employee Runtime claim/completion, and a production restart plus external
 outage drill. Passing this gate is a prerequisite for those drills, not a
@@ -429,13 +439,18 @@ Adapters first normalize their own authenticated health probes to:
   status is required for `http_error`); and
 - local runtime `ready` or `unavailable`.
 
+The two observations must identify different canonical backends. Contradictory
+health states for one backend fail closed instead of masquerading as fallback.
+
 `decideExecutionControlPlane({ controlPlane, localRuntime })` returns one
 machine-readable decision. Its `status` is `available` when the control plane
 is selected, `degraded` when a non-ready control plane falls back to the local
 runtime, and `blocked` only when neither backend can execute. A 403 therefore
 selects local execution when local is ready; it never discards or rolls back a
-Task already committed in Core. Every non-blocked decision has
-`taskAdmission: "allowed"`, and every decision declares
+Task already committed in Core. This gate must run only after Core ingest has
+durably accepted the Task. Every non-blocked decision has
+`dispatchAdmission: "allowed"`, while a blocked decision pauses dispatch but
+never rejects Core intake. Every decision declares
 `completionPolicy: "submit_for_review"`.
 
 This Module deliberately performs no HTTP request, process probe, task claim,

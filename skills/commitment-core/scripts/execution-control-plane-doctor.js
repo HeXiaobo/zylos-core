@@ -81,7 +81,7 @@ export function runExecutionControlPlaneDoctor(args = process.argv.slice(2)) {
   } else {
     process.stdout.write(
       `${decision.status} selected=${decision.selectedBackend ?? 'none'} `
-      + `admission=${decision.taskAdmission} reason=${decision.reasonCode} `
+      + `dispatch=${decision.dispatchAdmission} reason=${decision.reasonCode} `
       + `completion=${decision.completionPolicy}\n`,
     );
   }
