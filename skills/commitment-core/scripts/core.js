@@ -146,6 +146,10 @@ const COMMAND_DEFINITIONS = Object.freeze({
   },
 });
 
+const TASK_STATES = new Set(['ready', 'in_progress', 'review', 'done', 'cancelled']);
+const DEFAULT_QUERY_LIMIT = 50;
+const MAX_QUERY_LIMIT = 100;
+
 function normalizeCommand(command) {
   if (!command || typeof command !== 'object') {
     throw new TypeError('command must be an object');
@@ -167,6 +171,57 @@ function normalizeExpectedVersion(expectedVersion) {
     throw new TypeError('expectedVersion must be a positive integer');
   }
   return expectedVersion;
+}
+
+function rejectUnknownQueryFields(query, allowedFields) {
+  const unknown = Object.keys(query).filter((field) => !allowedFields.has(field));
+  if (unknown.length > 0) {
+    throw new TypeError(`unsupported query field: ${unknown[0]}`);
+  }
+}
+
+function normalizeQuery(query) {
+  if (!query || typeof query !== 'object' || Array.isArray(query)) {
+    throw new TypeError('query must be an object');
+  }
+
+  if (Object.hasOwn(query, 'taskId')) {
+    rejectUnknownQueryFields(query, new Set(['taskId', 'includeEvents']));
+    if (query.includeEvents !== undefined && typeof query.includeEvents !== 'boolean') {
+      throw new TypeError('includeEvents must be a boolean');
+    }
+    return {
+      mode: 'task',
+      taskId: requireText(query.taskId, 'taskId'),
+      includeEvents: query.includeEvents ?? false,
+    };
+  }
+
+  rejectUnknownQueryFields(query, new Set(['states', 'ownerId', 'assigneeId', 'limit']));
+  let states = null;
+  if (query.states !== undefined) {
+    if (!Array.isArray(query.states) || query.states.length === 0) {
+      throw new TypeError('states must be a non-empty array');
+    }
+    states = [...new Set(query.states.map((state) => requireText(state, 'states item')))];
+    const invalidState = states.find((state) => !TASK_STATES.has(state));
+    if (invalidState) throw new TypeError(`invalid task state: ${invalidState}`);
+  }
+
+  const limit = query.limit ?? DEFAULT_QUERY_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_QUERY_LIMIT) {
+    throw new TypeError(`limit must be an integer between 1 and ${MAX_QUERY_LIMIT}`);
+  }
+
+  return {
+    mode: 'list',
+    states,
+    ownerId: query.ownerId === undefined ? null : requireText(query.ownerId, 'ownerId'),
+    assigneeId: query.assigneeId === undefined
+      ? null
+      : requireText(query.assigneeId, 'assigneeId'),
+    limit,
+  };
 }
 
 const TASK_TABLE_COLUMNS = `
@@ -552,13 +607,39 @@ export function openCommitmentCore({
     command(command, expectedVersion) {
       return commandTransaction.immediate(command, expectedVersion);
     },
-    query({ taskId, includeEvents = false } = {}) {
-      const normalizedTaskId = requireText(taskId, 'taskId');
-      const task = toTaskView(selectTask.get(normalizedTaskId));
-      if (!includeEvents) return task;
+    query(query = {}) {
+      const normalized = normalizeQuery(query);
+      if (normalized.mode === 'list') {
+        const clauses = [];
+        const values = [];
+        if (normalized.states) {
+          clauses.push(`state IN (${normalized.states.map(() => '?').join(', ')})`);
+          values.push(...normalized.states);
+        }
+        if (normalized.ownerId) {
+          clauses.push('owner_id = ?');
+          values.push(normalized.ownerId);
+        }
+        if (normalized.assigneeId) {
+          clauses.push('assignee_id = ?');
+          values.push(normalized.assigneeId);
+        }
+        const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+        return database.prepare(`
+          SELECT id, title, description, state, owner_id, acceptor_id, assignee_id,
+                 version, created_at, updated_at
+          FROM commitment_tasks
+          ${where}
+          ORDER BY updated_at DESC, id ASC
+          LIMIT ?
+        `).all(...values, normalized.limit).map(toTaskView);
+      }
+
+      const task = toTaskView(selectTask.get(normalized.taskId));
+      if (!normalized.includeEvents) return task;
       return {
         task,
-        events: selectEvents.all(normalizedTaskId).map(toEventView),
+        events: selectEvents.all(normalized.taskId).map(toEventView),
       };
     },
     close() {

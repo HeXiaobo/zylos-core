@@ -31,6 +31,9 @@ to `~/zylos/commitments/commitments.db` when `ZYLOS_DIR` is unset.
 - `query({ taskId })` returns the task view or `null`.
 - `query({ taskId, includeEvents: true })` returns `{ task, events }`, with
   events ordered by Task version.
+- `query({ states?, ownerId?, assigneeId?, limit? })` lists Tasks ordered by
+  `updatedAt` descending and `id` ascending. The default limit is 50 and the
+  maximum is 100. List mode and `taskId` mode are mutually exclusive.
 - `command({ type, taskId, actorId, idempotencyKey }, expectedVersion)` applies
   one state transition and returns `{ task, event }`. `expectedVersion` must be
   a positive integer.
@@ -83,3 +86,8 @@ values throw `TypeError`.
 
 Assignment changes, reconciliation, and channel projection remain later slices
 and must extend this Interface deliberately.
+
+The local `zylos task` CLI is an Adapter over this Interface. It must not query
+or mutate the SQLite tables directly. It lazily loads the deployed Module from
+`$ZYLOS_DIR/.claude/skills/commitment-core`, where Skill dependencies are
+installed, so unrelated root CLI commands do not require SQLite at startup.

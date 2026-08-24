@@ -24,6 +24,14 @@ import { shellCommand } from './commands/shell.js';
 import { runtimeCommand } from './commands/runtime.js';
 import { migrateInstructionsCommand } from './commands/migrate-instructions.js';
 
+// Commitment Core has a native SQLite dependency installed with its deployed
+// Skill. Keep it off the root CLI startup path so setup/help remain available
+// before that Skill has been installed.
+async function taskCommand(args) {
+  const taskModule = await import('./commands/task.js');
+  return taskModule.taskCommand(args);
+}
+
 const commands = {
   // Environment setup
   init: initCommand,
@@ -33,6 +41,7 @@ const commands = {
   shell: shellCommand,
   runtime: runtimeCommand,
   'migrate-instructions': migrateInstructionsCommand,
+  task: taskCommand,
   // Service management
   status: showStatus,
   logs: showLogs,
@@ -101,6 +110,8 @@ Setup:
   migrate-instructions  Analyze/migrate legacy mixed instructions (dry-run by default)
                       --apply  Create durable backup and activate split instructions
                       --user-content <file>  User-only content for conservative C-class migration
+  task                Manage local commitments and tasks
+                      Run "zylos task --help" for subcommands and options
 
 Service Management:
   status              Show system status
@@ -134,6 +145,8 @@ Examples:
   zylos config set protocol http
   zylos status
   zylos logs activity
+  zylos task list
+  zylos task create --title "Follow up customer" --owner owner-id
 
   zylos add telegram
   zylos add telegram@0.2.0
