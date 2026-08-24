@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -93,5 +93,32 @@ test('reusing an idempotency key for different task content is rejected', () => 
     );
   } finally {
     harness.cleanup();
+  }
+});
+
+test('the default database lives under ZYLOS_DIR when it is configured', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-commitment-path-'));
+  const previousHome = process.env.HOME;
+  const previousZylosDir = process.env.ZYLOS_DIR;
+  const zylosDir = path.join(directory, 'custom-zylos');
+  process.env.HOME = path.join(directory, 'isolated-home');
+  process.env.ZYLOS_DIR = zylosDir;
+
+  try {
+    const moduleUrl = new URL(`../core.js?default-path-test=${Date.now()}`, import.meta.url);
+    const { openCommitmentCore: openDefaultCore } = await import(moduleUrl);
+    const core = openDefaultCore();
+    core.close();
+
+    assert.equal(
+      existsSync(path.join(zylosDir, 'commitments', 'commitments.db')),
+      true,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousZylosDir === undefined) delete process.env.ZYLOS_DIR;
+    else process.env.ZYLOS_DIR = previousZylosDir;
+    rmSync(directory, { recursive: true, force: true });
   }
 });

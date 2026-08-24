@@ -5,7 +5,10 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
-const DEFAULT_DB_PATH = path.join(os.homedir(), 'zylos', 'commitments', 'commitments.db');
+function defaultDbPath() {
+  const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+  return path.join(zylosDir, 'commitments', 'commitments.db');
+}
 
 function requireText(value, field) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -111,7 +114,7 @@ function initializeSchema(database) {
  * source deduplication, and persistence remain inside the Module.
  */
 export function openCommitmentCore({
-  dbPath = DEFAULT_DB_PATH,
+  dbPath = defaultDbPath(),
   clock = () => new Date().toISOString(),
   idGenerator = () => `task-${randomUUID()}`,
 } = {}) {

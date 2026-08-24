@@ -17,6 +17,8 @@ fields belong in Adapters, not in this Module.
 Open the Module with `openCommitmentCore({ dbPath, clock, idGenerator })` and
 close it when the runtime stops. Production callers normally omit the options;
 the injectable clock and ID generator exist for deterministic tests.
+The default database is `$ZYLOS_DIR/commitments/commitments.db`, falling back
+to `~/zylos/commitments/commitments.db` when `ZYLOS_DIR` is unset.
 
 - `ingest(envelope)` atomically creates one `ready` task for a new
   `idempotencyKey` and returns `{ created: true, task }`.
