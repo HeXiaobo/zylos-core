@@ -105,6 +105,7 @@ const WRITE_COMMANDS = Object.freeze({
   cancel: 'CancelTask',
   reopen: 'ReopenTask',
 });
+const RUN_COMMANDS = new Set(['claim', 'heartbeat', 'complete-run', 'release-run', 'runs']);
 
 function argumentError(message) {
   const error = new TypeError(message);
@@ -123,7 +124,11 @@ function parsePositiveInteger(value, field) {
   if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
     throw argumentError(`${field} must be a positive integer`);
   }
-  return Number(value);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw argumentError(`${field} must be a safe positive integer`);
+  }
+  return parsed;
 }
 
 function parseArgs(args, {
@@ -185,6 +190,10 @@ function printTask(task) {
   console.log(`${task.id}  ${task.state}  v${task.version}  ${task.title}`);
 }
 
+function printRun(run) {
+  console.log(`${run.id}  ${run.status}  v${run.version}  ${run.workerId}  ${run.taskId}`);
+}
+
 function showTaskHelp() {
   console.log(`
 Usage: zylos task <subcommand> [options]
@@ -199,6 +208,11 @@ Subcommands:
   rework <taskId>        review → ready
   cancel <taskId>        ready/in_progress/review → cancelled
   reopen <taskId>        done → ready
+  claim <taskId>         Claim a Task Run lease and start ready work
+  heartbeat <taskId>     Renew an active Task Run lease
+  complete-run <taskId>  End a Run and submit the Task for review
+  release-run <taskId>   Release a Run and return the Task to ready
+  runs <taskId>          List Task Runs
 
 Create options:
   --title <text>         Required task title
@@ -220,6 +234,19 @@ List/show options:
 State command options:
   --actor <id>           Required actor identity
   --expected-version <n> Required positive Task version
+  --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
+  --json                 JSON output
+
+Run command options:
+  --run <runId>          Required for heartbeat/complete-run/release-run
+  --worker <id>          Required worker identity
+  --actor <id>           Required actor when claiming
+  --lease-ms <n>         Required positive lease duration for claim/heartbeat
+  --expected-version <n> Required Task version for claim/finish
+  --expected-run-version <n> Required Run version for heartbeat/finish
+  --status <status>      Filter runs; repeat or use comma-separated statuses
+  --limit <1..100>       Run list limit (default: 50)
+  --events               Include Run events when listing
   --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
   --json                 JSON output
 `);
@@ -329,6 +356,109 @@ function applyStateCommand(core, subcommand, args, makeIdempotencyKey) {
   else printTask(result.task);
 }
 
+function claimRun(core, args, makeIdempotencyKey) {
+  const { options, positionals } = parseArgs(args, {
+    valueFlags: ['actor', 'worker', 'lease-ms', 'expected-version', 'idempotency-key'],
+    booleanFlags: ['json'],
+    positionalCount: 1,
+  });
+  const taskId = requireValue(positionals[0], 'taskId');
+  const result = core.runs.claim({
+    taskId,
+    actorId: requireValue(options.actor, '--actor'),
+    workerId: requireValue(options.worker, '--worker'),
+    leaseMs: parsePositiveInteger(options['lease-ms'], '--lease-ms'),
+    idempotencyKey: options['idempotency-key']
+      ? requireValue(options['idempotency-key'], '--idempotency-key')
+      : makeIdempotencyKey('run-claim'),
+  }, parsePositiveInteger(options['expected-version'], '--expected-version'));
+
+  if (options.json) printJson(result);
+  else {
+    printRun(result.run);
+    printTask(result.task);
+  }
+}
+
+function heartbeatRun(core, args, makeIdempotencyKey) {
+  const { options, positionals } = parseArgs(args, {
+    valueFlags: ['run', 'worker', 'lease-ms', 'expected-run-version', 'idempotency-key'],
+    booleanFlags: ['json'],
+    positionalCount: 1,
+  });
+  const result = core.runs.heartbeat({
+    taskId: requireValue(positionals[0], 'taskId'),
+    runId: requireValue(options.run, '--run'),
+    workerId: requireValue(options.worker, '--worker'),
+    leaseMs: parsePositiveInteger(options['lease-ms'], '--lease-ms'),
+    idempotencyKey: options['idempotency-key']
+      ? requireValue(options['idempotency-key'], '--idempotency-key')
+      : makeIdempotencyKey('run-heartbeat'),
+  }, parsePositiveInteger(options['expected-run-version'], '--expected-run-version'));
+
+  if (options.json) printJson(result);
+  else printRun(result.run);
+}
+
+function finishRun(core, operation, args, makeIdempotencyKey) {
+  const { options, positionals } = parseArgs(args, {
+    valueFlags: ['run', 'worker', 'expected-run-version', 'expected-version', 'idempotency-key'],
+    booleanFlags: ['json'],
+    positionalCount: 1,
+  });
+  const request = {
+    taskId: requireValue(positionals[0], 'taskId'),
+    runId: requireValue(options.run, '--run'),
+    workerId: requireValue(options.worker, '--worker'),
+    idempotencyKey: options['idempotency-key']
+      ? requireValue(options['idempotency-key'], '--idempotency-key')
+      : makeIdempotencyKey(`run-${operation}`),
+  };
+  const versions = {
+    runVersion: parsePositiveInteger(
+      options['expected-run-version'],
+      '--expected-run-version',
+    ),
+    taskVersion: parsePositiveInteger(options['expected-version'], '--expected-version'),
+  };
+  const result = core.runs[operation](request, versions);
+
+  if (options.json) printJson(result);
+  else {
+    printRun(result.run);
+    printTask(result.task);
+  }
+}
+
+function listRuns(core, args) {
+  const { options, positionals } = parseArgs(args, {
+    valueFlags: ['status', 'limit'],
+    booleanFlags: ['events', 'json'],
+    repeatableFlags: ['status'],
+    positionalCount: 1,
+  });
+  const statuses = options.status
+    ?.flatMap((value) => value.split(','))
+    .map((value) => value.trim());
+  if (statuses?.some((status) => status === '')) {
+    throw argumentError('--status contains an empty value');
+  }
+  const runs = core.runs.query({
+    taskId: requireValue(positionals[0], 'taskId'),
+    statuses,
+    limit: options.limit === undefined
+      ? undefined
+      : parsePositiveInteger(options.limit, '--limit'),
+  });
+  const result = options.events
+    ? runs.map((run) => core.runs.query({ runId: run.id, includeEvents: true }))
+    : runs;
+
+  if (options.json) printJson(result);
+  else if (runs.length === 0) console.log('No task runs.');
+  else runs.forEach(printRun);
+}
+
 export async function taskCommand(args, {
   openCore,
   loadCore = loadCommitmentCore,
@@ -343,7 +473,9 @@ export async function taskCommand(args, {
   const jsonMode = args.includes('--json');
   let core;
   try {
-    if (!['create', 'list', 'show'].includes(subcommand) && !WRITE_COMMANDS[subcommand]) {
+    if (!['create', 'list', 'show'].includes(subcommand)
+      && !WRITE_COMMANDS[subcommand]
+      && !RUN_COMMANDS.has(subcommand)) {
       throw argumentError(`unknown task subcommand: ${subcommand}`);
     }
     const openCommitmentCore = openCore ?? await loadCore();
@@ -354,6 +486,13 @@ export async function taskCommand(args, {
     else if (WRITE_COMMANDS[subcommand]) {
       applyStateCommand(core, subcommand, args.slice(1), makeIdempotencyKey);
     }
+    else if (subcommand === 'claim') claimRun(core, args.slice(1), makeIdempotencyKey);
+    else if (subcommand === 'heartbeat') heartbeatRun(core, args.slice(1), makeIdempotencyKey);
+    else if (subcommand === 'complete-run') {
+      finishRun(core, 'complete', args.slice(1), makeIdempotencyKey);
+    } else if (subcommand === 'release-run') {
+      finishRun(core, 'release', args.slice(1), makeIdempotencyKey);
+    } else if (subcommand === 'runs') listRuns(core, args.slice(1));
   } catch (error) {
     const code = error?.code || (error instanceof TypeError ? 'INVALID_ARGUMENT' : 'TASK_ERROR');
     const payload = { error: { code, message: error?.message || String(error) } };

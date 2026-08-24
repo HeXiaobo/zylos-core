@@ -133,3 +133,8 @@ The local `zylos task` CLI is an Adapter over this Interface. It must not query
 or mutate the SQLite tables directly. It lazily loads the deployed Module from
 `$ZYLOS_DIR/.claude/skills/commitment-core`, where Skill dependencies are
 installed, so unrelated root CLI commands do not require SQLite at startup.
+Task state commands are `create/list/show/start/submit/accept/rework/cancel/reopen`.
+Run operations are exposed separately as `claim`, `heartbeat`, `complete-run`,
+`release-run`, and `runs`; `complete-run` intentionally submits for review and
+does not accept the Task. Every mutating Run command requires explicit Task/Run
+versions and a worker identity, and accepts a stable caller idempotency key.

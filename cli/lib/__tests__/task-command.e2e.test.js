@@ -128,6 +128,73 @@ test('zylos task completes create through acceptance and filters the resulting t
   }
 });
 
+test('zylos task exposes the Task Run lease lifecycle without treating completion as acceptance', () => {
+  const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-run-cli-'));
+
+  try {
+    installTaskCore(zylosDir);
+    const task = json(runTask(zylosDir, [
+      'create', '--title', '执行 CRM 跟进', '--owner', 'owner-1',
+      '--acceptor', 'acceptor-1', '--assignee', 'agent-1', '--json',
+    ])).task;
+
+    const claimedResult = runTask(zylosDir, [
+      'claim', task.id,
+      '--actor', 'agent-1',
+      '--worker', 'worker-1',
+      '--lease-ms', '30000',
+      '--expected-version', '1',
+      '--idempotency-key', 'cli:run:claim:1',
+      '--json',
+    ]);
+    assert.equal(claimedResult.status, 0, claimedResult.stderr);
+    const claimed = json(claimedResult);
+    assert.equal(claimed.task.state, 'in_progress');
+    assert.equal(claimed.run.status, 'active');
+
+    const heartbeatResult = runTask(zylosDir, [
+      'heartbeat', task.id,
+      '--run', claimed.run.id,
+      '--worker', 'worker-1',
+      '--lease-ms', '30000',
+      '--expected-run-version', '1',
+      '--idempotency-key', 'cli:run:heartbeat:1',
+      '--json',
+    ]);
+    assert.equal(heartbeatResult.status, 0, heartbeatResult.stderr);
+    assert.equal(json(heartbeatResult).run.version, 2);
+
+    const listedRuns = runTask(zylosDir, [
+      'runs', task.id, '--status', 'active', '--events', '--json',
+    ]);
+    assert.equal(listedRuns.status, 0, listedRuns.stderr);
+    assert.equal(json(listedRuns)[0].run.id, claimed.run.id);
+
+    const completedResult = runTask(zylosDir, [
+      'complete-run', task.id,
+      '--run', claimed.run.id,
+      '--worker', 'worker-1',
+      '--expected-run-version', '2',
+      '--expected-version', '2',
+      '--idempotency-key', 'cli:run:complete:1',
+      '--json',
+    ]);
+    assert.equal(completedResult.status, 0, completedResult.stderr);
+    const completed = json(completedResult);
+    assert.equal(completed.run.status, 'completed');
+    assert.equal(completed.task.state, 'review');
+    assert.notEqual(completed.task.state, 'done');
+
+    const accepted = runTask(zylosDir, [
+      'accept', task.id, '--actor', 'acceptor-1', '--expected-version', '3', '--json',
+    ]);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.equal(json(accepted).task.state, 'done');
+  } finally {
+    rmSync(zylosDir, { recursive: true, force: true });
+  }
+});
+
 test('zylos task returns structured errors and non-zero process exits', () => {
   const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-cli-errors-'));
 
@@ -154,6 +221,13 @@ test('zylos task returns structured errors and non-zero process exits', () => {
     ]);
     assert.equal(stale.status, 1);
     assert.equal(json(stale).error.code, 'VERSION_CONFLICT');
+
+    const unsafeVersion = runTask(zylosDir, [
+      'start', created.id, '--actor', 'agent-1',
+      '--expected-version', '9007199254740993', '--json',
+    ]);
+    assert.equal(unsafeVersion.status, 2);
+    assert.equal(json(unsafeVersion).error.code, 'INVALID_ARGUMENT');
 
     const sameTitleA = json(runTask(zylosDir, [
       'create', '--title', '同名任务', '--owner', 'owner-1', '--json',
