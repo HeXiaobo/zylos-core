@@ -5,6 +5,7 @@
   "private": true,
   "description": "Durable commitment and task state for Zylos",
   "scripts": {
+    "gate:business-mvp": "node scripts/business-mvp-gate.js",
     "test": "node --test scripts/__tests__/*.test.js"
   },
   "dependencies": {

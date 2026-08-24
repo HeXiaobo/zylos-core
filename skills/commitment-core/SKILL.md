@@ -284,6 +284,36 @@ recovered by lease expiry; the replacement worker republishes before ack.
 The worker Interface intentionally has no redrive operation. Only the explicit
 operator Interface above can create a new redrive generation.
 
+## Business MVP offline gate
+
+Run the repeatable task-management business gate from the repository root:
+
+```sh
+npm --prefix skills/commitment-core run gate:business-mvp -- \
+  --output /tmp/zylos-business-mvp-gate.json
+```
+
+The command always writes the same JSON report to stdout and optionally to the
+explicit `--output` path. Exit status is zero only when all six local gates
+pass. The report uses schema
+`zylos.task-management.business-mvp-gate/v1` and covers:
+
+- ten replays of one Feishu-shaped source creating one intake and one Task;
+- replay after a simulated process exit between Core ingest and intake ack;
+- external projection outage isolation, retry, and idempotent recovery;
+- Agent execution completion stopping at `review`;
+- unauthorized acceptance rejection and authorized Acceptor transition to
+  `done`;
+- deletion, event replay, rebuild, and reconciliation of derived task state.
+
+The gate opens only temporary local SQLite databases and uses injected clock,
+process, and projection Adapter seams. It performs no network operation. Its
+report therefore sets every `liveEnvironmentProof` field to `false` and lists
+the remaining real-environment proofs: live Feishu card send/callback, a real
+AI employee Runtime claim/completion, and a production restart plus external
+outage drill. Passing this gate is a prerequisite for those drills, not a
+claim that they already succeeded.
+
 ## External execution Adapter seam
 
 `scripts/external-execution-adapter.js` defines the reusable Interface for
