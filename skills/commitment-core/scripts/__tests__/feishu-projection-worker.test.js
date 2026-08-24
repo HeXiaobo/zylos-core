@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 
 import { openCommitmentCore } from '../core.js';
@@ -253,4 +253,33 @@ test('the executable register command persists the selected projection policy wi
   } finally {
     rmSync(zylosDir, { recursive: true, force: true });
   }
+});
+
+test('PM2-style module loading starts projection only with the dedicated autostart opt-in', () => {
+  const script = `await import(${JSON.stringify(pathToFileURL(WORKER_PATH).href)});`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: {
+      ...process.env,
+      COMMITMENT_FEISHU_PROJECTION_AUTOSTART: '1',
+    },
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 1, result.stderr || result.stdout);
+  assert.match(result.stderr, /^feishu-projection-worker: usage:/);
+});
+
+test('projection module import fails closed for a non-opt-in autostart value', () => {
+  const script = `await import(${JSON.stringify(pathToFileURL(WORKER_PATH).href)});`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: {
+      ...process.env,
+      COMMITMENT_FEISHU_PROJECTION_AUTOSTART: '0',
+    },
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, '');
 });

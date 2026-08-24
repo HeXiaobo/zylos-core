@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   drainCommitmentIntake,
@@ -183,6 +183,58 @@ test('CLI exits non-zero with a structured fatal log for invalid configuration',
   assert.match(event.error, /C4_INTAKE_INTERVAL_MS must be a positive integer/);
 });
 
+test('CLI starts when invoked through a symlinked entry path', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-intake-cli-link-'));
+  const linkedEntry = path.join(directory, 'c4-intake-supervisor.js');
+  try {
+    fs.symlinkSync(SUPERVISOR_PATH, linkedEntry);
+    const result = spawnSync(process.execPath, [linkedEntry], {
+      env: {
+        ...process.env,
+        C4_INTAKE_INTERVAL_MS: '0',
+      },
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    const event = JSON.parse(result.stdout.trim());
+    assert.equal(event.event, 'commitment_intake_supervisor_fatal');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('PM2-style module loading starts with the dedicated autostart opt-in', () => {
+  const script = `await import(${JSON.stringify(pathToFileURL(SUPERVISOR_PATH).href)});`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: {
+      ...process.env,
+      C4_INTAKE_SUPERVISOR_AUTOSTART: '1',
+      C4_INTAKE_INTERVAL_MS: '0',
+    },
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 1, result.stderr || result.stdout);
+  const event = JSON.parse(result.stdout.trim());
+  assert.equal(event.event, 'commitment_intake_supervisor_fatal');
+});
+
+test('module import fails closed for a non-opt-in autostart value', () => {
+  const script = `await import(${JSON.stringify(pathToFileURL(SUPERVISOR_PATH).href)});`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    env: {
+      ...process.env,
+      C4_INTAKE_SUPERVISOR_AUTOSTART: '0',
+      C4_INTAKE_INTERVAL_MS: '0',
+    },
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(result.stdout, '');
+});
+
 test('CLI rejects an interval that would busy-spin the supervisor', () => {
   const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-intake-config-'));
   try {
@@ -307,6 +359,7 @@ test('PM2 ecosystem exposes the supervisor as a single isolated core process', (
     assert.equal(app.instances, 1);
     assert.equal(app.exec_mode, 'fork');
     assert.equal(app.autorestart, true);
+    assert.equal(app.env.C4_INTAKE_SUPERVISOR_AUTOSTART, '1');
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }

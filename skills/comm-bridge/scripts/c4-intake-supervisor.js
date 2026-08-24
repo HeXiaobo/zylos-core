@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
-import { fileURLToPath } from 'node:url';
-
 import { runCommitmentIntakeWorkerOnce } from './c4-intake-worker.js';
+import { isMainModule } from './main-module.js';
 
 export const DEFAULT_INTAKE_BATCH_SIZE = 25;
 export const DEFAULT_INTAKE_INTERVAL_MS = 2_000;
@@ -167,7 +166,7 @@ async function main() {
   }
 }
 
-const isMainModule = process.argv[1]
-  && fileURLToPath(import.meta.url) === process.argv[1];
+const shouldAutostart = process.env.C4_INTAKE_SUPERVISOR_AUTOSTART === '1'
+  || isMainModule(import.meta.url, process.argv[1]);
 
-if (isMainModule) await main();
+if (shouldAutostart) await main();

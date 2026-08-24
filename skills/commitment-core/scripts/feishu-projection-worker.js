@@ -334,8 +334,10 @@ export async function runFeishuProjectionWorkerCli({
 
 const isMainModule = process.argv[1]
   && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+const shouldAutostart = process.env.COMMITMENT_FEISHU_PROJECTION_AUTOSTART === '1'
+  || isMainModule;
 
-if (isMainModule) {
+if (shouldAutostart) {
   const controller = new AbortController();
   const stop = () => controller.abort();
   process.once('SIGINT', stop);

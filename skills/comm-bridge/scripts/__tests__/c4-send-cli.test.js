@@ -4,13 +4,24 @@ import { describe, it } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const CLI_PATH = fileURLToPath(new URL('../c4-send.js', import.meta.url));
 const DB_CLI_PATH = fileURLToPath(new URL('../c4-db.js', import.meta.url));
 
 function cli(args, env = {}, input = undefined) {
-  const result = spawnSync('node', [CLI_PATH, ...args], {
+  const nodeArgs = input === undefined
+    ? [
+      '--input-type=module',
+      '-e',
+      [
+        "Object.defineProperty(process.stdin, 'isTTY', { value: true });",
+        `process.argv = [process.execPath, ${JSON.stringify(CLI_PATH)}, ...${JSON.stringify(args)}];`,
+        `await import(${JSON.stringify(pathToFileURL(CLI_PATH).href)});`,
+      ].join(''),
+    ]
+    : [CLI_PATH, ...args];
+  const result = spawnSync('node', nodeArgs, {
     env: { ...process.env, ...env },
     encoding: 'utf8',
     timeout: 5000,

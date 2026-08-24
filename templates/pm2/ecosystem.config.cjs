@@ -236,6 +236,7 @@ module.exports = {
         PATH: ENHANCED_PATH,
         NODE_ENV: 'production',
         ZYLOS_DIR,
+        C4_INTAKE_SUPERVISOR_AUTOSTART: '1',
       },
       autorestart: true,
       max_restarts: 10,
