@@ -73,7 +73,7 @@ test('offline Feishu-shaped intake survives replay and closes only after human a
     const received = receiveTask(zylosDir, envelope);
     const replayedBeforeWorker = receiveTask(zylosDir, envelope);
     assert.equal(received.action, 'queued');
-    assert.equal(replayedBeforeWorker.action, 'replayed');
+    assert.equal(replayedBeforeWorker.action, 'already_pending');
     assert.equal(fs.existsSync(coreDbPath), false, 'C4 intake must not depend on Core availability');
 
     core = openCommitmentCore(coreOptions);
