@@ -12,6 +12,15 @@ import {
   runAttentionViewCli,
 } from '../render-attention-view.js';
 
+const OWNED_PREVIOUS_VIEW = [
+  '# Zylos Attention View',
+  '',
+  '<!-- zylos-attention-view: version=1; generated-at=2026-08-24T07:00:00.000Z; source=commitment-core; derived=true -->',
+  '',
+  '> previous attention view',
+  '',
+].join('\n');
+
 function task(id, state, updatedAt) {
   return {
     id,
@@ -125,10 +134,10 @@ test('keeps the rendered view within its byte budget and marks omitted tasks', (
   }
 });
 
-test('keeps the previous state.md when the atomic rename fails', () => {
+test('keeps the previous owned Attention view when the atomic rename fails', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-attention-view-'));
   const outputPath = path.join(directory, 'state.md');
-  fs.writeFileSync(outputPath, 'previous attention view\n');
+  fs.writeFileSync(outputPath, OWNED_PREVIOUS_VIEW);
   const failingFileSystem = {
     ...fs,
     renameSync() {
@@ -145,8 +154,33 @@ test('keeps the previous state.md when the atomic rename fails', () => {
       temporaryId: () => 'test-temp',
     }), /injected rename failure/);
 
-    assert.equal(readFileSync(outputPath, 'utf8'), 'previous attention view\n');
+    assert.equal(readFileSync(outputPath, 'utf8'), OWNED_PREVIOUS_VIEW);
     assert.deepEqual(fs.readdirSync(directory), ['state.md']);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('refuses to replace a file that lacks the Attention ownership/version marker', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-attention-view-foreign-'));
+  const outputPath = path.join(directory, 'state.md');
+  const foreignContent = '# Current Focus\n\nHuman-authored memory that must survive.\n';
+  fs.writeFileSync(outputPath, foreignContent);
+  let queries = 0;
+
+  try {
+    assert.throws(() => publishAttentionView({
+      core: {
+        query() {
+          queries += 1;
+          return [];
+        },
+      },
+      outputPath,
+      generatedAt: '2026-08-25T07:00:00.000Z',
+    }), (error) => error?.code === 'ATTENTION_VIEW_NOT_OWNED');
+    assert.equal(queries, 0);
+    assert.equal(readFileSync(outputPath, 'utf8'), foreignContent);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -198,7 +232,7 @@ test('standalone CLI opens Core, writes the default ZYLOS_DIR view, and closes C
       stdout: { write: (chunk) => { stdout += chunk; } },
     });
 
-    assert.equal(result.outputPath, path.join(directory, 'memory', 'state.md'));
+    assert.equal(result.outputPath, path.join(directory, 'memory', 'task-attention.md'));
     assert.equal(closed, true);
     assert.match(readFileSync(result.outputPath, 'utf8'), /ready task\\-1/);
     assert.deepEqual(JSON.parse(stdout), result);
@@ -236,7 +270,7 @@ test('standalone CLI rejects malformed arguments before opening Core', async () 
 test('rejects a non-canonical generation timestamp without replacing the old view', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-attention-view-'));
   const outputPath = path.join(directory, 'state.md');
-  fs.writeFileSync(outputPath, 'previous attention view\n');
+  fs.writeFileSync(outputPath, OWNED_PREVIOUS_VIEW);
 
   try {
     for (const generatedAt of ['not-a-date', '2026-08-25T07:00:00Z\n## injected']) {
@@ -246,7 +280,7 @@ test('rejects a non-canonical generation timestamp without replacing the old vie
         generatedAt,
       }), TypeError);
     }
-    assert.equal(readFileSync(outputPath, 'utf8'), 'previous attention view\n');
+    assert.equal(readFileSync(outputPath, 'utf8'), OWNED_PREVIOUS_VIEW);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -255,7 +289,7 @@ test('rejects a non-canonical generation timestamp without replacing the old vie
 test('fails closed when Core returns a malformed task record', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-attention-view-'));
   const outputPath = path.join(directory, 'state.md');
-  fs.writeFileSync(outputPath, 'previous attention view\n');
+  fs.writeFileSync(outputPath, OWNED_PREVIOUS_VIEW);
 
   try {
     assert.throws(() => publishAttentionView({
@@ -263,7 +297,7 @@ test('fails closed when Core returns a malformed task record', () => {
       outputPath,
       generatedAt: '2026-08-25T07:00:00.000Z',
     }), TypeError);
-    assert.equal(readFileSync(outputPath, 'utf8'), 'previous attention view\n');
+    assert.equal(readFileSync(outputPath, 'utf8'), OWNED_PREVIOUS_VIEW);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -298,7 +332,7 @@ test('bounds individual Core fields before rendering and marks content truncatio
   }
 });
 
-test('executable script rebuilds state.md through a real Core query', async () => {
+test('executable script rebuilds the dedicated task Attention view through a real Core query', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-attention-view-e2e-'));
   const { openCommitmentCore } = await import('../core.js');
   const core = openCommitmentCore({
@@ -325,7 +359,7 @@ test('executable script rebuilds state.md through a real Core query', async () =
     assert.equal(child.status, 0, child.stderr);
     const result = JSON.parse(child.stdout);
     assert.equal(result.taskCount, 1);
-    assert.equal(result.outputPath, path.join(directory, 'memory', 'state.md'));
+    assert.equal(result.outputPath, path.join(directory, 'memory', 'task-attention.md'));
     assert.match(readFileSync(result.outputPath, 'utf8'), /E2E task/);
   } finally {
     try {

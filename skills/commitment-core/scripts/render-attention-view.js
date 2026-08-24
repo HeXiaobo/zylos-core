@@ -17,10 +17,12 @@ const FIELD_LIMITS = Object.freeze({
   description: 1024,
   identifier: 256,
 });
+const VIEW_TITLE = '# Zylos Attention View';
+const OWNERSHIP_MARKER_PATTERN = /^<!-- zylos-attention-view: version=1; generated-at=([^;]+); source=commitment-core; derived=true -->$/m;
 
 function defaultOutputPath(env = process.env) {
   const zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-  return path.join(zylosDir, 'memory', 'state.md');
+  return path.join(zylosDir, 'memory', 'task-attention.md');
 }
 
 function compareTasks(left, right) {
@@ -89,7 +91,7 @@ function renderTask(task) {
 
 function renderDocument(renderedTasks, generatedAt, { omittedTaskCount, queryLimitReached }) {
   const lines = [
-    '# Zylos Attention View',
+    VIEW_TITLE,
     '',
     `<!-- zylos-attention-view: version=1; generated-at=${generatedAt}; source=commitment-core; derived=true -->`,
     '',
@@ -119,6 +121,30 @@ function renderDocument(renderedTasks, generatedAt, { omittedTaskCount, queryLim
   }
   lines.push('');
   return lines.join('\n');
+}
+
+function assertExistingViewOwnership(outputPath, fileSystem) {
+  let existing;
+  try {
+    existing = fileSystem.readFileSync(outputPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  const marker = OWNERSHIP_MARKER_PATTERN.exec(existing);
+  const generatedAt = marker?.[1];
+  const parsed = generatedAt ? new Date(generatedAt) : null;
+  const ownsFile = existing.startsWith(`${VIEW_TITLE}\n\n`)
+    && marker
+    && !Number.isNaN(parsed.getTime())
+    && parsed.toISOString() === generatedAt;
+  if (!ownsFile) {
+    const error = new Error(
+      `refusing to replace an Attention view without the version 1 ownership marker: ${outputPath}`,
+    );
+    error.code = 'ATTENTION_VIEW_NOT_OWNED';
+    throw error;
+  }
 }
 
 function renderWithinBudget(renderedTasks, generatedAt, maxBytes, queryLimitReached) {
@@ -253,6 +279,7 @@ export function publishAttentionView({
   if (typeof outputPath !== 'string' || outputPath.trim() === '') {
     throw new TypeError('outputPath must be a non-empty string');
   }
+  assertExistingViewOwnership(outputPath, fileSystem);
   const queriedTasks = core.query({ states: OPEN_STATES, limit: QUERY_LIMIT });
   assertQueriedTasks(queriedTasks);
   const queryLimitReached = queriedTasks.length === QUERY_LIMIT;

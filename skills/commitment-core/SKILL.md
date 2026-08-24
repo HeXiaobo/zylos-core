@@ -198,7 +198,34 @@ historical transactions contained Outbox rows. Task Run operations that change
 Task state already create a Task Event and therefore an Outbox row. Run-only
 Events, Evidence, and ExternalLink writes deliberately do not create projection
 records in this slice. Dead-letter inspection is included; operator redrive and
-platform-specific projection Adapters remain later slices.
+external platform projection Adapters remain later slices.
+
+## Projection Worker
+
+`processProjectionBatch(...)` in `scripts/projection-worker.js` is the
+runtime-neutral worker Interface. It claims one bounded delivery batch for one
+`projection`, calls the injected Adapter exactly once, and then settles each
+delivery independently with its claimed version. Success acknowledges each
+row. A retryable Adapter failure moves rows to `retry_wait`; an explicit
+`ProjectionAdapterError(..., { retryable: false })` or exhaustion of
+`maxAttempts` moves them to `dead_letter`. Settlement fencing on one row is
+counted and does not prevent settlement attempts for the rest of the batch.
+
+Every worker cycle must use a fresh `operationId`; the default is a random
+UUID. Reusing an operation identity would replay the durable claim receipt,
+including an earlier empty result. Acknowledge/fail receipt identities are
+derived deterministically from the delivery identity and version, so an exact
+settlement replay is safe.
+
+The Adapter Interface has one critical invariant: `publishBatch({ deliveries
+})` must either publish the batch atomically, or make every per-delivery effect
+idempotent under a replay of the same delivery version. If the Adapter throws,
+the worker treats the whole batch as failed and it may later be replayed.
+Adapters with partially successful, non-idempotent effects do not satisfy this
+Interface and must add their own durable per-item seam instead of using this
+batch worker directly. A process exit after publish but before acknowledge is
+recovered by lease expiry; the replacement worker republishes before ack.
+There is intentionally no unauthorized dead-letter redrive operation.
 
 ## External execution Adapter seam
 
@@ -219,10 +246,13 @@ authorized acceptor action may move a reviewed Task to `done`.
 
 ## Derived attention view
 
-`scripts/render-attention-view.js` rebuilds `$ZYLOS_DIR/memory/state.md` from the
-Core list-query Interface. This file is a disposable, read-only attention
-view: never parse it to create or update Tasks, and never treat edits to it as
-authoritative state.
+`scripts/render-attention-view.js` rebuilds the dedicated
+`$ZYLOS_DIR/memory/task-attention.md` from the Core list-query Interface. It
+never writes `memory/state.md`: that file also contains non-task memory and is
+not owned by this Module. The dedicated file is a disposable, read-only
+attention view: never parse it to create or update Tasks, and never treat edits
+to it as authoritative state. A later session injector may load it separately,
+or a separately reviewed merge Module may combine it with session context.
 
 Run it directly with:
 
@@ -242,7 +272,45 @@ is Markdown-escaped and bounded before rendering; the whole result is also
 byte-bounded. Truncation markers distinguish known byte-budget omissions from
 an unknown count when Core's 100-Task query limit is reached. Publication uses
 a same-directory temporary file, fsync, and atomic rename, so a failed publish
-does not replace the previous view.
+does not replace the previous view. Before replacing an existing destination,
+the publisher requires its exact version 1 ownership marker and fails closed
+with `ATTENTION_VIEW_NOT_OWNED` when the file is foreign or malformed.
+
+The Attention Adapter uses the transactional Outbox projection name
+`attention`. One batch of Task Events is only a wake-up signal: the Adapter
+rebuilds the current view once, then the worker acknowledges each Event. Atomic
+file replacement makes an expired-lease replay safe after publication but
+before all acknowledgements.
+
+Supervisor initialization explicitly calls
+`outbox.register({ projection: 'attention', bootstrapPolicy: 'from_now', ... })`
+before publishing the current snapshot. Register-first prevents an Event from
+falling into a gap between the snapshot and the registration baseline: Events
+after the baseline remain claimable, while the immediately following full
+snapshot covers all earlier state. Registration and publication repeat
+idempotently at every process start so a crash between those two operations is
+repaired on restart. The worker never relies on claim to create an implicit
+projection. Compatibility with a pre-registry Core is temporary; once the
+registry Interface is present, unknown projections fail closed.
+
+Run the opt-in worker with
+`node scripts/attention-projection-supervisor.js`, or one bounded cycle with
+`node scripts/attention-projection-supervisor.js --once`. Defaults are a 2,000
+ms interval, batch size 25, 30,000 ms lease, 5,000 ms retry delay, and five
+attempts. Override them with
+`COMMITMENT_ATTENTION_PROJECTION_INTERVAL_MS` (250..60,000),
+`COMMITMENT_ATTENTION_PROJECTION_BATCH_SIZE` (1..100),
+`COMMITMENT_ATTENTION_PROJECTION_LEASE_MS` (1..86,400,000),
+`COMMITMENT_ATTENTION_PROJECTION_RETRY_AFTER_MS` (1..604,800,000), and
+`COMMITMENT_ATTENTION_PROJECTION_MAX_ATTEMPTS` (1..100). The optional
+`COMMITMENT_ATTENTION_VIEW_PATH` selects a reviewed alternate destination.
+The supervisor uses one fresh operation identity per cycle, logs errors and
+continues, and holds a fenced singleton lease in
+`$ZYLOS_DIR/.zylos/supervisor-leases.db`. The lease owner is a random token,
+not a PID; a live lease rejects a contender, an expired lease can be taken over,
+and release is conditional on the owner token. The process renews the lease
+while active and releases it on SIGINT/SIGTERM. It is absent from the default
+PM2 ecosystem and does not run until an operator explicitly invokes it.
 
 ## Command policy
 
