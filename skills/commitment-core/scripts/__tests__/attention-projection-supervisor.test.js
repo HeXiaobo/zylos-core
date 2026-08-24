@@ -8,6 +8,7 @@ import test from 'node:test';
 
 import Database from 'better-sqlite3';
 
+import { resolveEcosystemTemplate } from './ecosystem-template-resolver.js';
 import { openCommitmentCore } from '../core.js';
 import {
   acquireAttentionProjectionLease,
@@ -19,9 +20,10 @@ import {
 const SUPERVISOR_PATH = fileURLToPath(
   new URL('../attention-projection-supervisor.js', import.meta.url),
 );
-const ECOSYSTEM_PATH = fileURLToPath(
+const SOURCE_ECOSYSTEM_PATH = fileURLToPath(
   new URL('../../../../templates/pm2/ecosystem.config.cjs', import.meta.url),
 );
+const ECOSYSTEM_PATH = resolveEcosystemTemplate(SOURCE_ECOSYSTEM_PATH);
 
 function pathEntryExists(filePath) {
   try {

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
+import { resolveEcosystemTemplate } from './ecosystem-template-resolver.js';
 import {
   acquireRunSweepLease,
   runLeaseSweepOnce,
@@ -15,9 +16,10 @@ import {
 const SUPERVISOR_PATH = fileURLToPath(
   new URL('../run-lease-sweep-supervisor.js', import.meta.url),
 );
-const ECOSYSTEM_PATH = fileURLToPath(
+const SOURCE_ECOSYSTEM_PATH = fileURLToPath(
   new URL('../../../../templates/pm2/ecosystem.config.cjs', import.meta.url),
 );
+const ECOSYSTEM_PATH = resolveEcosystemTemplate(SOURCE_ECOSYSTEM_PATH);
 
 test('a second process cannot acquire an unexpired Run sweep lease', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-run-sweep-lease-'));
