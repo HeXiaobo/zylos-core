@@ -604,12 +604,17 @@ export function openCommitmentCore({
     }
 
     const timestamp = requireText(clock(), 'clock result');
-    const result = transitionTask({
+    const result = runModule.coordinateTaskCommand({
+      type: command.type,
       task,
-      toState: definition.toState,
-      eventType: definition.eventType,
-      actorId: command.actorId,
       timestamp,
+      transition: () => transitionTask({
+        task,
+        toState: definition.toState,
+        eventType: definition.eventType,
+        actorId: command.actorId,
+        timestamp,
+      }),
     });
     insertCommand.run(
       command.idempotencyKey,
@@ -621,7 +626,7 @@ export function openCommitmentCore({
     return result;
   });
 
-  const runs = createTaskRunModule({
+  const runModule = createTaskRunModule({
     database,
     clock,
     runIdGenerator,
@@ -641,7 +646,7 @@ export function openCommitmentCore({
     command(command, expectedVersion) {
       return commandTransaction.immediate(command, expectedVersion);
     },
-    runs,
+    runs: runModule.publicInterface,
     query(query = {}) {
       const normalized = normalizeQuery(query);
       if (normalized.mode === 'list') {

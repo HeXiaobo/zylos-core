@@ -54,7 +54,8 @@ runtime process and may change after lease expiry.
   admitted in the same transaction. `leaseMs` is an integer from 1 through
   86,400,000.
 - `runs.heartbeat({ taskId, runId, workerId, idempotencyKey, leaseMs },
-  expectedRunVersion)` renews an unexpired lease owned by that worker.
+  expectedRunVersion)` renews an unexpired lease owned by that worker only
+  while the Task remains `in_progress`.
 - `runs.complete({ taskId, runId, workerId, idempotencyKey },
   { runVersion, taskVersion })` ends the Run and submits the Task to `review`.
   Execution completion never accepts a Task or moves it directly to `done`.
@@ -70,6 +71,14 @@ even if versions or time have since advanced; changed content with the same key
 returns `IDEMPOTENCY_CONFLICT`. Other stable Run errors include
 `LEASE_CONFLICT`, `LEASE_EXPIRED`, `LEASE_NOT_ACTIVE`, `LEASE_FORBIDDEN`,
 `RUN_NOT_FOUND`, `RUN_TASK_MISMATCH`, and `RUN_VERSION_CONFLICT`.
+
+The legacy Task command Interface coordinates with Run ownership. Direct
+`SubmitForReview` fails with `ACTIVE_RUN_CONFLICT` while a Run is active; the
+worker must call `runs.complete`. An authorized `CancelTask` atomically moves
+the Task to `cancelled`, marks its active Run `interrupted`, and records
+`TaskRunInterrupted`. Later heartbeat, complete, and release calls reject that
+Run as `LEASE_NOT_ACTIVE`. Exact Task command receipt replay still returns the
+original result without writing a second Run Event.
 
 The envelope owns only channel-neutral task fields. `source.channel` and
 `source.externalId` provide provenance; Adapters are responsible for deriving

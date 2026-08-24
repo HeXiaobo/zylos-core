@@ -3,7 +3,23 @@ import { createHash } from 'node:crypto';
 const MAX_LEASE_MS = 86_400_000;
 const DEFAULT_QUERY_LIMIT = 50;
 const MAX_QUERY_LIMIT = 100;
-const RUN_STATUSES = new Set(['active', 'completed', 'released', 'expired']);
+const RUN_STATUSES = new Set(['active', 'completed', 'released', 'expired', 'interrupted']);
+
+const RUN_TABLE_COLUMNS = `
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  worker_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ('active', 'completed', 'released', 'expired', 'interrupted')
+  ),
+  version INTEGER NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  last_heartbeat_at TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  FOREIGN KEY (task_id) REFERENCES commitment_tasks(id) ON DELETE RESTRICT
+`;
 
 function requireObject(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -184,23 +200,51 @@ function leaseExpiration(milliseconds, leaseMs) {
   return new Date(milliseconds + leaseMs).toISOString();
 }
 
+function createRunTableSql(tableName, { ifNotExists = false } = {}) {
+  const existenceClause = ifNotExists ? 'IF NOT EXISTS ' : '';
+  return `CREATE TABLE ${existenceClause}${tableName} (${RUN_TABLE_COLUMNS})`;
+}
+
+function migrateLegacyRunStatusSchema(database) {
+  const runTable = database.prepare(`
+    SELECT sql
+    FROM sqlite_master
+    WHERE type = 'table' AND name = 'commitment_task_runs'
+  `).get();
+  if (!runTable || runTable.sql.includes("'interrupted'")) return;
+
+  const migrate = database.transaction(() => {
+    database.exec(`
+      ${createRunTableSql('commitment_task_runs_migrated')};
+      INSERT INTO commitment_task_runs_migrated (
+        id, task_id, actor_id, worker_id, status, version, lease_expires_at,
+        last_heartbeat_at, started_at, ended_at
+      )
+      SELECT id, task_id, actor_id, worker_id, status, version, lease_expires_at,
+             last_heartbeat_at, started_at, ended_at
+      FROM commitment_task_runs;
+      DROP TABLE commitment_task_runs;
+      ALTER TABLE commitment_task_runs_migrated RENAME TO commitment_task_runs;
+    `);
+
+    const violations = database.pragma('foreign_key_check');
+    if (violations.length > 0) {
+      throw new Error('Task Run status migration violated foreign keys');
+    }
+  });
+
+  database.pragma('foreign_keys = OFF');
+  try {
+    migrate.immediate();
+  } finally {
+    database.pragma('foreign_keys = ON');
+  }
+}
+
 export function initializeTaskRunSchema(database) {
+  migrateLegacyRunStatusSchema(database);
   database.exec(`
-    CREATE TABLE IF NOT EXISTS commitment_task_runs (
-      id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL,
-      actor_id TEXT NOT NULL,
-      worker_id TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (
-        status IN ('active', 'completed', 'released', 'expired')
-      ),
-      version INTEGER NOT NULL,
-      lease_expires_at TEXT NOT NULL,
-      last_heartbeat_at TEXT NOT NULL,
-      started_at TEXT NOT NULL,
-      ended_at TEXT,
-      FOREIGN KEY (task_id) REFERENCES commitment_tasks(id) ON DELETE RESTRICT
-    );
+    ${createRunTableSql('commitment_task_runs', { ifNotExists: true })};
 
     CREATE UNIQUE INDEX IF NOT EXISTS uq_commitment_task_runs_active_task
       ON commitment_task_runs(task_id)
@@ -295,6 +339,11 @@ export function createTaskRunModule({
   const finishRun = database.prepare(`
     UPDATE commitment_task_runs
     SET status = ?, version = version + 1, ended_at = ?
+    WHERE id = ? AND status = 'active' AND version = ?
+  `);
+  const interruptRun = database.prepare(`
+    UPDATE commitment_task_runs
+    SET status = 'interrupted', version = version + 1, ended_at = ?
     WHERE id = ? AND status = 'active' AND version = ?
   `);
   const insertRunEvent = database.prepare(`
@@ -577,7 +626,40 @@ export function createTaskRunModule({
     taskEventType: 'TaskRunReleased',
   });
 
-  return Object.freeze({
+  /**
+   * Called only from Commitment Core's existing Task command transaction.
+   * It owns all Task/Run crossing policy without leaking Run tables to Core.
+   */
+  function coordinateTaskCommand({ type, task, timestamp, transition }) {
+    const activeRun = toRunView(selectActiveRun.get(task.id));
+    if (type === 'SubmitForReview' && activeRun) {
+      throw domainError(
+        'ACTIVE_RUN_CONFLICT',
+        `Task ${task.id} has active run ${activeRun.id}; use runs.complete`,
+      );
+    }
+
+    const result = transition();
+    if (type !== 'CancelTask' || !activeRun) return result;
+
+    const interrupted = interruptRun.run(timestamp, activeRun.id, activeRun.version);
+    if (interrupted.changes !== 1) {
+      throw domainError(
+        'RUN_VERSION_CONFLICT',
+        `run changed while interrupting: ${activeRun.id}`,
+      );
+    }
+    const updatedRun = toRunView(selectRun.get(activeRun.id));
+    recordRunEvent({
+      type: 'TaskRunInterrupted',
+      run: updatedRun,
+      taskVersion: result.task.version,
+      timestamp,
+    });
+    return result;
+  }
+
+  const publicInterface = Object.freeze({
     claim(request, expectedTaskVersion) {
       return claimTransaction.immediate(request, expectedTaskVersion);
     },
@@ -617,4 +699,6 @@ export function createTaskRunModule({
       `).all(...values, normalized.limit).map(toRunView);
     },
   });
+
+  return Object.freeze({ publicInterface, coordinateTaskCommand });
 }
