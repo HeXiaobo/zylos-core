@@ -161,6 +161,22 @@ describe('c4-send validation', () => {
     });
   });
 
+  it('reads the migration flag from the Zylos env file without a runtime restart', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      fs.writeFileSync(path.join(tmpDir, '.env'), 'C4_LEGACY_ARG_MODE=1\n');
+
+      const { status } = cli(
+        ['mock-channel', 'endpoint1', 'legacy after upgrade'],
+        env,
+      );
+
+      assert.equal(status, 0);
+      const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
+      assert.deepEqual(sent, ['endpoint1', 'legacy after upgrade']);
+    });
+  });
+
   it('rejects broadcast message arg-mode with exit 2 before dispatch', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');

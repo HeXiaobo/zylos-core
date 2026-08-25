@@ -21,16 +21,14 @@ Passing the message body as a CLI argument is disabled and exits with status 2 b
 disabled. Every use writes a `legacy_arg_mode_used` deprecation event without
 the message body, so operators can verify that old callers have been removed.
 
-For a Zylos runtime launched with clean environment filtering, add the variable
-to the existing comma-separated runtime manifest as well:
+The script reads this flag directly from `~/zylos/.env`, so it takes effect for
+the next send without restarting the current runtime:
 
 ```dotenv
 C4_LEGACY_ARG_MODE=1
-ZYLOS_TMUX_ENV=C4_LEGACY_ARG_MODE
 ```
 
-If `ZYLOS_TMUX_ENV` already contains names, append `C4_LEGACY_ARG_MODE` instead
-of replacing them. Remove the override after HXA/OpenMAX callers use stdin.
+Remove the override after HXA/OpenMAX callers use stdin.
 
 ### Important safety rule
 

@@ -26,6 +26,7 @@
 
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { spawn } from 'child_process';
 import { insertConversation, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
@@ -86,6 +87,26 @@ function publicAssistantOutput(message) {
   return /^\[MEDIA:(?:image|file)\].+/s.test(message) ? '' : message;
 }
 
+function legacyArgModeEnabled() {
+  if (process.env.C4_LEGACY_ARG_MODE === '1') return true;
+
+  const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+  try {
+    const content = fs.readFileSync(path.join(zylosDir, '.env'), 'utf8');
+    for (const rawLine of content.split('\n')) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const match = line.match(/^C4_LEGACY_ARG_MODE\s*=\s*(.+)$/);
+      if (!match) continue;
+      const value = match[1].trim().replace(/^(['"])(.*)\1$/, '$2');
+      return value === '1';
+    }
+  } catch {
+    // Missing/unreadable env files keep the secure default.
+  }
+  return false;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const parsed = parseArgs(args);
@@ -100,7 +121,7 @@ async function main() {
   const cleanArgs = parsed.positional;
   const hasStdinFlag = parsed.hasStdinFlag;
   const stdinAvailable = !process.stdin.isTTY;
-  const legacyArgMode = process.env.C4_LEGACY_ARG_MODE === '1';
+  const legacyArgMode = legacyArgModeEnabled();
 
   const channel = cleanArgs[0];
   let endpoint = null;

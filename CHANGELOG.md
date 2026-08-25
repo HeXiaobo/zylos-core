@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - A machine-readable `zylos capabilities --json` protocol contract for paired component upgrades.
-- A bounded `C4_LEGACY_ARG_MODE=1` migration path for endpoint-addressed legacy replies, with content-free deprecation telemetry.
+- A bounded `C4_LEGACY_ARG_MODE=1` migration path for endpoint-addressed legacy replies, loaded directly from the Zylos env file and recorded with content-free deprecation telemetry.
 
 ### Changed
 - C4 reply-route instructions now state the stdin-only message contract explicitly.
