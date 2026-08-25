@@ -38,6 +38,7 @@ import {
 import { deployManifestTemplate } from './runtime/tmux-env.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
+import { verifyCommunicationContinuity } from './communication-continuity.js';
 
 // Services that must be present for upgraded Core behavior to function. During
 // an upgrade we start one only when the machine was already running Zylos and
@@ -495,7 +496,7 @@ export function generateMigrationHints(templatesDir, deps = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// 11-step self-upgrade pipeline
+// 15-stage self-upgrade pipeline (steps 0-14)
 // ---------------------------------------------------------------------------
 
 /**
@@ -524,6 +525,45 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     success: false,
     error: null,
   };
+}
+
+/**
+ * Step 0: fail closed before mutation unless the target release declares that
+ * rolling upgrades remain compatible with exact legacy reply callers.
+ */
+export function step0_verifyTargetCommunicationCompatibility(ctx, deps = {}) {
+  const startTime = Date.now();
+  const fsApi = deps.fs ?? fs;
+  const manifestPath = path.join(ctx.tempDir || '', 'capabilities.json');
+
+  try {
+    const target = JSON.parse(fsApi.readFileSync(manifestPath, 'utf8'));
+    const actual = target?.protocols?.['c4.reply.argv-compat'];
+    if (!Number.isInteger(actual) || actual < 1) {
+      return {
+        step: 0,
+        name: 'verify_target_communication_compatibility',
+        status: 'failed',
+        error: `Protocol c4.reply.argv-compat requires >= 1, found ${actual ?? 'missing'}`,
+        duration: Date.now() - startTime,
+      };
+    }
+    return {
+      step: 0,
+      name: 'verify_target_communication_compatibility',
+      status: 'done',
+      message: `c4.reply.argv-compat=${actual}`,
+      duration: Date.now() - startTime,
+    };
+  } catch (err) {
+    return {
+      step: 0,
+      name: 'verify_target_communication_compatibility',
+      status: 'failed',
+      error: `Target capabilities could not be read: ${err.message}`,
+      duration: Date.now() - startTime,
+    };
+  }
 }
 
 /**
@@ -1418,22 +1458,61 @@ export function step12_verifyServices(ctx, deps = {}) {
   return { step: 12, name: 'verify_services', status: 'failed', error: `Timed out after ${TIMEOUT_MS / 1000}s`, duration: Date.now() - startTime };
 }
 
+/** Verify both C4 reply contracts without contacting an external channel. */
+export function step13_verifyCommunicationContinuity(_ctx, deps = {}) {
+  const startTime = Date.now();
+  const verify = deps.verify ?? verifyCommunicationContinuity;
+  const c4SendPath = deps.c4SendPath
+    ?? path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-send.js');
+
+  try {
+    const result = verify({ c4SendPath, zylosDir: deps.zylosDir ?? ZYLOS_DIR });
+    if (!result.compatible) {
+      return {
+        step: 13,
+        name: 'verify_communication_continuity',
+        status: 'failed',
+        error: result.error || 'C4 reply contract canary failed',
+        duration: Date.now() - startTime,
+      };
+    }
+    const passed = result.checks
+      .filter(({ status }) => status === 'passed')
+      .map(({ name }) => name);
+    return {
+      step: 13,
+      name: 'verify_communication_continuity',
+      status: 'done',
+      message: passed.join(', '),
+      duration: Date.now() - startTime,
+    };
+  } catch (err) {
+    return {
+      step: 13,
+      name: 'verify_communication_continuity',
+      status: 'failed',
+      error: err.message,
+      duration: Date.now() - startTime,
+    };
+  }
+}
+
 /** Commit every Core Skill baseline after the complete self-upgrade succeeds. */
-function step13_commitSkillBaselines(ctx) {
+function step14_commitSkillBaselines(ctx) {
   const startTime = Date.now();
   try {
     for (const baseline of ctx.pendingBaselines || []) {
       saveMergeBaseline(baseline.destDir, baseline.srcDir, baseline.manifest);
     }
     return {
-      step: 13,
+      step: 14,
       name: 'commit_skill_baselines',
       status: 'done',
       message: `${(ctx.pendingBaselines || []).length} committed`,
       duration: Date.now() - startTime,
     };
   } catch (err) {
-    return { step: 13, name: 'commit_skill_baselines', status: 'failed', error: err.message, duration: Date.now() - startTime };
+    return { step: 14, name: 'commit_skill_baselines', status: 'failed', error: err.message, duration: Date.now() - startTime };
   }
 }
 
@@ -1506,7 +1585,8 @@ const POST_INSTALL_STEPS = [
   step10_ensureCodexConfig,
   step11_startCoreServices,
   step12_verifyServices,
-  step13_commitSkillBaselines,
+  step13_verifyCommunicationContinuity,
+  step14_commitSkillBaselines,
 ];
 
 function buildSelfUpgradeResult(ctx, failedStep, rollbackResults = null, rollbackPerformed = Boolean(rollbackResults)) {
@@ -1637,7 +1717,7 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
   ctx.to = state.to || state.newVersion || null;
 
   const steps = deps.steps || POST_INSTALL_STEPS;
-  const total = deps.total || 13;
+  const total = deps.total || 15;
   let failedStep = null;
 
   for (const stepFn of steps) {
@@ -1653,14 +1733,16 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
   }
 
   if (failedStep) {
-    return buildSelfUpgradeResult(ctx, failedStep, null, false);
+    const rollbackFn = deps.rollbackSelf ?? rollbackSelf;
+    const rollbackResults = rollbackFn(ctx);
+    return buildSelfUpgradeResult(ctx, failedStep, rollbackResults, true);
   }
 
   return buildSelfUpgradeResult(ctx, null);
 }
 
 /**
- * Run the 13-step self-upgrade pipeline.
+ * Run the 15-stage self-upgrade pipeline (steps 0-14).
  * Template migration and Claude restart are handled by Claude after this completes.
  * Lock must be acquired by caller.
  *
@@ -1679,13 +1761,14 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
   ctx.to = newVersion || null;
 
   const preInstallSteps = deps.preInstallSteps ?? [
+    (stepCtx) => step0_verifyTargetCommunicationCompatibility(stepCtx, deps.step0),
     (stepCtx) => step1_backupCoreSkills(stepCtx, deps.step1),
     step2_preUpgradeHook,
     (stepCtx) => step3_stopCoreServices(stepCtx, deps.step3),
     (stepCtx) => step4_npmInstallGlobal(stepCtx, deps.step4),
   ];
 
-  const total = 13;
+  const total = 15;
   let failedStep = null;
 
   for (const stepFn of preInstallSteps) {
@@ -1733,7 +1816,9 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
     };
     ctx.steps.push(failedStep);
     if (onStep) onStep(failedStep);
-    return buildSelfUpgradeResult(ctx, failedStep, null, false);
+    const rollbackFn = deps.rollbackSelf ?? rollbackSelf;
+    const rollbackResults = rollbackFn(ctx);
+    return buildSelfUpgradeResult(ctx, failedStep, rollbackResults, true);
   }
 }
 

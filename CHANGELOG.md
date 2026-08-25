@@ -5,6 +5,19 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-3ai.3] - 2026-08-25
+
+### Added
+- A pre-mutation self-upgrade capability gate plus a hermetic post-install communication canary. Future targets must declare rolling reply compatibility before services stop, and deployed code must prove both stdin and exact legacy argv replies without contacting an external channel.
+- The `c4.reply.argv-compat` capability declares rolling-upgrade compatibility for older endpoint-addressed callers.
+
+### Fixed
+- Self-upgrade now restores backed-up Core Skills and PM2 configuration, then restarts previously running services, when any installed-finalizer step fails or the finalizer crashes.
+- Exact legacy `<channel> <endpoint_id> <message>` calls remain accepted by default, preventing a Core upgrade from disconnecting agents whose callers have not migrated yet. `C4_STRICT_STDIN_ONLY=1` is an explicit post-migration policy; `C4_LEGACY_ARG_MODE=1` overrides it as a no-restart break-glass recovery.
+
+### Changed
+- New and generated callers continue to use stdin; compatibility mode is deprecated and emits content-free telemetry.
+
 ## [0.7.2-3ai.2] - 2026-08-25
 
 ### Added

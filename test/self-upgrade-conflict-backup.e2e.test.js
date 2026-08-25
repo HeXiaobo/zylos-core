@@ -54,6 +54,11 @@ beforeEach(() => {
   packageDir = path.join(tmpRoot, 'new-package');
   fs.mkdirSync(skillsDir, { recursive: true });
   fs.mkdirSync(packageDir, { recursive: true });
+  fs.writeFileSync(path.join(packageDir, 'capabilities.json'), JSON.stringify({
+    schemaVersion: 1,
+    product: 'zylos-core',
+    protocols: { 'c4.reply.argv-compat': 1 },
+  }));
 });
 
 afterEach(() => {
@@ -98,15 +103,23 @@ describe('self-upgrade durable conflict backups (#717)', () => {
     }
   });
 
-  test('later finalizer failure performs no rollback and retains both backup lifecycles', () => {
+  test('later finalizer failure rolls back deployed skills and retains recovery backups', () => {
     prepareThreeWayConflictFixture();
 
-    const { result, transactionBackupDir } = runScenario('later-failure');
+    const { result, restartedServices, transactionBackupDir } = runScenario('later-failure');
 
     expect(result.success).toBe(false);
     expect(result.failedStep).toBe(6);
-    expect(result.rollback).toEqual({ performed: false, steps: [] });
+    expect(result.rollback).toEqual({
+      performed: true,
+      steps: [
+        { action: 'restore_core_skills', success: true },
+        { action: 'restart_fixture-service', success: true },
+      ],
+    });
+    expect(restartedServices).toEqual(['fixture-service']);
     expect(fs.existsSync(transactionBackupDir)).toBe(true);
+    expect(readFile(path.join(skillsDir, 'demo-skill', 'SKILL.md'))).toContain('value=local');
 
     const durableRoot = path.join(zylosDir, '.backup');
     const durableFiles = fs.readdirSync(durableRoot, { recursive: true })

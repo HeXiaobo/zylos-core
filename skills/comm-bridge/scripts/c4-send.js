@@ -3,16 +3,15 @@
  * C4 Communication Bridge - Send Interface
  * Sends messages from Claude to external channels
  *
- * Usage (stdin only — arg-mode is disabled):
+ * Preferred usage (stdin):
  *     node c4-send.js <channel> <endpoint_id> <<'EOF'
  *     message with "quotes", $vars, and special chars
  *     EOF
  *
- * The message body must be piped via stdin/heredoc. Passing it as a CLI
- * argument hard-fails with exit code 2 because shell quoting can silently
- * truncate or transform message content. During a bounded migration only,
- * C4_LEGACY_ARG_MODE=1 accepts the unambiguous channel + endpoint + message
- * form and emits a content-free deprecation event.
+ * The exact legacy channel + endpoint + message form remains accepted during
+ * the compatibility phase and emits a content-free deprecation event. Set
+ * C4_STRICT_STDIN_ONLY=1 only after every caller has migrated. If strict mode
+ * causes an outage, C4_LEGACY_ARG_MODE=1 is the break-glass override.
  *
  * Special channel 'void' (#689): internal-only messages (e.g. session
  * handoffs). The message is recorded in c4.db like any other conversation
@@ -34,7 +33,7 @@ import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 function printUsage() {
-  console.log('Usage (stdin only; CLI message arguments are disabled):');
+  console.log('Usage (preferred message body via stdin):');
   console.log('  node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
   console.log('  message content');
   console.log('  EOF');
@@ -87,24 +86,28 @@ function publicAssistantOutput(message) {
   return /^\[MEDIA:(?:image|file)\].+/s.test(message) ? '' : message;
 }
 
-function legacyArgModeEnabled() {
-  if (process.env.C4_LEGACY_ARG_MODE === '1') return true;
-
+function readZylosEnvFlag(name) {
+  if (process.env[name] !== undefined) return process.env[name] === '1';
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
   try {
     const content = fs.readFileSync(path.join(zylosDir, '.env'), 'utf8');
     for (const rawLine of content.split('\n')) {
       const line = rawLine.trim();
       if (!line || line.startsWith('#')) continue;
-      const match = line.match(/^C4_LEGACY_ARG_MODE\s*=\s*(.+)$/);
+      const match = line.match(new RegExp(`^${name}\\s*=\\s*(.+)$`));
       if (!match) continue;
       const value = match[1].trim().replace(/^(['"])(.*)\1$/, '$2');
       return value === '1';
     }
   } catch {
-    // Missing/unreadable env files keep the secure default.
+    // Missing/unreadable env files leave the flag disabled.
   }
   return false;
+}
+
+function legacyArgModeEnabled() {
+  if (readZylosEnvFlag('C4_LEGACY_ARG_MODE')) return true;
+  return !readZylosEnvFlag('C4_STRICT_STDIN_ONLY');
 }
 
 async function main() {
@@ -136,7 +139,7 @@ async function main() {
       endpointPresent: true,
     })}`);
   } else if (cleanArgs.length > 2) {
-    console.error('[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.');
+    console.error('[c4-send] arg-mode disabled by strict stdin-only policy: pass the message via stdin/heredoc.');
     process.exit(2);
   } else if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
     // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin

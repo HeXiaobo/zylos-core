@@ -23,6 +23,7 @@ describe('zylos capabilities', () => {
     assert.equal(actual.release, pkg.version);
     assert.deepEqual(actual.protocols, {
       'c4.reply': 2,
+      'c4.reply.argv-compat': 1,
       'c4.assistant-response-stream': 1,
       'work-intake': 1,
       'commitment-core': 1,

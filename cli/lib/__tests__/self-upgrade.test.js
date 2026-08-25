@@ -8,8 +8,11 @@ import { describe, it } from 'node:test';
 const {
   CORE_REPO,
   createFinalizeState,
+  runSelfUpgrade,
   runSelfUpgradeFinalize,
+  step0_verifyTargetCommunicationCompatibility,
   step1_backupCoreSkills,
+  step13_verifyCommunicationContinuity,
   step7_syncInstructions,
   rollbackSelf,
   step10_ensureCodexConfig,
@@ -118,7 +121,8 @@ describe('self-upgrade finalizer handoff', () => {
     }]);
   });
 
-  it('fails without rollback when a post-install step fails', () => {
+  it('rolls back when a post-install step fails', () => {
+    const rollbackCalls = [];
     const result = runSelfUpgradeFinalize({
       schemaVersion: 1,
       tempDir: '/tmp/new-core',
@@ -130,12 +134,118 @@ describe('self-upgrade finalizer handoff', () => {
       steps: [
         () => ({ step: 5, name: 'sync_core_skills', status: 'failed', error: 'sync failed' }),
       ],
+      rollbackSelf: (ctx) => {
+        rollbackCalls.push(ctx.backupDir);
+        return [{ action: 'restore_core_skills', success: true }];
+      },
     });
 
     assert.equal(result.success, false);
     assert.equal(result.failedStep, 5);
     assert.equal(result.error, 'sync failed');
-    assert.deepEqual(result.rollback, { performed: false, steps: [] });
+    assert.deepEqual(rollbackCalls, ['/tmp/backup']);
+    assert.deepEqual(result.rollback, {
+      performed: true,
+      steps: [{ action: 'restore_core_skills', success: true }],
+    });
+  });
+
+  it('rolls back when the installed finalizer crashes before returning a result', () => {
+    const rollbackCalls = [];
+    const result = runSelfUpgrade({
+      tempDir: '/tmp/new-core',
+      newVersion: '0.4.13',
+    }, {
+      getCurrentVersion: () => ({ success: true, version: '0.4.12' }),
+      preInstallSteps: [
+        (ctx) => {
+          ctx.backupDir = '/tmp/backup';
+          ctx.servicesWereRunning = ['c4-dispatcher'];
+          return { step: 1, name: 'backup_core_skills', status: 'done' };
+        },
+      ],
+      runInstalledFinalizer: () => {
+        throw new Error('finalizer crashed');
+      },
+      rollbackSelf: (ctx) => {
+        rollbackCalls.push(ctx.backupDir);
+        return [{ action: 'restore_core_skills', success: true }];
+      },
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.failedStep, 5);
+    assert.match(result.error, /finalizer crashed/);
+    assert.deepEqual(rollbackCalls, ['/tmp/backup']);
+    assert.equal(result.rollback.performed, true);
+  });
+});
+
+describe('self-upgrade communication continuity gate', () => {
+  it('accepts a target that declares rolling reply compatibility', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-target-'));
+    try {
+      fs.writeFileSync(path.join(tempDir, 'capabilities.json'), JSON.stringify({
+        schemaVersion: 1,
+        product: 'zylos-core',
+        protocols: { 'c4.reply.argv-compat': 1 },
+      }));
+
+      const result = step0_verifyTargetCommunicationCompatibility({ tempDir });
+
+      assert.equal(result.status, 'done');
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a target without rolling reply compatibility before mutation', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-target-'));
+    try {
+      fs.writeFileSync(path.join(tempDir, 'capabilities.json'), JSON.stringify({
+        schemaVersion: 1,
+        product: 'zylos-core',
+        protocols: { 'c4.reply': 2 },
+      }));
+
+      const result = step0_verifyTargetCommunicationCompatibility({ tempDir });
+
+      assert.equal(result.status, 'failed');
+      assert.match(result.error, /c4\.reply\.argv-compat requires >= 1, found missing/);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('passes only when both reply contracts are compatible', () => {
+    const result = step13_verifyCommunicationContinuity({}, {
+      verify: () => ({
+        compatible: true,
+        checks: [
+          { name: 'stdin_reply', status: 'passed' },
+          { name: 'legacy_argv_reply', status: 'passed' },
+        ],
+      }),
+    });
+
+    assert.equal(result.status, 'done');
+    assert.match(result.message, /stdin_reply, legacy_argv_reply/);
+  });
+
+  it('fails the upgrade when a reply contract is broken', () => {
+    const result = step13_verifyCommunicationContinuity({}, {
+      verify: () => ({
+        compatible: false,
+        checks: [
+          { name: 'stdin_reply', status: 'passed' },
+          { name: 'legacy_argv_reply', status: 'failed' },
+        ],
+        error: 'legacy_argv_reply exited 2',
+      }),
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /legacy_argv_reply exited 2/);
   });
 });
 

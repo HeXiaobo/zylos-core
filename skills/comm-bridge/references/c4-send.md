@@ -10,25 +10,39 @@ Your message here. Quotes, $vars, `backticks` — all safe.
 EOF
 ```
 
-Messages are piped via stdin using a heredoc. This bypasses shell argument parsing entirely, so any content (quotes, variables, markdown) is delivered verbatim.
+New callers pipe messages via stdin using a heredoc. This bypasses shell argument parsing entirely, so any content (quotes, variables, markdown) is delivered verbatim.
 
-Passing the message body as a CLI argument is disabled and exits with status 2 by default.
+The exact endpoint-addressed legacy form remains accepted by default during
+the compatibility phase. It exists to keep older HXA/OpenMAX/channel callers
+working during rolling upgrades; do not use it for new calls.
 
-### Bounded legacy migration
+### Compatibility and recovery policy
 
-`C4_LEGACY_ARG_MODE=1` temporarily accepts only the unambiguous legacy form
-`<channel> <endpoint_id> <message>`. Broadcast and `void` arg-mode remain
-disabled. Every use writes a `legacy_arg_mode_used` deprecation event without
-the message body, so operators can verify that old callers have been removed.
+Only the unambiguous legacy form `<channel> <endpoint_id> <message>` is
+accepted. Broadcast and `void` arg-mode remain disabled. Every use writes a
+`legacy_arg_mode_used` deprecation event without the message body, so operators
+can verify that old callers have been removed.
 
-The script reads this flag directly from `~/zylos/.env`, so it takes effect for
-the next send without restarting the current runtime:
+After all callers have demonstrably migrated, an operator may opt in to strict
+mode. The script reads both flags directly from `~/zylos/.env`, so changes take
+effect on the next send without restarting the runtime:
+
+```dotenv
+C4_STRICT_STDIN_ONLY=1
+```
+
+If strict mode interrupts communication, add the break-glass override
+immediately; it takes precedence over strict mode:
 
 ```dotenv
 C4_LEGACY_ARG_MODE=1
 ```
 
-Remove the override after HXA/OpenMAX callers use stdin.
+Self-upgrade runs a hermetic reply-path canary for both stdin and exact legacy
+calls. Under explicit strict mode, the legacy check temporarily applies the
+break-glass override only inside the canary to prove recovery remains possible.
+A failed canary restores the backed-up Core Skills and restarts the previously
+running services.
 
 ### Important safety rule
 

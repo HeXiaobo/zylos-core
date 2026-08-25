@@ -24,6 +24,7 @@ const {
   createFinalizeState,
   runSelfUpgrade,
   runSelfUpgradeFinalize,
+  rollbackSelf,
   step5_syncCoreSkills,
 } = await import('../../cli/lib/self-upgrade.js');
 const { printStep } = await import('../../cli/commands/component.js');
@@ -31,6 +32,7 @@ const { printStep } = await import('../../cli/commands/component.js');
 const transactionBackupDir = path.join(zylosDir, 'transaction-backup');
 const npmCommands = [];
 const stoppedServices = [];
+const restartedServices = [];
 const launcherOutput = [];
 const originalLog = console.log;
 console.log = (...args) => launcherOutput.push(args.join(' '));
@@ -71,7 +73,14 @@ try {
           error: 'injected later failure',
         }));
       }
-      return runSelfUpgradeFinalize(createFinalizeState(ctx), { steps });
+      return runSelfUpgradeFinalize(createFinalizeState(ctx), {
+        steps,
+        rollbackSelf: (finalizerCtx) => rollbackSelf(finalizerCtx, {
+          zylosDir,
+          skillsDir: path.join(zylosDir, '.claude', 'skills'),
+          restartManagedProcess: (name) => restartedServices.push(name),
+        }),
+      });
     },
   });
 
@@ -89,5 +98,6 @@ originalLog(JSON.stringify({
   launcherOutput,
   npmCommands,
   stoppedServices,
+  restartedServices,
   transactionBackupDir,
 }));
