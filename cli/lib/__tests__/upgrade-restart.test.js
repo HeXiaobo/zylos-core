@@ -34,14 +34,14 @@ describe('step7_runPostUpgradeHook', () => {
     }
   });
 
-  it('skips when the declared hook file is missing', () => {
+  it('fails closed when the declared hook file is missing', () => {
     const { tmpDir, skillDir } = makeSkillDir('lifecycle:\n  hooks:\n    post-upgrade: hooks/post-upgrade.js\n');
 
     try {
       const result = step7_runPostUpgradeHook({ component: 'demo', skillDir });
 
-      assert.equal(result.status, 'skipped');
-      assert.equal(result.message, 'hook not found: hooks/post-upgrade.js');
+      assert.equal(result.status, 'failed');
+      assert.equal(result.error, 'Hook not found: hooks/post-upgrade.js');
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -78,7 +78,7 @@ describe('step7_runPostUpgradeHook', () => {
     }
   });
 
-  it('treats a failing hook as non-fatal and keeps diagnostics', () => {
+  it('treats a failing hook as fatal and keeps diagnostics', () => {
     const { tmpDir, skillDir } = makeSkillDir('lifecycle:\n  hooks:\n    post-upgrade: hooks/post-upgrade.js\n');
     const hookPath = path.join(skillDir, 'hooks', 'post-upgrade.js');
     fs.mkdirSync(path.dirname(hookPath), { recursive: true });
@@ -89,9 +89,9 @@ describe('step7_runPostUpgradeHook', () => {
         spawnSync: () => ({ status: 1, stdout: 'before fail\n', stderr: 'bad things\n' }),
       });
 
-      assert.equal(result.status, 'skipped');
-      assert.match(result.message, /hook had issues/);
-      assert.match(result.message, /bad things/);
+      assert.equal(result.status, 'failed');
+      assert.match(result.error, /post-upgrade hook failed/);
+      assert.match(result.error, /bad things/);
       assert.deepEqual(result.output, { stdout: 'before fail\n', stderr: 'bad things\n' });
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -122,7 +122,7 @@ describe('step7_runPostUpgradeHook', () => {
     }
   });
 
-  it('skips hook paths that escape the skill directory', () => {
+  it('fails closed for hook paths that escape the skill directory', () => {
     const { tmpDir, skillDir } = makeSkillDir('lifecycle:\n  hooks:\n    post-upgrade: ../outside.js\n');
 
     try {
@@ -133,14 +133,14 @@ describe('step7_runPostUpgradeHook', () => {
         },
       });
 
-      assert.equal(result.status, 'skipped');
-      assert.match(result.message, /escapes skill directory/);
+      assert.equal(result.status, 'failed');
+      assert.match(result.error, /escapes component directory/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 
-  it('skips hook symlinks that resolve outside the skill directory', () => {
+  it('fails closed for hook symlinks that resolve outside the skill directory', () => {
     const { tmpDir, skillDir } = makeSkillDir('lifecycle:\n  hooks:\n    post-upgrade: hooks/outside.js\n');
     const outsideHook = path.join(tmpDir, 'outside.js');
     const hookPath = path.join(skillDir, 'hooks', 'outside.js');
@@ -155,8 +155,8 @@ describe('step7_runPostUpgradeHook', () => {
         },
       });
 
-      assert.equal(result.status, 'skipped');
-      assert.match(result.message, /escapes skill directory/);
+      assert.equal(result.status, 'failed');
+      assert.match(result.error, /escapes component directory/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -322,6 +322,48 @@ describe('component upgrade rollback', () => {
       opts: { ecosystemPath, stdio: 'pipe', save: true },
     }]);
 
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('restores the previous component Caddy routes before restarting service', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-rollback-caddy-'));
+    const skillDir = path.join(tmpDir, 'skills', 'demo');
+    const backupDir = path.join(skillDir, '.backup', 'run-1');
+    const oldRoutes = [{ path: '/old', type: 'reverse_proxy', target: 'localhost:3000' }];
+    fs.mkdirSync(backupDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(backupDir, 'SKILL.md'),
+      `---\nname: demo\nhttp_routes:\n  - path: /old\n    type: reverse_proxy\n    target: localhost:3000\n---\n`,
+      'utf8',
+    );
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      `---\nname: demo\nhttp_routes:\n  - path: /new\n    type: reverse_proxy\n    target: localhost:4000\n---\n`,
+      'utf8',
+    );
+    const calls = [];
+
+    const results = rollback({
+      component: 'demo',
+      backupDir,
+      skillDir,
+      dataDir: path.join(tmpDir, 'components', 'demo'),
+      dataDirExisted: false,
+      backupComplete: true,
+      caddyChanged: true,
+      serviceWasRunning: false,
+    }, {
+      applyCaddyRoutes: (component, routes) => {
+        calls.push({ component, routes });
+        return { success: true, action: 'updated' };
+      },
+      removeCaddyRoutes: () => {
+        throw new Error('old release has routes, should apply them');
+      },
+    });
+
+    assert.deepEqual(calls, [{ component: 'demo', routes: oldRoutes }]);
+    assert.equal(results.some(item => item.action === 'restore_caddy_routes' && item.success), true);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 });

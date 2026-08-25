@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execSync, spawnSync } from 'node:child_process';
-import { SKILLS_DIR, COMPONENTS_DIR } from './config.js';
+import { SKILLS_DIR, COMPONENTS_DIR, ENV_FILE } from './config.js';
 import { loadComponents } from './components.js';
 import { loadLocalRegistry } from './registry.js';
 import { parseSkillMd } from './skill.js';
@@ -18,7 +18,7 @@ import {
 import { downloadArchive, downloadBranch } from './download.js';
 import { fetchLatestTag, fetchRawFile, compareSemverDesc, sanitizeError } from './github.js';
 import { copyTree, syncTree } from './fs-utils.js';
-import { applyCaddyRoutes } from './caddy.js';
+import { applyCaddyRoutes, removeCaddyRoutes } from './caddy.js';
 import { smartSync, formatMergeResult } from './smart-merge.js';
 import { restartFromEcosystem, restartManagedProcess } from './pm2.js';
 import { verifyTargetCapabilities } from './capability-compatibility.js';
@@ -348,9 +348,17 @@ function createContext(component, { tempDir, newVersion, mode, jsonOutput } = {}
     jsonOutput: Boolean(jsonOutput),
     // State tracking
     backupDir: null,
+    dataBackupRoot: null,
+    dataBackupDir: null,
+    dataDirExisted: false,
+    envBackupPath: null,
+    envFileExisted: false,
+    backupComplete: false,
     serviceStopped: false,
     serviceExists: true,
     serviceWasRunning: false,
+    mutationStarted: false,
+    caddyChanged: false,
     mergeConflicts: [],
     mergedFiles: [],
     // Results
@@ -396,9 +404,9 @@ function step0_verifyCapabilities(ctx) {
 }
 
 /**
- * Step 1: stop PM2 service
+ * Step 3: stop PM2 service
  */
-function step1_stopService(ctx) {
+function step3_stopService(ctx) {
   const startTime = Date.now();
   const parsed = parseSkillMd(ctx.skillDir);
   const serviceName = parsed?.frontmatter?.lifecycle?.service?.name || `zylos-${ctx.component}`;
@@ -410,29 +418,29 @@ function step1_stopService(ctx) {
 
     if (!service) {
       ctx.serviceExists = false;
-      return { step: 1, name: 'stop_service', status: 'skipped', message: 'no service', duration: Date.now() - startTime };
+      return { step: 3, name: 'stop_service', status: 'skipped', message: 'no service', duration: Date.now() - startTime };
     }
 
     ctx.serviceExists = true;
     ctx.serviceWasRunning = service.pm2_env?.status === 'online';
 
     if (!ctx.serviceWasRunning) {
-      return { step: 1, name: 'stop_service', status: 'skipped', message: 'not running', duration: Date.now() - startTime };
+      return { step: 3, name: 'stop_service', status: 'skipped', message: 'not running', duration: Date.now() - startTime };
     }
 
     execSync(`pm2 stop ${serviceName} 2>/dev/null`, { stdio: 'pipe' });
     ctx.serviceStopped = true;
 
-    return { step: 1, name: 'stop_service', status: 'done', message: serviceName, duration: Date.now() - startTime };
+    return { step: 3, name: 'stop_service', status: 'done', message: serviceName, duration: Date.now() - startTime };
   } catch {
-    return { step: 1, name: 'stop_service', status: 'skipped', message: 'pm2 not available', duration: Date.now() - startTime };
+    return { step: 3, name: 'stop_service', status: 'skipped', message: 'pm2 not available', duration: Date.now() - startTime };
   }
 }
 
 /**
- * Step 2: filesystem backup to .backup/<timestamp>/
+ * Step 1: filesystem and component-data backup.
  */
-function step2_backup(ctx) {
+function step1_backup(ctx) {
   const startTime = Date.now();
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupDir = path.join(ctx.skillDir, '.backup', timestamp);
@@ -441,28 +449,54 @@ function step2_backup(ctx) {
     copyTree(ctx.skillDir, backupDir, { excludes: ['node_modules', '.backup', '.zylos'] });
 
     ctx.backupDir = backupDir;
-    return { step: 2, name: 'backup', status: 'done', message: path.basename(backupDir), duration: Date.now() - startTime };
+    ctx.dataBackupRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-component-state-backup-'));
+    ctx.dataDirExisted = fs.existsSync(ctx.dataDir);
+    if (ctx.dataDirExisted) {
+      ctx.dataBackupDir = path.join(ctx.dataBackupRoot, 'data');
+      copyTree(ctx.dataDir, ctx.dataBackupDir, { excludes: [] });
+    }
+    ctx.envFileExisted = fs.existsSync(ENV_FILE);
+    ctx.envBackupPath = path.join(ctx.dataBackupRoot, 'zylos.env');
+    if (ctx.envFileExisted) fs.copyFileSync(ENV_FILE, ctx.envBackupPath);
+    ctx.backupComplete = true;
+    return { step: 1, name: 'backup', status: 'done', message: path.basename(backupDir), duration: Date.now() - startTime };
   } catch (err) {
-    return { step: 2, name: 'backup', status: 'failed', error: `Backup failed: ${err.message}`, duration: Date.now() - startTime };
+    cleanupDataBackup(ctx);
+    return { step: 1, name: 'backup', status: 'failed', error: `Backup failed: ${err.message}`, duration: Date.now() - startTime };
   }
 }
 
 /**
- * Step 3: smart merge new files into skill dir
+ * Step 2: execute the target release's pre-upgrade gate after a recoverable
+ * backup exists, but before the service is stopped or installed files change.
+ * Components that predate lifecycle hooks remain compatible and are skipped.
+ */
+export function step2_runPreUpgradeHook(ctx, deps = {}) {
+  return runLifecycleHook(ctx, {
+    hookName: 'pre-upgrade',
+    rootDir: ctx.tempDir,
+    step: 2,
+    resultName: 'pre_upgrade_hook',
+  }, deps);
+}
+
+/**
+ * Step 4: smart merge new files into skill dir
  *
  * Uses three-way merge when possible:
  * - Local unmodified → overwrite
  * - Local modified + new unchanged → keep local
  * - Both changed → diff3 merge or overwrite + backup local
  */
-function step3_smartMerge(ctx) {
+function step4_smartMerge(ctx) {
   const startTime = Date.now();
 
   if (!ctx.tempDir || !fs.existsSync(ctx.tempDir)) {
-    return { step: 3, name: 'smart_merge', status: 'failed', error: 'Temp directory not available', duration: Date.now() - startTime };
+    return { step: 4, name: 'smart_merge', status: 'failed', error: 'Temp directory not available', duration: Date.now() - startTime };
   }
 
   try {
+    ctx.mutationStarted = true;
     const conflictBackupDir = ctx.backupDir ? path.join(ctx.backupDir, 'conflicts') : null;
     const mergeResult = smartSync(ctx.tempDir, ctx.skillDir, {
       backupDir: conflictBackupDir,
@@ -476,26 +510,26 @@ function step3_smartMerge(ctx) {
     const msg = formatMergeResult(mergeResult);
 
     if (mergeResult.errors.length > 0) {
-      return { step: 3, name: 'smart_merge', status: 'failed', error: mergeResult.errors.join('; '), duration: Date.now() - startTime };
+      return { step: 4, name: 'smart_merge', status: 'failed', error: mergeResult.errors.join('; '), duration: Date.now() - startTime };
     }
 
     ctx.nextManifest = mergeResult.nextManifest;
 
-    return { step: 3, name: 'smart_merge', status: 'done', message: msg, duration: Date.now() - startTime };
+    return { step: 4, name: 'smart_merge', status: 'done', message: msg, duration: Date.now() - startTime };
   } catch (err) {
-    return { step: 3, name: 'smart_merge', status: 'failed', error: `Merge failed: ${err.message}`, duration: Date.now() - startTime };
+    return { step: 4, name: 'smart_merge', status: 'failed', error: `Merge failed: ${err.message}`, duration: Date.now() - startTime };
   }
 }
 
 /**
- * Step 4: npm install
+ * Step 5: npm install
  */
-function step4_npmInstall(ctx) {
+function step5_npmInstall(ctx) {
   const startTime = Date.now();
   const packageJson = path.join(ctx.skillDir, 'package.json');
 
   if (!fs.existsSync(packageJson)) {
-    return { step: 4, name: 'npm_install', status: 'skipped', message: 'no package.json', duration: Date.now() - startTime };
+    return { step: 5, name: 'npm_install', status: 'skipped', message: 'no package.json', duration: Date.now() - startTime };
   }
 
   try {
@@ -504,23 +538,23 @@ function step4_npmInstall(ctx) {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return { step: 4, name: 'npm_install', status: 'done', duration: Date.now() - startTime };
+    return { step: 5, name: 'npm_install', status: 'done', duration: Date.now() - startTime };
   } catch (err) {
-    return { step: 4, name: 'npm_install', status: 'failed', error: err.stderr?.trim() || err.message, duration: Date.now() - startTime };
+    return { step: 5, name: 'npm_install', status: 'failed', error: err.stderr?.trim() || err.message, duration: Date.now() - startTime };
   }
 }
 
 /**
- * Step 5: verify that smart merge produced an authoritative baseline
+ * Step 6: verify that smart merge produced an authoritative baseline
  * candidate. It remains uncommitted until the outer transaction succeeds.
  */
-function step5_generateManifest(ctx) {
+function step6_generateManifest(ctx) {
   const startTime = Date.now();
 
   if (ctx.nextManifest) {
-    return { step: 5, name: 'generate_manifest', status: 'skipped', message: 'authoritative baseline pending outer commit', duration: Date.now() - startTime };
+    return { step: 6, name: 'generate_manifest', status: 'skipped', message: 'authoritative baseline pending outer commit', duration: Date.now() - startTime };
   }
-  return { step: 5, name: 'generate_manifest', status: 'failed', error: 'baseline candidate missing after smart merge', duration: Date.now() - startTime };
+  return { step: 6, name: 'generate_manifest', status: 'failed', error: 'baseline candidate missing after smart merge', duration: Date.now() - startTime };
 }
 
 /**
@@ -528,35 +562,36 @@ function step5_generateManifest(ctx) {
  * operation has succeeded. A pre-commit failure leaves the previous baseline
  * intact, so ordinary business-file rollback is sufficient.
  */
-function step9_commitBaseline(ctx) {
+function step10_commitBaseline(ctx) {
   const startTime = Date.now();
   try {
     saveMergeBaseline(ctx.skillDir, ctx.tempDir, ctx.nextManifest);
-    return { step: 9, name: 'commit_baseline', status: 'done', message: 'authoritative source baseline committed', duration: Date.now() - startTime };
+    return { step: 10, name: 'commit_baseline', status: 'done', message: 'authoritative source baseline committed', duration: Date.now() - startTime };
   } catch (err) {
-    return { step: 9, name: 'commit_baseline', status: 'failed', error: `Baseline commit failed: ${err.message}`, duration: Date.now() - startTime };
+    return { step: 10, name: 'commit_baseline', status: 'failed', error: `Baseline commit failed: ${err.message}`, duration: Date.now() - startTime };
   }
 }
 
 /**
- * Step 6: update Caddy routes (if http_routes declared in SKILL.md)
+ * Step 7: update Caddy routes (if http_routes declared in SKILL.md)
  */
-function step6_updateCaddyRoutes(ctx) {
+function step7_updateCaddyRoutes(ctx) {
   const startTime = Date.now();
   const parsed = parseSkillMd(ctx.skillDir);
   const httpRoutes = parsed?.frontmatter?.http_routes;
 
   if (!httpRoutes || !Array.isArray(httpRoutes) || httpRoutes.length === 0) {
-    return { step: 6, name: 'caddy_routes', status: 'skipped', message: 'no http_routes', duration: Date.now() - startTime };
+    return { step: 7, name: 'caddy_routes', status: 'skipped', message: 'no http_routes', duration: Date.now() - startTime };
   }
 
   const result = applyCaddyRoutes(ctx.component, httpRoutes);
   if (result.success) {
-    return { step: 6, name: 'caddy_routes', status: 'done', message: result.action, caddy: result, duration: Date.now() - startTime };
+    ctx.caddyChanged = result.action === 'added' || result.action === 'updated';
+    return { step: 7, name: 'caddy_routes', status: 'done', message: result.action, caddy: result, duration: Date.now() - startTime };
   }
   if (result.action === 'manual_required') {
     return {
-      step: 6,
+      step: 7,
       name: 'caddy_routes',
       status: 'skipped',
       message: 'manual configuration required',
@@ -565,49 +600,48 @@ function step6_updateCaddyRoutes(ctx) {
     };
   }
   // Caddy failures are non-fatal for upgrades
-  return { step: 6, name: 'caddy_routes', status: 'skipped', message: result.error, caddy: result, duration: Date.now() - startTime };
+  return { step: 7, name: 'caddy_routes', status: 'skipped', message: result.error, caddy: result, duration: Date.now() - startTime };
 }
 
-/**
- * Step 7: run post-upgrade hook (non-fatal).
- *
- * Mirrors the post-install soft-failure pattern in cli/commands/add.js: hook
- * problems are reported as 'skipped' (not 'failed') so they never trigger a
- * rollback of an otherwise-successful upgrade.
- */
-export function step7_runPostUpgradeHook(ctx, deps = {}) {
+function runLifecycleHook(ctx, {
+  hookName,
+  rootDir,
+  step,
+  resultName,
+}, deps = {}) {
   const startTime = Date.now();
   const spawn = deps.spawnSync ?? spawnSync;
   const exists = deps.existsSync ?? fs.existsSync;
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
 
-  const parsed = parseSkillMd(ctx.skillDir);
-  const hookRel = parsed?.frontmatter?.lifecycle?.hooks?.['post-upgrade'];
+  const parsed = parseSkillMd(rootDir);
+  const hookRel = parsed?.frontmatter?.lifecycle?.hooks?.[hookName];
   if (!hookRel) {
-    return { step: 7, name: 'post_upgrade_hook', status: 'skipped', message: 'no post-upgrade hook', duration: Date.now() - startTime };
+    return { step, name: resultName, status: 'skipped', message: `no ${hookName} hook`, duration: Date.now() - startTime };
   }
 
-  const hookPath = path.resolve(ctx.skillDir, hookRel);
-  const hookRelativePath = path.relative(ctx.skillDir, hookPath);
+  const hookPath = path.resolve(rootDir, hookRel);
+  const hookRelativePath = path.relative(rootDir, hookPath);
   if (hookRelativePath.startsWith('..') || path.isAbsolute(hookRelativePath)) {
-    return { step: 7, name: 'post_upgrade_hook', status: 'skipped', message: `hook path escapes skill directory: ${hookRel}`, duration: Date.now() - startTime };
+    return { step, name: resultName, status: 'failed', error: `Hook path escapes component directory: ${hookRel}`, duration: Date.now() - startTime };
   }
   if (!exists(hookPath)) {
-    return { step: 7, name: 'post_upgrade_hook', status: 'skipped', message: `hook not found: ${hookRel}`, duration: Date.now() - startTime };
+    return { step, name: resultName, status: 'failed', error: `Hook not found: ${hookRel}`, duration: Date.now() - startTime };
   }
 
-  const realSkillDir = fs.realpathSync(ctx.skillDir);
+  const realSkillDir = fs.realpathSync(rootDir);
   const realHookPath = fs.realpathSync(hookPath);
   const realHookRelativePath = path.relative(realSkillDir, realHookPath);
   if (realHookRelativePath.startsWith('..') || path.isAbsolute(realHookRelativePath)) {
-    return { step: 7, name: 'post_upgrade_hook', status: 'skipped', message: `hook path escapes skill directory: ${hookRel}`, duration: Date.now() - startTime };
+    return { step, name: resultName, status: 'failed', error: `Hook path escapes component directory: ${hookRel}`, duration: Date.now() - startTime };
   }
 
   const child = spawn(process.execPath, [hookPath], {
-    cwd: ctx.skillDir,
+    cwd: rootDir,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 300000,
   });
 
   const hookStdout = child.stdout || '';
@@ -623,13 +657,23 @@ export function step7_runPostUpgradeHook(ctx, deps = {}) {
   };
 
   if (child.error) {
-    return { step: 7, name: 'post_upgrade_hook', status: 'skipped', message: `hook had issues (non-fatal): ${child.error.message}`, output, duration: Date.now() - startTime };
+    return { step, name: resultName, status: 'failed', error: `Hook failed to start: ${child.error.message}`, output, duration: Date.now() - startTime };
   }
   if (child.status !== 0) {
     const detail = hookStderr.trim() || hookStdout.trim() || `exit code ${child.status}`;
-    return { step: 7, name: 'post_upgrade_hook', status: 'skipped', message: `hook had issues (non-fatal): ${truncateHookOutput(detail)}`, output, duration: Date.now() - startTime };
+    return { step, name: resultName, status: 'failed', error: `${hookName} hook failed: ${truncateHookOutput(detail)}`, output, duration: Date.now() - startTime };
   }
-  return { step: 7, name: 'post_upgrade_hook', status: 'done', message: hookRel, output, duration: Date.now() - startTime };
+  return { step, name: resultName, status: 'done', message: hookRel, output, duration: Date.now() - startTime };
+}
+
+/** Step 8: run the installed release's post-upgrade hook transactionally. */
+export function step7_runPostUpgradeHook(ctx, deps = {}) {
+  return runLifecycleHook(ctx, {
+    hookName: 'post-upgrade',
+    rootDir: ctx.skillDir,
+    step: 8,
+    resultName: 'post_upgrade_hook',
+  }, deps);
 }
 
 function truncateHookOutput(value, maxLength = 1000) {
@@ -638,7 +682,8 @@ function truncateHookOutput(value, maxLength = 1000) {
 }
 
 /**
- * Step 8: restart PM2 service (if it was running before upgrade)
+ * Step 9: restart PM2 service (if it was running before upgrade).
+ * The historical export name is retained for API compatibility.
  */
 export function step8_startService(ctx, deps = {}) {
   const startTime = Date.now();
@@ -648,7 +693,7 @@ export function step8_startService(ctx, deps = {}) {
   const restartViaEcosystem = deps.restartFromEcosystem ?? restartFromEcosystem;
 
   if (!ctx.serviceWasRunning) {
-    return { step: 8, name: 'start_service', status: 'skipped', message: 'was not running', duration: Date.now() - startTime };
+    return { step: 9, name: 'start_service', status: 'skipped', message: 'was not running', duration: Date.now() - startTime };
   }
 
   const parsed = parseSkillMd(ctx.skillDir);
@@ -657,7 +702,7 @@ export function step8_startService(ctx, deps = {}) {
 
   try {
     restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
-    return { step: 8, name: 'start_service', status: 'done', message: serviceName, duration: Date.now() - startTime };
+    return { step: 9, name: 'start_service', status: 'done', message: serviceName, duration: Date.now() - startTime };
   } catch {
     // If the process disappeared from PM2 between step1 and step8, retry via
     // the component ecosystem so PM2 reloads the current service definition.
@@ -667,9 +712,9 @@ export function step8_startService(ctx, deps = {}) {
       }
       try { exec(`pm2 delete "${serviceName}" 2>/dev/null`, { stdio: 'pipe' }); } catch {}
       restartViaEcosystem([serviceName], { ecosystemPath, stdio: 'pipe', save: true });
-      return { step: 8, name: 'start_service', status: 'done', message: `${serviceName} (restarted from ecosystem)`, duration: Date.now() - startTime };
+      return { step: 9, name: 'start_service', status: 'done', message: `${serviceName} (restarted from ecosystem)`, duration: Date.now() - startTime };
     } catch {
-      return { step: 8, name: 'start_service', status: 'failed', error: `Failed to restart ${serviceName}`, duration: Date.now() - startTime };
+      return { step: 9, name: 'start_service', status: 'failed', error: `Failed to restart ${serviceName}`, duration: Date.now() - startTime };
     }
   }
 }
@@ -691,7 +736,7 @@ export function rollback(ctx, deps = {}) {
   // Restore files from backup (--delete removes files added by the failed upgrade)
   if (ctx.backupDir && fs.existsSync(ctx.backupDir)) {
     try {
-      syncTree(ctx.backupDir, ctx.skillDir, { excludes: ['node_modules', '.backup', '.zylos'] });
+      syncTree(ctx.backupDir, ctx.skillDir, { excludes: ['node_modules', '.backup', '.zylos', '.zylos-data'] });
       results.push({ action: 'restore_files', success: true });
     } catch (err) {
       results.push({ action: 'restore_files', success: false, error: err.message });
@@ -709,6 +754,33 @@ export function rollback(ctx, deps = {}) {
       } catch (err) {
         results.push({ action: 'restore_dependencies', success: false, error: err.message });
       }
+    }
+  }
+
+  // Lifecycle hooks may migrate component-owned configuration or state. Put
+  // that data back in the same transaction as the code rollback. For a
+  // component that had no data directory before the attempt, remove only the
+  // directory created during the failed upgrade.
+  results.push(...rollbackComponentData(ctx));
+
+  if (ctx.caddyChanged) {
+    const applyRoutes = deps.applyCaddyRoutes ?? applyCaddyRoutes;
+    const removeRoutes = deps.removeCaddyRoutes ?? removeCaddyRoutes;
+    // Read the route contract from the immutable backup rather than trusting
+    // the live directory after a possibly-partial file restore.
+    const parsed = parseSkillMd(ctx.backupDir || ctx.skillDir);
+    const oldRoutes = parsed?.frontmatter?.http_routes;
+    try {
+      const result = Array.isArray(oldRoutes) && oldRoutes.length > 0
+        ? applyRoutes(ctx.component, oldRoutes)
+        : removeRoutes(ctx.component);
+      results.push({
+        action: 'restore_caddy_routes',
+        success: result.success !== false,
+        ...(result.success === false ? { error: result.error || 'Caddy route restore failed' } : {}),
+      });
+    } catch (err) {
+      results.push({ action: 'restore_caddy_routes', success: false, error: err.message });
     }
   }
 
@@ -730,6 +802,70 @@ export function rollback(ctx, deps = {}) {
   }
 
   return results;
+}
+
+function rollbackComponentData(ctx) {
+  if (!ctx.backupComplete) return [];
+  const results = [];
+  let restorationSucceeded = true;
+  if (ctx.dataDirExisted && ctx.dataBackupDir && fs.existsSync(ctx.dataBackupDir)) {
+    try {
+      syncTree(ctx.dataBackupDir, ctx.dataDir, { excludes: [] });
+      results.push({ action: 'restore_data', success: true });
+    } catch (err) {
+      restorationSucceeded = false;
+      results.push({ action: 'restore_data', success: false, error: err.message, backupDir: ctx.dataBackupDir });
+    }
+  } else if (!ctx.dataDirExisted && fs.existsSync(ctx.dataDir)) {
+    try {
+      fs.rmSync(ctx.dataDir, { recursive: true, force: true });
+      results.push({ action: 'remove_new_data', success: true });
+    } catch (err) {
+      restorationSucceeded = false;
+      results.push({ action: 'remove_new_data', success: false, error: err.message });
+    }
+  }
+
+  let envChanged = true;
+  try {
+    envChanged = ctx.envFileExisted
+      ? (!fs.existsSync(ENV_FILE) || !fs.readFileSync(ENV_FILE).equals(fs.readFileSync(ctx.envBackupPath)))
+      : fs.existsSync(ENV_FILE);
+  } catch {
+    // Treat an unreadable current file as changed and attempt the restore;
+    // the copy/remove branch below will retain the backup path on failure.
+  }
+  if (envChanged) {
+    try {
+      if (ctx.envFileExisted) {
+        fs.mkdirSync(path.dirname(ENV_FILE), { recursive: true });
+        fs.copyFileSync(ctx.envBackupPath, ENV_FILE);
+      } else {
+        fs.rmSync(ENV_FILE, { force: true });
+      }
+      results.push({ action: 'restore_environment', success: true });
+    } catch (err) {
+      restorationSucceeded = false;
+      results.push({ action: 'restore_environment', success: false, error: err.message, backupPath: ctx.envBackupPath });
+    }
+  }
+
+  if (restorationSucceeded) cleanupDataBackup(ctx);
+  return results;
+}
+
+function cleanupDataBackup(ctx) {
+  try {
+    if (ctx.dataBackupRoot && fs.existsSync(ctx.dataBackupRoot)) {
+      fs.rmSync(ctx.dataBackupRoot, { recursive: true, force: true });
+    }
+  } catch {
+    return false;
+  }
+  ctx.dataBackupRoot = null;
+  ctx.dataBackupDir = null;
+  ctx.envBackupPath = null;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -766,15 +902,16 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
 
   const steps = [
     step0_verifyCapabilities,
-    step1_stopService,
-    step2_backup,
-    step3_smartMerge,
-    step4_npmInstall,
-    step5_generateManifest,
-    step6_updateCaddyRoutes,
+    step1_backup,
+    step2_runPreUpgradeHook,
+    step3_stopService,
+    step4_smartMerge,
+    step5_npmInstall,
+    step6_generateManifest,
+    step7_updateCaddyRoutes,
     step7_runPostUpgradeHook,
     step8_startService,
-    step9_commitBaseline,
+    step10_commitBaseline,
   ];
 
   const total = steps.length;
@@ -795,7 +932,10 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
 
   // If failed, rollback
   if (failedStep) {
-    const rollbackResults = rollback(ctx);
+    const rollbackNeeded = ctx.serviceStopped || ctx.mutationStarted;
+    const dataRollback = !rollbackNeeded ? rollbackComponentData(ctx) : [];
+    const rollbackResults = rollbackNeeded ? rollback(ctx) : dataRollback;
+    const rollbackPerformed = rollbackNeeded || dataRollback.length > 0;
     return {
       action: 'upgrade',
       component,
@@ -805,11 +945,12 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
       failedStep: failedStep.step,
       error: failedStep.error,
       steps: ctx.steps,
-      rollback: { performed: true, steps: rollbackResults },
+      rollback: { performed: rollbackPerformed, steps: rollbackResults },
     };
   }
 
   // Success — read the new version and SKILL.md metadata
+  cleanupDataBackup(ctx);
   const updatedVersion = getLocalVersion(ctx.skillDir);
   if (updatedVersion.success) {
     ctx.to = updatedVersion.version;
