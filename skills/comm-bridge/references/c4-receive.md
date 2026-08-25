@@ -22,6 +22,8 @@ Messages are written to DB with `status='pending'`. The c4-dispatcher daemon han
 | `--no-reply` | Mark the message as having no reply target; defaults channel to `system` |
 | `--block-queue-until-idle` | Wait for sustained idle, then block later dispatch until execution settles |
 | `--task-envelope-json <json>` | Atomically persist a normalized task intent for Commitment Core |
+| `--work-intake-envelope-json <json>` | Classify a channel-neutral natural-language `InboundEnvelope` |
+| `--work-intake-confirmation-json <json>` | Resolve one persisted confirmation choice through Core |
 | `--json` | Output structured JSON instead of plain text |
 
 ## Priority Levels
@@ -89,6 +91,28 @@ optional fields versus explicit `null`, and omitted acceptor versus acceptor
 equal to owner do not change normalized identity.
 The intake worker and retry lifecycle are documented in
 [c4-intake-worker](c4-intake-worker.md).
+
+## WorkIntake Envelope
+
+`--work-intake-envelope-json`, `--work-intake-confirmation-json`, and
+`--task-envelope-json` are mutually exclusive. The WorkIntake envelope carries a stable channel/message identity,
+human sender, conversation type, plain text, and positive `intentRevision`.
+Its result is returned under `workIntake` in JSON output:
+
+- `chat_only`: store and dispatch as an ordinary message; no task intake row.
+- `create_task`: adapt the `TaskDraft` to Commitment intake using
+  `channel + message_id + intent_revision` as the permanent key.
+- `confirm`: store the conversation and decision as delivered, do not dispatch,
+  and do not create a task. A platform callback later submits only its stable
+  `sourceKey`, chosen `action`, and authenticated `actorId` through
+  `--work-intake-confirmation-json`; C4 reloads the original draft and performs
+  the Core conversion.
+
+Exact replay of a confirmation returns `confirmation_replayed` and the original
+conversation ID. The first human choice is durable and mutually exclusive;
+exact retries are idempotent, while a different later choice fails closed.
+Reusing its source key for different content fails with
+`IDEMPOTENCY_CONFLICT`.
 
 ## Message Storage
 

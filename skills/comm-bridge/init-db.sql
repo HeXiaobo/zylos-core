@@ -115,6 +115,21 @@ CREATE TABLE IF NOT EXISTS assistant_requests (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
 );
 
+-- Ambiguous WorkIntake decisions awaiting an authenticated human choice.
+-- These rows are not Commitment tasks and are never consumed by the task worker.
+CREATE TABLE IF NOT EXISTS work_intake_confirmations (
+    source_key TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL UNIQUE,
+    envelope_json TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    resolved_action TEXT,
+    resolved_by TEXT,
+    resolved_at INTEGER,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+);
+
 CREATE INDEX IF NOT EXISTS idx_assistant_requests_status_time
   ON assistant_requests(status, accepted_at, request_id);
 CREATE INDEX IF NOT EXISTS idx_assistant_requests_runtime

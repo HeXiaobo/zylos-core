@@ -21,6 +21,14 @@ import { parseTaskEnvelopeJson } from './c4-task-envelope.js';
 import { persistTaskBeforeRoute } from './c4-task-intake.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
 import {
+  parseWorkIntakeConfirmationJson,
+  recordWorkIntakeConfirmation,
+  resolveWorkIntakeConfirmation,
+} from './c4-work-intake-confirmations.js';
+import { classify } from '../../work-intake/index.js';
+import { parseInboundEnvelopeJson } from '../../work-intake/scripts/inbound-envelope.js';
+import { toCommitmentEnvelope } from '../../work-intake/scripts/commitment-adapter.js';
+import {
   AGENT_STATUS_FILE,
   ACTIVITY_MONITOR_DIR
 } from './c4-config.js';
@@ -32,7 +40,7 @@ const ROUTER_IPC_TIMEOUT_MS = 30000;
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json>] [--assistant-request-id <id> --assistant-source-id <id>] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json> | --work-intake-envelope-json <json> | --work-intake-confirmation-json <json>] [--assistant-request-id <id> --assistant-source-id <id>] [--json] --content "<message>"');
   console.log('');
   console.log('Options:');
   console.log('  --no-reply       Mark as not needing a reply target (use for system messages)');
@@ -41,8 +49,12 @@ function printUsage() {
   console.log('                   Legacy alias: --require-idle');
   console.log('  --task-envelope-json <json>');
   console.log('                   Atomically persist a normalized task envelope with the message');
+  console.log('  --work-intake-envelope-json <json>');
+  console.log('                   Classify a channel-neutral InboundEnvelope before routing');
+  console.log('  --work-intake-confirmation-json <json>');
+  console.log('                   Resolve one persisted WorkIntake confirmation choice');
   console.log('  --assistant-request-id <id> --assistant-source-id <id>');
-  console.log('                   Open a durable, runtime-neutral response stream for this message');
+  console.log('                   Open a durable response stream for an ordinary chat message');
   console.log('  --json           Output structured JSON');
   console.log('');
   console.log('Priority levels:');
@@ -61,6 +73,8 @@ function parseArgs(args) {
     requireIdle: false,
     json: false,
     taskEnvelopeJson: null,
+    workIntakeEnvelopeJson: null,
+    workIntakeConfirmationJson: null,
     assistantRequestId: null,
     assistantSourceId: null,
   };
@@ -91,6 +105,12 @@ function parseArgs(args) {
         break;
       case '--task-envelope-json':
         result.taskEnvelopeJson = args[++i];
+        break;
+      case '--work-intake-envelope-json':
+        result.workIntakeEnvelopeJson = args[++i];
+        break;
+      case '--work-intake-confirmation-json':
+        result.workIntakeConfirmationJson = args[++i];
         break;
       case '--assistant-request-id':
         result.assistantRequestId = args[++i];
@@ -239,9 +259,9 @@ async function queryRoute(channel, endpoint, noReply) {
   }
 }
 
-function emitSuccess(json, recordId, action = 'queued', extra = null) {
+function emitSuccess(json, recordId, action = 'queued', details = {}) {
   if (json) {
-    console.log(JSON.stringify({ ok: true, action, id: recordId, ...(extra || {}) }));
+    console.log(JSON.stringify({ ok: true, action, id: recordId, ...details }));
     return;
   }
   if (action === 'queued') {
@@ -332,24 +352,88 @@ async function main() {
 
   const {
     channel: rawChannel,
-    endpoint,
-    content,
+    endpoint: rawEndpoint,
+    content: rawContent,
     priority,
     noReply,
     requireIdle,
     json,
     taskEnvelopeJson,
+    workIntakeEnvelopeJson,
+    workIntakeConfirmationJson,
     assistantRequestId,
     assistantSourceId,
   } = parsed;
   let channel = rawChannel;
+  let endpoint = rawEndpoint;
+  let content = rawContent;
   let taskEnvelope = null;
+  let workIntakeEnvelope = null;
+  let workIntakeDecision = null;
+  let workIntakeConfirmation = null;
+
+  if ([taskEnvelopeJson, workIntakeEnvelopeJson, workIntakeConfirmationJson]
+    .filter((value) => value !== null).length > 1) {
+    emitError(json, 'INVALID_ARGS', 'task and WorkIntake protocols are mutually exclusive');
+  }
 
   if (taskEnvelopeJson !== null) {
     try {
       taskEnvelope = parseTaskEnvelopeJson(taskEnvelopeJson);
     } catch (err) {
       emitError(json, 'INVALID_ARGS', `invalid --task-envelope-json: ${err.message}`);
+    }
+  }
+
+  if (workIntakeEnvelopeJson !== null) {
+    try {
+      workIntakeEnvelope = parseInboundEnvelopeJson(workIntakeEnvelopeJson);
+      workIntakeDecision = classify(workIntakeEnvelope);
+      if (workIntakeDecision.decision === 'create_task') {
+        taskEnvelope = toCommitmentEnvelope({
+          envelope: workIntakeEnvelope,
+          decision: workIntakeDecision,
+        });
+      }
+    } catch (err) {
+      emitError(json, 'INVALID_ARGS', `invalid --work-intake-envelope-json: ${err.message}`);
+    }
+  }
+
+  if (workIntakeConfirmationJson !== null) {
+    try {
+      const request = parseWorkIntakeConfirmationJson(workIntakeConfirmationJson);
+      const sourceSeparator = request.sourceKey.indexOf(':');
+      const sourceChannel = sourceSeparator > 0
+        ? request.sourceKey.slice(0, sourceSeparator)
+        : null;
+      if (!sourceChannel || channel !== sourceChannel) {
+        emitError(json, 'INVALID_ARGS', 'WorkIntake confirmation source.channel must match --channel');
+      }
+      workIntakeConfirmation = resolveWorkIntakeConfirmation(request);
+      workIntakeEnvelope = workIntakeConfirmation.envelope;
+      workIntakeDecision = workIntakeConfirmation.decision;
+      if (channel !== workIntakeEnvelope.source.channel) {
+        emitError(json, 'INVALID_ARGS', 'WorkIntake confirmation source.channel must match --channel');
+      }
+      channel = workIntakeConfirmation.conversation.channel;
+      endpoint = workIntakeConfirmation.conversation.endpointId;
+      content = workIntakeConfirmation.action === 'chat_only'
+        ? `[Confirmed ordinary message] ${workIntakeEnvelope.text}`
+        : `[Confirmed WorkIntake ${workIntakeConfirmation.action}] ${workIntakeEnvelope.text}`;
+      if (workIntakeConfirmation.action === 'create_task') {
+        taskEnvelope = toCommitmentEnvelope({
+          envelope: workIntakeEnvelope,
+          decision: workIntakeDecision,
+        }, { confirmed: true });
+      }
+    } catch (err) {
+      const code = [
+        'CONFIRMATION_NOT_FOUND',
+        'CONFIRMATION_ALREADY_RESOLVED',
+        'FORBIDDEN',
+      ].includes(err.code) ? err.code : 'INVALID_ARGS';
+      emitError(json, code, `invalid WorkIntake confirmation: ${err.message}`);
     }
   }
 
@@ -365,6 +449,16 @@ async function main() {
   if (!content) {
     if (!json) printUsage();
     emitError(json, 'INVALID_ARGS', '--content is required');
+  }
+
+  if (workIntakeEnvelope && channel !== workIntakeEnvelope.source.channel) {
+    emitError(json, 'INVALID_ARGS', 'WorkIntake source.channel must match --channel');
+  }
+  if (workIntakeEnvelope && noReply) {
+    emitError(json, 'INVALID_ARGS', 'WorkIntake requires a reply-capable channel');
+  }
+  if (workIntakeEnvelope && !endpoint) {
+    emitError(json, 'INVALID_ARGS', 'WorkIntake requires --endpoint');
   }
 
   if (!Number.isInteger(priority) || priority < 1 || priority > 3) {
@@ -392,15 +486,96 @@ async function main() {
   if (assistantRequestId !== null && (noReply || !endpoint)) {
     emitError(json, 'INVALID_ARGS', 'assistant response streams require a reply endpoint');
   }
-  if (assistantRequestId !== null && taskEnvelope !== null) {
-    emitError(json, 'INVALID_ARGS', 'assistant response streams and task intake cannot share one message');
+  if (
+    assistantRequestId !== null
+    && (taskEnvelope !== null || workIntakeConfirmation !== null || workIntakeDecision?.decision === 'confirm')
+  ) {
+    emitError(json, 'INVALID_ARGS', 'assistant response streams are only valid for ordinary chat messages');
   }
 
   const replyEndpoint = noReply ? null : endpoint;
+  if (
+    workIntakeConfirmation
+    && !workIntakeConfirmation.created
+    && workIntakeConfirmation.action !== 'create_task'
+  ) {
+    emitSuccess(
+      json,
+      workIntakeConfirmation.conversation.id,
+      'confirmation_replayed',
+      {
+        workIntakeConfirmation: {
+          action: workIntakeConfirmation.action,
+          replayed: true,
+        },
+      },
+    );
+    close();
+    return;
+  }
+  if (workIntakeConfirmation?.action === 'edit') {
+    emitSuccess(
+      json,
+      workIntakeConfirmation.conversation.id,
+      'confirmation_resolved',
+      { workIntakeConfirmation: { action: 'edit', replayed: false } },
+    );
+    close();
+    return;
+  }
+  if (!workIntakeConfirmation && workIntakeDecision?.decision === 'confirm') {
+    try {
+      const confirmation = recordWorkIntakeConfirmation({
+        conversation: {
+          channel,
+          endpointId: replyEndpoint,
+          content,
+          priority,
+          requireIdle,
+        },
+        envelope: workIntakeEnvelope,
+        decision: workIntakeDecision,
+      });
+      emitSuccess(
+        json,
+        confirmation.conversation.id,
+        confirmation.created ? 'confirmation_required' : 'confirmation_replayed',
+        {
+          workIntake: {
+            ...confirmation.decision,
+            replayed: !confirmation.created,
+          },
+        },
+      );
+      close();
+      return;
+    } catch (err) {
+      emitError(
+        json,
+        err.code === 'IDEMPOTENCY_CONFLICT' ? err.code : 'INTERNAL_ERROR',
+        `WorkIntake confirmation persistence failed: ${err.message}`,
+      );
+    }
+  }
+
   let dbContent = content;
   let route;
   let taskIntake = null;
   let taskRecord = null;
+  const workIntakeSuccessDetails = (replayed) => {
+    if (workIntakeConfirmation) {
+      return {
+        workIntakeConfirmation: {
+          action: workIntakeConfirmation.action,
+          replayed,
+        },
+      };
+    }
+    return workIntakeDecision
+      ? { workIntake: { ...workIntakeDecision, replayed } }
+      : {};
+  };
+  let successDetails = workIntakeSuccessDetails(false);
   let assistantStream = null;
   let assistantResponse = null;
 
@@ -422,7 +597,8 @@ async function main() {
       });
       taskRecord = taskRoute.persisted.conversation;
       if (taskRoute.replayed) {
-        emitSuccess(json, taskRecord.id, taskRoute.replayAction);
+        successDetails = workIntakeSuccessDetails(true);
+        emitSuccess(json, taskRecord.id, taskRoute.replayAction, successDetails);
         close();
         return;
       }
@@ -500,7 +676,7 @@ async function main() {
       dbContent += `\n\n[C4] Status notification suppressed by cooldown while health=${statusNoticeType(route)} reason=${statusNoticeReason(route)}.`;
       try {
         const record = recordInbound(dbContent, 'suppressed');
-        emitSuccess(json, record.id, 'suppressed');
+        emitSuccess(json, record.id, 'suppressed', successDetails);
         return;
       } catch (err) {
         emitError(json, 'INTERNAL_ERROR', `failed to record suppressed unhealthy message: ${err.message}`);
@@ -520,6 +696,7 @@ async function main() {
         retryable: true,
       });
       emitSuccess(json, record.id, 'delivered', {
+        ...successDetails,
         assistantResponse: {
           requestId: failed.request.requestId,
           replayed: assistantResponse.replayed,
@@ -531,7 +708,7 @@ async function main() {
       return;
     }
     if (route.recovered || noReply) {
-      const assistant = assistantResponse
+      const assistantDetails = assistantResponse
         ? {
             assistantResponse: {
               requestId: assistantResponse.request.requestId,
@@ -539,14 +716,17 @@ async function main() {
               events: assistantResponse.events,
             },
           }
-        : null;
-      emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered', assistant);
+        : {};
+      emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered', {
+        ...successDetails,
+        ...assistantDetails,
+      });
       return;
     }
 
     const sendResult = sendUnhealthyMessage(channel, endpoint, route.userMessage);
     if (sendResult.status === 0) {
-      emitSuccess(json, record.id, 'delivered');
+      emitSuccess(json, record.id, 'delivered', successDetails);
       return;
     }
     if (cooldown?.key && Number.isFinite(cooldown.reservedAt)) {

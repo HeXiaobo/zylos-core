@@ -60,6 +60,7 @@ SQLite at `~/zylos/comm-bridge/c4.db`:
 - `checkpoints`: Recovery points with conversation id ranges
 - `control_queue`: System control messages (heartbeat, maintenance) with priority, ack deadlines, and status lifecycle
 - `commitment_intake_queue`: Durable task envelopes linked 1:1 to inbound conversations, consumed idempotently by Commitment Core
+- `work_intake_confirmations`: Durable ambiguous WorkIntake decisions; no Task exists until the human confirms
 
 ## Commitment Intake
 
@@ -68,6 +69,18 @@ Use the canonical channel name `feishu` for Feishu events and idempotency keys.
 Explicit task intents are atomically stored as a conversation plus intake row
 before health routing or any later trigger runs. Plain C4 messages keep their
 existing behavior and do not create intake rows.
+
+Natural-language adapters instead add `--work-intake-envelope-json <json>`.
+C4 invokes the channel-neutral WorkIntake `classify` Interface. `chat_only`
+continues through ordinary C4 dispatch, `create_task` is atomically adapted to
+the same durable Commitment intake above, and `confirm` is recorded with
+`delivery_action=work-intake-confirmation-required` without dispatch or task
+creation. The two envelope flags are mutually exclusive.
+
+Confirmation callbacks use `--work-intake-confirmation-json <json>` with only
+`sourceKey`, `action`, and authenticated `actorId`. C4 loads the persisted
+envelope/decision, records the first choice durably, rejects conflicting later
+choices, and performs any Commitment conversion inside Core.
 
 The `c4-intake-supervisor` PM2 core service consumes the queue in isolated,
 bounded batches. It does not share a loop or failure domain with
