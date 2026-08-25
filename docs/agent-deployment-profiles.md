@@ -30,6 +30,28 @@ The `3ai` Deployment Profile preserves the organization-specific Memory Sync
 governance that previously lived in the Core default. Local agents that do not
 need those rules should leave `profiles.deployment` unset.
 
+Do not replace the whole `profiles` object with a generic `zylos config set`
+command. Before installing a candidate Core, use the candidate's nested,
+atomic writer; it preserves all other `config.json` and `profiles` fields:
+
+```bash
+ZYLOS_DIR="$HOME/zylos" node /path/to/candidate/skills/zylos-memory/scripts/deployment-profile.js \
+  set --agent mylos --deployment 3ai
+```
+
+For the existing 玥然 deployment, the equivalent explicit compatibility
+selection is:
+
+```bash
+ZYLOS_DIR="$HOME/zylos" node /path/to/candidate/skills/zylos-memory/scripts/deployment-profile.js \
+  set --agent yueran --deployment 3ai
+```
+
+Run this preflight against the live `ZYLOS_DIR` before upgrading. The old Core
+ignores these new nested keys, while the new Core reads them on first start.
+Back up the resulting `.zylos/config.json`, verify it still contains all
+unrelated settings, then install/restart the runtime.
+
 ## Managed hosting
 
 COCO or another hosting platform can configure the same immutable Core build
@@ -40,13 +62,33 @@ ZYLOS_AGENT_PROFILE=coco-agent-26
 ZYLOS_DEPLOYMENT_PROFILE=3ai
 ```
 
+When WorkIntake should recognize and assign the same logical Agent, configure
+its explicit identity seam as well (for example in the runtime supervisor or
+the deployment's `.env`):
+
+```bash
+ZYLOS_AGENT_ID=agent:coco-agent-26
+ZYLOS_AGENT_LABEL='员工 26'
+ZYLOS_AGENT_ALIASES='["员工26"]'
+C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID=agent:coco-agent-26
+```
+
 Environment selection takes precedence over `config.json`. Both Claude and
-Codex Memory Sync call the same resolver, so changing runtime does not change
-the selected deployment policy.
+Codex clean environments retain the profile and WorkIntake identity variables
+above, whether supplied by the supervisor or the deployment `.env`. Both
+Memory Sync trigger paths mechanically resolve
+the same governance file and bind its path plus SHA-256 digest into the sync
+request, so changing runtime does not change the selected deployment policy.
+
+`profiles.agent` / `ZYLOS_AGENT_PROFILE` is shared instance metadata, but does
+not by itself define platform identity. WorkIntake's logical Agent id and
+natural-language aliases are explicit runtime configuration; Feishu `open_id`
+resolution and logical-id-to-platform mapping remain Feishu adapter concerns.
 
 ## Failure behavior
 
-Unknown, malformed, or path-like explicit profile ids fail closed. Memory Sync
+Unreadable/malformed config, unknown profiles, path-like ids, and profile files
+that escape the bundled profile root fail closed. Memory Sync
 must report the configuration error and stop instead of silently falling back
 to the generic policy. An Agent Profile by itself never activates a Deployment
 Profile. Missing or blank selection means no profile.

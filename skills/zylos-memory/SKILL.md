@@ -76,7 +76,14 @@ and do not start another sync writer while one is in flight.
 ### Optional Agent/Deployment Profile
 
 Agent identity and deployment policy are separate concerns. Before starting
-the Sync Flow, resolve the optional operator-selected Deployment Profile:
+the Sync Flow, honor the mechanically resolved Deployment Profile directive in
+the control/session-start request. It contains the exact governance path and
+SHA-256 digest selected by Core. Read that exact file, verify its digest, and
+apply it as mandatory additional steps. Do not re-resolve the profile from an
+agent name or channel.
+
+For a manual sync without a Core-generated directive, resolve the optional
+operator-selected Deployment Profile directly:
 
 ```bash
 node ~/zylos/.claude/skills/zylos-memory/scripts/deployment-profile.js

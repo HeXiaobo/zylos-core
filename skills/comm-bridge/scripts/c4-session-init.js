@@ -16,6 +16,7 @@
 import { logHookTiming } from './c4-diagnostic.js';
 import { formatSection } from './session-format.js';
 import { withinBudget } from '../../activity-monitor/scripts/shard-registry.js';
+import { createMemorySyncProfileDirective } from '../../zylos-memory/scripts/deployment-profile.js';
 import { fileURLToPath } from 'node:url';
 
 async function withC4Db(label, action) {
@@ -90,6 +91,9 @@ export async function emitC4Conversations(_payload, budget = null) {
     }
 
     const needsSync = range.count > CHECKPOINT_THRESHOLD;
+    const profileDirective = needsSync
+      ? createMemorySyncProfileDirective()
+      : null;
 
     // Get conversations: all if under threshold, last N if over
     const conversations = needsSync
@@ -108,7 +112,7 @@ export async function emitC4Conversations(_payload, budget = null) {
       if (needsSync) {
         sections.push(formatSection(
           'ACTION REQUIRED',
-          `There are ${range.count} unsummarized conversations (conversation id ${range.begin_id} ~ ${range.end_id}). Please use zylos-memory skill to process them.`,
+          `There are ${range.count} unsummarized conversations (conversation id ${range.begin_id} ~ ${range.end_id}). Please use zylos-memory skill to process them.\n\n${profileDirective}`,
         ));
       }
 
