@@ -21,10 +21,15 @@ import { parseTaskEnvelopeJson } from './c4-task-envelope.js';
 import { persistTaskBeforeRoute } from './c4-task-intake.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
 import {
+  completeWorkIntakeConfirmationEffect,
+  parseWorkIntakeConfirmationEffectJson,
   parseWorkIntakeConfirmationJson,
+  queueConfirmedWorkIntakeChat,
+  recordWorkIntakeDecision,
   recordWorkIntakeConfirmation,
   resolveWorkIntakeConfirmation,
 } from './c4-work-intake-confirmations.js';
+import { createWorkIntakeConfirmationCapability } from '../../work-intake/scripts/confirmation-capability.js';
 import { classify } from '../../work-intake/index.js';
 import { parseInboundEnvelopeJson } from '../../work-intake/scripts/inbound-envelope.js';
 import { toCommitmentEnvelope } from '../../work-intake/scripts/commitment-adapter.js';
@@ -40,7 +45,7 @@ const ROUTER_IPC_TIMEOUT_MS = 30000;
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json> | --work-intake-envelope-json <json> | --work-intake-confirmation-json <json>] [--assistant-request-id <id> --assistant-source-id <id>] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json> | --work-intake-envelope-json <json> | --work-intake-confirmation-json <json> | --work-intake-confirmation-effect-json <json>] [--assistant-request-id <id> --assistant-source-id <id>] [--json] --content "<message>"');
   console.log('');
   console.log('Options:');
   console.log('  --no-reply       Mark as not needing a reply target (use for system messages)');
@@ -53,6 +58,8 @@ function printUsage() {
   console.log('                   Classify a channel-neutral InboundEnvelope before routing');
   console.log('  --work-intake-confirmation-json <json>');
   console.log('                   Resolve one persisted WorkIntake confirmation choice');
+  console.log('  --work-intake-confirmation-effect-json <json>');
+  console.log('                   Acknowledge durable delivery of an external confirmation effect');
   console.log('  --assistant-request-id <id> --assistant-source-id <id>');
   console.log('                   Open a durable response stream for an ordinary chat message');
   console.log('  --json           Output structured JSON');
@@ -75,6 +82,7 @@ function parseArgs(args) {
     taskEnvelopeJson: null,
     workIntakeEnvelopeJson: null,
     workIntakeConfirmationJson: null,
+    workIntakeConfirmationEffectJson: null,
     assistantRequestId: null,
     assistantSourceId: null,
   };
@@ -111,6 +119,9 @@ function parseArgs(args) {
         break;
       case '--work-intake-confirmation-json':
         result.workIntakeConfirmationJson = args[++i];
+        break;
+      case '--work-intake-confirmation-effect-json':
+        result.workIntakeConfirmationEffectJson = args[++i];
         break;
       case '--assistant-request-id':
         result.assistantRequestId = args[++i];
@@ -361,6 +372,7 @@ async function main() {
     taskEnvelopeJson,
     workIntakeEnvelopeJson,
     workIntakeConfirmationJson,
+    workIntakeConfirmationEffectJson,
     assistantRequestId,
     assistantSourceId,
   } = parsed;
@@ -370,11 +382,64 @@ async function main() {
   let taskEnvelope = null;
   let workIntakeEnvelope = null;
   let workIntakeDecision = null;
+  let workIntakeDecisionReplayed = false;
   let workIntakeConfirmation = null;
 
-  if ([taskEnvelopeJson, workIntakeEnvelopeJson, workIntakeConfirmationJson]
+  if ([
+    taskEnvelopeJson,
+    workIntakeEnvelopeJson,
+    workIntakeConfirmationJson,
+    workIntakeConfirmationEffectJson,
+  ]
     .filter((value) => value !== null).length > 1) {
     emitError(json, 'INVALID_ARGS', 'task and WorkIntake protocols are mutually exclusive');
+  }
+
+  if (workIntakeConfirmationEffectJson !== null) {
+    try {
+      const request = parseWorkIntakeConfirmationEffectJson(workIntakeConfirmationEffectJson);
+      const capabilitySecret = process.env.C4_WORK_INTAKE_CAPABILITY_SECRET;
+      if (!capabilitySecret) {
+        const error = new Error('C4_WORK_INTAKE_CAPABILITY_SECRET is required');
+        error.code = 'INVALID_CONFIRMATION_CAPABILITY';
+        throw error;
+      }
+      createWorkIntakeConfirmationCapability({ secret: capabilitySecret }).verify({
+        token: request.capability,
+        sourceKey: request.sourceKey,
+        action: request.action,
+        actorId: request.actorId,
+      });
+      const sourceSeparator = request.sourceKey.indexOf(':');
+      const sourceChannel = sourceSeparator > 0
+        ? request.sourceKey.slice(0, sourceSeparator)
+        : null;
+      if (!sourceChannel || channel !== sourceChannel) {
+        emitError(json, 'INVALID_ARGS', 'WorkIntake confirmation effect source.channel must match --channel');
+      }
+      const effect = completeWorkIntakeConfirmationEffect({
+        sourceKey: request.sourceKey,
+        action: request.action,
+        actorId: request.actorId,
+      });
+      emitSuccess(json, effect.conversationId, 'confirmation_effect_applied', {
+        workIntakeConfirmation: {
+          action: request.action,
+          effectStatus: effect.effectStatus,
+          effectKey: request.effectKey,
+          replayed: effect.replayed,
+        },
+      });
+      close();
+      return;
+    } catch (err) {
+      const code = [
+        'CONFIRMATION_NOT_FOUND',
+        'CONFIRMATION_ALREADY_RESOLVED',
+        'INVALID_CONFIRMATION_CAPABILITY',
+      ].includes(err.code) ? err.code : 'INVALID_ARGS';
+      emitError(json, code, `invalid WorkIntake confirmation effect: ${err.message}`);
+    }
   }
 
   if (taskEnvelopeJson !== null) {
@@ -388,7 +453,12 @@ async function main() {
   if (workIntakeEnvelopeJson !== null) {
     try {
       workIntakeEnvelope = parseInboundEnvelopeJson(workIntakeEnvelopeJson);
-      workIntakeDecision = classify(workIntakeEnvelope);
+      const decisionReceipt = recordWorkIntakeDecision({
+        envelope: workIntakeEnvelope,
+        classify,
+      });
+      workIntakeDecision = decisionReceipt.decision;
+      workIntakeDecisionReplayed = decisionReceipt.replayed;
       if (workIntakeDecision.decision === 'create_task') {
         taskEnvelope = toCommitmentEnvelope({
           envelope: workIntakeEnvelope,
@@ -403,6 +473,18 @@ async function main() {
   if (workIntakeConfirmationJson !== null) {
     try {
       const request = parseWorkIntakeConfirmationJson(workIntakeConfirmationJson);
+      const capabilitySecret = process.env.C4_WORK_INTAKE_CAPABILITY_SECRET;
+      if (!capabilitySecret) {
+        const error = new Error('C4_WORK_INTAKE_CAPABILITY_SECRET is required');
+        error.code = 'INVALID_CONFIRMATION_CAPABILITY';
+        throw error;
+      }
+      createWorkIntakeConfirmationCapability({ secret: capabilitySecret }).verify({
+        token: request.capability,
+        sourceKey: request.sourceKey,
+        action: request.action,
+        actorId: request.actorId,
+      });
       const sourceSeparator = request.sourceKey.indexOf(':');
       const sourceChannel = sourceSeparator > 0
         ? request.sourceKey.slice(0, sourceSeparator)
@@ -410,7 +492,11 @@ async function main() {
       if (!sourceChannel || channel !== sourceChannel) {
         emitError(json, 'INVALID_ARGS', 'WorkIntake confirmation source.channel must match --channel');
       }
-      workIntakeConfirmation = resolveWorkIntakeConfirmation(request);
+      workIntakeConfirmation = resolveWorkIntakeConfirmation({
+        sourceKey: request.sourceKey,
+        action: request.action,
+        actorId: request.actorId,
+      });
       workIntakeEnvelope = workIntakeConfirmation.envelope;
       workIntakeDecision = workIntakeConfirmation.decision;
       if (channel !== workIntakeEnvelope.source.channel) {
@@ -432,6 +518,7 @@ async function main() {
         'CONFIRMATION_NOT_FOUND',
         'CONFIRMATION_ALREADY_RESOLVED',
         'FORBIDDEN',
+        'INVALID_CONFIRMATION_CAPABILITY',
       ].includes(err.code) ? err.code : 'INVALID_ARGS';
       emitError(json, code, `invalid WorkIntake confirmation: ${err.message}`);
     }
@@ -488,16 +575,22 @@ async function main() {
   }
   if (
     assistantRequestId !== null
-    && (taskEnvelope !== null || workIntakeConfirmation !== null || workIntakeDecision?.decision === 'confirm')
+    && (
+      workIntakeConfirmation !== null
+      || (taskEnvelope !== null && workIntakeEnvelope === null)
+    )
   ) {
-    emitError(json, 'INVALID_ARGS', 'assistant response streams are only valid for ordinary chat messages');
+    emitError(json, 'INVALID_ARGS', 'assistant response streams cannot accompany explicit task protocols');
   }
+  const assistantStreamEnabled = assistantRequestId !== null
+    && (!workIntakeDecision || workIntakeDecision.decision === 'chat_only');
 
   const replyEndpoint = noReply ? null : endpoint;
   if (
     workIntakeConfirmation
     && !workIntakeConfirmation.created
     && workIntakeConfirmation.action !== 'create_task'
+    && workIntakeConfirmation.effectStatus === 'applied'
   ) {
     emitSuccess(
       json,
@@ -507,6 +600,7 @@ async function main() {
         workIntakeConfirmation: {
           action: workIntakeConfirmation.action,
           replayed: true,
+          effectStatus: 'applied',
         },
       },
     );
@@ -514,11 +608,20 @@ async function main() {
     return;
   }
   if (workIntakeConfirmation?.action === 'edit') {
+    const effectKey = `${workIntakeConfirmation.sourceKey}:edit-guidance`;
     emitSuccess(
       json,
       workIntakeConfirmation.conversation.id,
       'confirmation_resolved',
-      { workIntakeConfirmation: { action: 'edit', replayed: false } },
+      {
+        workIntakeConfirmation: {
+          action: 'edit',
+          replayed: false,
+          decisionReplayed: !workIntakeConfirmation.created,
+          effectStatus: 'pending',
+          effectKey,
+        },
+      },
     );
     close();
     return;
@@ -568,6 +671,7 @@ async function main() {
         workIntakeConfirmation: {
           action: workIntakeConfirmation.action,
           replayed,
+          effectStatus: workIntakeConfirmation.effectStatus,
         },
       };
     }
@@ -575,7 +679,7 @@ async function main() {
       ? { workIntake: { ...workIntakeDecision, replayed } }
       : {};
   };
-  let successDetails = workIntakeSuccessDetails(false);
+  let successDetails = workIntakeSuccessDetails(workIntakeDecisionReplayed);
   let assistantStream = null;
   let assistantResponse = null;
 
@@ -596,6 +700,15 @@ async function main() {
         route: () => queryRoute(channel, endpoint, noReply),
       });
       taskRecord = taskRoute.persisted.conversation;
+      if (workIntakeConfirmation?.action === 'create_task') {
+        const effect = completeWorkIntakeConfirmationEffect({
+          sourceKey: workIntakeConfirmation.sourceKey,
+          action: 'create_task',
+          actorId: workIntakeConfirmation.actorId,
+        });
+        workIntakeConfirmation.effectStatus = effect.effectStatus;
+        successDetails = workIntakeSuccessDetails(taskRoute.replayed);
+      }
       if (taskRoute.replayed) {
         successDetails = workIntakeSuccessDetails(true);
         emitSuccess(json, taskRecord.id, taskRoute.replayAction, successDetails);
@@ -627,7 +740,28 @@ async function main() {
       });
       return taskRecord;
     }
-    if (assistantRequestId !== null) {
+    if (workIntakeConfirmation?.action === 'chat_only') {
+      const effect = queueConfirmedWorkIntakeChat({
+        sourceKey: workIntakeConfirmation.sourceKey,
+        actorId: workIntakeConfirmation.actorId,
+        status: dbStatus,
+      });
+      workIntakeConfirmation.effectStatus = effect.effectStatus;
+      successDetails = workIntakeSuccessDetails(!workIntakeConfirmation.created);
+      return {
+        id: effect.conversation.id,
+        direction: 'in',
+        channel,
+        endpoint_id: replyEndpoint,
+        content: storedContent,
+        status: effect.conversation.status,
+        delivery_action: effect.conversation.deliveryAction,
+        priority,
+        require_idle: requireIdle ? 1 : 0,
+        retry_count: 0,
+      };
+    }
+    if (assistantStreamEnabled) {
       assistantStream ??= openAssistantResponseStream();
       assistantResponse = assistantStream.execute({
         type: 'AcceptAssistantRequest',
@@ -666,7 +800,7 @@ async function main() {
     );
   };
 
-  if (!route.recovered && !noReply && assistantRequestId === null) {
+  if (!route.recovered && !noReply && !assistantStreamEnabled) {
     try {
       cooldown = reserveStatusNoticeCooldownForRoute(channel, endpoint, route);
     } catch (err) {

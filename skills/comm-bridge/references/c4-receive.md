@@ -23,7 +23,8 @@ Messages are written to DB with `status='pending'`. The c4-dispatcher daemon han
 | `--block-queue-until-idle` | Wait for sustained idle, then block later dispatch until execution settles |
 | `--task-envelope-json <json>` | Atomically persist a normalized task intent for Commitment Core |
 | `--work-intake-envelope-json <json>` | Classify a channel-neutral natural-language `InboundEnvelope` |
-| `--work-intake-confirmation-json <json>` | Resolve one persisted confirmation choice through Core |
+| `--work-intake-confirmation-json <json>` | Resolve one persisted, capability-authorized confirmation choice through Core |
+| `--work-intake-confirmation-effect-json <json>` | Acknowledge durable delivery of an external edit effect |
 | `--json` | Output structured JSON instead of plain text |
 
 ## Priority Levels
@@ -94,7 +95,8 @@ The intake worker and retry lifecycle are documented in
 
 ## WorkIntake Envelope
 
-`--work-intake-envelope-json`, `--work-intake-confirmation-json`, and
+`--work-intake-envelope-json`, `--work-intake-confirmation-json`,
+`--work-intake-confirmation-effect-json`, and
 `--task-envelope-json` are mutually exclusive. The WorkIntake envelope carries a stable channel/message identity,
 human sender, conversation type, plain text, and positive `intentRevision`.
 Its result is returned under `workIntake` in JSON output:
@@ -104,13 +106,25 @@ Its result is returned under `workIntake` in JSON output:
   `channel + message_id + intent_revision` as the permanent key.
 - `confirm`: store the conversation and decision as delivered, do not dispatch,
   and do not create a task. A platform callback later submits only its stable
-  `sourceKey`, chosen `action`, and authenticated `actorId` through
+  `sourceKey`, chosen `action`, authenticated `actorId`, and a short-lived
+  `capability` through
   `--work-intake-confirmation-json`; C4 reloads the original draft and performs
   the Core conversion.
 
-Exact replay of a confirmation returns `confirmation_replayed` and the original
-conversation ID. The first human choice is durable and mutually exclusive;
-exact retries are idempotent, while a different later choice fails closed.
+The capability is HMAC-SHA256 signed with `C4_WORK_INTAKE_CAPABILITY_SECRET`
+(minimum 32 bytes) and binds the source key, chosen action, actor ID, expiry,
+and adapter-provided nonce. The Channel Adapter issues it only after verifying
+the platform callback; Core remains channel-neutral and verifies no Feishu SDK
+types.
+
+Exact replay of an applied confirmation returns `confirmation_replayed` and the
+original conversation ID. The first human choice is durable and mutually
+exclusive; exact retries are idempotent, while a different later choice fails closed.
+If an `edit` effect is still pending, replay returns `confirmation_resolved`
+again with the same `effectKey`. The adapter uses that key for idempotent
+delivery and, after success, submits exact fields `sourceKey`, `action: edit`,
+`actorId`, `effectKey`, and a fresh `capability` through
+`--work-intake-confirmation-effect-json`.
 Reusing its source key for different content fails with
 `IDEMPOTENCY_CONFLICT`.
 

@@ -1,9 +1,19 @@
 import { createHash } from 'node:crypto';
 
 import { getDb } from './c4-db.js';
+import { workIntakeSourceKey } from '../../work-intake/scripts/inbound-envelope.js';
 
 const RESOLUTION_ACTIONS = new Set(['create_task', 'chat_only', 'edit']);
 const RESOLUTION_FIELDS = new Set(['sourceKey', 'action', 'actorId']);
+const CONFIRMATION_REQUEST_FIELDS = new Set(['sourceKey', 'action', 'actorId', 'capability']);
+const EFFECT_REQUEST_FIELDS = new Set([
+  'sourceKey',
+  'action',
+  'actorId',
+  'effectKey',
+  'capability',
+]);
+const DECISIONS = new Set(['create_task', 'chat_only', 'confirm']);
 
 function fingerprint(value) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -52,6 +62,14 @@ function normalizeResolution(input) {
 
 function ensureSchema(database) {
   database.exec(`
+    CREATE TABLE IF NOT EXISTS work_intake_decisions (
+      source_key TEXT PRIMARY KEY,
+      request_fingerprint TEXT NOT NULL,
+      envelope_json TEXT NOT NULL,
+      decision_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS work_intake_confirmations (
       source_key TEXT PRIMARY KEY,
       request_fingerprint TEXT NOT NULL,
@@ -61,6 +79,8 @@ function ensureSchema(database) {
       resolved_action TEXT,
       resolved_by TEXT,
       resolved_at INTEGER,
+      effect_status TEXT CHECK (effect_status IN ('pending', 'applied')),
+      effect_applied_at INTEGER,
       created_at INTEGER NOT NULL,
       FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
     )
@@ -77,6 +97,71 @@ function ensureSchema(database) {
   if (!columns.has('resolved_at')) {
     database.exec('ALTER TABLE work_intake_confirmations ADD COLUMN resolved_at INTEGER');
   }
+  if (!columns.has('effect_status')) {
+    database.exec(`
+      ALTER TABLE work_intake_confirmations
+      ADD COLUMN effect_status TEXT CHECK (effect_status IN ('pending', 'applied'))
+    `);
+  }
+  database.exec(`
+    UPDATE work_intake_confirmations
+    SET effect_status = 'pending'
+    WHERE resolved_action IS NOT NULL AND effect_status IS NULL
+  `);
+  if (!columns.has('effect_applied_at')) {
+    database.exec('ALTER TABLE work_intake_confirmations ADD COLUMN effect_applied_at INTEGER');
+  }
+}
+
+function normalizeDecision(decision, envelope, sourceKey) {
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
+    throw new TypeError('WorkIntake classifier must return a decision object');
+  }
+  if (!DECISIONS.has(decision.decision)) {
+    throw new TypeError('WorkIntake classifier returned an unsupported decision');
+  }
+  if (decision.sourceKey !== sourceKey || decision.intentRevision !== envelope.intentRevision) {
+    throw new TypeError('WorkIntake classifier decision identity does not match its envelope');
+  }
+  return JSON.parse(JSON.stringify(decision));
+}
+
+/**
+ * Persist the first classifier result for one immutable inbound intent. Replays
+ * return that receipt without invoking the current classifier implementation,
+ * so a software upgrade cannot reinterpret an already-observed message.
+ */
+export function recordWorkIntakeDecision({ envelope, classify }) {
+  if (typeof classify !== 'function') throw new TypeError('WorkIntake classifier must be a function');
+  const database = getDb();
+  ensureSchema(database);
+  const sourceKey = workIntakeSourceKey(envelope);
+  const requestFingerprint = fingerprint(envelope);
+  const select = database.prepare(`
+    SELECT request_fingerprint, decision_json
+    FROM work_intake_decisions
+    WHERE source_key = ?
+  `);
+  return database.transaction(() => {
+    const existing = select.get(sourceKey);
+    if (existing) {
+      if (existing.request_fingerprint !== requestFingerprint) throw conflict(sourceKey);
+      return { decision: JSON.parse(existing.decision_json), replayed: true };
+    }
+    const decision = normalizeDecision(classify(envelope), envelope, sourceKey);
+    database.prepare(`
+      INSERT INTO work_intake_decisions (
+        source_key, request_fingerprint, envelope_json, decision_json, created_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(
+      sourceKey,
+      requestFingerprint,
+      JSON.stringify(envelope),
+      JSON.stringify(decision),
+      Math.floor(Date.now() / 1000),
+    );
+    return { decision, replayed: false };
+  }).immediate();
 }
 
 export function parseWorkIntakeConfirmationJson(rawJson) {
@@ -84,10 +169,65 @@ export function parseWorkIntakeConfirmationJson(rawJson) {
     throw new TypeError('WorkIntake confirmation JSON must be a non-empty string');
   }
   try {
-    return normalizeResolution(JSON.parse(rawJson));
+    const parsed = JSON.parse(rawJson);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('WorkIntake confirmation request must be an object');
+    }
+    const keys = Object.keys(parsed);
+    if (keys.length !== CONFIRMATION_REQUEST_FIELDS.size
+      || keys.some(key => !CONFIRMATION_REQUEST_FIELDS.has(key))) {
+      throw new TypeError('WorkIntake confirmation request contains unsupported or missing fields');
+    }
+    return {
+      ...normalizeResolution({
+        sourceKey: parsed.sourceKey,
+        action: parsed.action,
+        actorId: parsed.actorId,
+      }),
+      capability: requireText(parsed.capability, 'WorkIntake confirmation capability', 8_192),
+    };
   } catch (error) {
     if (error instanceof SyntaxError) {
       throw new TypeError(`WorkIntake confirmation JSON is invalid: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+export function parseWorkIntakeConfirmationEffectJson(rawJson) {
+  if (typeof rawJson !== 'string' || rawJson === '') {
+    throw new TypeError('WorkIntake confirmation effect JSON must be a non-empty string');
+  }
+  try {
+    const parsed = JSON.parse(rawJson);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new TypeError('WorkIntake confirmation effect request must be an object');
+    }
+    const keys = Object.keys(parsed);
+    if (keys.length !== EFFECT_REQUEST_FIELDS.size
+      || keys.some(key => !EFFECT_REQUEST_FIELDS.has(key))) {
+      throw new TypeError('WorkIntake confirmation effect request contains unsupported or missing fields');
+    }
+    const resolution = normalizeResolution({
+      sourceKey: parsed.sourceKey,
+      action: parsed.action,
+      actorId: parsed.actorId,
+    });
+    if (resolution.action !== 'edit') {
+      throw new TypeError('only externally delivered edit effects may be acknowledged');
+    }
+    const expectedEffectKey = `${resolution.sourceKey}:edit-guidance`;
+    if (parsed.effectKey !== expectedEffectKey) {
+      throw new TypeError('WorkIntake confirmation effectKey does not match its source');
+    }
+    return {
+      ...resolution,
+      effectKey: expectedEffectKey,
+      capability: requireText(parsed.capability, 'WorkIntake confirmation capability', 8_192),
+    };
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new TypeError(`WorkIntake confirmation effect JSON is invalid: ${error.message}`);
     }
     throw error;
   }
@@ -181,6 +321,7 @@ export function resolveWorkIntakeConfirmation(input) {
   const select = database.prepare(`
     SELECT w.source_key, w.conversation_id, w.envelope_json, w.decision_json,
            w.resolved_action, w.resolved_by, w.resolved_at,
+           w.effect_status, w.effect_applied_at,
            c.channel, c.endpoint_id, c.content, c.priority, c.require_idle
     FROM work_intake_confirmations w
     JOIN conversations c ON c.id = w.conversation_id
@@ -206,7 +347,10 @@ export function resolveWorkIntakeConfirmation(input) {
       }
       return {
         created: false,
+        sourceKey: resolution.sourceKey,
+        actorId: resolution.actorId,
         action: row.resolved_action,
+        effectStatus: row.effect_status || 'pending',
         envelope,
         decision,
         conversation: {
@@ -222,7 +366,8 @@ export function resolveWorkIntakeConfirmation(input) {
 
     database.prepare(`
       UPDATE work_intake_confirmations
-      SET resolved_action = ?, resolved_by = ?, resolved_at = ?
+      SET resolved_action = ?, resolved_by = ?, resolved_at = ?,
+          effect_status = 'pending', effect_applied_at = NULL
       WHERE source_key = ? AND resolved_action IS NULL
     `).run(
       resolution.action,
@@ -232,7 +377,10 @@ export function resolveWorkIntakeConfirmation(input) {
     );
     return {
       created: true,
+      sourceKey: resolution.sourceKey,
+      actorId: resolution.actorId,
       action: resolution.action,
+      effectStatus: 'pending',
       envelope,
       decision,
       conversation: {
@@ -243,6 +391,109 @@ export function resolveWorkIntakeConfirmation(input) {
         priority: row.priority,
         requireIdle: Boolean(row.require_idle),
       },
+    };
+  }).immediate();
+}
+
+/**
+ * Promote the original held confirmation conversation onto the ordinary chat
+ * queue in the same transaction that marks the chosen effect applied. Replays
+ * observe the same conversation instead of inserting a duplicate.
+ */
+export function queueConfirmedWorkIntakeChat({ sourceKey, actorId, status }) {
+  const safeSourceKey = requireText(sourceKey, 'WorkIntake confirmation sourceKey');
+  const safeActorId = requireText(actorId, 'WorkIntake confirmation actorId', 256);
+  if (status !== 'pending' && status !== 'delivered') {
+    throw new TypeError('confirmed WorkIntake chat status is unsupported');
+  }
+  const database = getDb();
+  ensureSchema(database);
+  const select = database.prepare(`
+    SELECT w.conversation_id, w.resolved_action, w.resolved_by, w.effect_status,
+           c.status, c.delivery_action
+    FROM work_intake_confirmations w
+    JOIN conversations c ON c.id = w.conversation_id
+    WHERE w.source_key = ?
+  `);
+  return database.transaction(() => {
+    const row = select.get(safeSourceKey);
+    if (!row) throw codedError('CONFIRMATION_NOT_FOUND', 'WorkIntake confirmation does not exist');
+    if (row.resolved_action !== 'chat_only' || row.resolved_by !== safeActorId) {
+      throw codedError('CONFIRMATION_ALREADY_RESOLVED', 'WorkIntake confirmation is not an authorized chat-only choice');
+    }
+    if (row.effect_status === 'applied') {
+      return {
+        replayed: true,
+        effectStatus: 'applied',
+        conversation: {
+          id: row.conversation_id,
+          status: row.status,
+          deliveryAction: row.delivery_action,
+        },
+      };
+    }
+    const deliveryAction = 'work-intake-chat-only';
+    database.prepare(`
+      UPDATE conversations
+      SET status = ?, delivery_action = ?, retry_count = 0
+      WHERE id = ?
+    `).run(status, deliveryAction, row.conversation_id);
+    database.prepare(`
+      UPDATE work_intake_confirmations
+      SET effect_status = 'applied', effect_applied_at = ?
+      WHERE source_key = ? AND effect_status = 'pending'
+    `).run(Math.floor(Date.now() / 1000), safeSourceKey);
+    return {
+      replayed: false,
+      effectStatus: 'applied',
+      conversation: {
+        id: row.conversation_id,
+        status,
+        deliveryAction,
+      },
+    };
+  }).immediate();
+}
+
+/**
+ * Acknowledge a durable non-chat confirmation effect. Task creation calls this
+ * only after its idempotent intake row exists; channel adapters may use the
+ * same receipt for externally delivered edit guidance.
+ */
+export function completeWorkIntakeConfirmationEffect({ sourceKey, action, actorId }) {
+  const safeSourceKey = requireText(sourceKey, 'WorkIntake confirmation sourceKey');
+  const safeActorId = requireText(actorId, 'WorkIntake confirmation actorId', 256);
+  if (action !== 'create_task' && action !== 'edit') {
+    throw new TypeError('confirmation effect completion action is unsupported');
+  }
+  const database = getDb();
+  ensureSchema(database);
+  return database.transaction(() => {
+    const row = database.prepare(`
+      SELECT conversation_id, resolved_action, resolved_by, effect_status
+      FROM work_intake_confirmations
+      WHERE source_key = ?
+    `).get(safeSourceKey);
+    if (!row) throw codedError('CONFIRMATION_NOT_FOUND', 'WorkIntake confirmation does not exist');
+    if (row.resolved_action !== action || row.resolved_by !== safeActorId) {
+      throw codedError('CONFIRMATION_ALREADY_RESOLVED', 'WorkIntake confirmation effect does not match its durable choice');
+    }
+    if (row.effect_status === 'applied') {
+      return {
+        replayed: true,
+        effectStatus: 'applied',
+        conversationId: row.conversation_id,
+      };
+    }
+    database.prepare(`
+      UPDATE work_intake_confirmations
+      SET effect_status = 'applied', effect_applied_at = ?
+      WHERE source_key = ? AND effect_status = 'pending'
+    `).run(Math.floor(Date.now() / 1000), safeSourceKey);
+    return {
+      replayed: false,
+      effectStatus: 'applied',
+      conversationId: row.conversation_id,
     };
   }).immediate();
 }

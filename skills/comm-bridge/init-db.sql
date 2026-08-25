@@ -115,6 +115,15 @@ CREATE TABLE IF NOT EXISTS assistant_requests (
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
 );
 
+-- First-result receipts keep classifier upgrades from reinterpreting a replay.
+CREATE TABLE IF NOT EXISTS work_intake_decisions (
+    source_key TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 -- Ambiguous WorkIntake decisions awaiting an authenticated human choice.
 -- These rows are not Commitment tasks and are never consumed by the task worker.
 CREATE TABLE IF NOT EXISTS work_intake_confirmations (
@@ -126,6 +135,8 @@ CREATE TABLE IF NOT EXISTS work_intake_confirmations (
     resolved_action TEXT,
     resolved_by TEXT,
     resolved_at INTEGER,
+    effect_status TEXT CHECK (effect_status IN ('pending', 'applied')),
+    effect_applied_at INTEGER,
     created_at INTEGER NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
 );

@@ -60,6 +60,7 @@ SQLite at `~/zylos/comm-bridge/c4.db`:
 - `checkpoints`: Recovery points with conversation id ranges
 - `control_queue`: System control messages (heartbeat, maintenance) with priority, ack deadlines, and status lifecycle
 - `commitment_intake_queue`: Durable task envelopes linked 1:1 to inbound conversations, consumed idempotently by Commitment Core
+- `work_intake_decisions`: First classifier result for each immutable source key, retained across classifier upgrades
 - `work_intake_confirmations`: Durable ambiguous WorkIntake decisions; no Task exists until the human confirms
 
 ## Commitment Intake
@@ -77,10 +78,21 @@ the same durable Commitment intake above, and `confirm` is recorded with
 `delivery_action=work-intake-confirmation-required` without dispatch or task
 creation. The two envelope flags are mutually exclusive.
 
-Confirmation callbacks use `--work-intake-confirmation-json <json>` with only
-`sourceKey`, `action`, and authenticated `actorId`. C4 loads the persisted
-envelope/decision, records the first choice durably, rejects conflicting later
-choices, and performs any Commitment conversion inside Core.
+Confirmation callbacks use `--work-intake-confirmation-json <json>` with exact
+fields `sourceKey`, `action`, authenticated `actorId`, and `capability`. The
+capability is a short-lived HMAC attestation issued by the trusted Channel
+Adapter after platform callback verification. Both processes must receive the
+same `C4_WORK_INTAKE_CAPABILITY_SECRET` (at least 32 bytes). C4 binds the token
+to the source, action, and actor without importing a platform SDK, then loads
+the persisted envelope/decision, records the first choice durably, rejects
+conflicting later choices, and performs any Commitment conversion inside Core.
+
+Confirmation effects have a durable `pending`/`applied` receipt. Chat promotion
+reuses the original conversation and task promotion acknowledges only after the
+Commitment intake exists. An `edit` response includes a stable `effectKey` and
+remains redrivable until the adapter durably sends its guidance, then calls
+`--work-intake-confirmation-effect-json` with exact fields `sourceKey`, `action`,
+`actorId`, `effectKey`, and a fresh `capability`.
 
 The `c4-intake-supervisor` PM2 core service consumes the queue in isolated,
 bounded batches. It does not share a loop or failure domain with
