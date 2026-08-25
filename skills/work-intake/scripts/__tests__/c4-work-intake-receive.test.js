@@ -41,7 +41,7 @@ function inbound(text, messageId) {
   };
 }
 
-function receive(zylosDir, envelope, { assistantRequest = null } = {}) {
+function receive(zylosDir, envelope, { assistantRequest = null, env = {} } = {}) {
   const args = [
     C4_RECEIVE,
     '--channel', 'feishu',
@@ -58,7 +58,7 @@ function receive(zylosDir, envelope, { assistantRequest = null } = {}) {
   args.push('--content', `[Feishu DM] Sender said: ${envelope.text}`);
   const result = spawnSync(process.execPath, args, {
     encoding: 'utf8',
-    env: { ...process.env, ZYLOS_DIR: zylosDir },
+    env: { ...process.env, ZYLOS_DIR: zylosDir, ...env },
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const jsonLine = result.stdout.trim().split('\n').findLast((line) => line.startsWith('{'));
@@ -165,6 +165,26 @@ test('a clear assignment atomically queues one durable Commitment intake', () =>
       assert.equal(taskEnvelope.task.ownerId, 'ou_sender');
       assert.equal(taskEnvelope.task.acceptorId, 'ou_sender');
       assert.equal(taskEnvelope.task.assigneeId, 'agent:yueran');
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test('the configured deployment assignee is persisted for an otherwise unassigned task', () => {
+  withZylosDir((zylosDir) => {
+    const envelope = inbound('明天 18:00 前完成客户复盘', 'om_default_assignee');
+    const response = receive(zylosDir, envelope, {
+      env: { C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: 'agent:yueran' },
+    });
+
+    assert.equal(response.workIntake.decision, 'create_task');
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    try {
+      const queued = database.prepare('SELECT payload_json FROM commitment_intake_queue').get();
+      const task = JSON.parse(queued.payload_json).task;
+      assert.equal(task.assigneeId, 'agent:yueran');
+      assert.equal(task.dueAt, '2026-08-26T10:00:00.000Z');
     } finally {
       database.close();
     }

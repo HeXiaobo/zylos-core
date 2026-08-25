@@ -44,6 +44,14 @@ const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const ROUTER_IPC_TIMEOUT_MS = 30000;
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
+function classifyWorkIntake(envelope) {
+  return classify(envelope, { defaultAssigneeId: workIntakeDefaultAssigneeId() });
+}
+
+function workIntakeDefaultAssigneeId() {
+  return process.env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID?.trim() || null;
+}
+
 function printUsage() {
   console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json> | --work-intake-envelope-json <json> | --work-intake-confirmation-json <json> | --work-intake-confirmation-effect-json <json>] [--assistant-request-id <id> --assistant-source-id <id>] [--json] --content "<message>"');
   console.log('');
@@ -455,7 +463,7 @@ async function main() {
       workIntakeEnvelope = parseInboundEnvelopeJson(workIntakeEnvelopeJson);
       const decisionReceipt = recordWorkIntakeDecision({
         envelope: workIntakeEnvelope,
-        classify,
+        classify: classifyWorkIntake,
       });
       workIntakeDecision = decisionReceipt.decision;
       workIntakeDecisionReplayed = decisionReceipt.replayed;
@@ -463,7 +471,7 @@ async function main() {
         taskEnvelope = toCommitmentEnvelope({
           envelope: workIntakeEnvelope,
           decision: workIntakeDecision,
-        });
+        }, { defaultAssigneeId: workIntakeDefaultAssigneeId() });
       }
     } catch (err) {
       emitError(json, 'INVALID_ARGS', `invalid --work-intake-envelope-json: ${err.message}`);
@@ -511,7 +519,10 @@ async function main() {
         taskEnvelope = toCommitmentEnvelope({
           envelope: workIntakeEnvelope,
           decision: workIntakeDecision,
-        }, { confirmed: true });
+        }, {
+          confirmed: true,
+          defaultAssigneeId: workIntakeDefaultAssigneeId(),
+        });
       }
     } catch (err) {
       const code = [

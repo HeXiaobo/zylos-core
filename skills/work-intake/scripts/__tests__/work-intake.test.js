@@ -98,6 +98,56 @@ test('information questions stay chat-only even when they mention high-risk acti
   }
 });
 
+test('recognizes an explicit task behind a chat label and polite wrapper', () => {
+  const decision = classify(inbound(
+    '【上线验收·自然语言任务】请创建任务：明天 18:00 前完成“Zylos 自然语言任务创建验收”，执行人是玥然，发布人和验收人是我。创建后告诉我任务链接。',
+  ));
+
+  assert.equal(decision.decision, 'create_task');
+  assert.equal(decision.reasonCode, 'EXPLICIT_TASK_PREFIX');
+  assert.equal(decision.taskDraft.title, 'Zylos 自然语言任务创建验收');
+  assert.equal(decision.taskDraft.assigneeId, 'agent:yueran');
+  assert.equal(decision.taskDraft.dueText, '明天18:00前');
+});
+
+test('keeps wrapped risky tasks behind confirmation and task questions in chat', () => {
+  assert.equal(
+    classify(inbound('【CRM】请创建任务：明天 18:00 前完成客户复盘')).decision,
+    'create_task',
+  );
+  assert.equal(
+    classify(inbound('【财务】请创建任务：明天付款给供应商')).decision,
+    'confirm',
+  );
+  assert.equal(classify(inbound('玥然，怎么创建任务？')).decision, 'chat_only');
+});
+
+test('does not mistake ordinary response instructions for a human assignment', () => {
+  assert.equal(
+    classify(inbound('【上线验收·流式复测】玥然，请先显示处理状态，再只回复：流式复测通过。')).decision,
+    'chat_only',
+  );
+});
+
+test('applies a configured default assignee only when no person was assigned', () => {
+  const defaulted = classify(
+    inbound('明天 18:00 前完成客户复盘'),
+    { defaultAssigneeId: 'agent:yueran' },
+  );
+  assert.equal(defaulted.decision, 'create_task');
+  assert.equal(defaulted.taskDraft.assigneeId, 'agent:yueran');
+
+  const explicitHuman = classify(inbound('让小王负责整理销售报告', {
+    people: [{ name: '小王', id: 'ou_wang_1', candidateIds: ['ou_wang_1'], kind: 'human' }],
+  }), { defaultAssigneeId: 'agent:yueran' });
+  assert.equal(explicitHuman.taskDraft.assigneeId, 'ou_wang_1');
+
+  assert.equal(
+    classify(inbound('怎么创建任务？'), { defaultAssigneeId: 'agent:yueran' }).decision,
+    'chat_only',
+  );
+});
+
 test('returns a structured TaskDraft with human owner/acceptor and explicit yueran assignment', () => {
   const decision = classify(inbound('请玥然在周五前整理 A 客户的跟进记录'));
 

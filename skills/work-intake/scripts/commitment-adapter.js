@@ -1,4 +1,6 @@
 import { validateInboundEnvelope } from './inbound-envelope.js';
+import { resolveDueAt } from './deadline.js';
+import { hasExplicitYueranAssignment } from './work-intake.js';
 
 const DECISION_FIELDS = new Set([
   'decision',
@@ -48,7 +50,10 @@ function optionalText(value, field) {
  * writes Commitment Core. The adapter accepts either an automatic create or a
  * user-confirmed draft and produces the existing durable SourceEnvelope.
  */
-export function toCommitmentEnvelope(input, { confirmed = false } = {}) {
+export function toCommitmentEnvelope(input, {
+  confirmed = false,
+  defaultAssigneeId = null,
+} = {}) {
   const request = requireRecord(input, 'WorkIntake commitment request');
   const envelope = validateInboundEnvelope(request.envelope);
   const decision = requireRecord(request.decision, 'WorkIntake decision');
@@ -71,10 +76,16 @@ export function toCommitmentEnvelope(input, { confirmed = false } = {}) {
   }
   if (
     task.assigneeId === 'agent:yueran'
-    && !/(?:交给|让|请|麻烦|安排)\s*@?玥然|@?玥然\s*(?:来|负责|处理|完成|跟进|整理|帮)/u.test(envelope.text)
+    && !hasExplicitYueranAssignment(envelope.text)
+    && defaultAssigneeId !== 'agent:yueran'
   ) {
-    throw new TypeError('agent:yueran requires an explicit assignment to 玥然');
+    throw new TypeError('agent:yueran requires an explicit assignment or trusted default');
   }
+  const dueAt = resolveDueAt({
+    dueText: task.dueText,
+    receivedAt: envelope.receivedAt,
+    timeZone: envelope.timeZone,
+  });
 
   return {
     idempotencyKey: sourceKey,
@@ -89,6 +100,7 @@ export function toCommitmentEnvelope(input, { confirmed = false } = {}) {
       ownerId: requireText(task.ownerId, 'WorkIntake TaskDraft.ownerId'),
       acceptorId: requireText(task.acceptorId, 'WorkIntake TaskDraft.acceptorId'),
       assigneeId: optionalText(task.assigneeId, 'WorkIntake TaskDraft.assigneeId'),
+      ...(dueAt === null ? {} : { dueAt }),
     },
   };
 }
