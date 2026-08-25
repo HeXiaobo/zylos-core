@@ -288,4 +288,48 @@ describe('hook-activity', () => {
     assert.equal(serialized.includes('WebSearch'), false);
     stream.close();
   });
+
+  it('binds the pending run on the first tool event when prompt binding was missed', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.tool-bind-fallback',
+      sourceId: 'om_tool_bind_fallback',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_tool_bind_fallback' },
+      conversation: {
+        content: '[Feishu DM] tool binding fallback test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.tool-bind-fallback' });
+
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 'session-tool-bind-fallback',
+      tool_name: 'WebSearch',
+      tool_input: { query: 'private query must not escape' },
+      tool_use_id: 'toolu_tool_bind_fallback',
+    }, 9200);
+
+    const { request, events } = stream.query({
+      requestId: 'assistant.feishu.tool-bind-fallback',
+    });
+    assert.equal(request.runtimeSessionId, 'session-tool-bind-fallback');
+    assert.deepEqual(events.map(item => item.type), [
+      'AssistantRequestAccepted',
+      'RunQueued',
+      'RunStarted',
+      'ProgressUpdated',
+      'ProgressUpdated',
+    ]);
+    assert.equal(JSON.stringify(events).includes('private query must not escape'), false);
+    assert.equal(JSON.stringify(events).includes('WebSearch'), false);
+    stream.close();
+  });
 });

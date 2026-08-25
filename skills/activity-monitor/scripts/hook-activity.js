@@ -108,6 +108,14 @@ export function emitAssistantLifecycle(record) {
     }
     if (['pre_tool', 'post_tool', 'post_tool_failure'].includes(record.event)) {
       if (!record.tool) return null;
+      // Some Claude runtimes emit UserPromptSubmit before C4 has persisted
+      // RunStarted (or omit that hook entirely). The first real tool event is
+      // therefore a second, race-safe binding point. BindNextRun is idempotent
+      // for an already-bound active session.
+      responseStream.execute({
+        type: 'BindNextRun',
+        runtimeSessionId: record.session_id,
+      });
       const status = record.event === 'pre_tool'
         ? 'started'
         : (record.event === 'post_tool' ? 'completed' : 'failed');
