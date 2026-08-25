@@ -60,6 +60,9 @@ running services.
    use this opaque, content-free identity to make an ambiguous transport retry
    idempotent. Streamed assistant replies additionally receive their separate
    `C4_ASSISTANT_REQUEST_ID`; the two identities are not interchangeable.
+   Core advertises this channel contract as `c4.outbound-delivery-id:1` through
+   `zylos capabilities --json`; components that depend on proactive delivery
+   idempotency must require it before install or upgrade.
 
 ## Examples
 

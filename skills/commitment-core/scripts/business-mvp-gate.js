@@ -8,27 +8,45 @@ import { fileURLToPath } from 'node:url';
 
 import { openCommitmentIntakeQueue } from '../../comm-bridge/scripts/c4-db.js';
 import { runCommitmentIntakeWorkerOnce } from '../../comm-bridge/scripts/c4-intake-worker.js';
+import { workIntakeProfileFromEnv } from '../../comm-bridge/scripts/c4-work-intake-profile.js';
 import { openCommitmentCore } from './core.js';
 import { decideExecutionControlPlane } from './execution-control-plane-gate.js';
 import { mapExternalExecutionEvent } from './external-execution-adapter.js';
 import { processProjectionBatch } from './projection-worker.js';
 import { reconcileProjection } from './reconcile-projection.js';
 
-const FEISHU_ENVELOPE = Object.freeze({
-  idempotencyKey: 'feishu:om_business_mvp:task-intent',
-  source: Object.freeze({
-    channel: 'feishu',
-    externalId: 'om_business_mvp',
-    senderId: 'ou_business_owner',
-  }),
-  task: Object.freeze({
-    title: '完成重点客户回访',
-    description: '整理反馈并提交给业务负责人验收',
-    ownerId: 'ou_business_owner',
-    acceptorId: 'ou_business_acceptor',
-    assigneeId: 'agent:yueran',
-  }),
-});
+function createFeishuEnvelope(agentId) {
+  return Object.freeze({
+    idempotencyKey: 'feishu:om_business_mvp:task-intent',
+    source: Object.freeze({
+      channel: 'feishu',
+      externalId: 'om_business_mvp',
+      senderId: 'ou_business_owner',
+    }),
+    task: Object.freeze({
+      title: '完成重点客户回访',
+      description: '整理反馈并提交给业务负责人验收',
+      ownerId: 'ou_business_owner',
+      acceptorId: 'ou_business_acceptor',
+      assigneeId: agentId,
+    }),
+  });
+}
+
+function resolveBusinessGateAgentId({ agentId, agentProfile }) {
+  const profile = workIntakeProfileFromEnv({
+    ...(agentId === undefined || agentId === null ? {} : { ZYLOS_AGENT_ID: agentId }),
+    ...(agentProfile === undefined || agentProfile === null
+      ? {}
+      : { ZYLOS_AGENT_PROFILE: agentProfile }),
+  });
+  if (!profile.agentId) {
+    const error = new Error('business MVP gate requires an explicit Agent identity');
+    error.code = 'AGENT_ID_REQUIRED';
+    throw error;
+  }
+  return profile.agentId;
+}
 
 function createDefaultClock() {
   let milliseconds = Date.parse('2026-08-25T02:00:00.000Z');
@@ -121,6 +139,8 @@ function normalizeSourceRevision(value) {
  * Feishu or other external-system result.
  */
 export async function runBusinessMvpGate({
+  agentId = null,
+  agentProfile = null,
   clock = createDefaultClock(),
   executionClock = () => new Date().toISOString(),
   sourceRevision = process.env.ZYLOS_SOURCE_REVISION ?? null,
@@ -128,6 +148,8 @@ export async function runBusinessMvpGate({
   projectionAdapter = createDefaultProjectionAdapter(),
   replayProjectionAdapter = createDefaultProjectionAdapter({ failFirst: false }),
 } = {}) {
+  const effectiveAgentId = resolveBusinessGateAgentId({ agentId, agentProfile });
+  const feishuEnvelope = createFeishuEnvelope(effectiveAgentId);
   const executedAt = normalizeExecutedAt(executionClock);
   const normalizedSourceRevision = normalizeSourceRevision(sourceRevision);
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-business-mvp-'));
@@ -165,7 +187,7 @@ export async function runBusinessMvpGate({
             endpointId: 'oc_business_owner|type:p2p|msg:om_business_mvp',
             content: '请完成重点客户回访并提交验收',
           },
-          envelope: FEISHU_ENVELOPE,
+          envelope: feishuEnvelope,
         });
         if (recorded.created) intakeRowsCreated += 1;
       }
@@ -191,7 +213,7 @@ export async function runBusinessMvpGate({
     const queueStatusAfterCrash = readIntakeStatus({
       dbPath: c4DbPath,
       clock: clock.nowSeconds,
-      idempotencyKey: FEISHU_ENVELOPE.idempotencyKey,
+      idempotencyKey: feishuEnvelope.idempotencyKey,
     });
 
     clock.advanceBy(61_000);
@@ -203,7 +225,7 @@ export async function runBusinessMvpGate({
     const finalQueueStatus = readIntakeStatus({
       dbPath: c4DbPath,
       clock: clock.nowSeconds,
-      idempotencyKey: FEISHU_ENVELOPE.idempotencyKey,
+      idempotencyKey: feishuEnvelope.idempotencyKey,
     });
     const tasks = core.query({ limit: 100 });
     const fallbackDecision = decideExecutionControlPlane({
@@ -312,7 +334,7 @@ export async function runBusinessMvpGate({
     const readyTask = core.query({ taskId: 'task-business-mvp' });
     const claimed = core.runs.claim({
       taskId: readyTask.id,
-      actorId: 'agent:yueran',
+      actorId: effectiveAgentId,
       workerId: 'local-runtime:business-mvp',
       leaseMs: 60_000,
       idempotencyKey: 'business-mvp:run:claim',
@@ -322,7 +344,7 @@ export async function runBusinessMvpGate({
       eventId: 'business-mvp-local-delivered',
       eventType: 'delivered',
       taskId: claimed.task.id,
-      actorId: 'agent:yueran',
+      actorId: effectiveAgentId,
       expectedVersion: claimed.task.version,
     });
     const completed = core.runs.complete({
@@ -339,7 +361,7 @@ export async function runBusinessMvpGate({
       core.command({
         type: 'AcceptTask',
         taskId: completed.task.id,
-        actorId: 'agent:yueran',
+        actorId: effectiveAgentId,
         idempotencyKey: 'business-mvp:accept:unauthorized-agent',
       }, completed.task.version);
     } catch (error) {
@@ -504,7 +526,7 @@ export async function runBusinessMvpGate({
           && stateAfterRejectedAcceptance === 'review'
           && accepted.task.state === 'done',
         evidence: {
-          unauthorizedActor: 'agent:yueran',
+          unauthorizedActor: effectiveAgentId,
           rejectedWith,
           stateAfterRejectedAcceptance,
           authorizedAcceptor: 'ou_business_acceptor',
@@ -566,14 +588,25 @@ export async function runBusinessMvpGate({
 }
 
 function parseCliArgs(args) {
-  if (args.length === 0) return { outputPath: null };
-  if (args.length === 2 && args[0] === '--output') {
-    if (typeof args[1] !== 'string' || args[1].trim() === '') {
-      throw new TypeError('--output requires a file path');
+  const parsed = { outputPath: null, agentId: null, agentProfile: null };
+  const fields = new Map([
+    ['--agent-id', 'agentId'],
+    ['--agent-profile', 'agentProfile'],
+    ['--output', 'outputPath'],
+  ]);
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index];
+    const field = fields.get(flag);
+    const value = args[index + 1];
+    if (!field || typeof value !== 'string' || value.trim() === '') {
+      throw new TypeError(
+        'usage: business-mvp-gate.js (--agent-id <agent:id> | --agent-profile <profile>) [--output <report.json>]',
+      );
     }
-    return { outputPath: path.resolve(args[1]) };
+    if (parsed[field] !== null) throw new TypeError(`${flag} may be specified only once`);
+    parsed[field] = field === 'outputPath' ? path.resolve(value) : value;
   }
-  throw new TypeError('usage: business-mvp-gate.js [--output <report.json>]');
+  return parsed;
 }
 
 function unsafeOutputError(message) {
@@ -633,8 +666,11 @@ const isMainModule = process.argv[1]
 
 if (isMainModule) {
   try {
-    const { outputPath } = parseCliArgs(process.argv.slice(2));
-    const report = await runBusinessMvpGate();
+    const { outputPath, agentId, agentProfile } = parseCliArgs(process.argv.slice(2));
+    const report = await runBusinessMvpGate({
+      agentId: agentId ?? process.env.ZYLOS_AGENT_ID ?? null,
+      agentProfile: agentProfile ?? process.env.ZYLOS_AGENT_PROFILE ?? null,
+    });
     const serialized = `${JSON.stringify(report, null, 2)}\n`;
     if (outputPath) writeReportAtomically(outputPath, serialized);
     process.stdout.write(serialized);

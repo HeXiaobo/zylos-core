@@ -9,6 +9,11 @@ import { fileURLToPath } from 'node:url';
 import { runBusinessMvpGate } from '../business-mvp-gate.js';
 
 const GATE_CLI = fileURLToPath(new URL('../business-mvp-gate.js', import.meta.url));
+const TEST_AGENT_ID = 'agent:yueran';
+
+function runTestBusinessMvpGate(options = {}) {
+  return runBusinessMvpGate({ agentId: TEST_AGENT_ID, ...options });
+}
 
 function gate(report, id) {
   return report.gates.find((candidate) => candidate.id === id);
@@ -52,8 +57,24 @@ function createInjectedProjectionAdapter({ failures = 1 } = {}) {
   };
 }
 
+test('the business MVP gate fails closed without an explicit Agent identity', async () => {
+  await assert.rejects(
+    () => runBusinessMvpGate(),
+    { code: 'AGENT_ID_REQUIRED' },
+  );
+});
+
+test('the business MVP gate derives its logical Agent from an explicit Agent Profile', async () => {
+  const report = await runBusinessMvpGate({ agentProfile: 'mylos' });
+
+  assert.equal(
+    gate(report, 'acceptor_authority_enforced').evidence.unauthorizedActor,
+    'agent:mylos',
+  );
+});
+
 test('the business MVP gate deduplicates ten replays of one Feishu-shaped source', async () => {
-  const report = await runBusinessMvpGate();
+  const report = await runTestBusinessMvpGate();
 
   assert.deepEqual(gate(report, 'feishu_source_replay_deduplicated'), {
     id: 'feishu_source_replay_deduplicated',
@@ -70,7 +91,7 @@ test('the business MVP gate deduplicates ten replays of one Feishu-shaped source
 test('a killed intake process replays the durable source without creating another Task', async () => {
   let milliseconds = Date.parse('2026-08-25T02:00:00.000Z');
   let boundaryCalls = 0;
-  const report = await runBusinessMvpGate({
+  const report = await runTestBusinessMvpGate({
     clock: {
       nowIso: () => new Date(milliseconds).toISOString(),
       nowSeconds: () => Math.floor(milliseconds / 1_000),
@@ -101,7 +122,7 @@ test('a killed intake process replays the durable source without creating anothe
 
 test('an external projection outage cannot roll back Core and recovery applies no duplicate', async () => {
   const projectionAdapter = createInjectedProjectionAdapter();
-  const report = await runBusinessMvpGate({ projectionAdapter });
+  const report = await runTestBusinessMvpGate({ projectionAdapter });
 
   assert.deepEqual(gate(report, 'projection_failure_isolated_and_recovered'), {
     id: 'projection_failure_isolated_and_recovered',
@@ -118,7 +139,7 @@ test('an external projection outage cannot roll back Core and recovery applies n
 });
 
 test('the business gate degrades OpenMax 403 to local dispatch and review-only completion', async () => {
-  const report = await runBusinessMvpGate();
+  const report = await runTestBusinessMvpGate();
 
   assert.deepEqual(gate(report, 'control_plane_403_falls_back_to_local_review'), {
     id: 'control_plane_403_falls_back_to_local_review',
@@ -135,7 +156,7 @@ test('the business gate degrades OpenMax 403 to local dispatch and review-only c
 });
 
 test('the business gate blocks dispatch without rejecting an already ingested Core Task', async () => {
-  const report = await runBusinessMvpGate();
+  const report = await runTestBusinessMvpGate();
 
   assert.deepEqual(gate(report, 'unavailable_backends_block_dispatch_not_intake'), {
     id: 'unavailable_backends_block_dispatch_not_intake',
@@ -152,7 +173,7 @@ test('the business gate blocks dispatch without rejecting an already ingested Co
 });
 
 test('publish-before-ack crash replay applies the external event exactly once', async () => {
-  const report = await runBusinessMvpGate();
+  const report = await runTestBusinessMvpGate();
 
   assert.deepEqual(gate(report, 'publish_before_ack_replays_without_duplicate_effect'), {
     id: 'publish_before_ack_replays_without_duplicate_effect',
@@ -171,7 +192,7 @@ test('publish-before-ack crash replay applies the external event exactly once', 
 });
 
 test('Agent completion stops at review instead of closing the business Task', async () => {
-  const report = await runBusinessMvpGate();
+  const report = await runTestBusinessMvpGate();
 
   assert.deepEqual(gate(report, 'agent_completion_requires_review'), {
     id: 'agent_completion_requires_review',
@@ -185,7 +206,7 @@ test('Agent completion stops at review instead of closing the business Task', as
 });
 
 test('only the configured business Acceptor can move review to done', async () => {
-  const report = await runBusinessMvpGate();
+  const report = await runTestBusinessMvpGate();
 
   assert.deepEqual(gate(report, 'acceptor_authority_enforced'), {
     id: 'acceptor_authority_enforced',
@@ -202,7 +223,7 @@ test('only the configured business Acceptor can move review to done', async () =
 
 test('a deleted derived projection rebuilds from Core events and reconciles cleanly', async () => {
   const projectionAdapter = createInjectedProjectionAdapter();
-  const report = await runBusinessMvpGate({ projectionAdapter });
+  const report = await runTestBusinessMvpGate({ projectionAdapter });
 
   assert.deepEqual(gate(report, 'derived_projection_rebuilt_and_reconciled'), {
     id: 'derived_projection_rebuilt_and_reconciled',
@@ -220,7 +241,7 @@ test('a deleted derived projection rebuilds from Core events and reconciles clea
 });
 
 test('the gate report is machine-readable and does not claim live-environment proof', async () => {
-  const report = await runBusinessMvpGate({
+  const report = await runTestBusinessMvpGate({
     executionClock: () => '2026-08-25T06:30:00.000Z',
     sourceRevision: 'revision-under-test',
   });
@@ -251,7 +272,11 @@ test('the CLI emits and optionally persists the same machine-readable gate repor
   const outputPath = path.join(directory, 'gate-report.json');
   fs.writeFileSync(outputPath, 'stale report', { mode: 0o644 });
   try {
-    const result = spawnSync(process.execPath, [GATE_CLI, '--output', outputPath], {
+    const result = spawnSync(process.execPath, [
+      GATE_CLI,
+      '--agent-profile', 'mylos',
+      '--output', outputPath,
+    ], {
       encoding: 'utf8',
     });
 
@@ -268,6 +293,15 @@ test('the CLI emits and optionally persists the same machine-readable gate repor
   }
 });
 
+test('the CLI fails closed when no Agent ID or Agent Profile is selected', () => {
+  const result = spawnSync(process.execPath, [GATE_CLI], { encoding: 'utf8' });
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  const failure = JSON.parse(result.stderr);
+  assert.equal(failure.error.code, 'AGENT_ID_REQUIRED');
+});
+
 test('the CLI rejects a symlink output without modifying its target', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-mvp-gate-symlink-'));
   const victimPath = path.join(directory, 'victim.txt');
@@ -275,7 +309,11 @@ test('the CLI rejects a symlink output without modifying its target', () => {
   fs.writeFileSync(victimPath, 'keep this content', { mode: 0o600 });
   fs.symlinkSync(victimPath, outputPath);
   try {
-    const result = spawnSync(process.execPath, [GATE_CLI, '--output', outputPath], {
+    const result = spawnSync(process.execPath, [
+      GATE_CLI,
+      '--agent-id', TEST_AGENT_ID,
+      '--output', outputPath,
+    ], {
       encoding: 'utf8',
     });
 

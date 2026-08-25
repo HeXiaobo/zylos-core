@@ -25,6 +25,7 @@ describe('zylos capabilities', () => {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
       'c4.assistant-response-stream': 2,
+      'c4.outbound-delivery-id': 1,
       'work-intake': 1,
       'commitment-core': 1,
       'projection-outbox': 1,
