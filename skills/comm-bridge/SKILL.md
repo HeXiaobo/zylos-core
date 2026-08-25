@@ -56,13 +56,21 @@ Treat the heredoc wrapper as fixed shell syntax: only the message body goes betw
 ### Streamed reply exception
 
 When an inbound message ends with `---- streamed reply:`, reply directly as
-normal assistant text in the current Claude turn. Do **not** call `c4-send` for
-that response. Claude Code's synchronous `MessageDisplay` hook publishes the
-public text batches as runtime-neutral `OutputDelta` events, and the `Stop`
-hook records `last_assistant_message` as the canonical `RunCompleted.output`.
-The Feishu Adapter buffers and renders those deltas on the existing CardKit
-card. This path receives displayed assistant text only; it never reads or
-publishes thinking blocks, tool inputs, or tool results.
+normal assistant text in the current runtime turn. Do **not** call `c4-send`
+for that response. For meaningful steps, emit a short requester-safe work note
+on its own line with the exact prefix `[PUBLIC_REASONING] `. This is a public
+summary protocol, never permission to expose hidden chain-of-thought, tool
+inputs, raw tool results, paths, credentials, or secrets. Write the final
+answer as normal unprefixed text.
+
+Claude Code's synchronous `MessageDisplay` hook separates those marked work
+notes into runtime-neutral `PublicReasoningDelta` events and publishes the
+remaining displayed text as `OutputDelta`; `Stop` records the unmarked final
+message as canonical `RunCompleted.output`. With Codex, Activity Monitor tails
+the active rollout and consumes only public `reasoning.summary`, user-visible
+`commentary`, `final_answer`, and `task_complete` fields. It never reads
+`raw_content` or `encrypted_content`. The Feishu Adapter renders both streams
+on the existing CardKit card.
 
 All messages without the streamed marker continue to use `c4-send` exactly as
 described above.

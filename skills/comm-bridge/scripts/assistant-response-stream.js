@@ -19,6 +19,7 @@ export const ASSISTANT_RESPONSE_EVENT_TYPES = Object.freeze([
   'RunQueued',
   'RunStarted',
   'ProgressUpdated',
+  'PublicReasoningDelta',
   'OutputDelta',
   'RunCompleted',
   'RunFailed',
@@ -429,6 +430,57 @@ export function openAssistantResponseStream({
         };
       }
 
+      case 'AppendPublicReasoningDelta': {
+        const requestId = requireIdentifier(command.requestId, 'requestId');
+        const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
+        const delta = boundedUtf8(command.delta, 'delta', MAX_DELTA_BYTES);
+        if (delta.length === 0) throw new TypeError('delta must not be empty');
+        const request = selectRequest.get(requestId);
+        if (!request) throw new Error(`assistant request not found: ${requestId}`);
+        if (request.status !== 'started') {
+          throw new Error(`cannot append public reasoning while assistant request is ${request.status}`);
+        }
+        const existing = selectEventByKey.get(requestId, idempotencyKey);
+        if (existing) {
+          const persisted = toEvent(existing);
+          if (persisted.type !== 'PublicReasoningDelta' || persisted.payload.delta !== delta) {
+            const error = new Error('public reasoning idempotency key belongs to different payload');
+            error.code = 'ASSISTANT_EVENT_CONFLICT';
+            throw error;
+          }
+          return { request: toRequest(request), events: [persisted], replayed: true };
+        }
+        const emitted = appendEvent(
+          request,
+          'PublicReasoningDelta',
+          { delta },
+          idempotencyKey,
+        );
+        return {
+          request: toRequest(selectRequest.get(requestId)),
+          events: [emitted.event],
+          replayed: false,
+        };
+      }
+
+      case 'AppendRuntimePublicReasoningDelta': {
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const request = database.prepare(`
+          SELECT request_id
+          FROM assistant_requests
+          WHERE runtime_session_id = ? AND status = 'started'
+          ORDER BY updated_at DESC, accepted_at DESC
+          LIMIT 1
+        `).get(runtimeSessionId);
+        if (!request) return { request: null, events: [], replayed: false };
+        return executeTransaction({
+          type: 'AppendPublicReasoningDelta',
+          requestId: request.request_id,
+          delta: command.delta,
+          idempotencyKey: command.idempotencyKey,
+        });
+      }
+
       case 'AppendOutputDelta': {
         const requestId = requireIdentifier(command.requestId, 'requestId');
         const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
@@ -621,6 +673,14 @@ export function openAssistantResponseStream({
         ReportToolProgress: [
           ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
           ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
+        ],
+        AppendPublicReasoningDelta: [
+          ['type', 'requestId', 'delta', 'idempotencyKey'],
+          ['type', 'requestId', 'delta', 'idempotencyKey'],
+        ],
+        AppendRuntimePublicReasoningDelta: [
+          ['type', 'runtimeSessionId', 'delta', 'idempotencyKey'],
+          ['type', 'runtimeSessionId', 'delta', 'idempotencyKey'],
         ],
         AppendOutputDelta: [
           ['type', 'requestId', 'delta', 'idempotencyKey'],

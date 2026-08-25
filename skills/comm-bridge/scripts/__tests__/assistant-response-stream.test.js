@@ -144,6 +144,46 @@ test('appends displayed answer batches and completes through the bound runtime s
   stream.close();
 });
 
+test('streams public reasoning separately from the canonical answer', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-public-reasoning' });
+
+  const first = stream.execute({
+    type: 'AppendRuntimePublicReasoningDelta',
+    runtimeSessionId: 'session-public-reasoning',
+    delta: '先核对任务边界。\n',
+    idempotencyKey: 'reasoning:summary:0',
+  });
+  const replay = stream.execute({
+    type: 'AppendRuntimePublicReasoningDelta',
+    runtimeSessionId: 'session-public-reasoning',
+    delta: '先核对任务边界。\n',
+    idempotencyKey: 'reasoning:summary:0',
+  });
+  stream.execute({
+    type: 'AppendRuntimeOutputDelta',
+    runtimeSessionId: 'session-public-reasoning',
+    delta: '这是最终答案。',
+    idempotencyKey: 'answer:0',
+  });
+
+  assert.deepEqual(first.events[0], {
+    ...first.events[0],
+    type: 'PublicReasoningDelta',
+    payload: { delta: '先核对任务边界。\n' },
+  });
+  assert.equal(replay.replayed, true);
+  const result = stream.query({ requestId: 'assistant.feishu.om_1' });
+  assert.equal(result.request.output, '这是最终答案。');
+  assert.deepEqual(result.events.slice(-2).map(event => event.type), [
+    'PublicReasoningDelta',
+    'OutputDelta',
+  ]);
+  stream.close();
+});
+
 test('rejects fabricated stages, unsafe identifiers, and changed idempotent deltas', () => {
   const stream = openAssistantResponseStream({ dbPath: ':memory:' });
   assert.throws(

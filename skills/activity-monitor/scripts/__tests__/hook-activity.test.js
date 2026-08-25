@@ -378,6 +378,91 @@ describe('hook-activity', () => {
     stream.close();
   });
 
+  it('routes explicit public reasoning lines separately from visible answer text', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.public-reasoning-line',
+      sourceId: 'om_public_reasoning_line',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_public_reasoning_line' },
+      conversation: {
+        content: '[Feishu DM] public reasoning line test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.public-reasoning-line' });
+
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-public-reasoning-line',
+      message_id: 'message-public-reasoning-line',
+      index: 0,
+      final: false,
+      delta: '[PUBLIC_REASONING] 正在核对任务边界。\n这是给用户的答案。\n',
+    }, 9350);
+
+    const result = stream.query({ requestId: 'assistant.feishu.public-reasoning-line' });
+    assert.deepEqual(result.events.slice(-2).map(event => ({
+      type: event.type,
+      payload: event.payload,
+    })), [
+      {
+        type: 'PublicReasoningDelta',
+        payload: { delta: '正在核对任务边界。\n' },
+      },
+      {
+        type: 'OutputDelta',
+        payload: { delta: '这是给用户的答案。\n' },
+      },
+    ]);
+    assert.equal(result.request.output, '这是给用户的答案。\n');
+    stream.close();
+  });
+
+  it('redacts path and credential-shaped fragments from Claude public reasoning lines', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.public-reasoning-redact',
+      sourceId: 'om_public_reasoning_redact',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_public_reasoning_redact' },
+      conversation: {
+        content: '[Feishu DM] public reasoning redact test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.public-reasoning-redact' });
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-public-reasoning-redact',
+      message_id: 'message-public-reasoning-redact',
+      index: 0,
+      final: false,
+      delta: '[PUBLIC_REASONING] Checking /Users/example/private.txt with token=secret-value\n',
+    }, 9375);
+
+    const serialized = JSON.stringify(stream.query({
+      requestId: 'assistant.feishu.public-reasoning-redact',
+    }).events);
+    assert.equal(serialized.includes('/Users/example'), false);
+    assert.equal(serialized.includes('secret-value'), false);
+    assert.match(serialized, /\[local path\]/);
+    assert.match(serialized, /\[redacted\]/);
+    stream.close();
+  });
+
   it('uses the public Stop message as the canonical answer after streamed batches', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     const { openAssistantResponseStream } = await import(
@@ -419,6 +504,42 @@ describe('hook-activity', () => {
     assert.equal(result.request.output, '最终完整答案');
     assert.deepEqual(result.events.at(-1).payload, { output: '最终完整答案' });
     assert.equal(JSON.stringify(readEvents()).includes('最终完整答案'), false);
+    stream.close();
+  });
+
+  it('removes public reasoning marker lines from the canonical Stop answer', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.stop-filter-reasoning',
+      sourceId: 'om_stop_filter_reasoning',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_stop_filter_reasoning' },
+      conversation: {
+        content: '[Feishu DM] stop filter test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.stop-filter-reasoning' });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-stop-filter-reasoning',
+    }, 9600);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'session-stop-filter-reasoning',
+      last_assistant_message: '[PUBLIC_REASONING] 正在检查。\n最终答案。',
+      stop_hook_active: false,
+    }, 9700);
+
+    const result = stream.query({ requestId: 'assistant.feishu.stop-filter-reasoning' });
+    assert.equal(result.request.output, '最终答案。');
+    assert.equal(JSON.stringify(result.events).includes('PUBLIC_REASONING'), false);
     stream.close();
   });
 });

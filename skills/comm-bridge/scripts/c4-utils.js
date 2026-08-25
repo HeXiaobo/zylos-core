@@ -6,6 +6,7 @@ import {
   ATTACHMENTS_DIR,
   CONTENT_PREVIEW_CHARS
 } from './c4-config.js';
+import { PUBLIC_REASONING_LINE_PREFIX } from './assistant-public-reasoning.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,10 +23,12 @@ export function buildStreamedReplySuffix(assistantRequestId) {
   if (!assistantRequestId) return '';
   return [
     ' ---- streamed reply:',
-    'Reply directly in this Claude turn.',
+    'Reply directly in this runtime turn.',
     'Do not call c4-send for this reply.',
     'Your displayed assistant text is delivered automatically.',
-    'Output only user-facing text; never reveal hidden reasoning, tool inputs, tool results, or secrets.',
+    `Before or after meaningful steps, you may write one concise user-facing work summary on its own line prefixed exactly ${PUBLIC_REASONING_LINE_PREFIX}.`,
+    'These summaries must describe only safe progress and conclusions; never reveal hidden chain-of-thought, tool inputs, raw tool results, paths, credentials, or secrets.',
+    'Write the final answer as normal unprefixed user-facing text.',
     `assistant request: "${assistantRequestId}"`,
   ].join(' ');
 }

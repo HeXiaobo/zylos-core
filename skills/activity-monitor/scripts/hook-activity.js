@@ -26,6 +26,11 @@ import { randomBytes } from 'node:crypto';
 import { getClaudePid } from './claude-pid.js';
 import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
 import { openAssistantResponseStream } from '../../comm-bridge/scripts/assistant-response-stream.js';
+import {
+  sanitizePublicReasoningDelta,
+  splitPublicReasoningText,
+  stripPublicReasoningLines,
+} from '../../comm-bridge/scripts/assistant-public-reasoning.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
@@ -150,22 +155,46 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       const delta = hookData?.delta;
       if (typeof delta !== 'string' || delta.length === 0) return null;
       if (!record.message_id || !Number.isSafeInteger(record.batch_index)) return null;
-      return responseStream.execute({
-        type: 'AppendRuntimeOutputDelta',
-        runtimeSessionId: record.session_id,
-        delta,
-        idempotencyKey: `display:${record.message_id}:${record.batch_index}`,
-      });
+      const separated = splitPublicReasoningText(delta);
+      let result = null;
+      for (const [index, publicDelta] of separated.publicReasoningDeltas.entries()) {
+        const safeDelta = sanitizePublicReasoningDelta(publicDelta);
+        if (!safeDelta) continue;
+        result = responseStream.execute({
+          type: 'AppendRuntimePublicReasoningDelta',
+          runtimeSessionId: record.session_id,
+          delta: safeDelta,
+          idempotencyKey: `display-reasoning:${record.message_id}:${record.batch_index}:${index}`,
+        });
+      }
+      if (separated.answer.length > 0) {
+        result = responseStream.execute({
+          type: 'AppendRuntimeOutputDelta',
+          runtimeSessionId: record.session_id,
+          delta: separated.answer,
+          idempotencyKey: `display:${record.message_id}:${record.batch_index}`,
+        });
+      }
+      return result;
     }
     if (record.event === 'stop') {
       if (
         typeof hookData?.last_assistant_message === 'string'
         && hookData.last_assistant_message.trim()
       ) {
+        const output = stripPublicReasoningLines(hookData.last_assistant_message).trim();
+        if (!output) {
+          return responseStream.execute({
+            type: 'FailRun',
+            runtimeSessionId: record.session_id,
+            code: 'RESPONSE_NOT_DELIVERED',
+            retryable: true,
+          });
+        }
         return responseStream.execute({
           type: 'CompleteRuntimeRun',
           runtimeSessionId: record.session_id,
-          output: hookData.last_assistant_message,
+          output,
         });
       }
       return responseStream.execute({
