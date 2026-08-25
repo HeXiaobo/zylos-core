@@ -161,7 +161,7 @@ export function readProfileSelection({
 /**
  * Atomically update only Core's nested profile keys while preserving every
  * unrelated config.json field. This is the supported pre-upgrade opt-in seam
- * for branded deployments such as the existing 玥然/Mylos installation.
+ * for named deployments that must preserve an existing policy explicitly.
  */
 export function writeProfileSelection({
   zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),

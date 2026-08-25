@@ -66,7 +66,6 @@ const UPGRADE_REQUIRED_CORE_SERVICES = [
 //   The same variable is consumed by doctor, activity-monitor, the installer,
 //   and changelog lookup so check and download sources cannot drift apart.
 //   Stable no-branch upgrades still require a release tag in the selected repo.
-// Actual maker: Mylos (COO).
 export function resolveCoreRepository({ processEnv = process.env, readEnv = readEnvFile } = {}) {
   const processValue = String(processEnv.ZYLOS_SELF_UPGRADE_REPO || '').trim();
   if (processValue) return processValue;
