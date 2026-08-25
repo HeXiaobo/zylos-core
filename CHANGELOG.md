@@ -5,6 +5,12 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-3ai.4] - 2026-08-25
+
+### Fixed
+- Self-upgrade, doctor, changelog lookup, and the detached activity-monitor upgrade check now resolve `ZYLOS_SELF_UPGRADE_REPO` from the target instance's `ZYLOS_DIR/.env` when the live process does not override it. This keeps fork routing persistent across global npm installs, non-Git working directories, different home directories, shells, and service restarts without loading unrelated `.env` credentials into child processes.
+- Missing or unreadable persisted configuration retains the canonical repository fallback instead of making the CLI unusable.
+
 ## [0.7.2-3ai.3] - 2026-08-25
 
 ### Added

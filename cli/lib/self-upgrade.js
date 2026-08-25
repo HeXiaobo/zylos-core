@@ -39,6 +39,7 @@ import { deployManifestTemplate } from './runtime/tmux-env.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
 import { verifyCommunicationContinuity } from './communication-continuity.js';
+import { readEnvFile } from './env.js';
 
 // Services that must be present for upgraded Core behavior to function. During
 // an upgrade we start one only when the machine was already running Zylos and
@@ -66,7 +67,21 @@ const UPGRADE_REQUIRED_CORE_SERVICES = [
 //   and changelog lookup so check and download sources cannot drift apart.
 //   Stable no-branch upgrades still require a release tag in the selected repo.
 // Actual maker: Mylos (COO).
-export const CORE_REPO = process.env.ZYLOS_SELF_UPGRADE_REPO || 'zylos-ai/zylos-core';
+export function resolveCoreRepository({ processEnv = process.env, readEnv = readEnvFile } = {}) {
+  const processValue = String(processEnv.ZYLOS_SELF_UPGRADE_REPO || '').trim();
+  if (processValue) return processValue;
+
+  try {
+    const fileValue = String(readEnv().get('ZYLOS_SELF_UPGRADE_REPO') || '').trim();
+    if (fileValue) return fileValue;
+  } catch {
+    // An absent or unreadable persisted config must not make the CLI unusable.
+  }
+
+  return 'zylos-ai/zylos-core';
+}
+
+export const CORE_REPO = resolveCoreRepository();
 const REPO = CORE_REPO;
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 const {
-  CORE_REPO,
+  resolveCoreRepository,
   createFinalizeState,
   runSelfUpgrade,
   runSelfUpgradeFinalize,
@@ -42,22 +42,72 @@ function writeSplitPackage(pkgRoot) {
 
 describe('self-upgrade repository routing', () => {
   it('defaults to the canonical repository', () => {
-    assert.equal(CORE_REPO, 'zylos-ai/zylos-core');
+    assert.equal(resolveCoreRepository({
+      processEnv: {},
+      readEnv: () => new Map(),
+    }), 'zylos-ai/zylos-core');
+  });
+
+  it('loads the fork repository from the configured Zylos directory', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-repo-'));
+    const alternateHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-home-'));
+    fs.writeFileSync(
+      path.join(zylosDir, '.env'),
+      'ZYLOS_SELF_UPGRADE_REPO=HeXiaobo/zylos-core\n',
+    );
+
+    const moduleUrl = new URL('../self-upgrade.js', import.meta.url).href;
+    const childEnv = {
+      ...process.env,
+      HOME: alternateHome,
+      ZYLOS_DIR: zylosDir,
+    };
+    delete childEnv.ZYLOS_SELF_UPGRADE_REPO;
+    const result = spawnSync(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      `import { CORE_REPO } from ${JSON.stringify(moduleUrl)}; process.stdout.write(CORE_REPO);`,
+    ], {
+      cwd: alternateHome,
+      env: childEnv,
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'HeXiaobo/zylos-core');
   });
 
   it('exports the configured fork repository for every core upgrade consumer', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-override-'));
+    fs.writeFileSync(
+      path.join(zylosDir, '.env'),
+      'ZYLOS_SELF_UPGRADE_REPO=Other/core\n',
+    );
     const moduleUrl = new URL('../self-upgrade.js', import.meta.url).href;
     const result = spawnSync(process.execPath, [
       '--input-type=module',
       '--eval',
       `import { CORE_REPO } from ${JSON.stringify(moduleUrl)}; process.stdout.write(CORE_REPO);`,
     ], {
-      env: { ...process.env, ZYLOS_SELF_UPGRADE_REPO: 'HeXiaobo/zylos-core' },
+      env: {
+        ...process.env,
+        ZYLOS_DIR: zylosDir,
+        ZYLOS_SELF_UPGRADE_REPO: 'HeXiaobo/zylos-core',
+      },
       encoding: 'utf8',
     });
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, 'HeXiaobo/zylos-core');
+  });
+
+  it('retains canonical routing when persisted configuration is unreadable', () => {
+    assert.equal(resolveCoreRepository({
+      processEnv: {},
+      readEnv: () => {
+        throw new Error('permission denied');
+      },
+    }), 'zylos-ai/zylos-core');
   });
 });
 

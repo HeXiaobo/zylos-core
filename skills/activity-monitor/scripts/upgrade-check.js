@@ -10,12 +10,13 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { resolveCoreRepository } from './upgrade-source.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
 const COMPONENTS_JSON = path.join(ZYLOS_DIR, '.zylos', 'components.json');
-const CORE_REPO = process.env.ZYLOS_SELF_UPGRADE_REPO || 'zylos-ai/zylos-core';
+const CORE_REPO = resolveCoreRepository({ zylosDir: ZYLOS_DIR });
 
 function resolveCommBridgeScript(fileName) {
   const prodPath = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', fileName);
