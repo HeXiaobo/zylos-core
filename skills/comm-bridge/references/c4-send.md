@@ -55,6 +55,11 @@ running services.
 1. When stdin is piped, c4-send.js reads the full message from stdin.
 2. The heredoc content is raw bytes — no shell escaping needed.
 3. c4-send.js passes the message to the channel's `send.js` script via `spawn()`.
+   The child receives `C4_DELIVERY_ID=c4.outbound.<conversation-id>`, derived
+   from the persisted outbound C4 row before dispatch. Channel adapters may
+   use this opaque, content-free identity to make an ambiguous transport retry
+   idempotent. Streamed assistant replies additionally receive their separate
+   `C4_ASSISTANT_REQUEST_ID`; the two identities are not interchangeable.
 
 ## Examples
 

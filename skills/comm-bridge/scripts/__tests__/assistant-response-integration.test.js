@@ -29,6 +29,7 @@ import path from 'node:path';
 fs.writeFileSync(path.join(process.env.ZYLOS_DIR, 'send-result.json'), JSON.stringify({
   args: process.argv.slice(2),
   requestId: process.env.C4_ASSISTANT_REQUEST_ID || null,
+  deliveryId: process.env.C4_DELIVERY_ID || null,
 }));
 `);
     const env = { ...process.env, ZYLOS_DIR: temp };
@@ -60,6 +61,8 @@ fs.writeFileSync(path.join(process.env.ZYLOS_DIR, 'send-result.json'), JSON.stri
     assert.equal(send.status, 0, send.stderr || send.stdout);
     const adapter = JSON.parse(fs.readFileSync(path.join(temp, 'send-result.json'), 'utf8'));
     assert.equal(adapter.requestId, 'assistant.feishu.om_1');
+    assert.match(adapter.deliveryId, /^c4\.outbound\.\d+$/);
+    assert.notEqual(adapter.deliveryId, adapter.requestId);
     assert.deepEqual(adapter.args, ['oc_1|type:p2p|msg:om_1', '完整答案']);
 
     const database = new Database(path.join(temp, 'comm-bridge', 'c4.db'));

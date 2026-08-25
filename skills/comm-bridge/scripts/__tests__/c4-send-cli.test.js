@@ -71,6 +71,23 @@ function setupMockChannel(tmpDir, channelName) {
   return sentFile;
 }
 
+function setupDeliveryIdentityChannel(tmpDir, channelName, { exitCode = 0 } = {}) {
+  const skillDir = path.join(tmpDir, '.claude', 'skills', channelName, 'scripts');
+  fs.mkdirSync(skillDir, { recursive: true });
+
+  const sentFile = path.join(tmpDir, `${channelName}-delivery.json`);
+  fs.writeFileSync(path.join(skillDir, 'send.js'), `
+    import fs from 'fs';
+    fs.writeFileSync(${JSON.stringify(sentFile)}, JSON.stringify({
+      deliveryId: process.env.C4_DELIVERY_ID || null,
+      assistantRequestId: process.env.C4_ASSISTANT_REQUEST_ID || null,
+    }));
+    process.exit(${exitCode});
+  `);
+
+  return sentFile;
+}
+
 // -- basic send --
 
 describe('c4-send basic', () => {
@@ -97,6 +114,36 @@ describe('c4-send basic', () => {
 
       const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
       assert.deepEqual(sent, ['Hello broadcast!']);
+    });
+  });
+
+  it('passes the persisted outbound conversation identity to the channel adapter', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupDeliveryIdentityChannel(tmpDir, 'identity-channel');
+
+      const { status } = cli(['identity-channel', 'endpoint1'], env, 'Stable delivery');
+      assert.equal(status, 0);
+
+      const [outbound] = dbRecent(env, 1);
+      const delivered = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
+      assert.equal(delivered.deliveryId, `c4.outbound.${outbound.id}`);
+      assert.equal(delivered.assistantRequestId, null);
+      assert.doesNotMatch(delivered.deliveryId, /Stable delivery/);
+    });
+  });
+
+  it('uses a different stable identity for each persisted outbound delivery', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupDeliveryIdentityChannel(tmpDir, 'identity-channel');
+
+      assert.equal(cli(['identity-channel'], env, 'First').status, 0);
+      const first = JSON.parse(fs.readFileSync(sentFile, 'utf8')).deliveryId;
+      assert.equal(cli(['identity-channel'], env, 'Second').status, 0);
+      const second = JSON.parse(fs.readFileSync(sentFile, 'utf8')).deliveryId;
+
+      assert.notEqual(first, second);
+      assert.match(first, /^c4\.outbound\.\d+$/);
+      assert.match(second, /^c4\.outbound\.\d+$/);
     });
   });
 });
@@ -331,6 +378,21 @@ describe('c4-send failed channel', () => {
       const { stdout, status } = cli(['bad-channel'], env, 'Hello');
       assert.equal(status, 1);
       assert.ok(stdout.includes('Failed to send'));
+    });
+  });
+
+  it('keeps the persisted delivery identity when the adapter reports failure', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupDeliveryIdentityChannel(tmpDir, 'bad-identity-channel', {
+        exitCode: 1,
+      });
+
+      const { status } = cli(['bad-identity-channel'], env, 'Retry me');
+      assert.equal(status, 1);
+
+      const [outbound] = dbRecent(env, 1);
+      const delivered = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
+      assert.equal(delivered.deliveryId, `c4.outbound.${outbound.id}`);
     });
   });
 });

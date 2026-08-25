@@ -232,8 +232,9 @@ async function main() {
     }
   }
 
+  let outboundConversation = null;
   try {
-    insertConversation('out', channel, endpoint, message);
+    outboundConversation = insertConversation('out', channel, endpoint, message);
   } catch (err) {
     console.error(`[C4] Warning: DB audit write failed: ${err.stack}`);
   } finally {
@@ -249,13 +250,21 @@ async function main() {
   }
 
   const scriptArgs = endpoint ? [endpoint, message] : [message];
+  const childEnv = { ...process.env };
+  // The persisted outbound row is the delivery identity. Channel adapters use
+  // it to retry an ambiguous transport result without creating a second
+  // message. Never inherit a possibly stale delivery id from the parent.
+  if (outboundConversation) {
+    childEnv.C4_DELIVERY_ID = `c4.outbound.${outboundConversation.id}`;
+  } else {
+    delete childEnv.C4_DELIVERY_ID;
+  }
+  if (assistantRequestId) childEnv.C4_ASSISTANT_REQUEST_ID = assistantRequestId;
+  else delete childEnv.C4_ASSISTANT_REQUEST_ID;
 
   const child = spawn('node', [channelScript, ...scriptArgs], {
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      ...(assistantRequestId ? { C4_ASSISTANT_REQUEST_ID: assistantRequestId } : {}),
-    },
+    env: childEnv,
   });
 
   child.on('close', (code) => {
