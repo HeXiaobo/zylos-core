@@ -200,6 +200,15 @@ returns channel-neutral deliveries with `recipientId`, `reason`, `urgency`,
 These Interfaces make no Feishu SDK calls and do not render or deliver
 notifications. Channel Adapters own delivery receipts, rate limits, and UI.
 
+`createTaskCommentCoordinator({ core, publishNotification })` is the production
+coordination seam used after a platform comment has been authenticated. It
+records the canonical comment first, derives `action_required` deliveries for
+non-acting human audience members, and passes the decision to the injected
+publisher. Logical `agent:*` participants are excluded from this notification
+path because the runtime wake seam owns their exact reply context. Replaying a
+comment republishes the same decision, allowing the channel's durable dedupe
+receipt to recover a crash after Core commit.
+
 ## Transactional projection Outbox
 
 `core.outbox` is the runtime-neutral delivery Interface for projecting Task
