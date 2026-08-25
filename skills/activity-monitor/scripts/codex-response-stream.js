@@ -13,7 +13,7 @@ import {
 const CODEX_DIR = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_STATE_DB = path.join(CODEX_DIR, 'state_5.sqlite');
 const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
-const REQUEST_MARKER = /assistant request:\s*"([A-Za-z0-9][A-Za-z0-9._:-]*)"/;
+const REQUEST_MARKER = /assistant request:\s*"([A-Za-z0-9][A-Za-z0-9._:-]*)"\s*$/;
 const MAX_ROLLOUT_READ_BYTES = 1024 * 1024;
 
 function readDirSafe(dir) {
@@ -190,7 +190,9 @@ export function createCodexResponseStreamAdapter({
       const text = messageText(payload);
       if (payload.role === 'user') {
         const requestId = text.match(REQUEST_MARKER)?.[1] || null;
-        if (requestId) state.requestId = requestId;
+        // Every user message starts a new turn. A missing/non-terminal marker
+        // must clear the previous association instead of inheriting it.
+        state.requestId = requestId;
         return;
       }
       if (payload.role !== 'assistant' || !state.requestId || !text) return;

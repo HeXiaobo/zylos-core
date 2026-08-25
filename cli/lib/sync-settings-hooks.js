@@ -171,6 +171,11 @@ export function desiredClaudeHooks({
     'skills/activity-monitor/scripts/hook-activity.js',
     { async: true, timeout: 5 }
   );
+  const promptActivityHook = commandHook(
+    'skills/activity-monitor/scripts/hook-activity.js',
+    // The turn binding/rejection must be durable before any tool hook runs.
+    { async: false, timeout: 5 }
+  );
   const messageDisplayHook = commandHook(
     'skills/activity-monitor/scripts/hook-activity.js',
     // MessageDisplay batches must reach the durable stream in source order.
@@ -184,7 +189,7 @@ export function desiredClaudeHooks({
     })),
     UserPromptSubmit: [
       {
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...promptActivityHook }],
       },
     ],
     PreToolUse: [

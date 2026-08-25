@@ -9,7 +9,8 @@
  *
  * Registered on: UserPromptSubmit, PreToolUse, PostToolUse,
  * PostToolUseFailure, MessageDisplay, Stop, Notification(idle_prompt).
- * MessageDisplay is synchronous for ordering; the watchdog hooks are async.
+ * UserPromptSubmit and MessageDisplay are synchronous for binding/ordering;
+ * the remaining watchdog hooks are async.
  *
  * Scope: phase 1 watchdog tracks only the root Claude agent. Nested subagent
  * hook payloads carry agent_id and are ignored here because recovery actions
@@ -22,7 +23,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { getClaudePid } from './claude-pid.js';
 import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
 import { sequenceMessageDisplayBatch } from './message-display-sequencer.js';
@@ -38,7 +39,9 @@ const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const TOOL_EVENTS_FILE = path.join(MONITOR_DIR, 'tool-events.jsonl');
 const HOOK_ERROR_LOG = path.join(MONITOR_DIR, 'hook-activity-errors.log');
 const MESSAGE_DISPLAY_BUFFER_DIR = path.join(MONITOR_DIR, 'message-display-buffers');
+const TURN_BINDING_DIR = path.join(MONITOR_DIR, 'assistant-turn-bindings');
 const ASSISTANT_REQUEST_MARKER = /assistant request:\s*"([A-Za-z0-9][A-Za-z0-9._:-]*)"\s*$/;
+const ANY_ASSISTANT_REQUEST_MARKER = /assistant request:\s*"/;
 
 function appendError(message) {
   try {
@@ -66,6 +69,117 @@ function assistantRequestIdFromPrompt(hookData) {
     ? hookData.prompt
     : (typeof hookData?.user_prompt === 'string' ? hookData.user_prompt : '');
   return prompt.match(ASSISTANT_REQUEST_MARKER)?.[1] || null;
+}
+
+function promptContainsAssistantRequestMarker(hookData) {
+  const prompt = typeof hookData?.prompt === 'string'
+    ? hookData.prompt
+    : (typeof hookData?.user_prompt === 'string' ? hookData.user_prompt : '');
+  return ANY_ASSISTANT_REQUEST_MARKER.test(prompt);
+}
+
+function turnBindingFile(sessionId) {
+  const key = createHash('sha256').update(sessionId).digest('hex');
+  return path.join(TURN_BINDING_DIR, `${key}.json`);
+}
+
+function readTurnBinding(sessionId) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(turnBindingFile(sessionId), 'utf8'));
+    if (
+      parsed?.version === 1
+      && parsed.sessionId === sessionId
+      && ['bound', 'rejected', 'closed'].includes(parsed.mode)
+      && (parsed.requestId === null || typeof parsed.requestId === 'string')
+    ) {
+      return parsed;
+    }
+  } catch {
+    // A missing/corrupt best-effort state is handled as an unbound legacy hook.
+  }
+  return null;
+}
+
+function writeTurnBinding(sessionId, { mode, requestId = null, reason = null, nowMs = Date.now() }) {
+  fs.mkdirSync(TURN_BINDING_DIR, { recursive: true });
+  const file = turnBindingFile(sessionId);
+  const temp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  const state = {
+    version: 1,
+    sessionId,
+    mode,
+    requestId,
+    reason,
+    updatedAt: nowMs,
+  };
+  fs.writeFileSync(temp, `${JSON.stringify(state)}\n`, 'utf8');
+  fs.renameSync(temp, file);
+  return state;
+}
+
+function bindingFromResult(sessionId, result, nowMs) {
+  const requestId = result?.request?.requestId;
+  if (typeof requestId === 'string' && requestId) {
+    return writeTurnBinding(sessionId, { mode: 'bound', requestId, nowMs });
+  }
+  return writeTurnBinding(sessionId, {
+    mode: 'rejected',
+    reason: result?.ambiguous ? 'ambiguous' : 'no_candidate',
+    nowMs,
+  });
+}
+
+function bindPromptTurn(responseStream, record, hookData) {
+  const requestId = assistantRequestIdFromPrompt(hookData);
+  if (!requestId && promptContainsAssistantRequestMarker(hookData)) {
+    return writeTurnBinding(record.session_id, {
+      mode: 'rejected',
+      reason: 'non_terminal_marker',
+      nowMs: record.ts,
+    });
+  }
+  try {
+    const result = requestId
+      ? responseStream.execute({
+        type: 'BindTurn',
+        requestId,
+        runtimeSessionId: record.session_id,
+      })
+      : responseStream.execute({
+        type: 'BindNextRun',
+        runtimeSessionId: record.session_id,
+      });
+    return bindingFromResult(record.session_id, result, record.ts);
+  } catch (error) {
+    appendError(`assistant_binding_rejected ${error?.code || 'invalid_request'}`);
+    return writeTurnBinding(record.session_id, {
+      mode: 'rejected',
+      reason: error?.code || 'invalid_request',
+      nowMs: record.ts,
+    });
+  }
+}
+
+function resolveTurnBinding(responseStream, record, { allowLegacyFallback = false } = {}) {
+  const existing = readTurnBinding(record.session_id);
+  if (existing) return existing.mode === 'bound' ? existing : null;
+  if (!allowLegacyFallback) return null;
+  try {
+    const result = responseStream.execute({
+      type: 'BindNextRun',
+      runtimeSessionId: record.session_id,
+    });
+    const binding = bindingFromResult(record.session_id, result, record.ts);
+    return binding.mode === 'bound' ? binding : null;
+  } catch (error) {
+    appendError(`assistant_binding_rejected ${error?.code || 'legacy_fallback_failed'}`);
+    writeTurnBinding(record.session_id, {
+      mode: 'rejected',
+      reason: error?.code || 'legacy_fallback_failed',
+      nowMs: record.ts,
+    });
+    return null;
+  }
 }
 
 function buildToolEvent({ hookData, eventName, claudePid, nowMs }) {
@@ -127,35 +241,23 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
   const responseStream = openAssistantResponseStream();
   try {
     if (record.event === 'prompt') {
-      const requestId = assistantRequestIdFromPrompt(hookData);
-      if (requestId) {
-        return responseStream.execute({
-          type: 'BindRun',
-          requestId,
-          runtimeSessionId: record.session_id,
-        });
-      }
-      return responseStream.execute({
-        type: 'BindNextRun',
-        runtimeSessionId: record.session_id,
-      });
+      return bindPromptTurn(responseStream, record, hookData);
     }
     if (['pre_tool', 'post_tool', 'post_tool_failure'].includes(record.event)) {
       if (!record.tool) return null;
-      // Some Claude runtimes emit UserPromptSubmit before C4 has persisted
-      // RunStarted (or omit that hook entirely). The first real tool event is
-      // therefore a second, race-safe binding point. BindNextRun is idempotent
-      // for an already-bound active session.
-      responseStream.execute({
-        type: 'BindNextRun',
-        runtimeSessionId: record.session_id,
+      // Older installations may omit UserPromptSubmit. In that case only the
+      // first observed event may attempt the single-candidate compatibility
+      // binding. A prompt-time rejection is sticky and can never fall back.
+      const binding = resolveTurnBinding(responseStream, record, {
+        allowLegacyFallback: true,
       });
+      if (!binding) return null;
       const status = record.event === 'pre_tool'
         ? 'started'
         : (record.event === 'post_tool' ? 'completed' : 'failed');
       return responseStream.execute({
-        type: 'ReportToolProgress',
-        runtimeSessionId: record.session_id,
+        type: 'ReportRequestToolProgress',
+        requestId: binding.requestId,
         toolName: record.tool,
         status,
         // The Core maps tool identity to fixed public progress. Tool input and
@@ -166,10 +268,10 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       });
     }
     if (record.event === 'message_display') {
-      responseStream.execute({
-        type: 'BindNextRun',
-        runtimeSessionId: record.session_id,
+      const binding = resolveTurnBinding(responseStream, record, {
+        allowLegacyFallback: true,
       });
+      if (!binding) return null;
       const delta = hookData?.delta;
       if (typeof delta !== 'string' || delta.length === 0) return null;
       if (!record.message_id || !Number.isSafeInteger(record.batch_index)) return null;
@@ -187,16 +289,16 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
             const safeDelta = sanitizePublicReasoningDelta(publicDelta);
             if (!safeDelta) continue;
             result = responseStream.execute({
-              type: 'AppendRuntimePublicReasoningDelta',
-              runtimeSessionId: record.session_id,
+              type: 'AppendPublicReasoningDelta',
+              requestId: binding.requestId,
               delta: safeDelta,
               idempotencyKey: `display-reasoning:${record.message_id}:${batch.index}:${index}`,
             });
           }
           if (separated.answer.length > 0) {
             result = responseStream.execute({
-              type: 'AppendRuntimeOutputDelta',
-              runtimeSessionId: record.session_id,
+              type: 'AppendOutputDelta',
+              requestId: binding.requestId,
               delta: separated.answer,
               idempotencyKey: `display:${record.message_id}:${batch.index}`,
             });
@@ -206,31 +308,43 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       return result;
     }
     if (record.event === 'stop') {
+      const binding = resolveTurnBinding(responseStream, record);
+      if (!binding) return null;
+      let result;
       if (
         typeof hookData?.last_assistant_message === 'string'
         && hookData.last_assistant_message.trim()
       ) {
         const output = stripPublicReasoningLines(hookData.last_assistant_message).trim();
         if (!output) {
-          return responseStream.execute({
+          result = responseStream.execute({
             type: 'FailRun',
-            runtimeSessionId: record.session_id,
+            requestId: binding.requestId,
             code: 'RESPONSE_NOT_DELIVERED',
             retryable: true,
           });
+        } else {
+          result = responseStream.execute({
+            type: 'CompleteRun',
+            requestId: binding.requestId,
+            output,
+          });
         }
-        return responseStream.execute({
-          type: 'CompleteRuntimeRun',
-          runtimeSessionId: record.session_id,
-          output,
+      } else {
+        result = responseStream.execute({
+          type: 'FailRun',
+          requestId: binding.requestId,
+          code: 'RESPONSE_NOT_DELIVERED',
+          retryable: true,
         });
       }
-      return responseStream.execute({
-        type: 'FailRun',
-        runtimeSessionId: record.session_id,
-        code: 'RESPONSE_NOT_DELIVERED',
-        retryable: true,
+      writeTurnBinding(record.session_id, {
+        mode: 'closed',
+        requestId: binding.requestId,
+        reason: 'stop',
+        nowMs: record.ts,
       });
+      return result;
     }
     return null;
   } finally {

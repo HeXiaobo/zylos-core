@@ -345,7 +345,9 @@ export function openAssistantResponseStream({
         const request = selectRequest.get(requestId);
         if (!request) throw new Error(`assistant request not found: ${requestId}`);
         if (!['queued', 'started'].includes(request.status)) {
-          return { request: toRequest(request), events: [], replayed: true };
+          const error = new Error(`cannot bind a terminal assistant request (${request.status})`);
+          error.code = 'ASSISTANT_RUN_BINDING_TERMINAL';
+          throw error;
         }
         if (request.runtime_session_id === runtimeSessionId) {
           return { request: toRequest(request), events: [], replayed: true };
@@ -368,6 +370,68 @@ export function openAssistantResponseStream({
           error.code = 'ASSISTANT_RUN_BINDING_CONFLICT';
           throw error;
         }
+        const current = clock();
+        const events = [];
+        if (request.status === 'started') {
+          const progress = appendEvent(
+            request,
+            'ProgressUpdated',
+            RUNTIME_ANALYSIS_PROGRESS,
+            `runtime:${runtimeSessionId}:analyze`,
+          );
+          events.push(progress.event);
+        }
+        database.prepare(`
+          UPDATE assistant_requests
+          SET runtime_session_id = ?, updated_at = ?
+          WHERE request_id = ?
+            AND status IN ('queued', 'started')
+            AND runtime_session_id IS NULL
+        `).run(runtimeSessionId, current, requestId);
+        return {
+          request: toRequest(selectRequest.get(requestId)),
+          events,
+          replayed: false,
+        };
+      }
+
+      case 'BindTurn': {
+        const requestId = requireIdentifier(command.requestId, 'requestId');
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const request = selectRequest.get(requestId);
+        if (!request) throw new Error(`assistant request not found: ${requestId}`);
+        if (!['queued', 'started'].includes(request.status)) {
+          const error = new Error(`cannot bind a terminal assistant request (${request.status})`);
+          error.code = 'ASSISTANT_RUN_BINDING_TERMINAL';
+          throw error;
+        }
+        if (request.runtime_session_id === runtimeSessionId) {
+          return { request: toRequest(request), events: [], replayed: true };
+        }
+        if (request.runtime_session_id !== null) {
+          const error = new Error('assistant request is already bound to a different runtime session');
+          error.code = 'ASSISTANT_RUN_BINDING_CONFLICT';
+          throw error;
+        }
+
+        const sessionOwner = database.prepare(`
+          SELECT request_id
+          FROM assistant_requests
+          WHERE runtime_session_id = ?
+            AND status IN ('queued', 'started')
+            AND request_id <> ?
+          ORDER BY updated_at DESC, accepted_at DESC
+          LIMIT 1
+        `).get(runtimeSessionId, requestId);
+        if (sessionOwner) {
+          executeTransaction({
+            type: 'FailRun',
+            requestId: sessionOwner.request_id,
+            code: 'RUN_SUPERSEDED_BY_EXPLICIT_TURN',
+            retryable: true,
+          });
+        }
+
         const current = clock();
         const events = [];
         if (request.status === 'started') {
@@ -484,6 +548,25 @@ export function openAssistantResponseStream({
           LIMIT 1
         `).get(runtimeSessionId);
         if (!request) return { request: null, events: [], replayed: false };
+        const emitted = appendEvent(request, 'ProgressUpdated', progress, idempotencyKey);
+        return {
+          request: toRequest(selectRequest.get(request.request_id)),
+          events: [emitted.event],
+          replayed: emitted.replayed,
+        };
+      }
+
+      case 'ReportRequestToolProgress': {
+        const requestId = requireIdentifier(command.requestId, 'requestId');
+        const progress = publicProgressForRuntimeTool({
+          toolName: command.toolName,
+          status: command.status,
+        });
+        const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
+        const request = selectRequest.get(requestId);
+        if (!request || request.status !== 'started') {
+          return { request: request ? toRequest(request) : null, events: [], replayed: false };
+        }
         const emitted = appendEvent(request, 'ProgressUpdated', progress, idempotencyKey);
         return {
           request: toRequest(selectRequest.get(request.request_id)),
@@ -731,6 +814,10 @@ export function openAssistantResponseStream({
           ['type', 'requestId', 'runtimeSessionId'],
           ['type', 'requestId', 'runtimeSessionId'],
         ],
+        BindTurn: [
+          ['type', 'requestId', 'runtimeSessionId'],
+          ['type', 'requestId', 'runtimeSessionId'],
+        ],
         BindNextRun: [['type', 'runtimeSessionId'], ['type', 'runtimeSessionId']],
         ReportProgress: [
           ['type', 'runtimeSessionId', 'stage', 'idempotencyKey'],
@@ -739,6 +826,10 @@ export function openAssistantResponseStream({
         ReportToolProgress: [
           ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
           ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
+        ],
+        ReportRequestToolProgress: [
+          ['type', 'requestId', 'toolName', 'status', 'idempotencyKey'],
+          ['type', 'requestId', 'toolName', 'status', 'idempotencyKey'],
         ],
         AppendPublicReasoningDelta: [
           ['type', 'requestId', 'delta', 'idempotencyKey'],

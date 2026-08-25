@@ -334,6 +334,57 @@ test('retains an explicit binding when the prompt hook wins the RunStarted race'
   stream.close();
 });
 
+test('rejects explicit binding to a terminal request', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({
+    type: 'CompleteRun',
+    requestId: 'assistant.feishu.om_1',
+    output: 'Already finished.',
+  });
+
+  assert.throws(
+    () => stream.execute({
+      type: 'BindRun',
+      requestId: 'assistant.feishu.om_1',
+      runtimeSessionId: 'session-terminal-binding',
+    }),
+    error => error.code === 'ASSISTANT_RUN_BINDING_TERMINAL',
+  );
+  stream.close();
+});
+
+test('atomically switches an explicit new turn to its request and fails the abandoned owner', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  accept(stream, {
+    requestId: 'assistant.feishu.om_2',
+    sourceId: 'om_2',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_2' },
+  });
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_2' });
+  stream.execute({
+    type: 'BindRun',
+    requestId: 'assistant.feishu.om_1',
+    runtimeSessionId: 'session-turn-switch',
+  });
+
+  const switched = stream.execute({
+    type: 'BindTurn',
+    requestId: 'assistant.feishu.om_2',
+    runtimeSessionId: 'session-turn-switch',
+  });
+
+  assert.equal(stream.query({ requestId: 'assistant.feishu.om_1' }).request.status, 'failed');
+  assert.equal(stream.query({ requestId: 'assistant.feishu.om_1' }).request.output, '');
+  assert.equal(switched.request.requestId, 'assistant.feishu.om_2');
+  assert.equal(switched.request.runtimeSessionId, 'session-turn-switch');
+  assert.equal(switched.request.status, 'started');
+  stream.close();
+});
+
 test('reports observed tool completion without exposing the runtime tool name', () => {
   const stream = openAssistantResponseStream({ dbPath: ':memory:' });
   accept(stream);

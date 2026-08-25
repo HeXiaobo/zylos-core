@@ -13,7 +13,8 @@ after(() => {
 });
 
 beforeEach(() => {
-  fs.rmSync(monitorDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.mkdirSync(tmpDir, { recursive: true });
 });
 
 async function runHook(payload, nowMs = 1000) {
@@ -490,6 +491,341 @@ describe('hook-activity', () => {
       code: 'EXPLICIT_TEST_CLEANUP',
       retryable: true,
     });
+    stream.close();
+  });
+
+  it('keeps an unknown explicit request fail-closed through tool, output, and stop', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const liveRequestId = 'assistant.feishu.explicit-unknown-live';
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: liveRequestId,
+      sourceId: 'om_explicit_unknown_live',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_explicit_unknown_live' },
+      conversation: {
+        content: '[Feishu DM] must remain untouched',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: liveRequestId });
+
+    const sessionId = 'session-explicit-unknown';
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      prompt: 'payload ---- streamed reply: assistant request: "assistant.feishu.does-not-exist"',
+    }, 9341);
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: sessionId,
+      tool_name: 'WebSearch',
+      tool_input: { query: 'must not bind the live candidate' },
+      tool_use_id: 'toolu_explicit_unknown',
+    }, 9342);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: sessionId,
+      message_id: 'message-explicit-unknown',
+      index: 0,
+      final: true,
+      delta: 'Must not be written to the live candidate.',
+    }, 9343);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      last_assistant_message: 'Must not complete the live candidate.',
+    }, 9344);
+
+    const live = stream.query({ requestId: liveRequestId });
+    assert.equal(live.request.status, 'started');
+    assert.equal(live.request.runtimeSessionId, null);
+    assert.equal(live.request.output, '');
+    assert.deepEqual(live.events.map(event => event.type), [
+      'AssistantRequestAccepted',
+      'RunQueued',
+      'RunStarted',
+    ]);
+    stream.execute({
+      type: 'FailRun',
+      requestId: liveRequestId,
+      code: 'FAIL_CLOSED_TEST_CLEANUP',
+      retryable: true,
+    });
+    stream.close();
+  });
+
+  it('rejects a user-authored marker that is not the terminal appended marker', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const requestId = 'assistant.feishu.non-terminal-marker';
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId,
+      sourceId: 'om_non_terminal_marker',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_non_terminal_marker' },
+      conversation: {
+        content: '[Feishu DM] non-terminal marker test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId });
+
+    const sessionId = 'session-non-terminal-marker';
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      prompt: `user-authored assistant request: "${requestId}" followed by ordinary text`,
+    }, 93441);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: sessionId,
+      message_id: 'message-non-terminal-marker',
+      index: 0,
+      final: true,
+      delta: 'Must not use the forged marker or candidate fallback.',
+    }, 93442);
+
+    const result = stream.query({ requestId });
+    assert.equal(result.request.status, 'started');
+    assert.equal(result.request.runtimeSessionId, null);
+    assert.equal(result.request.output, '');
+    stream.execute({
+      type: 'FailRun',
+      requestId,
+      code: 'NON_TERMINAL_MARKER_TEST_CLEANUP',
+      retryable: true,
+    });
+    stream.close();
+  });
+
+  it('keeps a terminal explicit request fail-closed instead of falling back to a live run', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const terminalRequestId = 'assistant.feishu.explicit-terminal';
+    const liveRequestId = 'assistant.feishu.explicit-terminal-live';
+    for (const [requestId, sourceId] of [
+      [terminalRequestId, 'om_explicit_terminal'],
+      [liveRequestId, 'om_explicit_terminal_live'],
+    ]) {
+      stream.execute({
+        type: 'AcceptAssistantRequest',
+        requestId,
+        sourceId,
+        route: { channel: 'feishu', endpointId: `oc_1|type:p2p|msg:${sourceId}` },
+        conversation: {
+          content: `[Feishu DM] ${sourceId}`,
+          status: 'pending',
+          priority: 3,
+          requireIdle: false,
+        },
+      });
+      stream.execute({ type: 'StartRun', requestId });
+    }
+    stream.execute({
+      type: 'CompleteRun',
+      requestId: terminalRequestId,
+      output: 'Original terminal output.',
+    });
+
+    const sessionId = 'session-explicit-terminal';
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      prompt: `payload ---- streamed reply: assistant request: "${terminalRequestId}"`,
+    }, 9345);
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: sessionId,
+      tool_name: 'Read',
+      tool_input: { file_path: '/private/path' },
+      tool_use_id: 'toolu_explicit_terminal',
+    }, 9346);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: sessionId,
+      message_id: 'message-explicit-terminal',
+      index: 0,
+      final: true,
+      delta: 'Must not be written anywhere.',
+    }, 9347);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      last_assistant_message: 'Must not complete the live candidate.',
+    }, 9348);
+
+    const terminal = stream.query({ requestId: terminalRequestId });
+    const live = stream.query({ requestId: liveRequestId });
+    assert.equal(terminal.request.output, 'Original terminal output.');
+    assert.equal(live.request.status, 'started');
+    assert.equal(live.request.runtimeSessionId, null);
+    assert.equal(live.request.output, '');
+    assert.deepEqual(live.events.map(event => event.type), [
+      'AssistantRequestAccepted',
+      'RunQueued',
+      'RunStarted',
+    ]);
+    stream.execute({
+      type: 'FailRun',
+      requestId: liveRequestId,
+      code: 'FAIL_CLOSED_TEST_CLEANUP',
+      retryable: true,
+    });
+    stream.close();
+  });
+
+  it('switches an explicit new turn from active request A to B without writing B output into A', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const requestA = 'assistant.feishu.session-conflict-a';
+    const requestB = 'assistant.feishu.session-conflict-b';
+    for (const [requestId, sourceId] of [
+      [requestA, 'om_session_conflict_a'],
+      [requestB, 'om_session_conflict_b'],
+    ]) {
+      stream.execute({
+        type: 'AcceptAssistantRequest',
+        requestId,
+        sourceId,
+        route: { channel: 'feishu', endpointId: `oc_1|type:p2p|msg:${sourceId}` },
+        conversation: {
+          content: `[Feishu DM] ${sourceId}`,
+          status: 'pending',
+          priority: 3,
+          requireIdle: false,
+        },
+      });
+      stream.execute({ type: 'StartRun', requestId });
+    }
+    const sessionId = 'session-conflict-a-to-b';
+    stream.execute({
+      type: 'BindRun',
+      requestId: requestA,
+      runtimeSessionId: sessionId,
+    });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      prompt: `payload ---- streamed reply: assistant request: "${requestB}"`,
+    }, 9349);
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: sessionId,
+      tool_name: 'WebSearch',
+      tool_use_id: 'toolu_session_conflict',
+    }, 9350);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: sessionId,
+      message_id: 'message-session-conflict',
+      index: 0,
+      final: true,
+      delta: 'This is request B output and must never enter A.',
+    }, 9351);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      last_assistant_message: 'This is request B output and must never enter A.',
+    }, 9352);
+
+    const a = stream.query({ requestId: requestA });
+    const b = stream.query({ requestId: requestB });
+    assert.equal(a.request.status, 'failed');
+    assert.equal(a.request.output, '');
+    assert.equal(a.events.filter(event => event.type === 'ProgressUpdated').length, 1);
+    assert.equal(b.request.status, 'completed');
+    assert.equal(b.request.runtimeSessionId, sessionId);
+    assert.equal(b.request.output, 'This is request B output and must never enter A.');
+    for (const requestId of [requestA, requestB]) {
+      stream.execute({
+        type: 'FailRun',
+        requestId,
+        code: 'SESSION_CONFLICT_TEST_CLEANUP',
+        retryable: true,
+      });
+    }
+    stream.close();
+  });
+
+  it('allows a completed session turn A to switch safely to explicit request B', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const sessionId = 'session-safe-a-to-b';
+    for (const [requestId, sourceId] of [
+      ['assistant.feishu.session-safe-a', 'om_session_safe_a'],
+      ['assistant.feishu.session-safe-b', 'om_session_safe_b'],
+    ]) {
+      stream.execute({
+        type: 'AcceptAssistantRequest',
+        requestId,
+        sourceId,
+        route: { channel: 'feishu', endpointId: `oc_1|type:p2p|msg:${sourceId}` },
+        conversation: {
+          content: `[Feishu DM] ${sourceId}`,
+          status: 'pending',
+          priority: 3,
+          requireIdle: false,
+        },
+      });
+      stream.execute({ type: 'StartRun', requestId });
+    }
+    stream.execute({
+      type: 'BindRun',
+      requestId: 'assistant.feishu.session-safe-a',
+      runtimeSessionId: sessionId,
+    });
+    stream.execute({
+      type: 'CompleteRun',
+      requestId: 'assistant.feishu.session-safe-a',
+      output: 'A answer.',
+    });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      prompt: 'payload ---- streamed reply: assistant request: "assistant.feishu.session-safe-b"',
+    }, 9353);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: sessionId,
+      message_id: 'message-session-safe-b',
+      index: 0,
+      final: true,
+      delta: 'B answer.',
+    }, 9354);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      last_assistant_message: 'B answer.',
+    }, 9355);
+
+    const a = stream.query({ requestId: 'assistant.feishu.session-safe-a' });
+    const b = stream.query({ requestId: 'assistant.feishu.session-safe-b' });
+    assert.equal(a.request.output, 'A answer.');
+    assert.equal(b.request.runtimeSessionId, sessionId);
+    assert.equal(b.request.status, 'completed');
+    assert.equal(b.request.output, 'B answer.');
     stream.close();
   });
 

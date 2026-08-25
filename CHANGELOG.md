@@ -5,6 +5,13 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-3ai.6] - 2026-08-26
+
+### Fixed
+- Claude streamed replies now persist a synchronous turn-level binding or rejection before tool hooks run. Unknown, terminal, conflicting, and non-terminal request markers remain fail-closed through tool progress, displayed output, and stop handling instead of falling back to a session candidate.
+- A valid explicit new turn atomically supersedes an abandoned active request on the same Claude session, while every later event writes by the saved request ID rather than re-resolving the session.
+- Codex accepts only the terminal system-appended request marker and clears the previous association on every new user turn, preventing an earlier user-authored marker or an unmarked next turn from inheriting response output.
+
 ## [0.7.2-3ai.5] - 2026-08-26
 
 ### Fixed

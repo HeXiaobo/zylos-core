@@ -11,7 +11,7 @@ describe('3AI release metadata', () => {
     const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
     const capabilities = JSON.parse(fs.readFileSync(path.join(ROOT, 'capabilities.json'), 'utf8'));
 
-    assert.equal(pkg.version, '0.7.2-3ai.5');
+    assert.equal(pkg.version, '0.7.2-3ai.6');
     assert.equal(lock.version, pkg.version);
     assert.equal(lock.packages[''].version, pkg.version);
     assert.equal(capabilities.release, pkg.version);

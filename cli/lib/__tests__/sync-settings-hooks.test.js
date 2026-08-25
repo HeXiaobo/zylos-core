@@ -169,6 +169,15 @@ describe('desiredClaudeHooks', () => {
     assert.equal(groups[0].hooks[0].async, false);
     assert.equal(groups[0].hooks[0].timeout, 5);
   });
+
+  it('registers UserPromptSubmit synchronously so turn binding precedes tool hooks', () => {
+    const groups = desiredClaudeHooks().UserPromptSubmit || [];
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].hooks.length, 1);
+    assert.ok(groups[0].hooks[0].command.includes('hook-activity.js'));
+    assert.equal(groups[0].hooks[0].async, false);
+    assert.equal(groups[0].hooks[0].timeout, 5);
+  });
 });
 
 describe('Activity monitor threshold fallback', () => {
