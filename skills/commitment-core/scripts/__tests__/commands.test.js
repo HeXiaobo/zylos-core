@@ -584,6 +584,7 @@ test('opening a first-tranche database migrates task states without losing sourc
       core.query({ taskId: 'task-legacy', includeEvents: true }).events.map((event) => event.type),
       ['TaskCreated'],
     );
+    assert.equal(core.query({ taskId: 'task-legacy' }).dueAt, null);
     assert.equal(core.ingest(envelope).created, false);
     const started = core.command({
       type: 'StartTask',

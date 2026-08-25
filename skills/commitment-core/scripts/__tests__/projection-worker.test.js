@@ -191,6 +191,34 @@ test('permanent failures and exhausted retry attempts are dead-lettered', async 
   }
 });
 
+test('a platform Adapter can mark a failure permanent without importing Core classes', async () => {
+  const harness = createHarness();
+  try {
+    createTask(harness.core, 1);
+    const platformError = new Error('invalid platform member');
+    platformError.retryable = false;
+    const summary = await processProjectionBatch({
+      core: harness.core,
+      projection: 'attention',
+      workerId: 'attention-worker-1',
+      leaseMs: 30_000,
+      limit: 1,
+      retryAfterMs: 5_000,
+      maxAttempts: 2,
+      operationId: 'platform-cycle-1',
+      adapter: { async publishBatch() { throw platformError; } },
+    });
+
+    assert.equal(summary.deadLettered, 1);
+    assert.equal(
+      harness.core.outbox.query({ projection: 'attention', eventId: 'event-1' }).status,
+      'dead_letter',
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('the Attention Adapter rebuilds one atomic view for a whole Event batch', async () => {
   const harness = createHarness();
   const outputPath = path.join(os.tmpdir(), `zylos-attention-projection-${process.pid}.md`);

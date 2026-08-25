@@ -246,6 +246,36 @@ test('ExternalLink normalizes backend and maintains a stable bidirectional mappi
   }
 });
 
+test('Card and Task v2 keep independent unique ExternalLinks for one Core Task', () => {
+  const harness = openHarness();
+  try {
+    const task = createTask(harness.core, 'task-1');
+    const card = harness.core.externalLinks.link({
+      taskId: task.id,
+      actorId: task.ownerId,
+      backend: 'feishu',
+      externalId: 'om_card_message',
+      idempotencyKey: 'link:feishu-card',
+    });
+    const taskV2 = harness.core.externalLinks.link({
+      taskId: task.id,
+      actorId: task.ownerId,
+      backend: 'feishu-task-v2',
+      externalId: 'task-guid-1',
+      idempotencyKey: 'link:feishu-task-v2',
+    });
+
+    assert.equal(card.link.externalId, 'om_card_message');
+    assert.equal(taskV2.link.externalId, 'task-guid-1');
+    assert.deepEqual(
+      harness.core.externalLinks.query({ taskId: task.id }).map((link) => link.backend),
+      ['feishu', 'feishu-task-v2'],
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('ExternalLink uniqueness holds across Core connections and at the SQLite boundary', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-external-link-concurrency-'));
   const dbPath = path.join(directory, 'commitments.db');

@@ -33,6 +33,19 @@ function optionalText(value, field) {
   return requireText(value, field);
 }
 
+function optionalTimestamp(value, field) {
+  if (value === undefined || value === null) return null;
+  const timestamp = requireText(value, field);
+  if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp)) {
+    throw new TypeError(`${field} must be an RFC 3339 timestamp`);
+  }
+  const milliseconds = Date.parse(timestamp);
+  if (!Number.isFinite(milliseconds)) {
+    throw new TypeError(`${field} must be an RFC 3339 timestamp`);
+  }
+  return new Date(milliseconds).toISOString();
+}
+
 function toTaskView(row) {
   if (!row) return null;
   return {
@@ -43,6 +56,7 @@ function toTaskView(row) {
     ownerId: row.owner_id,
     acceptorId: row.acceptor_id,
     assigneeId: row.assignee_id,
+    dueAt: row.due_at,
     version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -86,12 +100,19 @@ function normalizeEnvelope(envelope) {
       ownerId,
       acceptorId: optionalText(task.acceptorId, 'task.acceptorId') ?? ownerId,
       assigneeId: optionalText(task.assigneeId, 'task.assigneeId'),
+      dueAt: optionalTimestamp(task.dueAt, 'task.dueAt'),
     },
   };
 }
 
 function fingerprintEnvelope(envelope) {
   return createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
+}
+
+function fingerprintLegacyEnvelope(envelope) {
+  if (envelope?.task?.dueAt !== null) return null;
+  const { dueAt: _dueAt, ...legacyTask } = envelope.task;
+  return fingerprintEnvelope({ ...envelope, task: legacyTask });
 }
 
 function idempotencyConflict(key) {
@@ -245,6 +266,7 @@ const TASK_TABLE_COLUMNS = `
   owner_id TEXT NOT NULL,
   acceptor_id TEXT NOT NULL,
   assignee_id TEXT,
+  due_at TEXT,
   version INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -280,15 +302,18 @@ function migrateLegacyTaskStateSchema(database) {
   `).get();
   if (!taskTable || taskTable.sql.includes("'in_progress'")) return;
 
+  const legacyHasDueAt = database.pragma('table_info(commitment_tasks)')
+    .some((column) => column.name === 'due_at');
+  const legacyDueAt = legacyHasDueAt ? 'due_at' : 'NULL';
   const migrate = database.transaction(() => {
     database.exec(`
       ${createTaskTableSql('commitment_tasks_migrated')};
       INSERT INTO commitment_tasks_migrated (
         id, title, description, state, owner_id, acceptor_id, assignee_id,
-        version, created_at, updated_at
+        due_at, version, created_at, updated_at
       )
       SELECT id, title, description, state, owner_id, acceptor_id, assignee_id,
-             version, created_at, updated_at
+             ${legacyDueAt}, version, created_at, updated_at
       FROM commitment_tasks;
       DROP TABLE commitment_tasks;
       ALTER TABLE commitment_tasks_migrated RENAME TO commitment_tasks;
@@ -306,6 +331,12 @@ function migrateLegacyTaskStateSchema(database) {
   } finally {
     database.pragma('foreign_keys = ON');
   }
+}
+
+function migrateTaskDueAtSchema(database) {
+  const taskTable = database.pragma('table_info(commitment_tasks)');
+  if (taskTable.length === 0 || taskTable.some((column) => column.name === 'due_at')) return;
+  database.exec('ALTER TABLE commitment_tasks ADD COLUMN due_at TEXT');
 }
 
 function migrateLegacyEventSchema(database) {
@@ -447,6 +478,7 @@ export function openCommitmentCore({
   database.pragma('busy_timeout = 5000');
   if (dbPath !== ':memory:') database.pragma('journal_mode = WAL');
   migrateLegacyTaskStateSchema(database);
+  migrateTaskDueAtSchema(database);
   migrateLegacyEventSchema(database);
   database.pragma('foreign_keys = ON');
   initializeSchema(database);
@@ -458,7 +490,7 @@ export function openCommitmentCore({
   backfillCreationEvents(database, eventIdGenerator, projectionOutboxModule.append);
 
   const selectTask = database.prepare(`
-    SELECT id, title, description, state, owner_id, acceptor_id, assignee_id,
+    SELECT id, title, description, state, owner_id, acceptor_id, assignee_id, due_at,
            version, created_at, updated_at
     FROM commitment_tasks
     WHERE id = ?
@@ -482,9 +514,9 @@ export function openCommitmentCore({
   `);
   const insertTask = database.prepare(`
     INSERT INTO commitment_tasks (
-      id, title, description, state, owner_id, acceptor_id, assignee_id,
+      id, title, description, state, owner_id, acceptor_id, assignee_id, due_at,
       version, created_at, updated_at
-    ) VALUES (?, ?, ?, 'ready', ?, ?, ?, 1, ?, ?)
+    ) VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, 1, ?, ?)
   `);
   const insertSource = database.prepare(`
     INSERT INTO commitment_sources (
@@ -547,7 +579,10 @@ export function openCommitmentCore({
     const fingerprint = fingerprintEnvelope(envelope);
     const existing = selectTaskForSource.get(envelope.idempotencyKey);
     if (existing) {
-      if (existing.request_fingerprint !== fingerprint) {
+      if (
+        existing.request_fingerprint !== fingerprint
+        && existing.request_fingerprint !== fingerprintLegacyEnvelope(envelope)
+      ) {
         throw idempotencyConflict(envelope.idempotencyKey);
       }
       return { created: false, task: toTaskView(selectTask.get(existing.task_id)) };
@@ -562,6 +597,7 @@ export function openCommitmentCore({
       envelope.task.ownerId,
       envelope.task.acceptorId,
       envelope.task.assigneeId,
+      envelope.task.dueAt,
       timestamp,
       timestamp,
     );
@@ -713,7 +749,7 @@ export function openCommitmentCore({
         }
         const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
         return database.prepare(`
-          SELECT id, title, description, state, owner_id, acceptor_id, assignee_id,
+          SELECT id, title, description, state, owner_id, acceptor_id, assignee_id, due_at,
                  version, created_at, updated_at
           FROM commitment_tasks
           ${where}

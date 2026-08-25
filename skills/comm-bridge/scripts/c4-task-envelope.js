@@ -14,6 +14,19 @@ function optionalText(value, field) {
   return requireText(value, field);
 }
 
+function optionalTimestamp(value, field) {
+  if (value === undefined || value === null) return undefined;
+  const timestamp = requireText(value, field);
+  if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp)) {
+    throw new TypeError(`task envelope ${field} must be an RFC 3339 timestamp`);
+  }
+  const milliseconds = Date.parse(timestamp);
+  if (!Number.isFinite(milliseconds)) {
+    throw new TypeError(`task envelope ${field} must be an RFC 3339 timestamp`);
+  }
+  return new Date(milliseconds).toISOString();
+}
+
 export function validateTaskEnvelope(envelope) {
   if (!isRecord(envelope)) {
     throw new TypeError('task envelope must be an object');
@@ -26,6 +39,7 @@ export function validateTaskEnvelope(envelope) {
   }
 
   const ownerId = requireText(envelope.task.ownerId, 'task.ownerId');
+  const dueAt = optionalTimestamp(envelope.task.dueAt, 'task.dueAt');
   return {
     idempotencyKey: requireText(envelope.idempotencyKey, 'idempotencyKey'),
     source: {
@@ -39,6 +53,7 @@ export function validateTaskEnvelope(envelope) {
       ownerId,
       acceptorId: optionalText(envelope.task.acceptorId, 'task.acceptorId') ?? ownerId,
       assigneeId: optionalText(envelope.task.assigneeId, 'task.assigneeId'),
+      ...(dueAt === undefined ? {} : { dueAt }),
     },
   };
 }

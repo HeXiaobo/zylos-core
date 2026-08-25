@@ -220,6 +220,7 @@ Create options:
   --acceptor <id>        Acceptor identity (defaults to owner)
   --assignee <id>        Assignee identity
   --description <text>   Optional description
+  --due-at <timestamp>   Optional RFC 3339 deadline
   --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
   --json                 JSON output
 
@@ -254,7 +255,9 @@ Run command options:
 
 function createTask(core, args, makeIdempotencyKey) {
   const { options } = parseArgs(args, {
-    valueFlags: ['title', 'owner', 'acceptor', 'assignee', 'description', 'idempotency-key'],
+    valueFlags: [
+      'title', 'owner', 'acceptor', 'assignee', 'description', 'due-at', 'idempotency-key',
+    ],
     booleanFlags: ['json'],
   });
   const title = requireValue(options.title, '--title');
@@ -275,6 +278,7 @@ function createTask(core, args, makeIdempotencyKey) {
       ownerId,
       acceptorId: options.acceptor,
       assigneeId: options.assignee,
+      dueAt: options['due-at'],
     },
   });
 

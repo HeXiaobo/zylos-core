@@ -43,7 +43,7 @@ function errorDetail(error) {
 }
 
 function isRetryableAdapterFailure(error) {
-  return !(error instanceof ProjectionAdapterError && error.retryable === false);
+  return error?.retryable !== false;
 }
 
 /**

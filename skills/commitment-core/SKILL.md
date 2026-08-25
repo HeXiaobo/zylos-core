@@ -153,6 +153,11 @@ It never calls or synchronizes Feishu, OpenMax, Paperclip, or another backend.
   omitting `externalId` lists mappings for a backend. Lists have a default
   limit of 50, maximum of 100, and deterministic identity ordering.
 
+Task snapshots expose an optional canonical RFC 3339 `dueAt`. It is a Core
+business fact shared by every projection; platform Adapters translate it to
+their own deadline representation. Existing databases migrate with `dueAt =
+null` and task creation remains backward compatible when it is omitted.
+
 Evidence rows, ExternalLink rows, and their receipts commit in their respective
 single SQLite transactions. Callers must use these Interfaces instead of the
 underlying tables.
@@ -262,9 +267,11 @@ contact an external backend, or automatically retry the delivery.
 runtime-neutral worker Interface. It claims one bounded delivery batch for one
 `projection`, calls the injected Adapter exactly once, and then settles each
 delivery independently with its claimed version. Success acknowledges each
-row. A retryable Adapter failure moves rows to `retry_wait`; an explicit
-`ProjectionAdapterError(..., { retryable: false })` or exhaustion of
-`maxAttempts` moves them to `dead_letter`. Settlement fencing on one row is
+row. A retryable Adapter failure moves rows to `retry_wait`; an error carrying
+`retryable: false` (including `ProjectionAdapterError`) or exhaustion of
+`maxAttempts` moves it to `dead_letter`. This structural flag lets platform
+Adapters honor the worker Interface without importing Core implementation
+classes. Settlement fencing on one row is
 counted and does not prevent settlement attempts for the rest of the batch.
 
 Every worker cycle must use a fresh `operationId`; the default is a random

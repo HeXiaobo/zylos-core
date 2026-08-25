@@ -57,10 +57,41 @@ test('replaying one source creates exactly one ready task', () => {
       ownerId: 'ou_owner',
       acceptorId: 'ou_owner',
       assigneeId: 'agent:yueran',
+      dueAt: null,
       version: 1,
       createdAt: '2026-08-24T10:00:00.000Z',
       updatedAt: '2026-08-24T10:00:00.000Z',
     });
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('normalizes an optional deadline as a channel-neutral Core fact', () => {
+  const harness = createHarness();
+
+  try {
+    const result = harness.core.ingest({
+      idempotencyKey: 'lark:om_due_at:task-intent',
+      source: {
+        channel: 'lark',
+        externalId: 'om_due_at',
+        senderId: 'ou_owner',
+      },
+      task: {
+        title: '在截止时间前交付',
+        ownerId: 'ou_owner',
+        dueAt: '2026-08-28T18:00:00+08:00',
+      },
+    });
+
+    assert.equal(result.task.dueAt, '2026-08-28T10:00:00.000Z');
+    assert.equal(harness.core.query({ taskId: result.task.id }).dueAt, result.task.dueAt);
+    assert.throws(() => harness.core.ingest({
+      idempotencyKey: 'lark:om_bad_due_at:task-intent',
+      source: { channel: 'lark', externalId: 'om_bad_due_at', senderId: 'ou_owner' },
+      task: { title: '非法截止时间', ownerId: 'ou_owner', dueAt: 'tomorrow' },
+    }), /RFC 3339/);
   } finally {
     harness.cleanup();
   }
