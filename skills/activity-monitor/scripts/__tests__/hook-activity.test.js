@@ -688,6 +688,72 @@ describe('hook-activity', () => {
     stream.close();
   });
 
+  it('does not reuse active request A for a later unmarked prompt in the same session', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const requestA = 'assistant.feishu.unmarked-next-turn-a';
+    const sessionId = 'session-unmarked-next-turn';
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: requestA,
+      sourceId: 'om_unmarked_next_turn_a',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_unmarked_next_turn_a' },
+      conversation: {
+        content: '[Feishu DM] request A must not receive the next local turn',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: requestA });
+    stream.execute({
+      type: 'BindRun',
+      requestId: requestA,
+      runtimeSessionId: sessionId,
+    });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      prompt: 'ordinary local follow-up with no assistant request marker',
+    }, 93481);
+    // runHook reloads the hook module for each lifecycle event. The rejected
+    // decision therefore has to survive process/module restart, not just memory.
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: sessionId,
+      message_id: 'message-unmarked-next-turn',
+      index: 0,
+      final: true,
+      delta: 'This later turn must never be streamed into request A.',
+    }, 93482);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      last_assistant_message: 'This later turn must never complete request A.',
+    }, 93483);
+
+    const a = stream.query({ requestId: requestA });
+    assert.equal(a.request.status, 'started');
+    assert.equal(a.request.output, '');
+    assert.deepEqual(a.events.map(event => event.type), [
+      'AssistantRequestAccepted',
+      'RunQueued',
+      'RunStarted',
+      'ProgressUpdated',
+    ]);
+    stream.execute({
+      type: 'FailRun',
+      requestId: requestA,
+      code: 'UNMARKED_NEXT_TURN_TEST_CLEANUP',
+      retryable: true,
+    });
+    stream.close();
+  });
+
   it('switches an explicit new turn from active request A to B without writing B output into A', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     const { openAssistantResponseStream } = await import(

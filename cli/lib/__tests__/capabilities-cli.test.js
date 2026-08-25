@@ -24,7 +24,7 @@ describe('zylos capabilities', () => {
     assert.deepEqual(actual.protocols, {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
-      'c4.assistant-response-stream': 1,
+      'c4.assistant-response-stream': 2,
       'work-intake': 1,
       'commitment-core': 1,
       'projection-outbox': 1,

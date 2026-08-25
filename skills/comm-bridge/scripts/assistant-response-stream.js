@@ -457,6 +457,7 @@ export function openAssistantResponseStream({
         };
       }
 
+      case 'BeginNextRun':
       case 'BindNextRun': {
         const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
         const existing = database.prepare(`
@@ -468,7 +469,17 @@ export function openAssistantResponseStream({
           ORDER BY updated_at DESC, accepted_at DESC
           LIMIT 1
         `).get(runtimeSessionId);
-        if (existing) return { request: toRequest(existing), events: [], replayed: true };
+        if (existing) {
+          if (command.type === 'BeginNextRun') {
+            return {
+              request: null,
+              events: [],
+              replayed: false,
+              conflict: true,
+            };
+          }
+          return { request: toRequest(existing), events: [], replayed: true };
+        }
         const candidates = database.prepare(`
           SELECT request_id, conversation_id, route_channel, route_endpoint, source_id,
                  status, runtime_session_id, next_sequence, output_text,
@@ -818,6 +829,7 @@ export function openAssistantResponseStream({
           ['type', 'requestId', 'runtimeSessionId'],
           ['type', 'requestId', 'runtimeSessionId'],
         ],
+        BeginNextRun: [['type', 'runtimeSessionId'], ['type', 'runtimeSessionId']],
         BindNextRun: [['type', 'runtimeSessionId'], ['type', 'runtimeSessionId']],
         ReportProgress: [
           ['type', 'runtimeSessionId', 'stage', 'idempotencyKey'],

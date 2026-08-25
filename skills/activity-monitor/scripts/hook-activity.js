@@ -124,7 +124,9 @@ function bindingFromResult(sessionId, result, nowMs) {
   }
   return writeTurnBinding(sessionId, {
     mode: 'rejected',
-    reason: result?.ambiguous ? 'ambiguous' : 'no_candidate',
+    reason: result?.conflict
+      ? 'active_turn_conflict'
+      : (result?.ambiguous ? 'ambiguous' : 'no_candidate'),
     nowMs,
   });
 }
@@ -138,6 +140,16 @@ function bindPromptTurn(responseStream, record, hookData) {
       nowMs: record.ts,
     });
   }
+  if (!requestId && readTurnBinding(record.session_id)?.mode === 'bound') {
+    // A UserPromptSubmit is a new turn boundary. Reusing the prior turn's
+    // active binding would route this turn's output into the wrong request.
+    // Persist the rejection so later hook processes cannot fall back to A.
+    return writeTurnBinding(record.session_id, {
+      mode: 'rejected',
+      reason: 'active_turn_conflict',
+      nowMs: record.ts,
+    });
+  }
   try {
     const result = requestId
       ? responseStream.execute({
@@ -146,7 +158,7 @@ function bindPromptTurn(responseStream, record, hookData) {
         runtimeSessionId: record.session_id,
       })
       : responseStream.execute({
-        type: 'BindNextRun',
+        type: 'BeginNextRun',
         runtimeSessionId: record.session_id,
       });
     return bindingFromResult(record.session_id, result, record.ts);
