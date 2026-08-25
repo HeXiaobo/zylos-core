@@ -221,4 +221,71 @@ describe('hook-activity', () => {
     const [event] = readEvents();
     assert.equal(Object.hasOwn(event, 'rule_id'), false);
   });
+
+  it('projects real tool start and completion as safe public progress', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.hook-progress',
+      sourceId: 'om_hook_progress',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_hook_progress' },
+      conversation: {
+        content: '[Feishu DM] progress test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.hook-progress' });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-hook-progress',
+    }, 9000);
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 'session-hook-progress',
+      tool_name: 'WebSearch',
+      tool_input: { query: 'private customer information must not escape' },
+      tool_use_id: 'toolu_hook_progress',
+    }, 9100);
+    await runHook({
+      hook_event_name: 'PostToolUse',
+      session_id: 'session-hook-progress',
+      tool_name: 'WebSearch',
+      tool_input: { query: 'private customer information must not escape' },
+      tool_use_id: 'toolu_hook_progress',
+    }, 9200);
+
+    const progress = stream.query({ requestId: 'assistant.feishu.hook-progress' }).events
+      .filter(event => event.type === 'ProgressUpdated');
+    assert.deepEqual(progress.map(event => event.payload), [
+      {
+        stage: 'organizing',
+        action: 'analyze_request',
+        status: 'started',
+        summary: 'Analyzing the request',
+      },
+      {
+        stage: 'searching',
+        action: 'search_sources',
+        status: 'started',
+        summary: 'Searching relevant sources',
+      },
+      {
+        stage: 'searching',
+        action: 'search_sources',
+        status: 'completed',
+        summary: 'Relevant sources found',
+      },
+    ]);
+    const serialized = JSON.stringify(progress);
+    assert.equal(serialized.includes('private customer'), false);
+    assert.equal(serialized.includes('WebSearch'), false);
+    stream.close();
+  });
 });

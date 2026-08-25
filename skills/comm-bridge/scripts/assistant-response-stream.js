@@ -4,7 +4,15 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import {
+  publicProgressForRuntimeTool,
+  RUNTIME_ANALYSIS_PROGRESS,
+  SAFE_PROGRESS_STAGES,
+  safeProgressStageForTool,
+} from './assistant-public-progress.js';
 import { ensureAssistantResponseSchema, getDb } from './c4-db.js';
+
+export { SAFE_PROGRESS_STAGES, safeProgressStageForTool } from './assistant-public-progress.js';
 
 export const ASSISTANT_RESPONSE_EVENT_TYPES = Object.freeze([
   'AssistantRequestAccepted',
@@ -14,17 +22,6 @@ export const ASSISTANT_RESPONSE_EVENT_TYPES = Object.freeze([
   'OutputDelta',
   'RunCompleted',
   'RunFailed',
-]);
-
-export const SAFE_PROGRESS_STAGES = Object.freeze([
-  'reading',
-  'searching',
-  'querying',
-  'writing',
-  'executing',
-  'communicating',
-  'organizing',
-  'recovering',
 ]);
 
 const EVENT_TYPE_SET = new Set(ASSISTANT_RESPONSE_EVENT_TYPES);
@@ -158,23 +155,6 @@ function safeErrorCode(value) {
     throw new TypeError('code must be a public uppercase error identifier');
   }
   return code;
-}
-
-function progressStageForTool(toolName, failed = false) {
-  if (failed) return 'recovering';
-  const normalized = String(toolName || '').toLowerCase();
-  if (!normalized) return null;
-  if (/(read|open|view|fetch)/.test(normalized)) return 'reading';
-  if (/(grep|glob|find|search)/.test(normalized)) return 'searching';
-  if (/(calendar|sheet|base|database|query|list|get)/.test(normalized)) return 'querying';
-  if (/(write|edit|patch|create|update)/.test(normalized)) return 'writing';
-  if (/(send|mail|message|notify)/.test(normalized)) return 'communicating';
-  if (/(bash|shell|exec|command|computer|browser)/.test(normalized)) return 'executing';
-  return 'organizing';
-}
-
-export function safeProgressStageForTool(toolName, { failed = false } = {}) {
-  return progressStageForTool(toolName, failed);
 }
 
 /**
@@ -381,6 +361,12 @@ export function openAssistantResponseStream({
         `).get();
         if (!request) return { request: null, events: [], replayed: false };
         const current = clock();
+        const progress = appendEvent(
+          request,
+          'ProgressUpdated',
+          RUNTIME_ANALYSIS_PROGRESS,
+          `runtime:${runtimeSessionId}:analyze`,
+        );
         database.prepare(`
           UPDATE assistant_requests
           SET runtime_session_id = ?, updated_at = ?
@@ -388,7 +374,7 @@ export function openAssistantResponseStream({
         `).run(runtimeSessionId, current, request.request_id);
         return {
           request: toRequest(selectRequest.get(request.request_id)),
-          events: [],
+          events: [progress.event],
           replayed: false,
         };
       }
@@ -411,6 +397,31 @@ export function openAssistantResponseStream({
         `).get(runtimeSessionId);
         if (!request) return { request: null, events: [], replayed: false };
         const emitted = appendEvent(request, 'ProgressUpdated', { stage }, idempotencyKey);
+        return {
+          request: toRequest(selectRequest.get(request.request_id)),
+          events: [emitted.event],
+          replayed: emitted.replayed,
+        };
+      }
+
+      case 'ReportToolProgress': {
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const progress = publicProgressForRuntimeTool({
+          toolName: command.toolName,
+          status: command.status,
+        });
+        const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
+        const request = database.prepare(`
+          SELECT request_id, conversation_id, route_channel, route_endpoint, source_id,
+                 status, runtime_session_id, next_sequence, output_text,
+                 accepted_at, updated_at, terminal_at
+          FROM assistant_requests
+          WHERE runtime_session_id = ? AND status = 'started'
+          ORDER BY updated_at DESC, accepted_at DESC
+          LIMIT 1
+        `).get(runtimeSessionId);
+        if (!request) return { request: null, events: [], replayed: false };
+        const emitted = appendEvent(request, 'ProgressUpdated', progress, idempotencyKey);
         return {
           request: toRequest(selectRequest.get(request.request_id)),
           events: [emitted.event],
@@ -571,6 +582,10 @@ export function openAssistantResponseStream({
         ReportProgress: [
           ['type', 'runtimeSessionId', 'stage', 'idempotencyKey'],
           ['type', 'runtimeSessionId', 'stage', 'idempotencyKey'],
+        ],
+        ReportToolProgress: [
+          ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
+          ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
         ],
         AppendOutputDelta: [
           ['type', 'requestId', 'delta', 'idempotencyKey'],

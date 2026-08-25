@@ -91,6 +91,7 @@ test('records verified lifecycle, real deltas, and canonical full completion', (
     'RunQueued',
     'RunStarted',
     'ProgressUpdated',
+    'ProgressUpdated',
     'OutputDelta',
     'RunCompleted',
   ]);
@@ -113,6 +114,14 @@ test('rejects fabricated stages, unsafe identifiers, and changed idempotent delt
     stage: 'thinking_about_hidden_reasoning',
     idempotencyKey: 'tool:unsafe',
   }), /safe public progress stage/);
+  assert.throws(() => stream.execute({
+    type: 'ReportToolProgress',
+    runtimeSessionId: 'session-1',
+    toolName: 'WebSearch',
+    status: 'started',
+    toolInput: { query: 'must never reach the public event' },
+    idempotencyKey: 'tool:input-forbidden',
+  }), /unsupported fields/);
   stream.execute({
     type: 'AppendOutputDelta',
     requestId: 'assistant.feishu.om_1',
@@ -134,6 +143,117 @@ test('maps actual tool names to a fixed public stage without carrying parameters
   assert.equal(safeProgressStageForTool('mcp__lark__calendar_get'), 'querying');
   assert.equal(safeProgressStageForTool('Bash'), 'executing');
   assert.equal(safeProgressStageForTool('Bash', { failed: true }), 'recovering');
+});
+
+test('turns an observed tool start into a fixed public progress summary', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-1' });
+
+  const progress = stream.execute({
+    type: 'ReportToolProgress',
+    runtimeSessionId: 'session-1',
+    toolName: 'WebSearch',
+    status: 'started',
+    idempotencyKey: 'tool:start:1',
+  });
+
+  assert.deepEqual(progress.events[0].payload, {
+    stage: 'searching',
+    action: 'search_sources',
+    status: 'started',
+    summary: 'Searching relevant sources',
+  });
+  assert.equal(JSON.stringify(progress.events[0]).includes('WebSearch'), false);
+  stream.close();
+});
+
+test('binding the runtime emits a safe analysis summary even when no tools are needed', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+
+  const bound = stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-no-tools' });
+
+  assert.deepEqual(bound.events.map(event => event.payload), [{
+    stage: 'organizing',
+    action: 'analyze_request',
+    status: 'started',
+    summary: 'Analyzing the request',
+  }]);
+  stream.close();
+});
+
+test('reports observed tool completion without exposing the runtime tool name', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-1' });
+
+  const progress = stream.execute({
+    type: 'ReportToolProgress',
+    runtimeSessionId: 'session-1',
+    toolName: 'mcp__lark__calendar_get',
+    status: 'completed',
+    idempotencyKey: 'tool:completed:1',
+  });
+
+  assert.deepEqual(progress.events[0].payload, {
+    stage: 'querying',
+    action: 'query_data',
+    status: 'completed',
+    summary: 'Relevant data checked',
+  });
+  assert.equal(JSON.stringify(progress.events[0]).includes('calendar_get'), false);
+  stream.close();
+});
+
+test('reports tool failure as generic recovery without leaking custom tool identity', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-1' });
+
+  const progress = stream.execute({
+    type: 'ReportToolProgress',
+    runtimeSessionId: 'session-1',
+    toolName: 'mcp__private_customer__lookup',
+    status: 'failed',
+    idempotencyKey: 'tool:failed:1',
+  });
+
+  assert.deepEqual(progress.events[0].payload, {
+    stage: 'recovering',
+    action: 'recover_tool',
+    status: 'failed',
+    summary: 'Adjusting after a tool issue',
+  });
+  assert.equal(JSON.stringify(progress.events[0]).includes('private_customer'), false);
+  stream.close();
+});
+
+test('reports root-agent delegation as safe coordination rather than hidden reasoning', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-1' });
+
+  const progress = stream.execute({
+    type: 'ReportToolProgress',
+    runtimeSessionId: 'session-1',
+    toolName: 'Agent',
+    status: 'started',
+    idempotencyKey: 'tool:agent:1',
+  });
+
+  assert.deepEqual(progress.events[0].payload, {
+    stage: 'organizing',
+    action: 'coordinate_work',
+    status: 'started',
+    summary: 'Coordinating work',
+  });
+  stream.close();
 });
 
 test('leases deliveries with fencing and recovers stale requests as RunFailed', () => {

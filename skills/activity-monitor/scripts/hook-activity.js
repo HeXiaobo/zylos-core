@@ -24,10 +24,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { getClaudePid } from './claude-pid.js';
 import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
-import {
-  openAssistantResponseStream,
-  safeProgressStageForTool,
-} from '../../comm-bridge/scripts/assistant-response-stream.js';
+import { openAssistantResponseStream } from '../../comm-bridge/scripts/assistant-response-stream.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
@@ -109,18 +106,20 @@ export function emitAssistantLifecycle(record) {
         runtimeSessionId: record.session_id,
       });
     }
-    if (record.event === 'pre_tool' || record.event === 'post_tool_failure') {
-      const stage = safeProgressStageForTool(record.tool, {
-        failed: record.event === 'post_tool_failure',
-      });
-      if (!stage) return null;
+    if (['pre_tool', 'post_tool', 'post_tool_failure'].includes(record.event)) {
+      if (!record.tool) return null;
+      const status = record.event === 'pre_tool'
+        ? 'started'
+        : (record.event === 'post_tool' ? 'completed' : 'failed');
       return responseStream.execute({
-        type: 'ReportProgress',
+        type: 'ReportToolProgress',
         runtimeSessionId: record.session_id,
-        stage,
-        // The key carries lifecycle identity only.  Tool input/summary is
-        // deliberately excluded so secrets and hidden parameters never enter
-        // the user-visible stream ledger.
+        toolName: record.tool,
+        status,
+        // The Core maps tool identity to fixed public progress. Tool input and
+        // the monitor's diagnostic summary are deliberately excluded, so
+        // secrets, paths, queries, and hidden parameters never enter the
+        // user-visible stream ledger.
         idempotencyKey: `hook:${record.event}:${record.event_id || record.ts}`,
       });
     }
