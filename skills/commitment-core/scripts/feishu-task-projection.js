@@ -78,7 +78,7 @@ function resolveAcceptorDmTarget({ task }) {
  * Core-to-Feishu projection Module.
  *
  * Its public Interface is the generic projection Adapter's single
- * `publishBatch({ deliveries })` operation. Current Task snapshot reads,
+ * `publishDelivery({ delivery })` operation. Current Task snapshot reads,
  * target resolution, create/update choice, stable remote idempotency, and
  * durable ExternalLink ownership stay inside this Module.
  */
@@ -101,10 +101,27 @@ export function createFeishuTaskProjectionAdapter({
 
   async function publishOne(delivery) {
     const taskId = requireText(delivery.event?.taskId, 'delivery.event.taskId');
+    const eventVersion = delivery.event?.version;
+    if (!Number.isSafeInteger(eventVersion) || eventVersion < 1) {
+      throw new ProjectionAdapterError('delivery.event.version must be a positive integer', {
+        retryable: false,
+      });
+    }
     const task = core.query({ taskId });
     if (!task) {
       throw new ProjectionAdapterError(`Core task not found: ${taskId}`, { retryable: false });
     }
+    if (eventVersion > task.version) {
+      throw new ProjectionAdapterError(
+        `delivery version ${eventVersion} is ahead of Core task ${taskId} version ${task.version}`,
+      );
+    }
+    // Several state changes may accumulate before a worker cycle. Publishing
+    // every old event from the latest snapshot repeats the same CardKit
+    // sequence and leaves otherwise successful rows in dead-letter. The
+    // newest durable event will project the authoritative snapshot, so older
+    // versions are safely acknowledged as superseded without a remote write.
+    if (eventVersion < task.version) return;
     const target = requireTarget(await resolveTarget({ task }));
     const links = core.externalLinks.query({ taskId, backend: PROJECTION });
     if (links.length > 1) {
@@ -150,10 +167,8 @@ export function createFeishuTaskProjectionAdapter({
   }
 
   return Object.freeze({
-    async publishBatch({ deliveries } = {}) {
-      for (const delivery of requireDeliveries(deliveries)) {
-        await publishOne(delivery);
-      }
+    async publishDelivery({ delivery } = {}) {
+      await publishOne(requireDeliveries([delivery])[0]);
     },
   });
 }

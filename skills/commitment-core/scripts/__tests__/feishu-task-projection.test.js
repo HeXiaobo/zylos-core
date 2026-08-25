@@ -160,6 +160,65 @@ test('updates the linked Feishu task from the latest Core snapshot without creat
   }
 });
 
+test('coalesces several pending versions of one linked task into one latest card update', async () => {
+  const harness = createHarness();
+  const updates = [];
+  let lastRemoteVersion = 0;
+  try {
+    const createdTask = ingestTask(harness.core);
+    const adapter = createFeishuTaskProjectionAdapter({
+      core: harness.core,
+      resolveTarget: () => ({ receiveId: 'chat-1', receiveIdType: 'chat_id' }),
+      publisher: {
+        async createTask() {
+          return { externalId: 'feishu-task-9001' };
+        },
+        async updateTask(request) {
+          if (request.task.version <= lastRemoteVersion) {
+            throw new Error('sequence number compare failed');
+          }
+          lastRemoteVersion = request.task.version;
+          updates.push(request);
+          return { externalId: request.externalId };
+        },
+      },
+    });
+    await runWorker(harness.core, adapter, 'cycle-create');
+
+    const started = harness.core.command({
+      type: 'StartTask',
+      taskId: createdTask.id,
+      actorId: 'agent-1',
+      idempotencyKey: 'command:start:coalesced',
+    }, createdTask.version).task;
+    const submitted = harness.core.command({
+      type: 'SubmitForReview',
+      taskId: createdTask.id,
+      actorId: 'agent-1',
+      idempotencyKey: 'command:submit:coalesced',
+    }, started.version).task;
+    const accepted = harness.core.command({
+      type: 'AcceptTask',
+      taskId: createdTask.id,
+      actorId: 'manager-1',
+      idempotencyKey: 'command:accept:coalesced',
+    }, submitted.version).task;
+
+    const summary = await runWorker(harness.core, adapter, 'cycle-coalesced');
+
+    assert.equal(summary.acknowledged, 3);
+    assert.equal(summary.retryWaiting, 0);
+    assert.deepEqual(updates.map(request => request.task.version), [accepted.version]);
+    assert.equal(
+      harness.core.outbox.query({ projection: 'feishu', limit: 10 })
+        .filter(delivery => delivery.status !== 'acknowledged').length,
+      0,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('replays the same remote create identity after a crash before ExternalLink persistence', async () => {
   const harness = createHarness();
   const createRequests = [];
@@ -206,7 +265,7 @@ test('replays the same remote create identity after a crash before ExternalLink 
   }
 });
 
-test('a partially published batch safely replays: linked tasks update and unlinked tasks reuse create identity', async () => {
+test('one failed Feishu delivery does not replay or hold back successful tasks', async () => {
   const harness = createHarness();
   const creates = [];
   const updates = [];
@@ -240,20 +299,21 @@ test('a partially published batch safely replays: linked tasks update and unlink
     });
 
     const partial = await runWorker(harness.core, adapter, 'cycle-1');
-    assert.equal(partial.retryWaiting, 2);
+    assert.equal(partial.acknowledged, 1);
+    assert.equal(partial.retryWaiting, 1);
     assert.equal(harness.core.externalLinks.query({ taskId: first.id }).length, 1);
     assert.equal(harness.core.externalLinks.query({ taskId: second.id }).length, 0);
 
     harness.setNow('2026-08-25T10:00:05.000Z');
     const recovered = await runWorker(harness.core, adapter, 'cycle-2');
 
-    assert.equal(recovered.acknowledged, 2);
+    assert.equal(recovered.acknowledged, 1);
     assert.deepEqual(creates.map((request) => request.idempotencyKey), [
       'zylos:feishu:create:task-1',
       'zylos:feishu:create:task-2',
       'zylos:feishu:create:task-2',
     ]);
-    assert.deepEqual(updates.map((request) => request.externalId), ['feishu-task-1']);
+    assert.deepEqual(updates, []);
     assert.equal(harness.core.externalLinks.query({ backend: 'feishu' }).length, 2);
   } finally {
     harness.cleanup();
@@ -410,10 +470,9 @@ test('the default MVP target is the Task acceptor Feishu open_id DM and rejects 
   }
 });
 
-test('concurrent Event workers converge on one Feishu identity through stable create and link receipts', async () => {
+test('concurrent Event workers skip a superseded version and create one Feishu identity', async () => {
   const harness = createHarness();
   const createRequests = [];
-  const createWaiters = [];
   try {
     const task = ingestTask(harness.core);
     harness.core.command({
@@ -423,14 +482,9 @@ test('concurrent Event workers converge on one Feishu identity through stable cr
       idempotencyKey: 'command:start:concurrent',
     }, task.version);
     const publisher = {
-      createTask(request) {
+      async createTask(request) {
         createRequests.push(request);
-        return new Promise((resolve) => {
-          createWaiters.push(resolve);
-          if (createWaiters.length === 2) {
-            for (const finish of createWaiters) finish({ externalId: 'feishu-converged-1' });
-          }
-        });
+        return { externalId: 'feishu-converged-1' };
       },
       async updateTask() { assert.fail('both workers reach create before either link commits'); },
     };
@@ -464,9 +518,8 @@ test('concurrent Event workers converge on one Feishu identity through stable cr
 
     assert.equal(first.acknowledged, 1);
     assert.equal(second.acknowledged, 1);
-    assert.equal(createRequests.length, 2);
+    assert.equal(createRequests.length, 1);
     assert.equal(createRequests[0].idempotencyKey, 'zylos:feishu:create:task-1');
-    assert.equal(createRequests[1].idempotencyKey, createRequests[0].idempotencyKey);
     assert.deepEqual(
       harness.core.externalLinks.query({ taskId: task.id, backend: 'feishu' })
         .map((link) => link.externalId),

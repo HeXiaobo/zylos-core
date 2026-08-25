@@ -388,11 +388,17 @@ claim that they already succeeded.
 
 `createFeishuTaskProjectionAdapter(...)` in
 `scripts/feishu-task-projection.js` is the deep Core-to-Feishu projection
-Module. Its only worker-facing Interface is `publishBatch({ deliveries })`.
+Module. Its only worker-facing Interface is `publishDelivery({ delivery })`.
 The Module hides current Task snapshot reads, target resolution, create/update
 selection, remote idempotency identities, and durable `ExternalLink` writes.
 Commitment Core remains the fact source; Feishu is a replaceable projection and
 must never drive Task state directly through this Module.
+
+If several versions of one Task accumulate before a worker cycle, deliveries
+older than the current authoritative Task version are acknowledged as
+superseded without a remote write. Only the matching latest version publishes
+the current snapshot. This prevents repeated CardKit sequence numbers while
+preserving eventual convergence through the newer durable Outbox event.
 
 The injected publisher Interface is deliberately SDK-free:
 
