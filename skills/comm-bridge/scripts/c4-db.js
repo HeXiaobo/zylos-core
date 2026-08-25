@@ -210,6 +210,7 @@ export function ensureAssistantResponseSchema(database) {
       delivery_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
       retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
       available_at INTEGER NOT NULL,
       lease_token TEXT,
       lease_expires_at INTEGER,
@@ -226,6 +227,15 @@ export function ensureAssistantResponseSchema(database) {
     CREATE INDEX IF NOT EXISTS idx_assistant_response_events_request
       ON assistant_response_events(request_id, sequence);
   `);
+
+  const eventColumns = getColumnNames(database, 'assistant_response_events');
+  if (!eventColumns.has('redrive_count')) {
+    database.exec(`
+      ALTER TABLE assistant_response_events
+      ADD COLUMN redrive_count INTEGER NOT NULL DEFAULT 0
+        CHECK (redrive_count >= 0)
+    `);
+  }
 }
 
 function toCommitmentIntakeView(row) {

@@ -243,3 +243,78 @@ test('delivery retry fences later sequences until the earlier batch is available
   assert.deepEqual(payloads[0].events.map(item => item.sequence), [1, 2, 3]);
   succeedingWorker.close();
 });
+
+test('delivery worker bounds a hung adapter and returns the leased events to retry', async () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => 8_000 });
+  accept(stream);
+  const worker = createAssistantResponseDeliveryWorker({
+    responseStream: stream,
+    adapterForChannel: () => '/adapter/feishu/stream.js',
+    adapterExists: () => true,
+    deliver: async () => new Promise(() => {}),
+    clock: () => 8_000,
+    staleSeconds: 1_000,
+    deliveryTimeoutMs: 10,
+    logger: { warn() {} },
+  });
+
+  const result = await Promise.race([
+    worker.drainOnce(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('worker did not time out')), 200)),
+  ]);
+  assert.equal(result.retried, 2);
+  assert.equal(result.deadLettered, 0);
+  worker.close();
+});
+
+test('dead-letter deliveries are observable and can be explicitly redriven in order', () => {
+  let now = 9_000;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });
+  accept(stream);
+  const leased = stream.claimDeliveries({ limit: 10 });
+  stream.retryDeliveries(leased.map(item => ({
+    deliveryId: item.deliveryId,
+    leaseToken: item.leaseToken,
+    error: 'Feishu unavailable',
+  })), { maxAttempts: 1 });
+
+  const failed = stream.queryDeliveries({
+    requestId: 'assistant.feishu.om_1',
+    status: 'dead_letter',
+    limit: 10,
+  });
+  assert.deepEqual(failed.map(item => ({
+    sequence: item.event.sequence,
+    status: item.status,
+    retryCount: item.retryCount,
+    redriveCount: item.redriveCount,
+  })), [
+    { sequence: 1, status: 'dead_letter', retryCount: 1, redriveCount: 0 },
+    { sequence: 2, status: 'dead_letter', retryCount: 1, redriveCount: 0 },
+  ]);
+
+  now += 1;
+  const redrive = stream.redriveDeadLetters({
+    requestId: 'assistant.feishu.om_1',
+    limit: 10,
+  });
+  assert.deepEqual(redrive, { requestId: 'assistant.feishu.om_1', redriven: 2 });
+  const pending = stream.queryDeliveries({
+    requestId: 'assistant.feishu.om_1',
+    status: 'pending',
+    limit: 10,
+  });
+  assert.deepEqual(pending.map(item => ({
+    sequence: item.event.sequence,
+    retryCount: item.retryCount,
+    redriveCount: item.redriveCount,
+  })), [
+    { sequence: 1, retryCount: 0, redriveCount: 1 },
+    { sequence: 2, retryCount: 0, redriveCount: 1 },
+  ]);
+  assert.deepEqual(
+    stream.claimDeliveries({ limit: 10 }).map(item => item.event.sequence),
+    [1, 2],
+  );
+  stream.close();
+});

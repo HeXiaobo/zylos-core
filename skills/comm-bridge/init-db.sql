@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS assistant_response_events (
     delivery_status TEXT NOT NULL DEFAULT 'pending'
       CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
     retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
     available_at INTEGER NOT NULL,
     lease_token TEXT,
     lease_expires_at INTEGER,

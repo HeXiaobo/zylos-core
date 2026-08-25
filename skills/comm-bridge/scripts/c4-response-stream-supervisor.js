@@ -33,11 +33,12 @@ function groupDeliveries(deliveries) {
   ));
 }
 
-function deliverToAdapter(adapterPath, payload) {
+function deliverToAdapter(adapterPath, payload, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('node', [adapterPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: process.env,
+      signal,
     });
     let stderr = '';
     child.stderr.setEncoding('utf8');
@@ -56,6 +57,23 @@ function deliverToAdapter(adapterPath, payload) {
   });
 }
 
+function deliverWithinDeadline(deliver, adapterPath, payload, timeoutMs) {
+  const controller = new AbortController();
+  let timeout = null;
+  const deadline = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      const error = new Error(`response stream adapter timed out after ${timeoutMs}ms`);
+      error.code = 'ASSISTANT_ADAPTER_TIMEOUT';
+      reject(error);
+    }, timeoutMs);
+  });
+  return Promise.race([
+    Promise.resolve().then(() => deliver(adapterPath, payload, { signal: controller.signal })),
+    deadline,
+  ]).finally(() => clearTimeout(timeout));
+}
+
 export function createAssistantResponseDeliveryWorker({
   responseStream = openAssistantResponseStream(),
   adapterForChannel = channel => path.join(SKILLS_DIR, channel, 'scripts', 'stream.js'),
@@ -66,8 +84,12 @@ export function createAssistantResponseDeliveryWorker({
   staleSeconds = DEFAULT_STALE_SECONDS,
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
   retryDelaySeconds = 2,
+  deliveryTimeoutMs = 30_000,
   logger = console,
 } = {}) {
+  if (!Number.isSafeInteger(deliveryTimeoutMs) || deliveryTimeoutMs < 1) {
+    throw new TypeError('deliveryTimeoutMs must be a positive integer');
+  }
   return Object.freeze({
     async drainOnce() {
       const expired = responseStream.execute({
@@ -87,12 +109,12 @@ export function createAssistantResponseDeliveryWorker({
           if (!adapterExists(adapterPath)) {
             throw new Error(`response stream adapter not found for channel ${route.channel}`);
           }
-          await deliver(adapterPath, {
+          await deliverWithinDeadline(deliver, adapterPath, {
             schemaVersion: 1,
             requestId: event.requestId,
             route,
             events: group.map(item => item.event),
-          });
+          }, deliveryTimeoutMs);
           const results = responseStream.acknowledgeDeliveries(group.map(item => ({
             deliveryId: item.deliveryId,
             leaseToken: item.leaseToken,
@@ -137,6 +159,7 @@ async function main() {
     batchSize: positiveInteger(process.env.C4_RESPONSE_STREAM_BATCH_SIZE, DEFAULT_BATCH_SIZE),
     staleSeconds: positiveInteger(process.env.C4_RESPONSE_STREAM_STALE_SECONDS, DEFAULT_STALE_SECONDS),
     maxAttempts: positiveInteger(process.env.C4_RESPONSE_STREAM_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS),
+    deliveryTimeoutMs: positiveInteger(process.env.C4_RESPONSE_STREAM_DELIVERY_TIMEOUT_MS, 30_000),
   });
   const shutdown = () => { shuttingDown = true; };
   process.on('SIGINT', shutdown);

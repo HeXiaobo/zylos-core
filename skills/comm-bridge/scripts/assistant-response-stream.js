@@ -599,18 +599,79 @@ export function openAssistantResponseStream({
       };
     },
 
-    resolveRequestId({ channel, endpointId } = {}) {
-      const safeChannel = requireText(channel, 'channel');
-      const safeEndpoint = requireText(endpointId, 'endpointId');
-      const rows = database.prepare(`
-        SELECT request_id
-        FROM assistant_requests
-        WHERE route_channel = ? AND route_endpoint = ?
-          AND status IN ('queued', 'started')
-        ORDER BY updated_at DESC, accepted_at DESC
-        LIMIT 2
-      `).all(safeChannel, safeEndpoint);
-      return rows.length === 1 ? rows[0].request_id : null;
+    queryDeliveries({ requestId = null, status = 'dead_letter', limit = 50 } = {}) {
+      const safeRequestId = requestId === null ? null : requireIdentifier(requestId, 'requestId');
+      const safeStatus = requireText(status, 'status', 32);
+      if (!['pending', 'processing', 'delivered', 'dead_letter'].includes(safeStatus)) {
+        throw new TypeError('status is not a supported delivery status');
+      }
+      requireInteger(limit, 'limit', { minimum: 1 });
+      if (limit > 500) throw new TypeError('limit must be <= 500');
+      const rows = safeRequestId === null
+        ? database.prepare(`
+            SELECT e.id, e.request_id, e.sequence, e.event_type, e.payload_json,
+                   e.created_at, e.delivery_status, e.retry_count, e.redrive_count,
+                   e.available_at, e.last_error, e.delivered_at,
+                   r.route_channel, r.route_endpoint
+            FROM assistant_response_events e
+            JOIN assistant_requests r ON r.request_id = e.request_id
+            WHERE e.delivery_status = ?
+            ORDER BY e.id ASC
+            LIMIT ?
+          `).all(safeStatus, limit)
+        : database.prepare(`
+            SELECT e.id, e.request_id, e.sequence, e.event_type, e.payload_json,
+                   e.created_at, e.delivery_status, e.retry_count, e.redrive_count,
+                   e.available_at, e.last_error, e.delivered_at,
+                   r.route_channel, r.route_endpoint
+            FROM assistant_response_events e
+            JOIN assistant_requests r ON r.request_id = e.request_id
+            WHERE e.request_id = ? AND e.delivery_status = ?
+            ORDER BY e.sequence ASC
+            LIMIT ?
+          `).all(safeRequestId, safeStatus, limit);
+      return rows.map(row => ({
+        deliveryId: row.id,
+        route: { channel: row.route_channel, endpointId: row.route_endpoint },
+        event: toEvent(row),
+        status: row.delivery_status,
+        retryCount: row.retry_count,
+        redriveCount: row.redrive_count,
+        availableAt: row.available_at,
+        lastError: row.last_error,
+        deliveredAt: row.delivered_at,
+      }));
+    },
+
+    redriveDeadLetters({ requestId, limit = 50 } = {}) {
+      const safeRequestId = requireIdentifier(requestId, 'requestId');
+      requireInteger(limit, 'limit', { minimum: 1 });
+      if (limit > 500) throw new TypeError('limit must be <= 500');
+      return database.transaction(() => {
+        const rows = database.prepare(`
+          SELECT id
+          FROM assistant_response_events
+          WHERE request_id = ? AND delivery_status = 'dead_letter'
+          ORDER BY sequence ASC
+          LIMIT ?
+        `).all(safeRequestId, limit);
+        if (rows.length === 0) return { requestId: safeRequestId, redriven: 0 };
+        const current = clock();
+        const update = database.prepare(`
+          UPDATE assistant_response_events
+          SET delivery_status = 'pending', retry_count = 0,
+              redrive_count = redrive_count + 1, available_at = ?,
+              lease_token = NULL, lease_expires_at = NULL,
+              last_error = CASE
+                WHEN last_error IS NULL THEN 'OPERATOR_REDRIVE'
+                ELSE 'OPERATOR_REDRIVE: ' || last_error
+              END
+          WHERE id = ? AND delivery_status = 'dead_letter'
+        `);
+        let redriven = 0;
+        for (const row of rows) redriven += update.run(current, row.id).changes;
+        return { requestId: safeRequestId, redriven };
+      }).immediate();
     },
 
     claimDeliveries({ limit = 50, leaseSeconds = 30 } = {}) {
@@ -654,7 +715,8 @@ export function openAssistantResponseStream({
           if (claimed.changes !== 1) continue;
           const row = database.prepare(`
             SELECT e.id, e.request_id, e.sequence, e.event_type, e.payload_json,
-                   e.created_at, e.retry_count, r.route_channel, r.route_endpoint
+                   e.created_at, e.retry_count, e.redrive_count,
+                   r.route_channel, r.route_endpoint
             FROM assistant_response_events e
             JOIN assistant_requests r ON r.request_id = e.request_id
             WHERE e.id = ?
@@ -663,6 +725,7 @@ export function openAssistantResponseStream({
             deliveryId: row.id,
             leaseToken: token,
             retryCount: row.retry_count,
+            redriveCount: row.redrive_count,
             route: { channel: row.route_channel, endpointId: row.route_endpoint },
             event: toEvent(row),
           });

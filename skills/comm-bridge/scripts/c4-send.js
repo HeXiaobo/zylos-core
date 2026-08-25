@@ -80,6 +80,10 @@ function readStdin() {
   });
 }
 
+function publicAssistantOutput(message) {
+  return /^\[MEDIA:(?:image|file)\].+/s.test(message) ? '' : message;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const parsed = parseArgs(args);
@@ -130,7 +134,7 @@ async function main() {
     process.exit(1);
   }
 
-  let assistantRequestId = parsed.requestId;
+  const assistantRequestId = parsed.requestId;
 
   // Virtual 'void' channel (#689): record-only, never dispatched.
   // No skill directory exists for it, so skip channel-path validation and
@@ -179,22 +183,27 @@ async function main() {
     }
   }
 
+  if (assistantRequestId) {
+    try {
+      const responseStream = openAssistantResponseStream();
+      const stream = responseStream.query({ requestId: assistantRequestId });
+      responseStream.close();
+      if (!stream) throw new Error('assistant request does not exist');
+      if (stream.request.route.channel !== channel || stream.request.route.endpointId !== endpoint) {
+        throw new Error('assistant request does not match its channel route');
+      }
+    } catch (err) {
+      console.error(`[C4] Invalid assistant request: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
   try {
     insertConversation('out', channel, endpoint, message);
   } catch (err) {
     console.error(`[C4] Warning: DB audit write failed: ${err.stack}`);
   } finally {
     close();
-  }
-
-  if (!assistantRequestId && endpoint) {
-    try {
-      const responseStream = openAssistantResponseStream();
-      assistantRequestId = responseStream.resolveRequestId({ channel, endpointId: endpoint });
-      responseStream.close();
-    } catch (err) {
-      console.error(`[C4] Warning: response stream lookup failed: ${err.message}`);
-    }
   }
 
   const channelScript = path.join(SKILLS_DIR, channel, 'scripts', 'send.js');
@@ -216,6 +225,7 @@ async function main() {
   });
 
   child.on('close', (code) => {
+    let terminalWriteFailed = false;
     if (assistantRequestId) {
       try {
         const responseStream = openAssistantResponseStream();
@@ -223,7 +233,7 @@ async function main() {
           ? {
               type: 'CompleteRun',
               requestId: assistantRequestId,
-              output: message,
+              output: publicAssistantOutput(message),
             }
           : {
               type: 'FailRun',
@@ -233,15 +243,19 @@ async function main() {
             });
         responseStream.close();
       } catch (err) {
+        terminalWriteFailed = true;
         console.error(`[C4] Warning: failed to record assistant terminal event: ${err.message}`);
       }
     }
-    if (code === 0) {
+    const exitCode = terminalWriteFailed ? 1 : code;
+    if (exitCode === 0) {
       console.log(`[C4] Message sent via ${channel}`);
-    } else {
+    } else if (code !== 0) {
       console.log(`[C4] Failed to send message via ${channel} (exit code: ${code})`);
+    } else {
+      console.log(`[C4] Failed to complete message via ${channel} (exit code: ${exitCode})`);
     }
-    process.exit(code);
+    process.exit(exitCode);
   });
 
   child.on('error', (err) => {
