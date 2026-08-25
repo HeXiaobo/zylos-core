@@ -15,6 +15,7 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
 const COMPONENTS_JSON = path.join(ZYLOS_DIR, '.zylos', 'components.json');
+const CORE_REPO = process.env.ZYLOS_SELF_UPGRADE_REPO || 'zylos-ai/zylos-core';
 
 function resolveCommBridgeScript(fileName) {
   const prodPath = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', fileName);
@@ -95,7 +96,7 @@ function main() {
     const coreVersion = execFileSync('zylos', ['--version'], {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     }).trim();
-    const result = getLatestTag('zylos-ai/zylos-core');
+    const result = getLatestTag(CORE_REPO);
     if (result.error) {
       log(`Upgrade check: failed to fetch zylos-core tag (${result.error})`);
       failures++;

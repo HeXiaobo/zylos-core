@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
 const {
+  CORE_REPO,
   createFinalizeState,
   runSelfUpgradeFinalize,
   step1_backupCoreSkills,
@@ -34,6 +36,27 @@ function writeSplitPackage(pkgRoot) {
   fs.writeFileSync(path.join(templatesDir, 'onboarding.md'), '# Onboarding\n');
   fs.copyFileSync(path.resolve('cli/lib/runtime/assembler.mjs'), path.join(runtimeDir, 'assembler.mjs'));
 }
+
+describe('self-upgrade repository routing', () => {
+  it('defaults to the canonical repository', () => {
+    assert.equal(CORE_REPO, 'zylos-ai/zylos-core');
+  });
+
+  it('exports the configured fork repository for every core upgrade consumer', () => {
+    const moduleUrl = new URL('../self-upgrade.js', import.meta.url).href;
+    const result = spawnSync(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      `import { CORE_REPO } from ${JSON.stringify(moduleUrl)}; process.stdout.write(CORE_REPO);`,
+    ], {
+      env: { ...process.env, ZYLOS_SELF_UPGRADE_REPO: 'HeXiaobo/zylos-core' },
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'HeXiaobo/zylos-core');
+  });
+});
 
 describe('self-upgrade finalizer handoff', () => {
   it('serializes the state needed by the newly installed finalizer', () => {

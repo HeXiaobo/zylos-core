@@ -49,12 +49,12 @@ import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
 //   ZYLOS_REPO with a DIFFERENT meaning (a full URL, for fresh installs). Same
 //   name + two meanings (URL vs slug) would silently mis-resolve here, so the
 //   self-upgrade override gets its own name.
-//   OPEN (registered, see fork-based-upgrade-process doc): this override covers
-//   the self-upgrade DOWNLOAD source only. The version-CHECK sources
-//   (upgrade-check.js, doctor.js, install.sh's latest-check) remain hardcoded
-//   to canonical; pointing those at the fork needs a fork release/tag strategy.
+//   The same variable is consumed by doctor, activity-monitor, the installer,
+//   and changelog lookup so check and download sources cannot drift apart.
+//   Stable no-branch upgrades still require a release tag in the selected repo.
 // Actual maker: Mylos (COO).
-const REPO = process.env.ZYLOS_SELF_UPGRADE_REPO || 'zylos-ai/zylos-core';
+export const CORE_REPO = process.env.ZYLOS_SELF_UPGRADE_REPO || 'zylos-ai/zylos-core';
+const REPO = CORE_REPO;
 
 // ---------------------------------------------------------------------------
 // Version helpers

@@ -12,6 +12,8 @@ EOF
 
 Messages are piped via stdin using a heredoc. This bypasses shell argument parsing entirely, so any content (quotes, variables, markdown) is delivered verbatim.
 
+Passing the message body as a CLI argument is disabled and exits with status 2. This is an enforced safety boundary, not a deprecation warning.
+
 ### Important safety rule
 
 - The heredoc terminator line (for example `EOF`) is shell wrapper syntax, not part of the message body.

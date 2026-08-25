@@ -5,6 +5,16 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-3ai.1] - 2026-08-25
+
+### Added
+- Commitment Core task/run state, durable SQLite intake, projection outbox, WorkIntake, response streaming, and Feishu task integration seams from the task-management MVP integration branch.
+- Mylos memory anti-recurrence gates, crash-loop diagnosis guidance, and fork-aware self-upgrade routing through `ZYLOS_SELF_UPGRADE_REPO`.
+
+### Changed
+- `c4-send` now accepts message bodies through stdin only. CLI argument mode fails before dispatch with exit code 2.
+- Core upgrade checks, changelog reads, doctor output, activity-monitor checks, and branch installs consistently honor the configured fork repository.
+
 ## [0.7.1] - 2026-08-18
 
 ### Added

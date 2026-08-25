@@ -74,7 +74,12 @@ while [ $# -gt 0 ]; do
 done
 
 # ── Configuration ─────────────────────────────────────────────
-ZYLOS_REPO="https://github.com/zylos-ai/zylos-core"
+ZYLOS_REPO_SLUG="${ZYLOS_SELF_UPGRADE_REPO:-zylos-ai/zylos-core}"
+if [[ ! "$ZYLOS_REPO_SLUG" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "[zylos] Error: ZYLOS_SELF_UPGRADE_REPO must be an owner/repo slug" >&2
+  exit 1
+fi
+ZYLOS_REPO="https://github.com/${ZYLOS_REPO_SLUG}"
 NODE_VERSION="24"               # LTS-track major version
 MIN_NODE_MAJOR=20
 NVM_INSTALL_URL="https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh"
@@ -102,7 +107,7 @@ fail()  { printf "${RED}[zylos]${NC} %s\n" "$*" >&2; exit 1; }
 if [ -z "$BRANCH" ]; then
   # No --branch specified: resolve latest release tag (stable version).
   # Uses GitHub API (curl is available; git may not be installed yet).
-  LATEST_TAG="$(curl -fsSL "https://api.github.com/repos/zylos-ai/zylos-core/releases/latest" 2>/dev/null \
+  LATEST_TAG="$(curl -fsSL "https://api.github.com/repos/${ZYLOS_REPO_SLUG}/releases/latest" 2>/dev/null \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
   if [ -n "$LATEST_TAG" ]; then
     BRANCH="$LATEST_TAG"

@@ -3,17 +3,14 @@
  * C4 Communication Bridge - Send Interface
  * Sends messages from Claude to external channels
  *
- * Usage:
- *   Recommended (stdin — safe for any content):
+ * Usage (stdin only — arg-mode is disabled):
  *     node c4-send.js <channel> <endpoint_id> <<'EOF'
  *     message with "quotes", $vars, and special chars
  *     EOF
  *
- *   Simple messages (CLI arg — backward compatible):
- *     node c4-send.js <channel> [endpoint_id] "short message"
- *
- * When no message argument is provided, the message is read from stdin.
- * This avoids shell escaping issues with quotes and special characters.
+ * The message body must be piped via stdin/heredoc. Passing it as a CLI
+ * argument hard-fails with exit code 2 because shell quoting can silently
+ * truncate or transform message content.
  *
  * Special channel 'void' (#689): internal-only messages (e.g. session
  * handoffs). The message is recorded in c4.db like any other conversation
@@ -34,11 +31,14 @@ import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 function printUsage() {
-  console.log('Usage: node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
-  console.log('       message content');
-  console.log('       EOF');
-  console.log('       node c4-send.js <channel> [endpoint_id] "message"');
-  console.log('Example: node c4-send.js telegram 8101553026 "Hello!"');
+  console.log('Usage (stdin only; CLI message arguments are disabled):');
+  console.log('  node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
+  console.log('  message content');
+  console.log('  EOF');
+  console.log('Example:');
+  console.log('  node c4-send.js telegram 8101553026 <<\'EOF\'');
+  console.log('  Hello!');
+  console.log('  EOF');
   process.exit(1);
 }
 
@@ -103,7 +103,10 @@ async function main() {
   let endpoint = null;
   let message = null;
 
-  if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
+  if (cleanArgs.length > 2) {
+    console.error('[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.');
+    process.exit(2);
+  } else if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
     // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin
     endpoint = cleanArgs[1];
     message = (await readStdin()).trimEnd();
@@ -112,23 +115,19 @@ async function main() {
     message = (await readStdin()).trimEnd();
   } else if (cleanArgs.length === 1) {
     printUsage();
-  } else if (cleanArgs.length === 2) {
-    // 2 args, no stdin: channel + message (no endpoint)
-    process.stderr.write('[c4-send] Deprecated: passing message as CLI argument. Use stdin/heredoc mode instead.\n');
-    message = cleanArgs[1];
-    // Unescape literal \n sequences that shell may have preserved when passing
-    // multi-line content as a CLI argument (defense-in-depth; prefer stdin mode)
-    message = message.replace(/\\n/g, '\n');
   } else {
-    // 3+ args: channel + endpoint + message
-    process.stderr.write('[c4-send] Deprecated: passing message as CLI argument. Use stdin/heredoc mode instead.\n');
-    endpoint = cleanArgs[1];
-    message = cleanArgs[2];
-    // Same defense for the 3-arg form
-    message = message.replace(/\\n/g, '\n');
+    // 2 args with a TTY means the second positional can only be an arg-mode
+    // message or an endpoint with a missing stdin body. Both are unsafe.
+    console.error('[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.');
+    process.exit(2);
   }
 
   if (!message) {
+    if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
+      console.error('[c4-send] Message is required, but stdin was empty.');
+      console.error('  CLI message arguments are disabled; pipe the body via stdin/heredoc.');
+      process.exit(2);
+    }
     if (cleanArgs.length === 1) printUsage();
     console.error('Error: Message is required');
     process.exit(1);

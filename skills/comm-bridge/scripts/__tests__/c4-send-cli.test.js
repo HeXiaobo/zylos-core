@@ -74,11 +74,11 @@ function setupMockChannel(tmpDir, channelName) {
 // -- basic send --
 
 describe('c4-send basic', () => {
-  it('sends message via mock channel with endpoint', () => {
+  it('sends a message from stdin via mock channel with endpoint', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
 
-      const { stdout, status } = cli(['mock-channel', 'endpoint1', 'Hello!'], env);
+      const { stdout, status } = cli(['mock-channel', 'endpoint1'], env, 'Hello!');
       assert.equal(status, 0);
       assert.ok(stdout.includes('Message sent via mock-channel'));
 
@@ -87,11 +87,11 @@ describe('c4-send basic', () => {
     });
   });
 
-  it('sends message via mock channel without endpoint (broadcast)', () => {
+  it('sends a message from stdin via mock channel without endpoint (broadcast)', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
 
-      const { stdout, status } = cli(['mock-channel', 'Hello broadcast!'], env);
+      const { stdout, status } = cli(['mock-channel', '--stdin'], env, 'Hello broadcast!');
       assert.equal(status, 0);
       assert.ok(stdout.includes('Message sent via mock-channel'));
 
@@ -126,9 +126,57 @@ describe('c4-send validation', () => {
       const skillDir = path.join(tmpDir, '.claude', 'skills', 'fake-channel');
       fs.mkdirSync(skillDir, { recursive: true });
 
-      const { stderr, status } = cli(['fake-channel', 'Hello'], env);
+      const { stderr, status } = cli(['fake-channel'], env, 'Hello');
       assert.equal(status, 1);
       assert.ok(stderr.includes('Channel script not found'));
+    });
+  });
+
+  it('rejects endpoint message arg-mode with exit 2 before dispatch', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+
+      const { stderr, status } = cli(['mock-channel', 'endpoint1', 'unsafe $message'], env);
+
+      assert.equal(status, 2);
+      assert.match(stderr, /arg-mode disabled/i);
+      assert.equal(fs.existsSync(sentFile), false);
+    });
+  });
+
+  it('rejects broadcast message arg-mode with exit 2 before dispatch', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+
+      const { stderr, status } = cli(['mock-channel', 'unsafe $message'], env);
+
+      assert.equal(status, 2);
+      assert.match(stderr, /arg-mode disabled/i);
+      assert.equal(fs.existsSync(sentFile), false);
+    });
+  });
+
+  it('rejects empty stdin with exit 2 instead of treating the endpoint as a message', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+
+      const { stderr, status } = cli(['mock-channel', 'endpoint1'], env, '');
+
+      assert.equal(status, 2);
+      assert.match(stderr, /stdin was empty/i);
+      assert.equal(fs.existsSync(sentFile), false);
+    });
+  });
+
+  it('rejects unknown options instead of parsing them as message content', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+
+      const { stderr, status } = cli(['mock-channel', 'endpoint1', '--skip-guard'], env, 'safe body');
+
+      assert.equal(status, 1);
+      assert.match(stderr, /Unknown option: --skip-guard/);
+      assert.equal(fs.existsSync(sentFile), false);
     });
   });
 });
@@ -138,7 +186,7 @@ describe('c4-send validation', () => {
 describe('c4-send void channel', () => {
   it('records the message in c4.db and exits 0 without a skill directory', () => {
     withTmpDir(({ env }) => {
-      const { stdout, status } = cli(['void', 'session-handoff', 'handoff summary'], env);
+      const { stdout, status } = cli(['void', 'session-handoff'], env, 'handoff summary');
       assert.equal(status, 0);
       assert.ok(stdout.includes('recorded on void channel'));
       assert.ok(!stdout.includes('Message sent via'));
@@ -157,7 +205,7 @@ describe('c4-send void channel', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'void');
 
-      const { status } = cli(['void', 'session-handoff', 'handoff summary'], env);
+      const { status } = cli(['void', 'session-handoff'], env, 'handoff summary');
       assert.equal(status, 0);
       assert.ok(!fs.existsSync(sentFile), 'void must never dispatch to a send script');
     });
@@ -199,7 +247,7 @@ describe('c4-send failed channel', () => {
       fs.mkdirSync(skillDir, { recursive: true });
       fs.writeFileSync(path.join(skillDir, 'send.js'), 'process.exit(1);');
 
-      const { stdout, status } = cli(['bad-channel', 'Hello'], env);
+      const { stdout, status } = cli(['bad-channel'], env, 'Hello');
       assert.equal(status, 1);
       assert.ok(stdout.includes('Failed to send'));
     });

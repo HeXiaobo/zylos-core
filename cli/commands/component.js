@@ -11,7 +11,7 @@ import { loadRegistry } from '../lib/registry.js';
 import { loadComponents, saveComponents } from '../lib/components.js';
 import { checkForUpdates, getLocalSourceUpgradeError, getRepo, runUpgrade, downloadToTemp, readChangelog, filterChangelog, cleanupTemp } from '../lib/upgrade.js';
 import {
-  checkForCoreUpdates, runSelfUpgrade,
+  CORE_REPO, checkForCoreUpdates, runSelfUpgrade,
   downloadCoreToTemp, readChangelog as readCoreChangelog,
   cleanupTemp as cleanupCoreTemp, cleanupBackup,
 } from '../lib/self-upgrade.js';
@@ -954,11 +954,11 @@ function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
     } else {
       // Fallback: fetch changelog from remote
       try {
-        const rawChangelog = fetchRawFile('zylos-ai/zylos-core', 'CHANGELOG.md', `v${check.latest}`);
+        const rawChangelog = fetchRawFile(CORE_REPO, 'CHANGELOG.md', `v${check.latest}`);
         changelog = filterChangelog(rawChangelog, check.current);
       } catch {
         try {
-          const rawChangelog = fetchRawFile('zylos-ai/zylos-core', 'CHANGELOG.md');
+          const rawChangelog = fetchRawFile(CORE_REPO, 'CHANGELOG.md');
           changelog = filterChangelog(rawChangelog, check.current);
         } catch {
           // CHANGELOG.md may not exist
