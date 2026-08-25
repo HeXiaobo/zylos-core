@@ -171,6 +171,11 @@ export function desiredClaudeHooks({
     'skills/activity-monitor/scripts/hook-activity.js',
     { async: true, timeout: 5 }
   );
+  const messageDisplayHook = commandHook(
+    'skills/activity-monitor/scripts/hook-activity.js',
+    // MessageDisplay batches must reach the durable stream in source order.
+    { async: false, timeout: 5 }
+  );
 
   return {
     SessionStart: ['startup', 'clear', 'compact'].map(matcher => ({
@@ -208,6 +213,11 @@ export function desiredClaudeHooks({
       {
         matcher: '',
         hooks: [{ ...activityHook }],
+      },
+    ],
+    MessageDisplay: [
+      {
+        hooks: [{ ...messageDisplayHook }],
       },
     ],
     Stop: [
@@ -508,10 +518,16 @@ export function syncHooks(installedSettings, _templateSettings, {
             }
             added++;
             log(`  + ${event}[${matcherValue}]: ${templateCmd.command}`);
-          } else if (existing.command !== templateCmd.command || existing.timeout !== templateCmd.timeout) {
+          } else if (
+            existing.command !== templateCmd.command
+            || existing.timeout !== templateCmd.timeout
+            || existing.async !== templateCmd.async
+          ) {
             if (!dryRun) {
               existing.command = templateCmd.command;
               if (templateCmd.timeout !== undefined) existing.timeout = templateCmd.timeout;
+              if (templateCmd.async !== undefined) existing.async = templateCmd.async;
+              else delete existing.async;
             }
             updated++;
             log(`  ~ ${event}[${matcherValue}]: ${templateCmd.command}`);

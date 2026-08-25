@@ -18,6 +18,18 @@ export function buildReplyViaSuffix(channel, endpointId, assistantRequestId = nu
   return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"${requestOption}`;
 }
 
+export function buildStreamedReplySuffix(assistantRequestId) {
+  if (!assistantRequestId) return '';
+  return [
+    ' ---- streamed reply:',
+    'Reply directly in this Claude turn.',
+    'Do not call c4-send for this reply.',
+    'Your displayed assistant text is delivered automatically.',
+    'Output only user-facing text; never reveal hidden reasoning, tool inputs, tool results, or secrets.',
+    `assistant request: "${assistantRequestId}"`,
+  ].join(' ');
+}
+
 export function hasLegacyReplyViaSuffix(content = '') {
   return /---- reply via: node\b.*\bc4-send\.js\b/.test(content);
 }

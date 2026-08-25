@@ -462,6 +462,24 @@ export function openAssistantResponseStream({
         };
       }
 
+      case 'AppendRuntimeOutputDelta': {
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const request = database.prepare(`
+          SELECT request_id
+          FROM assistant_requests
+          WHERE runtime_session_id = ? AND status = 'started'
+          ORDER BY updated_at DESC, accepted_at DESC
+          LIMIT 1
+        `).get(runtimeSessionId);
+        if (!request) return { request: null, events: [], replayed: false };
+        return executeTransaction({
+          type: 'AppendOutputDelta',
+          requestId: request.request_id,
+          delta: command.delta,
+          idempotencyKey: command.idempotencyKey,
+        });
+      }
+
       case 'CompleteRun': {
         const requestId = requireIdentifier(command.requestId, 'requestId');
         const output = boundedUtf8(command.output, 'output', MAX_OUTPUT_BYTES);
@@ -497,6 +515,23 @@ export function openAssistantResponseStream({
           events: emitted,
           replayed: false,
         };
+      }
+
+      case 'CompleteRuntimeRun': {
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const request = database.prepare(`
+          SELECT request_id
+          FROM assistant_requests
+          WHERE runtime_session_id = ? AND status = 'started'
+          ORDER BY updated_at DESC, accepted_at DESC
+          LIMIT 1
+        `).get(runtimeSessionId);
+        if (!request) return { request: null, events: [], replayed: false };
+        return executeTransaction({
+          type: 'CompleteRun',
+          requestId: request.request_id,
+          output: command.output,
+        });
       }
 
       case 'FailRun': {
@@ -591,7 +626,15 @@ export function openAssistantResponseStream({
           ['type', 'requestId', 'delta', 'idempotencyKey'],
           ['type', 'requestId', 'delta', 'idempotencyKey'],
         ],
+        AppendRuntimeOutputDelta: [
+          ['type', 'runtimeSessionId', 'delta', 'idempotencyKey'],
+          ['type', 'runtimeSessionId', 'delta', 'idempotencyKey'],
+        ],
         CompleteRun: [['type', 'requestId', 'output'], ['type', 'requestId', 'output']],
+        CompleteRuntimeRun: [
+          ['type', 'runtimeSessionId', 'output'],
+          ['type', 'runtimeSessionId', 'output'],
+        ],
         FailRun: [
           ['type', 'requestId', 'runtimeSessionId', 'code', 'retryable'],
           ['type', 'code', 'retryable'],

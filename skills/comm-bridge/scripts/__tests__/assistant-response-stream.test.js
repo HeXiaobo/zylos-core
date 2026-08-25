@@ -99,6 +99,51 @@ test('records verified lifecycle, real deltas, and canonical full completion', (
   stream.close();
 });
 
+test('appends displayed answer batches and completes through the bound runtime session', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-display' });
+
+  const first = stream.execute({
+    type: 'AppendRuntimeOutputDelta',
+    runtimeSessionId: 'session-display',
+    delta: '第一段\n',
+    idempotencyKey: 'display:message-1:0',
+  });
+  const replay = stream.execute({
+    type: 'AppendRuntimeOutputDelta',
+    runtimeSessionId: 'session-display',
+    delta: '第一段\n',
+    idempotencyKey: 'display:message-1:0',
+  });
+  const second = stream.execute({
+    type: 'AppendRuntimeOutputDelta',
+    runtimeSessionId: 'session-display',
+    delta: '第二段',
+    idempotencyKey: 'display:message-1:1',
+  });
+  const completed = stream.execute({
+    type: 'CompleteRuntimeRun',
+    runtimeSessionId: 'session-display',
+    output: '第一段\n第二段',
+  });
+
+  assert.deepEqual(first.events[0].payload, { delta: '第一段\n' });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(second.events[0].payload, { delta: '第二段' });
+  assert.deepEqual(completed.events[0].payload, { output: '第一段\n第二段' });
+  const result = stream.query({ requestId: 'assistant.feishu.om_1' });
+  assert.equal(result.request.status, 'completed');
+  assert.equal(result.request.output, '第一段\n第二段');
+  assert.deepEqual(result.events.slice(-3).map(event => event.type), [
+    'OutputDelta',
+    'OutputDelta',
+    'RunCompleted',
+  ]);
+  stream.close();
+});
+
 test('rejects fabricated stages, unsafe identifiers, and changed idempotent deltas', () => {
   const stream = openAssistantResponseStream({ dbPath: ':memory:' });
   assert.throws(

@@ -7,8 +7,9 @@
  * merges this stream into foreground/background session state and derives the
  * external api-activity.json snapshot.
  *
- * Registered as an async hook on: UserPromptSubmit, PreToolUse, PostToolUse,
- * PostToolUseFailure, Stop, Notification(idle_prompt).
+ * Registered on: UserPromptSubmit, PreToolUse, PostToolUse,
+ * PostToolUseFailure, MessageDisplay, Stop, Notification(idle_prompt).
+ * MessageDisplay is synchronous for ordering; the watchdog hooks are async.
  *
  * Scope: phase 1 watchdog tracks only the root Claude agent. Nested subagent
  * hook payloads carry agent_id and are ignored here because recovery actions
@@ -83,6 +84,16 @@ function buildToolEvent({ hookData, eventName, claudePid, nowMs }) {
     base.event_id = `evt_${nowMs}_${randomBytes(4).toString('hex')}`;
   }
 
+  if (eventName === 'message_display') {
+    if (typeof hookData.message_id === 'string' && hookData.message_id.trim()) {
+      base.message_id = hookData.message_id.trim();
+    }
+    if (Number.isSafeInteger(hookData.index) && hookData.index >= 0) {
+      base.batch_index = hookData.index;
+    }
+    if (typeof hookData.final === 'boolean') base.final = hookData.final;
+  }
+
   if (eventName === 'pre_tool') {
     if (rule?.id) {
       base.rule_id = rule.id;
@@ -96,7 +107,7 @@ function appendJsonLine(filePath, record) {
   fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, 'utf8');
 }
 
-export function emitAssistantLifecycle(record) {
+export function emitAssistantLifecycle(record, { hookData = null } = {}) {
   if (!record?.session_id) return null;
   const responseStream = openAssistantResponseStream();
   try {
@@ -131,7 +142,32 @@ export function emitAssistantLifecycle(record) {
         idempotencyKey: `hook:${record.event}:${record.event_id || record.ts}`,
       });
     }
+    if (record.event === 'message_display') {
+      responseStream.execute({
+        type: 'BindNextRun',
+        runtimeSessionId: record.session_id,
+      });
+      const delta = hookData?.delta;
+      if (typeof delta !== 'string' || delta.length === 0) return null;
+      if (!record.message_id || !Number.isSafeInteger(record.batch_index)) return null;
+      return responseStream.execute({
+        type: 'AppendRuntimeOutputDelta',
+        runtimeSessionId: record.session_id,
+        delta,
+        idempotencyKey: `display:${record.message_id}:${record.batch_index}`,
+      });
+    }
     if (record.event === 'stop') {
+      if (
+        typeof hookData?.last_assistant_message === 'string'
+        && hookData.last_assistant_message.trim()
+      ) {
+        return responseStream.execute({
+          type: 'CompleteRuntimeRun',
+          runtimeSessionId: record.session_id,
+          output: hookData.last_assistant_message,
+        });
+      }
       return responseStream.execute({
         type: 'FailRun',
         runtimeSessionId: record.session_id,
@@ -164,6 +200,9 @@ export function handleHookActivity(hookData, { nowMs = Date.now(), claudePid = g
     case 'PostToolUseFailure':
       eventName = 'post_tool_failure';
       break;
+    case 'MessageDisplay':
+      eventName = 'message_display';
+      break;
     case 'Stop':
       eventName = 'stop';
       break;
@@ -177,12 +216,23 @@ export function handleHookActivity(hookData, { nowMs = Date.now(), claudePid = g
   const record = buildToolEvent({ hookData, eventName, claudePid, nowMs });
   if (!record) return null;
 
+  // Display batches feed the durable response stream only. They are not
+  // watchdog activity facts and must not copy answer text into tool logs.
+  if (record.event === 'message_display') {
+    try {
+      emitAssistantLifecycle(record, { hookData });
+    } catch (err) {
+      appendError(`assistant_stream ${err?.message || 'unknown_error'}`);
+    }
+    return record;
+  }
+
   if (!fs.existsSync(MONITOR_DIR)) {
     fs.mkdirSync(MONITOR_DIR, { recursive: true });
   }
   appendJsonLine(TOOL_EVENTS_FILE, record);
   try {
-    emitAssistantLifecycle(record);
+    emitAssistantLifecycle(record, { hookData });
   } catch (err) {
     // Lifecycle projection is best-effort from a runtime hook.  It must never
     // block a prompt/tool, and stale-run recovery will close an orphaned card.

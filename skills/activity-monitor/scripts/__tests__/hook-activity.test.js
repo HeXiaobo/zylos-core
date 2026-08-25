@@ -332,4 +332,93 @@ describe('hook-activity', () => {
     assert.equal(JSON.stringify(events).includes('WebSearch'), false);
     stream.close();
   });
+
+  it('projects MessageDisplay batches as answer deltas without copying text into activity logs', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.display-delta',
+      sourceId: 'om_display_delta',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_display_delta' },
+      conversation: {
+        content: '[Feishu DM] display delta test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.display-delta' });
+
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-display-delta',
+      turn_id: 'turn-display-1',
+      message_id: 'message-display-1',
+      index: 0,
+      final: false,
+      delta: '这是公开回答的第一段。\n',
+    }, 9300);
+
+    const result = stream.query({ requestId: 'assistant.feishu.display-delta' });
+    assert.equal(result.request.runtimeSessionId, 'session-display-delta');
+    assert.deepEqual(result.events.at(-1), {
+      schemaVersion: 1,
+      eventId: 'assistant.feishu.display-delta:5',
+      requestId: 'assistant.feishu.display-delta',
+      sequence: 5,
+      type: 'OutputDelta',
+      occurredAt: result.events.at(-1).occurredAt,
+      payload: { delta: '这是公开回答的第一段。\n' },
+    });
+    assert.equal(fs.existsSync(eventsFile), false);
+    stream.close();
+  });
+
+  it('uses the public Stop message as the canonical answer after streamed batches', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.stop-complete',
+      sourceId: 'om_stop_complete',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_stop_complete' },
+      conversation: {
+        content: '[Feishu DM] stop completion test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.stop-complete' });
+
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-stop-complete',
+      turn_id: 'turn-stop-1',
+      message_id: 'message-stop-1',
+      index: 0,
+      final: true,
+      delta: '逐步形成的答案',
+    }, 9400);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'session-stop-complete',
+      last_assistant_message: '最终完整答案',
+      stop_hook_active: false,
+    }, 9500);
+
+    const result = stream.query({ requestId: 'assistant.feishu.stop-complete' });
+    assert.equal(result.request.status, 'completed');
+    assert.equal(result.request.output, '最终完整答案');
+    assert.deepEqual(result.events.at(-1).payload, { output: '最终完整答案' });
+    assert.equal(JSON.stringify(readEvents()).includes('最终完整答案'), false);
+    stream.close();
+  });
 });

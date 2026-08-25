@@ -57,7 +57,12 @@ import {
   findPromptY as sharedFindPromptY,
   isUsageOverlayCapture as sharedIsUsageOverlayCapture
 } from './tmux-input-state.js';
-import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
+import {
+  buildReplyViaSuffix,
+  buildStreamedReplySuffix,
+  hasLegacyReplyViaSuffix,
+  truncateForDelivery,
+} from './c4-utils.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 let isShuttingDown = false;
@@ -509,10 +514,14 @@ function hasAckSuffix(content = '') {
 export function getDeliveryContent(item) {
   const rawContent = item.content || '';
   if (item.type === 'conversation') {
-    const replyViaSuffix = (
-      item.endpoint_id &&
-      !hasLegacyReplyViaSuffix(rawContent)
-    ) ? buildReplyViaSuffix(item.channel, item.endpoint_id, item.assistant_request_id) : '';
+    const replyViaSuffix = item.assistant_request_id
+      ? buildStreamedReplySuffix(item.assistant_request_id)
+      : (
+          item.endpoint_id
+          && !hasLegacyReplyViaSuffix(rawContent)
+            ? buildReplyViaSuffix(item.channel, item.endpoint_id)
+            : ''
+        );
     return truncateForDelivery(rawContent, replyViaSuffix, item.id);
   }
 

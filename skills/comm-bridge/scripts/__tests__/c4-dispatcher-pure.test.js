@@ -428,7 +428,7 @@ describe('getDeliveryContent', () => {
     assert.ok(result.includes('"telegram" "123"'));
   });
 
-  it('carries the durable assistant request through the existing reply command', () => {
+  it('routes durable assistant responses through displayed text instead of a completed send command', () => {
     const result = getDeliveryContent({
       type: 'conversation',
       channel: 'feishu',
@@ -437,8 +437,11 @@ describe('getDeliveryContent', () => {
       content: 'hello',
     });
 
-    assert.ok(result.includes('"feishu" "oc_1|type:p2p|msg:om_1"'));
-    assert.ok(result.endsWith('--request-id "assistant.feishu.om_1"'));
+    assert.match(result, /reply directly in this Claude turn/i);
+    assert.match(result, /displayed assistant text is delivered automatically/i);
+    assert.match(result, /assistant\.feishu\.om_1/);
+    assert.equal(result.includes('c4-send.js'), false);
+    assert.equal(result.includes('oc_1|type:p2p|msg:om_1'), false);
   });
 
   it('does not add reply routing for conversation items without endpoints', () => {

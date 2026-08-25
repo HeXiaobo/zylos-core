@@ -1,5 +1,12 @@
 # Proposal: Hook-Based Activity Tracking for zylos-core
 
+> Current addendum (2026-08-25): `MessageDisplay` is also registered for
+> response-stream requests. Unlike watchdog hooks, it runs synchronously so
+> displayed answer batches stay ordered, writes only to the durable assistant
+> response ledger, and does not enter `tool-events.jsonl`. `Stop` records the
+> final displayed assistant message as canonical output. Neither hook receives
+> or publishes Claude thinking blocks.
+
 **Status:** Reviewed and approved
 **Branch:** feat/heartbeat-v2
 **Target version:** v0.1.8
