@@ -39,6 +39,18 @@ import { deployManifestTemplate } from './runtime/tmux-env.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
 
+// Services that must be present for upgraded Core behavior to function. During
+// an upgrade we start one only when the machine was already running Zylos and
+// PM2 has no record of that service at all. A deliberately stopped process is
+// therefore preserved, while a process introduced by the new release is not
+// silently omitted from the old process list.
+const UPGRADE_REQUIRED_CORE_SERVICES = [
+  {
+    name: 'c4-response-stream-supervisor',
+    script: ['comm-bridge', 'scripts', 'c4-response-stream-supervisor.js'],
+  },
+];
+
 // Patch #6 (3AI fork layer): allow self-upgrade to target an alternate repo
 // (e.g. the 3AI fork) via the ZYLOS_SELF_UPGRADE_REPO env var. Value is an
 // `owner/repo` slug (e.g. `HeXiaobo/zylos-core`). Default stays canonical, so
@@ -501,6 +513,8 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     backupDir: null,
     servicesStopped: [],
     servicesWereRunning: [],
+    servicesExpectedAfterUpgrade: [],
+    servicesStartedByUpgrade: [],
     mergeConflicts: [],
     mergedFiles: [],
     // Results
@@ -1235,6 +1249,7 @@ export function step11_startCoreServices(ctx, deps = {}) {
   const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
   const exec = deps.execSync ?? execSync;
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
 
   if (ctx.servicesWereRunning.length === 0) {
     return { step: 11, name: 'start_core_services', status: 'skipped', message: 'no services to restart', duration: Date.now() - startTime };
@@ -1263,10 +1278,50 @@ export function step11_startCoreServices(ctx, deps = {}) {
   }
   ecosystemPath = ecosystemPath ?? ecosystemDest;
 
+  const servicesToStart = [...new Set(ctx.servicesWereRunning)];
+  ctx.servicesStartedByUpgrade = Array.isArray(ctx.servicesStartedByUpgrade)
+    ? ctx.servicesStartedByUpgrade
+    : [];
+  const requiredServices = deps.requiredCoreServices ?? UPGRADE_REQUIRED_CORE_SERVICES;
+  const availableRequiredServices = requiredServices.filter(service =>
+    fsApi.existsSync(path.join(skillsDir, ...service.script))
+  );
+
+  if (availableRequiredServices.length > 0) {
+    const getPm2ProcessNames = deps.getPm2ProcessNames ?? (() => {
+      const output = exec('pm2 jlist 2>/dev/null', { encoding: 'utf8', stdio: 'pipe' });
+      const processes = JSON.parse(String(output));
+      return processes.map(process => process.name).filter(Boolean);
+    });
+
+    let pm2ProcessNames;
+    try {
+      pm2ProcessNames = new Set(getPm2ProcessNames());
+    } catch (err) {
+      const detail = err?.message ? `: ${err.message}` : '';
+      return {
+        step: 11,
+        name: 'start_core_services',
+        status: 'failed',
+        error: `failed to inspect PM2 process list before core restart${detail}`,
+        duration: Date.now() - startTime,
+      };
+    }
+
+    for (const service of availableRequiredServices) {
+      if (!pm2ProcessNames.has(service.name) && !servicesToStart.includes(service.name)) {
+        servicesToStart.push(service.name);
+        ctx.servicesStartedByUpgrade.push(service.name);
+      }
+    }
+  }
+
+  ctx.servicesExpectedAfterUpgrade = [...servicesToStart];
+
   const started = [];
   const failed = [];
 
-  for (const name of ctx.servicesWereRunning) {
+  for (const name of servicesToStart) {
     try {
       restartFn(name, {
         ecosystemPath,
@@ -1320,10 +1375,14 @@ export function step11_startCoreServices(ctx, deps = {}) {
  * Some services (e.g. component bots) take longer than 2 s to start after
  * PM2 restarts them — a one-shot check caused spurious rollbacks.
  */
-function step12_verifyServices(ctx) {
+export function step12_verifyServices(ctx, deps = {}) {
   const startTime = Date.now();
+  const exec = deps.execSync ?? execSync;
+  const servicesToVerify = ctx.servicesExpectedAfterUpgrade?.length > 0
+    ? ctx.servicesExpectedAfterUpgrade
+    : ctx.servicesWereRunning;
 
-  if (ctx.servicesWereRunning.length === 0) {
+  if (servicesToVerify.length === 0) {
     return { step: 12, name: 'verify_services', status: 'skipped', message: 'no services to verify', duration: Date.now() - startTime };
   }
 
@@ -1331,13 +1390,13 @@ function step12_verifyServices(ctx) {
   const TIMEOUT_MS = 30000;
 
   while (Date.now() - startTime < TIMEOUT_MS) {
-    try { execSync('sleep 2', { stdio: 'pipe' }); } catch { /* ignore */ }
+    try { exec('sleep 2', { stdio: 'pipe' }); } catch { /* ignore */ }
 
     try {
-      const output = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
+      const output = exec('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
       const processes = JSON.parse(output);
 
-      const notOnline = ctx.servicesWereRunning.filter(name => {
+      const notOnline = servicesToVerify.filter(name => {
         const proc = processes.find(p => p.name === name);
         return !proc || proc.pm2_env?.status !== 'online';
       });

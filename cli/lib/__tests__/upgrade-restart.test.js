@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 const { rollback, step7_runPostUpgradeHook, step8_startService } = await import('../upgrade.js');
-const { step11_startCoreServices } = await import('../self-upgrade.js');
+const { step11_startCoreServices, step12_verifyServices } = await import('../self-upgrade.js');
 const { restartRuntimeServices } = await import('../../commands/runtime.js');
 
 function makeSkillDir(frontmatter) {
@@ -327,6 +327,66 @@ describe('component upgrade rollback', () => {
 });
 
 describe('step11_startCoreServices', () => {
+  it('starts a newly introduced required Core service that is absent from PM2', () => {
+    const calls = [];
+    const ctx = {
+      tempDir: null,
+      servicesWereRunning: ['c4-dispatcher'],
+      servicesExpectedAfterUpgrade: [],
+      servicesStartedByUpgrade: [],
+    };
+    const result = step11_startCoreServices(ctx, {
+      fs: {
+        existsSync: () => true,
+        mkdirSync: () => {},
+        copyFileSync: () => {},
+      },
+      skillsDir: '/tmp/skills',
+      ecosystemPath: '/tmp/core-ecosystem.config.cjs',
+      getPm2ProcessNames: () => ['c4-dispatcher'],
+      restartManagedProcess: (name, opts) => calls.push({ name, opts }),
+      execSync: (cmd) => calls.push({ type: 'exec', cmd }),
+    });
+
+    assert.equal(result.status, 'done');
+    assert.deepEqual(ctx.servicesStartedByUpgrade, ['c4-response-stream-supervisor']);
+    assert.deepEqual(ctx.servicesExpectedAfterUpgrade, [
+      'c4-dispatcher',
+      'c4-response-stream-supervisor',
+    ]);
+    assert.deepEqual(calls.filter(call => call.name).map(call => call.name), [
+      'c4-dispatcher',
+      'c4-response-stream-supervisor',
+    ]);
+  });
+
+  it('preserves a required Core service that is explicitly stopped in PM2', () => {
+    const calls = [];
+    const ctx = {
+      tempDir: null,
+      servicesWereRunning: ['c4-dispatcher'],
+      servicesExpectedAfterUpgrade: [],
+      servicesStartedByUpgrade: [],
+    };
+    const result = step11_startCoreServices(ctx, {
+      fs: {
+        existsSync: () => true,
+        mkdirSync: () => {},
+        copyFileSync: () => {},
+      },
+      skillsDir: '/tmp/skills',
+      ecosystemPath: '/tmp/core-ecosystem.config.cjs',
+      getPm2ProcessNames: () => ['c4-dispatcher', 'c4-response-stream-supervisor'],
+      restartManagedProcess: (name, opts) => calls.push({ name, opts }),
+      execSync: (cmd) => calls.push({ type: 'exec', cmd }),
+    });
+
+    assert.equal(result.status, 'done');
+    assert.deepEqual(ctx.servicesStartedByUpgrade, []);
+    assert.deepEqual(ctx.servicesExpectedAfterUpgrade, ['c4-dispatcher']);
+    assert.deepEqual(calls.filter(call => call.name).map(call => call.name), ['c4-dispatcher']);
+  });
+
   it('passes the core ecosystem path instead of null when no template is available yet', () => {
     const calls = [];
     const result = step11_startCoreServices({
@@ -458,6 +518,30 @@ describe('step11_startCoreServices', () => {
     assert.equal(result.status, 'failed');
     assert.match(result.error, /ZYLOS_PACKAGE_ROOT/);
     assert.equal(calls.some(call => call.type === 'exec' && call.cmd === 'pm2 save 2>/dev/null'), false);
+  });
+});
+
+describe('step12_verifyServices', () => {
+  it('verifies services introduced during the upgrade as well as previously running services', () => {
+    const commands = [];
+    const result = step12_verifyServices({
+      servicesWereRunning: ['c4-dispatcher'],
+      servicesExpectedAfterUpgrade: ['c4-dispatcher', 'c4-response-stream-supervisor'],
+    }, {
+      execSync: (cmd) => {
+        commands.push(cmd);
+        if (cmd.startsWith('pm2 jlist')) {
+          return JSON.stringify([
+            { name: 'c4-dispatcher', pm2_env: { status: 'online' } },
+            { name: 'c4-response-stream-supervisor', pm2_env: { status: 'online' } },
+          ]);
+        }
+        return '';
+      },
+    });
+
+    assert.equal(result.status, 'done');
+    assert.equal(commands.some(cmd => cmd.startsWith('pm2 jlist')), true);
   });
 });
 
