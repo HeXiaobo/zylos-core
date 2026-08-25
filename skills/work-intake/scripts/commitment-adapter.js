@@ -1,6 +1,6 @@
 import { validateInboundEnvelope } from './inbound-envelope.js';
 import { resolveDueAt } from './deadline.js';
-import { hasExplicitYueranAssignment } from './work-intake.js';
+import { hasExplicitAgentAssignment } from './work-intake.js';
 
 const DECISION_FIELDS = new Set([
   'decision',
@@ -50,10 +50,23 @@ function optionalText(value, field) {
  * writes Commitment Core. The adapter accepts either an automatic create or a
  * user-confirmed draft and produces the existing durable SourceEnvelope.
  */
-export function toCommitmentEnvelope(input, {
-  confirmed = false,
-  defaultAssigneeId = null,
-} = {}) {
+export function toCommitmentEnvelope(input, options = {}) {
+  const adapterOptions = requireRecord(options, 'WorkIntake commitment options');
+  const supportedOptions = new Set([
+    'confirmed',
+    'defaultAssigneeId',
+    'agentId',
+    'agentAliases',
+  ]);
+  const unknownOption = Object.keys(adapterOptions).find(key => !supportedOptions.has(key));
+  if (unknownOption) {
+    throw new TypeError(`WorkIntake commitment options contain unsupported field: ${unknownOption}`);
+  }
+  const confirmed = adapterOptions.confirmed ?? false;
+  if (typeof confirmed !== 'boolean') throw new TypeError('confirmed must be a boolean');
+  const defaultAssigneeId = adapterOptions.defaultAssigneeId ?? null;
+  const agentId = adapterOptions.agentId ?? null;
+  const agentAliases = adapterOptions.agentAliases ?? [];
   const request = requireRecord(input, 'WorkIntake commitment request');
   const envelope = validateInboundEnvelope(request.envelope);
   const decision = requireRecord(request.decision, 'WorkIntake decision');
@@ -74,12 +87,12 @@ export function toCommitmentEnvelope(input, {
   if (task.ownerId !== envelope.sender.id || task.acceptorId !== envelope.sender.id) {
     throw new TypeError('WorkIntake owner and acceptor must be the human sender');
   }
-  if (
-    task.assigneeId === 'agent:yueran'
-    && !hasExplicitYueranAssignment(envelope.text)
-    && defaultAssigneeId !== 'agent:yueran'
-  ) {
-    throw new TypeError('agent:yueran requires an explicit assignment or trusted default');
+  if (typeof task.assigneeId === 'string' && task.assigneeId.startsWith('agent:')) {
+    const explicitConfiguredAgent = task.assigneeId === agentId
+      && hasExplicitAgentAssignment(envelope.text, { agentId, agentAliases });
+    if (!explicitConfiguredAgent && task.assigneeId !== defaultAssigneeId) {
+      throw new TypeError(`${task.assigneeId} requires an explicit assignment or trusted default`);
+    }
   }
   const dueAt = resolveDueAt({
     dueText: task.dueText,

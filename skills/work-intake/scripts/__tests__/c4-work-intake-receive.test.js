@@ -144,8 +144,12 @@ function withZylosDir(run) {
 test('a clear assignment atomically queues one durable Commitment intake', () => {
   withZylosDir((zylosDir) => {
     const envelope = inbound('请玥然在周五前整理 A 客户的跟进记录', 'om_create');
-    const first = receive(zylosDir, envelope);
-    const replay = receive(zylosDir, envelope);
+    const deploymentEnv = {
+      ZYLOS_AGENT_ID: 'agent:yueran',
+      ZYLOS_AGENT_ALIASES: '["玥然"]',
+    };
+    const first = receive(zylosDir, envelope, { env: deploymentEnv });
+    const replay = receive(zylosDir, envelope, { env: deploymentEnv });
 
     assert.equal(first.action, 'queued');
     assert.equal(first.workIntake.decision, 'create_task');
@@ -165,6 +169,27 @@ test('a clear assignment atomically queues one durable Commitment intake', () =>
       assert.equal(taskEnvelope.task.ownerId, 'ou_sender');
       assert.equal(taskEnvelope.task.acceptorId, 'ou_sender');
       assert.equal(taskEnvelope.task.assigneeId, 'agent:yueran');
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test('maps a configured non-Yueran Agent alias to its logical deployment identity', () => {
+  withZylosDir((zylosDir) => {
+    const envelope = inbound('请 Mylos 明天整理客户回访记录', 'om_mylos');
+    const response = receive(zylosDir, envelope, {
+      env: {
+        ZYLOS_AGENT_ID: 'agent:mylos',
+        ZYLOS_AGENT_ALIASES: '["Mylos","麦洛斯"]',
+      },
+    });
+
+    assert.equal(response.workIntake.decision, 'create_task');
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    try {
+      const queued = database.prepare('SELECT payload_json FROM commitment_intake_queue').get();
+      assert.equal(JSON.parse(queued.payload_json).task.assigneeId, 'agent:mylos');
     } finally {
       database.close();
     }
@@ -474,6 +499,10 @@ test('a deferred response stream is opened only when WorkIntake resolves to ordi
         assistantRequest: {
           requestId: 'assistant.feishu.deferred-task',
           sourceId: 'om_deferred_task',
+        },
+        env: {
+          ZYLOS_AGENT_ID: 'agent:yueran',
+          ZYLOS_AGENT_ALIASES: '["玥然"]',
         },
       },
     );

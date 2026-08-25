@@ -33,6 +33,7 @@ import { createWorkIntakeConfirmationCapability } from '../../work-intake/script
 import { classify } from '../../work-intake/index.js';
 import { parseInboundEnvelopeJson } from '../../work-intake/scripts/inbound-envelope.js';
 import { toCommitmentEnvelope } from '../../work-intake/scripts/commitment-adapter.js';
+import { workIntakeProfileFromEnv } from './c4-work-intake-profile.js';
 import {
   AGENT_STATUS_FILE,
   ACTIVITY_MONITOR_DIR
@@ -45,11 +46,7 @@ const ROUTER_IPC_TIMEOUT_MS = 30000;
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function classifyWorkIntake(envelope) {
-  return classify(envelope, { defaultAssigneeId: workIntakeDefaultAssigneeId() });
-}
-
-function workIntakeDefaultAssigneeId() {
-  return process.env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID?.trim() || null;
+  return classify(envelope, workIntakeProfileFromEnv());
 }
 
 function printUsage() {
@@ -471,7 +468,7 @@ async function main() {
         taskEnvelope = toCommitmentEnvelope({
           envelope: workIntakeEnvelope,
           decision: workIntakeDecision,
-        }, { defaultAssigneeId: workIntakeDefaultAssigneeId() });
+        }, workIntakeProfileFromEnv());
       }
     } catch (err) {
       emitError(json, 'INVALID_ARGS', `invalid --work-intake-envelope-json: ${err.message}`);
@@ -521,7 +518,7 @@ async function main() {
           decision: workIntakeDecision,
         }, {
           confirmed: true,
-          defaultAssigneeId: workIntakeDefaultAssigneeId(),
+          ...workIntakeProfileFromEnv(),
         });
       }
     } catch (err) {

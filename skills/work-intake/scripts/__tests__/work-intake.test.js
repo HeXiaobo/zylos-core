@@ -4,6 +4,11 @@ import test from 'node:test';
 import { classify } from '../../index.js';
 import { toCommitmentEnvelope } from '../commitment-adapter.js';
 
+const YUERAN_OPTIONS = Object.freeze({
+  agentId: 'agent:yueran',
+  agentAliases: ['玥然'],
+});
+
 function inbound(text, overrides = {}) {
   return {
     source: {
@@ -82,7 +87,7 @@ const REGRESSION_CASES = [
 
 test(`Chinese classification regression corpus (${REGRESSION_CASES.length} cases)`, () => {
   for (const [text, expected] of REGRESSION_CASES) {
-    assert.equal(classify(inbound(text)).decision, expected, text);
+    assert.equal(classify(inbound(text), YUERAN_OPTIONS).decision, expected, text);
   }
 });
 
@@ -101,7 +106,7 @@ test('information questions stay chat-only even when they mention high-risk acti
 test('recognizes an explicit task behind a chat label and polite wrapper', () => {
   const decision = classify(inbound(
     '【上线验收·自然语言任务】请创建任务：明天 18:00 前完成“Zylos 自然语言任务创建验收”，执行人是玥然，发布人和验收人是我。创建后告诉我任务链接。',
-  ));
+  ), YUERAN_OPTIONS);
 
   assert.equal(decision.decision, 'create_task');
   assert.equal(decision.reasonCode, 'EXPLICIT_TASK_PREFIX');
@@ -119,12 +124,12 @@ test('keeps wrapped risky tasks behind confirmation and task questions in chat',
     classify(inbound('【财务】请创建任务：明天付款给供应商')).decision,
     'confirm',
   );
-  assert.equal(classify(inbound('玥然，怎么创建任务？')).decision, 'chat_only');
+  assert.equal(classify(inbound('玥然，怎么创建任务？'), YUERAN_OPTIONS).decision, 'chat_only');
 });
 
 test('does not mistake ordinary response instructions for a human assignment', () => {
   assert.equal(
-    classify(inbound('【上线验收·流式复测】玥然，请先显示处理状态，再只回复：流式复测通过。')).decision,
+    classify(inbound('【上线验收·流式复测】玥然，请先显示处理状态，再只回复：流式复测通过。'), YUERAN_OPTIONS).decision,
     'chat_only',
   );
 });
@@ -149,7 +154,7 @@ test('applies a configured default assignee only when no person was assigned', (
 });
 
 test('returns a structured TaskDraft with human owner/acceptor and explicit yueran assignment', () => {
-  const decision = classify(inbound('请玥然在周五前整理 A 客户的跟进记录'));
+  const decision = classify(inbound('请玥然在周五前整理 A 客户的跟进记录'), YUERAN_OPTIONS);
 
   assert.equal(decision.reasonCode, 'EXPLICIT_ASSIGNMENT');
   assert.equal(decision.sourceKey, 'feishu:om_regression:work-intake:r1');
@@ -162,6 +167,33 @@ test('returns a structured TaskDraft with human owner/acceptor and explicit yuer
     dueText: '周五前',
     riskLevel: 'normal',
   });
+});
+
+test('does not recognize a branded Agent name without an explicit Agent Profile', () => {
+  const decision = classify(inbound('请玥然在周五前整理 A 客户的跟进记录'));
+
+  assert.equal(decision.decision, 'confirm');
+  assert.equal(decision.reasonCode, 'PERSON_AMBIGUOUS');
+  assert.equal(decision.taskDraft.assigneeId, null);
+});
+
+test('uses the configured Agent identity and aliases without changing WorkIntake semantics', () => {
+  const options = {
+    agentId: 'agent:mylos',
+    agentAliases: ['Mylos', '麦洛斯'],
+  };
+  const englishAlias = classify(inbound('请 Mylos 明天整理客户回访记录'), options);
+  const chineseAlias = classify(inbound('让麦洛斯负责完成新员工手册'), options);
+
+  assert.equal(englishAlias.decision, 'create_task');
+  assert.equal(englishAlias.reasonCode, 'EXPLICIT_ASSIGNMENT');
+  assert.equal(englishAlias.taskDraft.assigneeId, 'agent:mylos');
+  assert.equal(chineseAlias.decision, 'create_task');
+  assert.equal(chineseAlias.taskDraft.assigneeId, 'agent:mylos');
+  assert.equal(toCommitmentEnvelope({
+    envelope: inbound('请 Mylos 明天整理客户回访记录'),
+    decision: englishAlias,
+  }, options).task.assigneeId, 'agent:mylos');
 });
 
 test('does not infer yueran as assignee without an explicit assignment', () => {

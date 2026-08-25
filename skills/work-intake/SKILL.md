@@ -8,7 +8,11 @@ description: Channel-neutral natural-language classification for deciding whethe
 WorkIntake is an independent deep module. Its public Interface is:
 
 ```text
-classify(InboundEnvelope, { defaultAssigneeId? }) -> chat_only | create_task | confirm
+classify(InboundEnvelope, {
+  defaultAssigneeId?,
+  agentId?,
+  agentAliases?
+}) -> chat_only | create_task | confirm
 ```
 
 The returned value always includes a stable `reasonCode`, `intentRevision`, and
@@ -23,10 +27,13 @@ identity resolution, mentions, and confirmation-card rendering.
 Invariants:
 
 - `ownerId = acceptorId =` the human sender by default.
-- An explicit human or Agent assignment always wins. A deployment may set
-  `C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID` for otherwise unassigned tasks (the
-  current 玥然 deployment uses `agent:yueran`). Core validates this trusted
-  default again when adapting the decision.
+- An explicit human or configured Agent assignment always wins. Core has no
+  built-in Agent name or logical identity. C4 resolves the deployment from
+  `ZYLOS_AGENT_ID` (or `ZYLOS_AGENT_PROFILE`) plus the JSON array
+  `ZYLOS_AGENT_ALIASES`; Channel Adapters consume the same logical ID.
+- A deployment may set `C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID` for otherwise
+  unassigned tasks. Core validates both explicit Agent assignments and this
+  trusted default again when adapting the decision.
 - ambiguous people, ambiguous times, and high-risk external actions return
   `confirm`.
 - Supported Chinese relative/calendar deadlines are normalized against the
