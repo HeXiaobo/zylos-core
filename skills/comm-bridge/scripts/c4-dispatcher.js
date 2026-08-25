@@ -58,6 +58,7 @@ import {
   isUsageOverlayCapture as sharedIsUsageOverlayCapture
 } from './tmux-input-state.js';
 import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
+import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
@@ -511,7 +512,7 @@ export function getDeliveryContent(item) {
     const replyViaSuffix = (
       item.endpoint_id &&
       !hasLegacyReplyViaSuffix(rawContent)
-    ) ? buildReplyViaSuffix(item.channel, item.endpoint_id) : '';
+    ) ? buildReplyViaSuffix(item.channel, item.endpoint_id, item.assistant_request_id) : '';
     return truncateForDelivery(rawContent, replyViaSuffix, item.id);
   }
 
@@ -529,6 +530,20 @@ async function handleConversationDeliveryFailure(msg) {
 
     if (nextCount >= MAX_RETRIES) {
       markFailed(msg.id);
+      if (msg.assistant_request_id) {
+        try {
+          const responseStream = openAssistantResponseStream();
+          responseStream.execute({
+            type: 'FailRun',
+            requestId: msg.assistant_request_id,
+            code: 'RUNTIME_DISPATCH_FAILED',
+            retryable: true,
+          });
+          responseStream.close();
+        } catch (err) {
+          log(`Warning: failed to record assistant dispatch failure (${err.message})`);
+        }
+      }
       log(`FAILED: conversation id=${msg.id} channel=${msg.channel} marked as failed after ${nextCount} retries`);
       logDeliveryFailure('conversation', msg.id, 'MAX_RETRIES', { channel: msg.channel, retries: nextCount });
       return;
@@ -713,6 +728,21 @@ async function processNextMessage() {
   if (result === 'submitted') {
     if (item.type === 'conversation') {
       markDelivered(item.id);
+      if (item.assistant_request_id) {
+        try {
+          const responseStream = openAssistantResponseStream();
+          responseStream.execute({
+            type: 'StartRun',
+            requestId: item.assistant_request_id,
+          });
+          responseStream.close();
+        } catch (err) {
+          // The conversation is already verified as submitted.  Preserve that
+          // delivery and let CompleteRun's compatibility path synthesize a
+          // missing RunStarted event if the lifecycle write is unavailable.
+          log(`Warning: failed to record assistant run start (${err.message})`);
+        }
+      }
       log(`Conversation id=${item.id} delivered`);
       notifyMessageDelivered({ conversationId: item.id, channel: item.channel }).catch((err) => {
         log(`Warning: failed to notify AM of message delivery: ${err.message}`);

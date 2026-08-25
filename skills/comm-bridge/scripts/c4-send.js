@@ -31,6 +31,7 @@ import { spawn } from 'child_process';
 import { insertConversation, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
+import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 function printUsage() {
   console.log('Usage: node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
@@ -39,6 +40,31 @@ function printUsage() {
   console.log('       node c4-send.js <channel> [endpoint_id] "message"');
   console.log('Example: node c4-send.js telegram 8101553026 "Hello!"');
   process.exit(1);
+}
+
+function parseArgs(args) {
+  const positional = [];
+  let requestId = null;
+  let hasStdinFlag = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--stdin') {
+      hasStdinFlag = true;
+      continue;
+    }
+    if (arg === '--request-id') {
+      if (requestId !== null || index + 1 >= args.length) {
+        return { error: '--request-id requires one value' };
+      }
+      requestId = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--')) return { error: `Unknown option: ${arg}` };
+    positional.push(arg);
+  }
+  return { positional, requestId, hasStdinFlag };
 }
 
 /**
@@ -56,14 +82,17 @@ function readStdin() {
 
 async function main() {
   const args = process.argv.slice(2);
-
-  if (args.length < 2) {
+  const parsed = parseArgs(args);
+  if (parsed.error) {
+    console.error(`Error: ${parsed.error}`);
+    process.exit(1);
+  }
+  if (parsed.positional.length < 1) {
     printUsage();
   }
 
-  // Remove --stdin flag if present (backward compat)
-  const cleanArgs = args.filter(a => a !== '--stdin');
-  const hasStdinFlag = cleanArgs.length !== args.length;
+  const cleanArgs = parsed.positional;
+  const hasStdinFlag = parsed.hasStdinFlag;
   const stdinAvailable = !process.stdin.isTTY;
 
   const channel = cleanArgs[0];
@@ -77,6 +106,8 @@ async function main() {
   } else if (cleanArgs.length === 1 && (stdinAvailable || hasStdinFlag)) {
     // 1 arg (channel only) with piped stdin: read from stdin
     message = (await readStdin()).trimEnd();
+  } else if (cleanArgs.length === 1) {
+    printUsage();
   } else if (cleanArgs.length === 2) {
     // 2 args, no stdin: channel + message (no endpoint)
     process.stderr.write('[c4-send] Deprecated: passing message as CLI argument. Use stdin/heredoc mode instead.\n');
@@ -94,9 +125,12 @@ async function main() {
   }
 
   if (!message) {
+    if (cleanArgs.length === 1) printUsage();
     console.error('Error: Message is required');
     process.exit(1);
   }
+
+  let assistantRequestId = parsed.requestId;
 
   // Virtual 'void' channel (#689): record-only, never dispatched.
   // No skill directory exists for it, so skip channel-path validation and
@@ -153,6 +187,16 @@ async function main() {
     close();
   }
 
+  if (!assistantRequestId && endpoint) {
+    try {
+      const responseStream = openAssistantResponseStream();
+      assistantRequestId = responseStream.resolveRequestId({ channel, endpointId: endpoint });
+      responseStream.close();
+    } catch (err) {
+      console.error(`[C4] Warning: response stream lookup failed: ${err.message}`);
+    }
+  }
+
   const channelScript = path.join(SKILLS_DIR, channel, 'scripts', 'send.js');
 
   if (!fs.existsSync(channelScript)) {
@@ -164,10 +208,34 @@ async function main() {
   const scriptArgs = endpoint ? [endpoint, message] : [message];
 
   const child = spawn('node', [channelScript, ...scriptArgs], {
-    stdio: 'inherit'
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      ...(assistantRequestId ? { C4_ASSISTANT_REQUEST_ID: assistantRequestId } : {}),
+    },
   });
 
   child.on('close', (code) => {
+    if (assistantRequestId) {
+      try {
+        const responseStream = openAssistantResponseStream();
+        responseStream.execute(code === 0
+          ? {
+              type: 'CompleteRun',
+              requestId: assistantRequestId,
+              output: message,
+            }
+          : {
+              type: 'FailRun',
+              requestId: assistantRequestId,
+              code: 'CHANNEL_DELIVERY_FAILED',
+              retryable: true,
+            });
+        responseStream.close();
+      } catch (err) {
+        console.error(`[C4] Warning: failed to record assistant terminal event: ${err.message}`);
+      }
+    }
     if (code === 0) {
       console.log(`[C4] Message sent via ${channel}`);
     } else {
@@ -177,6 +245,20 @@ async function main() {
   });
 
   child.on('error', (err) => {
+    if (assistantRequestId) {
+      try {
+        const responseStream = openAssistantResponseStream();
+        responseStream.execute({
+          type: 'FailRun',
+          requestId: assistantRequestId,
+          code: 'CHANNEL_ADAPTER_UNAVAILABLE',
+          retryable: true,
+        });
+        responseStream.close();
+      } catch (streamError) {
+        console.error(`[C4] Warning: failed to record assistant failure event: ${streamError.message}`);
+      }
+    }
     console.error(`[C4] Error executing channel script: ${err.stack}`);
     process.exit(1);
   });

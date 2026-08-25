@@ -24,6 +24,10 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { getClaudePid } from './claude-pid.js';
 import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
+import {
+  openAssistantResponseStream,
+  safeProgressStageForTool,
+} from '../../comm-bridge/scripts/assistant-response-stream.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
@@ -95,6 +99,45 @@ function appendJsonLine(filePath, record) {
   fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, 'utf8');
 }
 
+export function emitAssistantLifecycle(record) {
+  if (!record?.session_id) return null;
+  const responseStream = openAssistantResponseStream();
+  try {
+    if (record.event === 'prompt') {
+      return responseStream.execute({
+        type: 'BindNextRun',
+        runtimeSessionId: record.session_id,
+      });
+    }
+    if (record.event === 'pre_tool' || record.event === 'post_tool_failure') {
+      const stage = safeProgressStageForTool(record.tool, {
+        failed: record.event === 'post_tool_failure',
+      });
+      if (!stage) return null;
+      return responseStream.execute({
+        type: 'ReportProgress',
+        runtimeSessionId: record.session_id,
+        stage,
+        // The key carries lifecycle identity only.  Tool input/summary is
+        // deliberately excluded so secrets and hidden parameters never enter
+        // the user-visible stream ledger.
+        idempotencyKey: `hook:${record.event}:${record.event_id || record.ts}`,
+      });
+    }
+    if (record.event === 'stop') {
+      return responseStream.execute({
+        type: 'FailRun',
+        runtimeSessionId: record.session_id,
+        code: 'RESPONSE_NOT_DELIVERED',
+        retryable: true,
+      });
+    }
+    return null;
+  } finally {
+    responseStream.close();
+  }
+}
+
 export function handleHookActivity(hookData, { nowMs = Date.now(), claudePid = getClaudePid() } = {}) {
   if (isSubagentHook(hookData)) return null;
 
@@ -131,6 +174,13 @@ export function handleHookActivity(hookData, { nowMs = Date.now(), claudePid = g
     fs.mkdirSync(MONITOR_DIR, { recursive: true });
   }
   appendJsonLine(TOOL_EVENTS_FILE, record);
+  try {
+    emitAssistantLifecycle(record);
+  } catch (err) {
+    // Lifecycle projection is best-effort from a runtime hook.  It must never
+    // block a prompt/tool, and stale-run recovery will close an orphaned card.
+    appendError(`assistant_stream ${err?.message || 'unknown_error'}`);
+  }
   return record;
 }
 

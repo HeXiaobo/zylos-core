@@ -43,6 +43,7 @@ export function getDb() {
     ensureControlQueueSchema(db);
     ensureStatusNoticeCooldownSchema(db);
     ensureCommitmentIntakeSchema(db);
+    ensureAssistantResponseSchema(db);
     ensureVoidChannelMigration(db);
   }
   return db;
@@ -171,6 +172,60 @@ function ensureCommitmentIntakeSchema(database) {
         CHECK (retry_generation >= 0)
     `);
   }
+}
+
+export function ensureAssistantResponseSchema(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS assistant_requests (
+      request_id TEXT PRIMARY KEY,
+      conversation_id INTEGER UNIQUE,
+      route_channel TEXT NOT NULL,
+      route_endpoint TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      status TEXT NOT NULL
+        CHECK (status IN ('queued', 'started', 'completed', 'failed')),
+      runtime_session_id TEXT,
+      next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
+      output_text TEXT NOT NULL DEFAULT '',
+      accepted_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_at INTEGER,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_requests_status_time
+      ON assistant_requests(status, accepted_at, request_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_requests_runtime
+      ON assistant_requests(runtime_session_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_assistant_requests_route
+      ON assistant_requests(route_channel, route_endpoint, status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS assistant_response_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL,
+      sequence INTEGER NOT NULL CHECK (sequence >= 1),
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      idempotency_key TEXT,
+      delivery_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+      retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      available_at INTEGER NOT NULL,
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      delivered_at INTEGER,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+      UNIQUE (request_id, sequence),
+      UNIQUE (request_id, idempotency_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_response_events_delivery
+      ON assistant_response_events(delivery_status, available_at, id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_response_events_request
+      ON assistant_response_events(request_id, sequence);
+  `);
 }
 
 function toCommitmentIntakeView(row) {
@@ -559,10 +614,13 @@ export function getStatusNoticeCooldowns() {
 export function getNextPending() {
   const db = getDb();
   return db.prepare(`
-    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count
-    FROM conversations
-    WHERE direction = 'in' AND status = 'pending'
-    ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
+    SELECT c.id, c.direction, c.channel, c.endpoint_id, c.content, c.timestamp,
+           c.priority, c.require_idle, c.retry_count,
+           ar.request_id AS assistant_request_id
+    FROM conversations c
+    LEFT JOIN assistant_requests ar ON ar.conversation_id = c.id
+    WHERE c.direction = 'in' AND c.status = 'pending'
+    ORDER BY COALESCE(c.priority, 3) ASC, c.timestamp ASC
     LIMIT 1
   `).get() || null;
 }

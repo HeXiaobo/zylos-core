@@ -1,0 +1,162 @@
+#!/usr/bin/env node
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+
+import { SKILLS_DIR } from './c4-config.js';
+import { openAssistantResponseStream } from './assistant-response-stream.js';
+
+const DEFAULT_POLL_MS = 250;
+const DEFAULT_STALE_SECONDS = 15 * 60;
+const DEFAULT_BATCH_SIZE = 100;
+const DEFAULT_MAX_ATTEMPTS = 5;
+
+function positiveInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sleep(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function groupDeliveries(deliveries) {
+  const groups = new Map();
+  for (const delivery of deliveries) {
+    const key = `${delivery.route.channel}\u0000${delivery.event.requestId}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(delivery);
+  }
+  return [...groups.values()].map(group => group.sort(
+    (left, right) => left.event.sequence - right.event.sequence,
+  ));
+}
+
+function deliverToAdapter(adapterPath, payload) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', [adapterPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', chunk => {
+      if (stderr.length < 16_384) stderr += chunk;
+    });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(stderr.trim() || `stream adapter exited ${code}`));
+    });
+    child.stdin.end(`${JSON.stringify(payload)}\n`);
+  });
+}
+
+export function createAssistantResponseDeliveryWorker({
+  responseStream = openAssistantResponseStream(),
+  adapterForChannel = channel => path.join(SKILLS_DIR, channel, 'scripts', 'stream.js'),
+  adapterExists = fs.existsSync,
+  deliver = deliverToAdapter,
+  clock = () => Math.floor(Date.now() / 1000),
+  batchSize = DEFAULT_BATCH_SIZE,
+  staleSeconds = DEFAULT_STALE_SECONDS,
+  maxAttempts = DEFAULT_MAX_ATTEMPTS,
+  retryDelaySeconds = 2,
+  logger = console,
+} = {}) {
+  return Object.freeze({
+    async drainOnce() {
+      const expired = responseStream.execute({
+        type: 'ExpireStaleRuns',
+        staleBefore: clock() - staleSeconds,
+      }).events.length;
+      const deliveries = responseStream.claimDeliveries({ limit: batchSize });
+      const groups = groupDeliveries(deliveries);
+      let acknowledged = 0;
+      let retried = 0;
+      let deadLettered = 0;
+
+      for (const group of groups) {
+        const [{ route, event }] = group;
+        const adapterPath = adapterForChannel(route.channel);
+        try {
+          if (!adapterExists(adapterPath)) {
+            throw new Error(`response stream adapter not found for channel ${route.channel}`);
+          }
+          await deliver(adapterPath, {
+            schemaVersion: 1,
+            requestId: event.requestId,
+            route,
+            events: group.map(item => item.event),
+          });
+          const results = responseStream.acknowledgeDeliveries(group.map(item => ({
+            deliveryId: item.deliveryId,
+            leaseToken: item.leaseToken,
+          })));
+          acknowledged += results.filter(item => item.acknowledged).length;
+        } catch (err) {
+          const results = responseStream.retryDeliveries(group.map(item => ({
+            deliveryId: item.deliveryId,
+            leaseToken: item.leaseToken,
+            error: err?.message || 'stream adapter failed',
+          })), { maxAttempts, delaySeconds: retryDelaySeconds });
+          retried += results.filter(item => item.status === 'pending').length;
+          deadLettered += results.filter(item => item.status === 'dead_letter').length;
+          logger.warn?.('assistant response stream delivery failed', {
+            channel: route.channel,
+            requestId: event.requestId,
+            error: err?.message || String(err),
+          });
+        }
+      }
+
+      return {
+        expired,
+        claimed: deliveries.length,
+        groups: groups.length,
+        acknowledged,
+        retried,
+        deadLettered,
+      };
+    },
+    close() {
+      responseStream.close();
+    },
+  });
+}
+
+let shuttingDown = false;
+
+async function main() {
+  const pollMs = positiveInteger(process.env.C4_RESPONSE_STREAM_POLL_MS, DEFAULT_POLL_MS);
+  const worker = createAssistantResponseDeliveryWorker({
+    batchSize: positiveInteger(process.env.C4_RESPONSE_STREAM_BATCH_SIZE, DEFAULT_BATCH_SIZE),
+    staleSeconds: positiveInteger(process.env.C4_RESPONSE_STREAM_STALE_SECONDS, DEFAULT_STALE_SECONDS),
+    maxAttempts: positiveInteger(process.env.C4_RESPONSE_STREAM_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS),
+  });
+  const shutdown = () => { shuttingDown = true; };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  console.log('[C4] Assistant response stream supervisor started');
+  while (!shuttingDown) {
+    try {
+      const result = await worker.drainOnce();
+      if (result.claimed > 0 || result.expired > 0) {
+        console.log(`[C4] Response stream drain ${JSON.stringify(result)}`);
+      }
+    } catch (err) {
+      console.error(`[C4] Response stream supervisor error: ${err.stack || err.message}`);
+    }
+    await sleep(pollMs);
+  }
+  worker.close();
+}
+
+if (process.env.C4_RESPONSE_STREAM_AUTOSTART === '1') {
+  main();
+}

@@ -428,6 +428,19 @@ describe('getDeliveryContent', () => {
     assert.ok(result.includes('"telegram" "123"'));
   });
 
+  it('carries the durable assistant request through the existing reply command', () => {
+    const result = getDeliveryContent({
+      type: 'conversation',
+      channel: 'feishu',
+      endpoint_id: 'oc_1|type:p2p|msg:om_1',
+      assistant_request_id: 'assistant.feishu.om_1',
+      content: 'hello',
+    });
+
+    assert.ok(result.includes('"feishu" "oc_1|type:p2p|msg:om_1"'));
+    assert.ok(result.endsWith('--request-id "assistant.feishu.om_1"'));
+  });
+
   it('does not add reply routing for conversation items without endpoints', () => {
     assert.equal(getDeliveryContent({
       type: 'conversation',

@@ -34,6 +34,7 @@ describe('restartServicesWithDeps', () => {
         'scheduler',
         'c4-dispatcher',
         'c4-intake-supervisor',
+        'c4-response-stream-supervisor',
         'web-console',
       ],
     );

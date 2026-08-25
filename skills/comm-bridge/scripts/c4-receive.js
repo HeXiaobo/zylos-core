@@ -19,6 +19,7 @@ import {
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { parseTaskEnvelopeJson } from './c4-task-envelope.js';
 import { persistTaskBeforeRoute } from './c4-task-intake.js';
+import { openAssistantResponseStream } from './assistant-response-stream.js';
 import {
   AGENT_STATUS_FILE,
   ACTIVITY_MONITOR_DIR
@@ -31,7 +32,7 @@ const ROUTER_IPC_TIMEOUT_MS = 30000;
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json>] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--task-envelope-json <json>] [--assistant-request-id <id> --assistant-source-id <id>] [--json] --content "<message>"');
   console.log('');
   console.log('Options:');
   console.log('  --no-reply       Mark as not needing a reply target (use for system messages)');
@@ -40,6 +41,8 @@ function printUsage() {
   console.log('                   Legacy alias: --require-idle');
   console.log('  --task-envelope-json <json>');
   console.log('                   Atomically persist a normalized task envelope with the message');
+  console.log('  --assistant-request-id <id> --assistant-source-id <id>');
+  console.log('                   Open a durable, runtime-neutral response stream for this message');
   console.log('  --json           Output structured JSON');
   console.log('');
   console.log('Priority levels:');
@@ -57,7 +60,9 @@ function parseArgs(args) {
     noReply: false,
     requireIdle: false,
     json: false,
-    taskEnvelopeJson: null
+    taskEnvelopeJson: null,
+    assistantRequestId: null,
+    assistantSourceId: null,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -86,6 +91,12 @@ function parseArgs(args) {
         break;
       case '--task-envelope-json':
         result.taskEnvelopeJson = args[++i];
+        break;
+      case '--assistant-request-id':
+        result.assistantRequestId = args[++i];
+        break;
+      case '--assistant-source-id':
+        result.assistantSourceId = args[++i];
         break;
       default:
         if (args[i].startsWith('--')) {
@@ -228,9 +239,9 @@ async function queryRoute(channel, endpoint, noReply) {
   }
 }
 
-function emitSuccess(json, recordId, action = 'queued') {
+function emitSuccess(json, recordId, action = 'queued', extra = null) {
   if (json) {
-    console.log(JSON.stringify({ ok: true, action, id: recordId }));
+    console.log(JSON.stringify({ ok: true, action, id: recordId, ...(extra || {}) }));
     return;
   }
   if (action === 'queued') {
@@ -328,6 +339,8 @@ async function main() {
     requireIdle,
     json,
     taskEnvelopeJson,
+    assistantRequestId,
+    assistantSourceId,
   } = parsed;
   let channel = rawChannel;
   let taskEnvelope = null;
@@ -373,11 +386,23 @@ async function main() {
     }
   }
 
+  if ((assistantRequestId === null) !== (assistantSourceId === null)) {
+    emitError(json, 'INVALID_ARGS', '--assistant-request-id and --assistant-source-id must be provided together');
+  }
+  if (assistantRequestId !== null && (noReply || !endpoint)) {
+    emitError(json, 'INVALID_ARGS', 'assistant response streams require a reply endpoint');
+  }
+  if (assistantRequestId !== null && taskEnvelope !== null) {
+    emitError(json, 'INVALID_ARGS', 'assistant response streams and task intake cannot share one message');
+  }
+
   const replyEndpoint = noReply ? null : endpoint;
   let dbContent = content;
   let route;
   let taskIntake = null;
   let taskRecord = null;
+  let assistantStream = null;
+  let assistantResponse = null;
 
   if (taskEnvelope) {
     taskIntake = openCommitmentIntakeQueue();
@@ -426,6 +451,33 @@ async function main() {
       });
       return taskRecord;
     }
+    if (assistantRequestId !== null) {
+      assistantStream ??= openAssistantResponseStream();
+      assistantResponse = assistantStream.execute({
+        type: 'AcceptAssistantRequest',
+        requestId: assistantRequestId,
+        sourceId: assistantSourceId,
+        route: { channel, endpointId: replyEndpoint },
+        conversation: {
+          content: storedContent,
+          status: dbStatus,
+          priority,
+          requireIdle,
+        },
+      });
+      return {
+        id: assistantResponse.request.conversationId,
+        direction: 'in',
+        channel,
+        endpoint_id: replyEndpoint,
+        content: storedContent,
+        status: dbStatus,
+        delivery_action: deliveryAction,
+        priority,
+        require_idle: requireIdle ? 1 : 0,
+        retry_count: 0,
+      };
+    }
     return insertConversation(
       'in',
       channel,
@@ -438,7 +490,7 @@ async function main() {
     );
   };
 
-  if (!route.recovered && !noReply) {
+  if (!route.recovered && !noReply && assistantRequestId === null) {
     try {
       cooldown = reserveStatusNoticeCooldownForRoute(channel, endpoint, route);
     } catch (err) {
@@ -460,8 +512,35 @@ async function main() {
 
   try {
     const record = recordInbound(dbContent);
+    if (!route.recovered && assistantResponse) {
+      const failed = assistantStream.execute({
+        type: 'FailRun',
+        requestId: assistantRequestId,
+        code: 'RUNTIME_UNAVAILABLE',
+        retryable: true,
+      });
+      emitSuccess(json, record.id, 'delivered', {
+        assistantResponse: {
+          requestId: failed.request.requestId,
+          replayed: assistantResponse.replayed,
+          events: failed.replayed
+            ? assistantResponse.events
+            : [...assistantResponse.events, ...failed.events],
+        },
+      });
+      return;
+    }
     if (route.recovered || noReply) {
-      emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered');
+      const assistant = assistantResponse
+        ? {
+            assistantResponse: {
+              requestId: assistantResponse.request.requestId,
+              replayed: assistantResponse.replayed,
+              events: assistantResponse.events,
+            },
+          }
+        : null;
+      emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered', assistant);
       return;
     }
 
@@ -478,6 +557,7 @@ async function main() {
   } catch (err) {
     emitError(json, 'INTERNAL_ERROR', `failed to queue message: ${err.message}`);
   } finally {
+    assistantStream?.close();
     close();
   }
 }

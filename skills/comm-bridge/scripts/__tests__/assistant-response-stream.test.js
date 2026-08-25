@@ -1,0 +1,245 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  ASSISTANT_RESPONSE_EVENT_TYPES,
+  openAssistantResponseStream,
+  safeProgressStageForTool,
+} from '../assistant-response-stream.js';
+import { createAssistantResponseDeliveryWorker } from '../c4-response-stream-supervisor.js';
+
+function accept(stream, overrides = {}) {
+  return stream.execute({
+    type: 'AcceptAssistantRequest',
+    requestId: 'assistant.feishu.om_1',
+    sourceId: 'om_1',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_1' },
+    conversation: {
+      content: '[Feishu DM] User said: hello',
+      status: 'pending',
+      priority: 3,
+      requireIdle: false,
+    },
+    ...overrides,
+  });
+}
+
+test('accepts once and exposes only the runtime-neutral event contract', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => 100 });
+  const first = accept(stream);
+  const replay = accept(stream);
+
+  assert.equal(first.replayed, false);
+  assert.equal(replay.replayed, true);
+  assert.equal(first.request.conversationId, replay.request.conversationId);
+  assert.deepEqual(first.events.map(event => event.type), [
+    'AssistantRequestAccepted',
+    'RunQueued',
+  ]);
+  assert.deepEqual(first.events.map(event => event.sequence), [1, 2]);
+  assert.deepEqual(first.events[0].payload, { sourceId: 'om_1' });
+  assert.equal(first.events.every(event => ASSISTANT_RESPONSE_EVENT_TYPES.includes(event.type)), true);
+  const serialized = JSON.stringify(first.events).toLowerCase();
+  assert.equal(serialized.includes('cardkit'), false);
+  assert.equal(serialized.includes('card_id'), false);
+  assert.equal(serialized.includes('sequence_id'), false);
+
+  assert.throws(
+    () => accept(stream, { route: { channel: 'telegram', endpointId: 'other' } }),
+    error => error.code === 'ASSISTANT_REQUEST_CONFLICT',
+  );
+  stream.close();
+});
+
+test('records verified lifecycle, real deltas, and canonical full completion', () => {
+  let now = 200;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now++ });
+  accept(stream);
+  const started = stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-1' });
+  const progress = stream.execute({
+    type: 'ReportProgress',
+    runtimeSessionId: 'session-1',
+    stage: 'reading',
+    idempotencyKey: 'tool:1',
+  });
+  const delta = stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: 'assistant.feishu.om_1',
+    delta: '真实',
+    idempotencyKey: 'delta:1',
+  });
+  const replay = stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: 'assistant.feishu.om_1',
+    delta: '真实',
+    idempotencyKey: 'delta:1',
+  });
+  const completed = stream.execute({
+    type: 'CompleteRun',
+    requestId: 'assistant.feishu.om_1',
+    output: '真实完整答案',
+  });
+
+  assert.equal(started.events[0].type, 'RunStarted');
+  assert.deepEqual(progress.events[0].payload, { stage: 'reading' });
+  assert.deepEqual(delta.events[0].payload, { delta: '真实' });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(completed.events[0].payload, { output: '真实完整答案' });
+  assert.deepEqual(stream.query({ requestId: 'assistant.feishu.om_1' }).events.map(event => event.type), [
+    'AssistantRequestAccepted',
+    'RunQueued',
+    'RunStarted',
+    'ProgressUpdated',
+    'OutputDelta',
+    'RunCompleted',
+  ]);
+  assert.equal(stream.query({ requestId: 'assistant.feishu.om_1' }).request.status, 'completed');
+  stream.close();
+});
+
+test('rejects fabricated stages, unsafe identifiers, and changed idempotent deltas', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  assert.throws(
+    () => accept(stream, { requestId: 'bad";rm' }),
+    /unsafe characters/,
+  );
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'BindNextRun', runtimeSessionId: 'session-1' });
+  assert.throws(() => stream.execute({
+    type: 'ReportProgress',
+    runtimeSessionId: 'session-1',
+    stage: 'thinking_about_hidden_reasoning',
+    idempotencyKey: 'tool:unsafe',
+  }), /safe public progress stage/);
+  stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: 'assistant.feishu.om_1',
+    delta: 'a',
+    idempotencyKey: 'delta:stable',
+  });
+  assert.throws(() => stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: 'assistant.feishu.om_1',
+    delta: 'b',
+    idempotencyKey: 'delta:stable',
+  }), error => error.code === 'ASSISTANT_EVENT_CONFLICT');
+  stream.close();
+});
+
+test('maps actual tool names to a fixed public stage without carrying parameters', () => {
+  assert.equal(safeProgressStageForTool('Read'), 'reading');
+  assert.equal(safeProgressStageForTool('WebSearch'), 'searching');
+  assert.equal(safeProgressStageForTool('mcp__lark__calendar_get'), 'querying');
+  assert.equal(safeProgressStageForTool('Bash'), 'executing');
+  assert.equal(safeProgressStageForTool('Bash', { failed: true }), 'recovering');
+});
+
+test('leases deliveries with fencing and recovers stale requests as RunFailed', () => {
+  let now = 1_000;
+  let token = 0;
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    clock: () => now,
+    leaseToken: () => `lease-${++token}`,
+  });
+  accept(stream);
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  now = 2_000;
+  const expired = stream.execute({ type: 'ExpireStaleRuns', staleBefore: 1_500 });
+  assert.equal(expired.events[0].type, 'RunFailed');
+  assert.deepEqual(expired.events[0].payload, {
+    code: 'RUN_STALE_AFTER_RESTART',
+    retryable: true,
+  });
+
+  const deliveries = stream.claimDeliveries({ limit: 20, leaseSeconds: 10 });
+  assert.equal(deliveries.length, 4);
+  assert.deepEqual(deliveries.map(item => item.event.sequence), [1, 2, 3, 4]);
+  assert.equal(stream.acknowledgeDeliveries([{ deliveryId: deliveries[0].deliveryId, leaseToken: 'wrong' }])[0].acknowledged, false);
+  const acknowledgements = stream.acknowledgeDeliveries(deliveries.map(item => ({
+    deliveryId: item.deliveryId,
+    leaseToken: item.leaseToken,
+  })));
+  assert.equal(acknowledgements.every(item => item.acknowledged), true);
+  stream.close();
+});
+
+test('delivery worker coalesces one request batch and retries adapter failure', async () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => 5_000 });
+  accept(stream);
+  const payloads = [];
+  const worker = createAssistantResponseDeliveryWorker({
+    responseStream: stream,
+    adapterForChannel: channel => `/adapters/${channel}/stream.js`,
+    adapterExists: () => true,
+    deliver: async (_adapter, payload) => payloads.push(payload),
+    clock: () => 5_000,
+    staleSeconds: 1_000,
+  });
+  const result = await worker.drainOnce();
+  assert.deepEqual(result, {
+    expired: 0,
+    claimed: 2,
+    groups: 1,
+    acknowledged: 2,
+    retried: 0,
+    deadLettered: 0,
+  });
+  assert.equal(payloads.length, 1);
+  assert.deepEqual(payloads[0].events.map(event => event.type), [
+    'AssistantRequestAccepted',
+    'RunQueued',
+  ]);
+  worker.close();
+
+  const failedStream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => 6_000 });
+  accept(failedStream);
+  const failedWorker = createAssistantResponseDeliveryWorker({
+    responseStream: failedStream,
+    adapterForChannel: () => '/missing',
+    adapterExists: () => false,
+    clock: () => 6_000,
+    staleSeconds: 1_000,
+    maxAttempts: 1,
+    logger: { warn() {} },
+  });
+  const failed = await failedWorker.drainOnce();
+  assert.equal(failed.deadLettered, 2);
+  failedWorker.close();
+});
+
+test('delivery retry fences later sequences until the earlier batch is available', async () => {
+  let now = 7_000;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });
+  accept(stream);
+  const failedWorker = createAssistantResponseDeliveryWorker({
+    responseStream: stream,
+    adapterForChannel: () => '/adapter/feishu/stream.js',
+    adapterExists: () => true,
+    deliver: async () => { throw new Error('temporary adapter failure'); },
+    clock: () => now,
+    staleSeconds: 1_000,
+    retryDelaySeconds: 2,
+    logger: { warn() {} },
+  });
+  const failed = await failedWorker.drainOnce();
+  assert.equal(failed.retried, 2);
+
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  const payloads = [];
+  const succeedingWorker = createAssistantResponseDeliveryWorker({
+    responseStream: stream,
+    adapterForChannel: () => '/adapter/feishu/stream.js',
+    adapterExists: () => true,
+    deliver: async (_adapter, payload) => payloads.push(payload),
+    clock: () => now,
+    staleSeconds: 1_000,
+  });
+  assert.equal((await succeedingWorker.drainOnce()).claimed, 0);
+  now += 2;
+  assert.equal((await succeedingWorker.drainOnce()).claimed, 3);
+  assert.deepEqual(payloads[0].events.map(item => item.sequence), [1, 2, 3]);
+  succeedingWorker.close();
+});

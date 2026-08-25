@@ -10,9 +10,12 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export function buildReplyViaSuffix(channel, endpointId) {
+export function buildReplyViaSuffix(channel, endpointId, assistantRequestId = null) {
   if (!channel || !endpointId) return '';
-  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"`;
+  const requestOption = assistantRequestId
+    ? ` --request-id "${assistantRequestId}"`
+    : '';
+  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"${requestOption}`;
 }
 
 export function hasLegacyReplyViaSuffix(content = '') {
