@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "product": "zylos-core",
+  "release": "0.7.2-3ai.2",
+  "protocols": {
+    "c4.reply": 2,
+    "c4.assistant-response-stream": 1,
+    "work-intake": 1,
+    "commitment-core": 1,
+    "projection-outbox": 1
+  }
+}

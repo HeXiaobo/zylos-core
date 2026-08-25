@@ -21,6 +21,7 @@ import { copyTree, syncTree } from './fs-utils.js';
 import { applyCaddyRoutes } from './caddy.js';
 import { smartSync, formatMergeResult } from './smart-merge.js';
 import { restartFromEcosystem, restartManagedProcess } from './pm2.js';
+import { verifyTargetCapabilities } from './capability-compatibility.js';
 
 // ---------------------------------------------------------------------------
 // Version helpers
@@ -362,8 +363,37 @@ function createContext(component, { tempDir, newVersion, mode, jsonOutput } = {}
 }
 
 // ---------------------------------------------------------------------------
-// 7-step upgrade pipeline
+// Upgrade pipeline
 // ---------------------------------------------------------------------------
+
+/**
+ * Step 0: verify target-declared protocol requirements before stopping the
+ * running channel or writing backups/files.
+ */
+function step0_verifyCapabilities(ctx) {
+  const startTime = Date.now();
+  if (!ctx.tempDir || !fs.existsSync(ctx.tempDir)) {
+    return { step: 0, name: 'verify_capabilities', status: 'failed', error: 'Temp directory not available', duration: Date.now() - startTime };
+  }
+
+  const result = verifyTargetCapabilities(ctx.tempDir);
+  if (result.status === 'incompatible') {
+    return {
+      step: 0,
+      name: 'verify_capabilities',
+      status: 'failed',
+      error: `Incompatible target component: ${result.errors.join('; ')}`,
+      duration: Date.now() - startTime,
+    };
+  }
+  return {
+    step: 0,
+    name: 'verify_capabilities',
+    status: result.status === 'compatible' ? 'done' : 'skipped',
+    message: result.status === 'compatible' ? 'zylos-core protocols compatible' : result.reason,
+    duration: Date.now() - startTime,
+  };
+}
 
 /**
  * Step 1: stop PM2 service
@@ -707,7 +737,7 @@ export function rollback(ctx, deps = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * Run the 9-step upgrade pipeline (mechanical operations only).
+ * Run the validated upgrade pipeline (mechanical operations only).
  * Lock must be acquired by caller (component.js).
  *
  * @param {string} component
@@ -735,6 +765,7 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
   ctx.to = newVersion || null;
 
   const steps = [
+    step0_verifyCapabilities,
     step1_stopService,
     step2_backup,
     step3_smartMerge,

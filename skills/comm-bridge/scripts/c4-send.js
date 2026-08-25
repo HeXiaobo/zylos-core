@@ -10,7 +10,9 @@
  *
  * The message body must be piped via stdin/heredoc. Passing it as a CLI
  * argument hard-fails with exit code 2 because shell quoting can silently
- * truncate or transform message content.
+ * truncate or transform message content. During a bounded migration only,
+ * C4_LEGACY_ARG_MODE=1 accepts the unambiguous channel + endpoint + message
+ * form and emits a content-free deprecation event.
  *
  * Special channel 'void' (#689): internal-only messages (e.g. session
  * handoffs). The message is recorded in c4.db like any other conversation
@@ -98,12 +100,21 @@ async function main() {
   const cleanArgs = parsed.positional;
   const hasStdinFlag = parsed.hasStdinFlag;
   const stdinAvailable = !process.stdin.isTTY;
+  const legacyArgMode = process.env.C4_LEGACY_ARG_MODE === '1';
 
   const channel = cleanArgs[0];
   let endpoint = null;
   let message = null;
 
-  if (cleanArgs.length > 2) {
+  if (cleanArgs.length === 3 && legacyArgMode && cleanArgs[0] !== 'void') {
+    endpoint = cleanArgs[1];
+    message = cleanArgs[2];
+    console.error(`[c4-send] ${JSON.stringify({
+      event: 'legacy_arg_mode_used',
+      channel,
+      endpointPresent: true,
+    })}`);
+  } else if (cleanArgs.length > 2) {
     console.error('[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.');
     process.exit(2);
   } else if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {

@@ -16,7 +16,7 @@ export function buildReplyViaSuffix(channel, endpointId, assistantRequestId = nu
   const requestOption = assistantRequestId
     ? ` --request-id "${assistantRequestId}"`
     : '';
-  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"${requestOption}`;
+  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"${requestOption} (stdin only: pipe the complete reply body; do not append it as a message argument)`;
 }
 
 export function buildStreamedReplySuffix(assistantRequestId) {

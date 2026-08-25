@@ -12,7 +12,25 @@ EOF
 
 Messages are piped via stdin using a heredoc. This bypasses shell argument parsing entirely, so any content (quotes, variables, markdown) is delivered verbatim.
 
-Passing the message body as a CLI argument is disabled and exits with status 2. This is an enforced safety boundary, not a deprecation warning.
+Passing the message body as a CLI argument is disabled and exits with status 2 by default.
+
+### Bounded legacy migration
+
+`C4_LEGACY_ARG_MODE=1` temporarily accepts only the unambiguous legacy form
+`<channel> <endpoint_id> <message>`. Broadcast and `void` arg-mode remain
+disabled. Every use writes a `legacy_arg_mode_used` deprecation event without
+the message body, so operators can verify that old callers have been removed.
+
+For a Zylos runtime launched with clean environment filtering, add the variable
+to the existing comma-separated runtime manifest as well:
+
+```dotenv
+C4_LEGACY_ARG_MODE=1
+ZYLOS_TMUX_ENV=C4_LEGACY_ARG_MODE
+```
+
+If `ZYLOS_TMUX_ENV` already contains names, append `C4_LEGACY_ARG_MODE` instead
+of replacing them. Remove the override after HXA/OpenMAX callers use stdin.
 
 ### Important safety rule
 

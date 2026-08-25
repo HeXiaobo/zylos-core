@@ -437,7 +437,7 @@ describe('getDeliveryContent', () => {
       content: 'hello',
     });
 
-    assert.match(result, /reply directly in this Claude turn/i);
+    assert.match(result, /reply directly in this runtime turn/i);
     assert.match(result, /displayed assistant text is delivered automatically/i);
     assert.match(result, /assistant\.feishu\.om_1/);
     assert.equal(result.includes('c4-send.js'), false);

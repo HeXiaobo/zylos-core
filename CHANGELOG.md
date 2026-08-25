@@ -5,6 +5,15 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-3ai.2] - 2026-08-25
+
+### Added
+- A machine-readable `zylos capabilities --json` protocol contract for paired component upgrades.
+- A bounded `C4_LEGACY_ARG_MODE=1` migration path for endpoint-addressed legacy replies, with content-free deprecation telemetry.
+
+### Changed
+- C4 reply-route instructions now state the stdin-only message contract explicitly.
+
 ## [0.7.2-3ai.1] - 2026-08-25
 
 ### Added

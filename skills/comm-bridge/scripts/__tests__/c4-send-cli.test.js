@@ -144,6 +144,23 @@ describe('c4-send validation', () => {
     });
   });
 
+  it('temporarily accepts endpoint message arg-mode behind the explicit migration flag', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1', 'legacy message with $vars'],
+        { ...env, C4_LEGACY_ARG_MODE: '1' },
+      );
+
+      assert.equal(status, 0);
+      assert.match(stderr, /legacy_arg_mode_used/);
+      assert.doesNotMatch(stderr, /legacy message with \$vars/);
+      const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
+      assert.deepEqual(sent, ['endpoint1', 'legacy message with $vars']);
+    });
+  });
+
   it('rejects broadcast message arg-mode with exit 2 before dispatch', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
