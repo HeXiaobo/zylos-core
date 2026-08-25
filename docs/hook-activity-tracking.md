@@ -6,7 +6,10 @@
 > response ledger, and does not enter `tool-events.jsonl`. `Stop` records the
 > final displayed assistant message as canonical output. Neither hook receives
 > or publishes Claude thinking blocks. Explicit `[PUBLIC_REASONING]` lines are
-> routed to `PublicReasoningDelta` and removed from the canonical answer.
+> routed to `PublicReasoningDelta` and removed from the canonical answer. A
+> mode-0600 transient buffer flushes concurrent hook processes by
+> `message_id + batch_index`, so process scheduling cannot reverse visible
+> reasoning or answer segments.
 >
 > Codex does not use this Claude hook. Activity Monitor tails the active Codex
 > rollout with a persisted byte offset and maps only public reasoning summaries,

@@ -25,6 +25,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { getClaudePid } from './claude-pid.js';
 import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
+import { sequenceMessageDisplayBatch } from './message-display-sequencer.js';
 import { openAssistantResponseStream } from '../../comm-bridge/scripts/assistant-response-stream.js';
 import {
   sanitizePublicReasoningDelta,
@@ -36,6 +37,7 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const TOOL_EVENTS_FILE = path.join(MONITOR_DIR, 'tool-events.jsonl');
 const HOOK_ERROR_LOG = path.join(MONITOR_DIR, 'hook-activity-errors.log');
+const MESSAGE_DISPLAY_BUFFER_DIR = path.join(MONITOR_DIR, 'message-display-buffers');
 
 function appendError(message) {
   try {
@@ -155,26 +157,36 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       const delta = hookData?.delta;
       if (typeof delta !== 'string' || delta.length === 0) return null;
       if (!record.message_id || !Number.isSafeInteger(record.batch_index)) return null;
-      const separated = splitPublicReasoningText(delta);
       let result = null;
-      for (const [index, publicDelta] of separated.publicReasoningDeltas.entries()) {
-        const safeDelta = sanitizePublicReasoningDelta(publicDelta);
-        if (!safeDelta) continue;
-        result = responseStream.execute({
-          type: 'AppendRuntimePublicReasoningDelta',
-          runtimeSessionId: record.session_id,
-          delta: safeDelta,
-          idempotencyKey: `display-reasoning:${record.message_id}:${record.batch_index}:${index}`,
-        });
-      }
-      if (separated.answer.length > 0) {
-        result = responseStream.execute({
-          type: 'AppendRuntimeOutputDelta',
-          runtimeSessionId: record.session_id,
-          delta: separated.answer,
-          idempotencyKey: `display:${record.message_id}:${record.batch_index}`,
-        });
-      }
+      sequenceMessageDisplayBatch({
+        directory: MESSAGE_DISPLAY_BUFFER_DIR,
+        sessionId: record.session_id,
+        messageId: record.message_id,
+        batchIndex: record.batch_index,
+        final: record.final === true,
+        delta,
+        emit: batch => {
+          const separated = splitPublicReasoningText(batch.delta);
+          for (const [index, publicDelta] of separated.publicReasoningDeltas.entries()) {
+            const safeDelta = sanitizePublicReasoningDelta(publicDelta);
+            if (!safeDelta) continue;
+            result = responseStream.execute({
+              type: 'AppendRuntimePublicReasoningDelta',
+              runtimeSessionId: record.session_id,
+              delta: safeDelta,
+              idempotencyKey: `display-reasoning:${record.message_id}:${batch.index}:${index}`,
+            });
+          }
+          if (separated.answer.length > 0) {
+            result = responseStream.execute({
+              type: 'AppendRuntimeOutputDelta',
+              runtimeSessionId: record.session_id,
+              delta: separated.answer,
+              idempotencyKey: `display:${record.message_id}:${batch.index}`,
+            });
+          }
+        },
+      });
       return result;
     }
     if (record.event === 'stop') {

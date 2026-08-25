@@ -463,6 +463,61 @@ describe('hook-activity', () => {
     stream.close();
   });
 
+  it('flushes concurrently delivered MessageDisplay batches in batch-index order', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.display-order',
+      sourceId: 'om_display_order',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_display_order' },
+      conversation: {
+        content: '[Feishu DM] display order test',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.display-order' });
+
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-display-order',
+      message_id: 'message-display-order',
+      index: 1,
+      final: true,
+      delta: '[PUBLIC_REASONING] 第二步。\n最终答案。',
+    }, 9380);
+    let result = stream.query({ requestId: 'assistant.feishu.display-order' });
+    assert.equal(result.events.some(event => event.type === 'PublicReasoningDelta'), false);
+    assert.equal(result.events.some(event => event.type === 'OutputDelta'), false);
+
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-display-order',
+      message_id: 'message-display-order',
+      index: 0,
+      final: false,
+      delta: '[PUBLIC_REASONING] 第一步。\n',
+    }, 9390);
+
+    result = stream.query({ requestId: 'assistant.feishu.display-order' });
+    assert.deepEqual(
+      result.events
+        .filter(event => ['PublicReasoningDelta', 'OutputDelta'].includes(event.type))
+        .map(event => ({ type: event.type, delta: event.payload.delta })),
+      [
+        { type: 'PublicReasoningDelta', delta: '第一步。\n' },
+        { type: 'PublicReasoningDelta', delta: '第二步。\n' },
+        { type: 'OutputDelta', delta: '最终答案。' },
+      ],
+    );
+    stream.close();
+  });
+
   it('uses the public Stop message as the canonical answer after streamed batches', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     const { openAssistantResponseStream } = await import(
