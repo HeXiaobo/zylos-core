@@ -72,6 +72,37 @@ test('list query filters tasks and uses stable recently-updated ordering', () =>
   }
 });
 
+test('list query cursor walks beyond the bounded page without gaps or duplicates', () => {
+  let taskNumber = 0;
+  const core = openCommitmentCore({
+    dbPath: ':memory:',
+    idGenerator: () => `task-${String(++taskNumber).padStart(3, '0')}`,
+    clock: () => '2026-08-25T10:00:00.000Z',
+  });
+
+  try {
+    for (let index = 1; index <= 5; index += 1) {
+      createTask(core, `source-${index}`, { ownerId: 'owner-1' });
+    }
+    const first = core.query({ limit: 2 });
+    const second = core.query({
+      limit: 2,
+      cursor: { updatedAt: first.at(-1).updatedAt, taskId: first.at(-1).id },
+    });
+    const third = core.query({
+      limit: 2,
+      cursor: { updatedAt: second.at(-1).updatedAt, taskId: second.at(-1).id },
+    });
+
+    assert.deepEqual(
+      [...first, ...second, ...third].map(task => task.id),
+      ['task-001', 'task-002', 'task-003', 'task-004', 'task-005'],
+    );
+  } finally {
+    core.close();
+  }
+});
+
 test('task and list query modes are mutually exclusive and strictly validated', () => {
   const core = openCommitmentCore({ dbPath: ':memory:' });
 
@@ -91,6 +122,9 @@ test('task and list query modes are mutually exclusive and strictly validated', 
       { limit: 101 },
       { limit: 1.5 },
       { limit: '10' },
+      { cursor: null },
+      { cursor: { updatedAt: '2026-08-25T10:00:00.000Z' } },
+      { cursor: { updatedAt: '2026-08-25T10:00:00.000Z', taskId: 'task-1', extra: true } },
       { unknown: true },
     ];
 

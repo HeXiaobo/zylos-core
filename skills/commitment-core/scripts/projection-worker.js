@@ -49,11 +49,11 @@ function isRetryableAdapterFailure(error) {
 /**
  * Claim and settle one bounded projection batch.
  *
- * The Adapter is called once per non-empty batch. A successful Adapter call
- * makes every leased delivery eligible for acknowledge; a failed call makes
- * every delivery eligible for retry/dead-letter according to one shared
- * failure classification. Settlement remains per delivery so one fenced row
- * cannot prevent the rest of the batch from progressing.
+ * A batch Adapter is called once per non-empty batch and shares one failure
+ * classification across the batch. A per-delivery Adapter is called for every
+ * leased delivery and isolates publication failures. Settlement always remains
+ * per delivery so one poison or fenced row cannot prevent the rest of the
+ * batch from progressing.
  */
 export async function processProjectionBatch({
   core,
@@ -72,8 +72,10 @@ export async function processProjectionBatch({
     throw new TypeError('core.outbox must provide claim, ack, and fail functions');
   }
   requireObject(adapter, 'adapter');
-  if (typeof adapter.publishBatch !== 'function') {
-    throw new TypeError('adapter.publishBatch must be a function');
+  const publishesBatch = typeof adapter.publishBatch === 'function';
+  const publishesDelivery = typeof adapter.publishDelivery === 'function';
+  if (!publishesBatch && !publishesDelivery) {
+    throw new TypeError('adapter must provide publishBatch or publishDelivery');
   }
   const normalizedProjection = requireText(projection, 'projection');
   const normalizedWorkerId = requireText(workerId, 'workerId');
@@ -111,16 +113,31 @@ export async function processProjectionBatch({
   };
   if (deliveries.length === 0) return summary;
 
-  let adapterFailure = null;
-  try {
-    await adapter.publishBatch({ deliveries });
-    summary.published = deliveries.length;
-  } catch (error) {
-    adapterFailure = error;
+  let batchFailure = null;
+  const deliveryFailures = new Map();
+  if (publishesDelivery) {
+    for (const delivery of deliveries) {
+      try {
+        await adapter.publishDelivery({ delivery });
+        summary.published += 1;
+      } catch (error) {
+        deliveryFailures.set(delivery.eventId, error);
+      }
+    }
+  } else {
+    try {
+      await adapter.publishBatch({ deliveries });
+      summary.published = deliveries.length;
+    } catch (error) {
+      batchFailure = error;
+    }
   }
 
   for (const delivery of deliveries) {
     try {
+      const adapterFailure = publishesDelivery
+        ? deliveryFailures.get(delivery.eventId) ?? null
+        : batchFailure;
       if (adapterFailure === null) {
         core.outbox.ack({
           projection: normalizedProjection,

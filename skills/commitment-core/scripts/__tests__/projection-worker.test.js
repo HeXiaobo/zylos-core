@@ -219,6 +219,54 @@ test('a platform Adapter can mark a failure permanent without importing Core cla
   }
 });
 
+test('a per-delivery Adapter isolates one permanent failure from the rest of the claimed batch', async () => {
+  const harness = createHarness();
+  const visited = [];
+  try {
+    createTask(harness.core, 1);
+    createTask(harness.core, 2);
+    createTask(harness.core, 3);
+
+    const summary = await processProjectionBatch({
+      core: harness.core,
+      projection: 'attention',
+      workerId: 'attention-worker-1',
+      leaseMs: 30_000,
+      limit: 10,
+      retryAfterMs: 5_000,
+      maxAttempts: 3,
+      operationId: 'isolated-platform-cycle-1',
+      adapter: {
+        async publishDelivery({ delivery }) {
+          visited.push(delivery.eventId);
+          if (delivery.eventId === 'event-2') {
+            throw new ProjectionAdapterError('invalid destination', { retryable: false });
+          }
+        },
+      },
+    });
+
+    assert.deepEqual(visited, ['event-1', 'event-2', 'event-3']);
+    assert.deepEqual(summary, {
+      projection: 'attention',
+      claimed: 3,
+      published: 2,
+      acknowledged: 2,
+      retryWaiting: 0,
+      deadLettered: 1,
+      settlementFailed: 0,
+      idle: false,
+    });
+    assert.deepEqual(
+      harness.core.outbox.query({ projection: 'attention', limit: 10 })
+        .map(delivery => delivery.status),
+      ['acknowledged', 'dead_letter', 'acknowledged'],
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('the Attention Adapter rebuilds one atomic view for a whole Event batch', async () => {
   const harness = createHarness();
   const outputPath = path.join(os.tmpdir(), `zylos-attention-projection-${process.pid}.md`);

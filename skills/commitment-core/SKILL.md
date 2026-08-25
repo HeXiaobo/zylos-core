@@ -33,9 +33,10 @@ to `~/zylos/commitments/commitments.db` when `ZYLOS_DIR` is unset.
 - `query({ taskId })` returns the task view or `null`.
 - `query({ taskId, includeEvents: true })` returns `{ task, events }`, with
   events ordered by Task version.
-- `query({ states?, ownerId?, assigneeId?, limit? })` lists Tasks ordered by
-  `updatedAt` descending and `id` ascending. The default limit is 50 and the
-  maximum is 100. List mode and `taskId` mode are mutually exclusive.
+- `query({ states?, ownerId?, assigneeId?, cursor?, limit? })` lists Tasks
+  ordered by `updatedAt` descending and `id` ascending. Continue a page with
+  the last row's `{ updatedAt, taskId }` cursor. The default limit is 50 and
+  the maximum is 100. List mode and `taskId` mode are mutually exclusive.
 - `command({ type, taskId, actorId, idempotencyKey }, expectedVersion)` applies
   one state transition and returns `{ task, event }`. `expectedVersion` must be
   a positive integer.
@@ -265,14 +266,21 @@ contact an external backend, or automatically retry the delivery.
 
 `processProjectionBatch(...)` in `scripts/projection-worker.js` is the
 runtime-neutral worker Interface. It claims one bounded delivery batch for one
-`projection`, calls the injected Adapter exactly once, and then settles each
-delivery independently with its claimed version. Success acknowledges each
-row. A retryable Adapter failure moves rows to `retry_wait`; an error carrying
-`retryable: false` (including `ProjectionAdapterError`) or exhaustion of
-`maxAttempts` moves it to `dead_letter`. This structural flag lets platform
-Adapters honor the worker Interface without importing Core implementation
-classes. Settlement fencing on one row is
-counted and does not prevent settlement attempts for the rest of the batch.
+`projection`, invokes the injected Adapter, and settles each delivery with its
+claimed version. An Adapter may expose either `publishBatch({ deliveries })`
+or `publishDelivery({ delivery })`. Batch publication retains all-or-nothing
+failure classification. Per-delivery publication isolates a failed external
+effect so later deliveries are still attempted and successful rows can be
+acknowledged immediately. If both functions exist, the worker selects
+`publishDelivery`.
+
+A retryable Adapter failure moves only the affected settlement unit to
+`retry_wait`; an error carrying `retryable: false` (including
+`ProjectionAdapterError`) or exhaustion of `maxAttempts` moves it to
+`dead_letter`. This structural flag lets platform Adapters honor the worker
+Interface without importing Core implementation classes. Settlement fencing
+on one row is counted and does not prevent settlement attempts for the rest of
+the batch.
 
 Every worker cycle must use a fresh `operationId`; the default is a random
 UUID. Reusing an operation identity would replay the durable claim receipt,
@@ -280,14 +288,14 @@ including an earlier empty result. Acknowledge/fail receipt identities are
 derived deterministically from the delivery identity and version, so an exact
 settlement replay is safe.
 
-The Adapter Interface has one critical invariant: `publishBatch({ deliveries
-})` must either publish the batch atomically, or make every per-delivery effect
-idempotent under a replay of the same delivery version. If the Adapter throws,
-the worker treats the whole batch as failed and it may later be replayed.
-Adapters with partially successful, non-idempotent effects do not satisfy this
-Interface and must add their own durable per-item seam instead of using this
-batch worker directly. A process exit after publish but before acknowledge is
-recovered by lease expiry; the replacement worker republishes before ack.
+The batch Adapter Interface has one critical invariant: `publishBatch({
+deliveries })` must either publish the batch atomically, or make every
+per-delivery effect idempotent under a replay of the same delivery version. If
+the Adapter throws, the worker treats the whole batch as failed and it may
+later be replayed. Non-atomic external Adapters should expose
+`publishDelivery` so one poison event does not hold back unrelated deliveries;
+each individual effect must still be idempotent because a process exit after
+publish but before acknowledge is recovered by lease expiry and republish.
 The worker Interface intentionally has no redrive operation. Only the explicit
 operator Interface above can create a new redrive generation.
 

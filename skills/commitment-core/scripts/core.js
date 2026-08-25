@@ -212,6 +212,20 @@ function rejectUnknownQueryFields(query, allowedFields) {
   }
 }
 
+function normalizeTaskListCursor(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('cursor must be an object');
+  }
+  rejectUnknownQueryFields(value, new Set(['updatedAt', 'taskId']));
+  if (!Object.hasOwn(value, 'updatedAt') || !Object.hasOwn(value, 'taskId')) {
+    throw new TypeError('cursor must contain updatedAt and taskId');
+  }
+  return {
+    updatedAt: requireText(value.updatedAt, 'cursor.updatedAt'),
+    taskId: requireText(value.taskId, 'cursor.taskId'),
+  };
+}
+
 function normalizeQuery(query) {
   if (!query || typeof query !== 'object' || Array.isArray(query)) {
     throw new TypeError('query must be an object');
@@ -229,7 +243,7 @@ function normalizeQuery(query) {
     };
   }
 
-  rejectUnknownQueryFields(query, new Set(['states', 'ownerId', 'assigneeId', 'limit']));
+  rejectUnknownQueryFields(query, new Set(['states', 'ownerId', 'assigneeId', 'limit', 'cursor']));
   let states = null;
   if (query.states !== undefined) {
     if (!Array.isArray(query.states) || query.states.length === 0) {
@@ -252,6 +266,7 @@ function normalizeQuery(query) {
     assigneeId: query.assigneeId === undefined
       ? null
       : requireText(query.assigneeId, 'assigneeId'),
+    cursor: query.cursor === undefined ? null : normalizeTaskListCursor(query.cursor),
     limit,
   };
 }
@@ -746,6 +761,14 @@ export function openCommitmentCore({
         if (normalized.assigneeId) {
           clauses.push('assignee_id = ?');
           values.push(normalized.assigneeId);
+        }
+        if (normalized.cursor) {
+          clauses.push('(updated_at < ? OR (updated_at = ? AND id > ?))');
+          values.push(
+            normalized.cursor.updatedAt,
+            normalized.cursor.updatedAt,
+            normalized.cursor.taskId,
+          );
         }
         const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
         return database.prepare(`
