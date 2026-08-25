@@ -163,6 +163,43 @@ Evidence rows, ExternalLink rows, and their receipts commit in their respective
 single SQLite transactions. Callers must use these Interfaces instead of the
 underlying tables.
 
+## Task conversation, audience, and notification policy
+
+`core.conversation` owns channel-neutral Task comments. It stores append-only
+events and never updates or deletes comment history.
+
+- `conversation.record(command)` accepts `AddComment`, `ReviseComment`, or
+  `DeleteComment`. Every command includes `taskId`, logical `commentId`,
+  authenticated `actorId`, canonical `occurredAt`, and `idempotencyKey`.
+  Add/revise also require `body`; replies may include `replyToCommentId`.
+- A delete appends `CommentDeleted` with a null body. It is a tombstone, not a
+  row deletion. Late older events remain in history but cannot replace a newer
+  materialized comment view.
+- `conversation.query({ taskId, commentId?, includeHistory?, limit? })` returns
+  current comment views and, when requested, their immutable event history.
+- Each comment event and exact-replay receipt commits in one transaction.
+  Reusing a key with different normalized content returns
+  `IDEMPOTENCY_CONFLICT`.
+
+`core.audience.resolve({ taskId })` returns the unique business participants
+and their merged `owner`, `acceptor`, and `assignee` roles. Platform followers
+are deliberately absent: an Adapter may project this audience as followers,
+but follower state is not a Core fact.
+
+`core.notifications.decide({ taskId, eventId, kind, actorId?, targetIds? })`
+returns channel-neutral deliveries with `recipientId`, `reason`, `urgency`,
+`deliveryMode`, `coalesceWindowMs`, and `dedupeKey`.
+
+- `review` immediately targets the Acceptor.
+- `blocked`, `failed`, and `overdue` target Owner and Assignee and may be
+  coalesced for 30 seconds.
+- `action_required` immediately targets explicit Task-audience members.
+- `progress` produces no direct-message delivery.
+- The event actor is always removed from the recipient set.
+
+These Interfaces make no Feishu SDK calls and do not render or deliver
+notifications. Channel Adapters own delivery receipts, rate limits, and UI.
+
 ## Transactional projection Outbox
 
 `core.outbox` is the runtime-neutral delivery Interface for projecting Task

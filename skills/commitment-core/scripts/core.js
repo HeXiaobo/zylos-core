@@ -15,6 +15,14 @@ import {
   initializeProjectionOutboxSchema,
 } from './projection-outbox.js';
 import { createTaskRunModule, initializeTaskRunSchema } from './task-runs.js';
+import {
+  createTaskConversationModule,
+  initializeTaskConversationSchema,
+} from './task-conversation.js';
+import {
+  createNotificationPolicyModule,
+  createTaskAudienceModule,
+} from './task-notifications.js';
 
 function defaultDbPath() {
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -486,6 +494,7 @@ export function openCommitmentCore({
   runEventIdGenerator = () => `run-event-${randomUUID()}`,
   evidenceIdGenerator = () => `evidence-${randomUUID()}`,
   externalLinkIdGenerator = () => `external-link-${randomUUID()}`,
+  conversationEventIdGenerator = () => `comment-event-${randomUUID()}`,
 } = {}) {
   if (dbPath !== ':memory:') mkdirSync(path.dirname(dbPath), { recursive: true });
 
@@ -501,6 +510,7 @@ export function openCommitmentCore({
   initializeTaskRunSchema(database);
   initializeEvidenceSchema(database);
   initializeExternalLinkSchema(database);
+  initializeTaskConversationSchema(database);
   const projectionOutboxModule = createProjectionOutboxModule({ database, clock });
   backfillCreationEvents(database, eventIdGenerator, projectionOutboxModule.append);
 
@@ -733,6 +743,14 @@ export function openCommitmentCore({
     externalLinkIdGenerator,
     taskStore,
   });
+  const conversationModule = createTaskConversationModule({
+    database,
+    clock,
+    eventIdGenerator: conversationEventIdGenerator,
+    taskStore,
+  });
+  const audienceModule = createTaskAudienceModule({ taskStore });
+  const notificationPolicyModule = createNotificationPolicyModule({ taskStore });
 
   return Object.freeze({
     ingest(envelope) {
@@ -744,6 +762,9 @@ export function openCommitmentCore({
     runs: runModule.publicInterface,
     evidence: evidenceModule,
     externalLinks: externalLinkModule,
+    conversation: conversationModule,
+    audience: audienceModule,
+    notifications: notificationPolicyModule,
     outbox: projectionOutboxModule.publicInterface,
     query(query = {}) {
       const normalized = normalizeQuery(query);
