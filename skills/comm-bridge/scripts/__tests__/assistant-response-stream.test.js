@@ -270,6 +270,70 @@ test('binding the runtime emits a safe analysis summary even when no tools are n
   stream.close();
 });
 
+test('binds an explicit request and refuses to guess or share a runtime session', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+  accept(stream, {
+    requestId: 'assistant.feishu.om_2',
+    sourceId: 'om_2',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_2' },
+  });
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_2' });
+
+  const ambiguous = stream.execute({
+    type: 'BindNextRun',
+    runtimeSessionId: 'session-explicit',
+  });
+  assert.equal(ambiguous.request, null);
+  assert.equal(ambiguous.ambiguous, true);
+
+  const bound = stream.execute({
+    type: 'BindRun',
+    requestId: 'assistant.feishu.om_2',
+    runtimeSessionId: 'session-explicit',
+  });
+  assert.equal(bound.request.requestId, 'assistant.feishu.om_2');
+  assert.equal(bound.request.runtimeSessionId, 'session-explicit');
+  assert.equal(stream.query({ requestId: 'assistant.feishu.om_1' }).request.runtimeSessionId, null);
+  assert.throws(
+    () => stream.execute({
+      type: 'BindRun',
+      requestId: 'assistant.feishu.om_1',
+      runtimeSessionId: 'session-explicit',
+    }),
+    error => error.code === 'ASSISTANT_RUN_BINDING_CONFLICT',
+  );
+  stream.close();
+});
+
+test('retains an explicit binding when the prompt hook wins the RunStarted race', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream);
+
+  const bound = stream.execute({
+    type: 'BindRun',
+    requestId: 'assistant.feishu.om_1',
+    runtimeSessionId: 'session-queued-binding',
+  });
+  assert.equal(bound.request.status, 'queued');
+  assert.equal(bound.request.runtimeSessionId, 'session-queued-binding');
+  assert.deepEqual(bound.events, []);
+
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.om_1' });
+  stream.execute({
+    type: 'AppendRuntimeOutputDelta',
+    runtimeSessionId: 'session-queued-binding',
+    delta: 'Bound before start.',
+    idempotencyKey: 'queued-binding:delta:1',
+  });
+  assert.equal(
+    stream.query({ requestId: 'assistant.feishu.om_1' }).request.output,
+    'Bound before start.',
+  );
+  stream.close();
+});
+
 test('reports observed tool completion without exposing the runtime tool name', () => {
   const stream = openAssistantResponseStream({ dbPath: ':memory:' });
   accept(stream);

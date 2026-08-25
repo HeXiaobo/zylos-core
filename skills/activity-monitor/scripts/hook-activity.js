@@ -38,6 +38,7 @@ const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const TOOL_EVENTS_FILE = path.join(MONITOR_DIR, 'tool-events.jsonl');
 const HOOK_ERROR_LOG = path.join(MONITOR_DIR, 'hook-activity-errors.log');
 const MESSAGE_DISPLAY_BUFFER_DIR = path.join(MONITOR_DIR, 'message-display-buffers');
+const ASSISTANT_REQUEST_MARKER = /assistant request:\s*"([A-Za-z0-9][A-Za-z0-9._:-]*)"\s*$/;
 
 function appendError(message) {
   try {
@@ -58,6 +59,13 @@ function hasMeaningfulToolInput(toolInput) {
 
 function isSubagentHook(hookData) {
   return typeof hookData?.agent_id === 'string' && hookData.agent_id.trim().length > 0;
+}
+
+function assistantRequestIdFromPrompt(hookData) {
+  const prompt = typeof hookData?.prompt === 'string'
+    ? hookData.prompt
+    : (typeof hookData?.user_prompt === 'string' ? hookData.user_prompt : '');
+  return prompt.match(ASSISTANT_REQUEST_MARKER)?.[1] || null;
 }
 
 function buildToolEvent({ hookData, eventName, claudePid, nowMs }) {
@@ -119,6 +127,14 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
   const responseStream = openAssistantResponseStream();
   try {
     if (record.event === 'prompt') {
+      const requestId = assistantRequestIdFromPrompt(hookData);
+      if (requestId) {
+        return responseStream.execute({
+          type: 'BindRun',
+          requestId,
+          runtimeSessionId: record.session_id,
+        });
+      }
       return responseStream.execute({
         type: 'BindNextRun',
         runtimeSessionId: record.session_id,

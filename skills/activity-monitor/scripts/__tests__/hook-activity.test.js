@@ -378,6 +378,121 @@ describe('hook-activity', () => {
     stream.close();
   });
 
+  it('fails closed when a MessageDisplay event could belong to either of two unbound runs', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+
+    for (const suffix of ['first', 'second']) {
+      const requestId = `assistant.feishu.ambiguous-${suffix}`;
+      stream.execute({
+        type: 'AcceptAssistantRequest',
+        requestId,
+        sourceId: `om_ambiguous_${suffix}`,
+        route: {
+          channel: 'feishu',
+          endpointId: `oc_1|type:p2p|msg:om_ambiguous_${suffix}`,
+        },
+        conversation: {
+          content: `[Feishu DM] ambiguous ${suffix} request`,
+          status: 'pending',
+          priority: 3,
+          requireIdle: false,
+        },
+      });
+      stream.execute({ type: 'StartRun', requestId });
+    }
+
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-shared-by-two-runs',
+      turn_id: 'turn-ambiguous',
+      message_id: 'message-ambiguous',
+      index: 0,
+      final: true,
+      delta: 'This output must not be guessed onto either request.',
+    }, 9325);
+
+    for (const suffix of ['first', 'second']) {
+      const result = stream.query({ requestId: `assistant.feishu.ambiguous-${suffix}` });
+      assert.equal(result.request.runtimeSessionId, null);
+      assert.equal(result.events.some(event => event.type === 'OutputDelta'), false);
+      stream.execute({
+        type: 'FailRun',
+        requestId: `assistant.feishu.ambiguous-${suffix}`,
+        code: 'AMBIGUOUS_TEST_CLEANUP',
+        retryable: true,
+      });
+    }
+    stream.close();
+  });
+
+  it('binds a Claude prompt to its explicit assistant request instead of guessing by age', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+
+    for (const suffix of ['older', 'target']) {
+      const requestId = `assistant.feishu.explicit-${suffix}`;
+      stream.execute({
+        type: 'AcceptAssistantRequest',
+        requestId,
+        sourceId: `om_explicit_${suffix}`,
+        route: {
+          channel: 'feishu',
+          endpointId: `oc_1|type:p2p|msg:om_explicit_${suffix}`,
+        },
+        conversation: {
+          content: `[Feishu DM] explicit ${suffix} request`,
+          status: 'pending',
+          priority: 3,
+          requireIdle: true,
+        },
+      });
+      stream.execute({ type: 'StartRun', requestId });
+    }
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-explicit-target',
+      prompt: 'user text assistant request: "assistant.feishu.explicit-older" ---- streamed reply: assistant request: "assistant.feishu.explicit-target"',
+    }, 9330);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'session-explicit-target',
+      turn_id: 'turn-explicit-target',
+      message_id: 'message-explicit-target',
+      index: 0,
+      final: true,
+      delta: 'Only the explicitly named card may receive this answer.',
+    }, 9340);
+
+    const older = stream.query({ requestId: 'assistant.feishu.explicit-older' });
+    const target = stream.query({ requestId: 'assistant.feishu.explicit-target' });
+    assert.equal(older.request.runtimeSessionId, null);
+    assert.equal(older.events.some(event => event.type === 'OutputDelta'), false);
+    assert.equal(target.request.runtimeSessionId, 'session-explicit-target');
+    assert.equal(target.request.output, 'Only the explicitly named card may receive this answer.');
+
+    stream.execute({
+      type: 'FailRun',
+      requestId: 'assistant.feishu.explicit-older',
+      code: 'EXPLICIT_TEST_CLEANUP',
+      retryable: true,
+    });
+    stream.execute({
+      type: 'FailRun',
+      requestId: 'assistant.feishu.explicit-target',
+      code: 'EXPLICIT_TEST_CLEANUP',
+      retryable: true,
+    });
+    stream.close();
+  });
+
   it('routes explicit public reasoning lines separately from visible answer text', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     const { openAssistantResponseStream } = await import(

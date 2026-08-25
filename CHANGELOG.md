@@ -5,6 +5,12 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-3ai.5] - 2026-08-26
+
+### Fixed
+- Claude response streams now bind the runtime session to the explicit `assistant request` marker carried by the delivered prompt, so a newer request cannot inherit output merely because an older request was queued first.
+- The legacy single-candidate binding path now fails closed when more than one unbound run is eligible. Ambiguous output is withheld instead of being projected into an arbitrary response card.
+
 ## [0.7.2-3ai.4] - 2026-08-25
 
 ### Fixed

@@ -339,6 +339,60 @@ export function openAssistantResponseStream({
         };
       }
 
+      case 'BindRun': {
+        const requestId = requireIdentifier(command.requestId, 'requestId');
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const request = selectRequest.get(requestId);
+        if (!request) throw new Error(`assistant request not found: ${requestId}`);
+        if (!['queued', 'started'].includes(request.status)) {
+          return { request: toRequest(request), events: [], replayed: true };
+        }
+        if (request.runtime_session_id === runtimeSessionId) {
+          return { request: toRequest(request), events: [], replayed: true };
+        }
+        if (request.runtime_session_id !== null) {
+          const error = new Error('assistant request is already bound to a different runtime session');
+          error.code = 'ASSISTANT_RUN_BINDING_CONFLICT';
+          throw error;
+        }
+        const sessionOwner = database.prepare(`
+          SELECT request_id
+          FROM assistant_requests
+          WHERE runtime_session_id = ?
+            AND status IN ('queued', 'started')
+            AND request_id <> ?
+          LIMIT 1
+        `).get(runtimeSessionId, requestId);
+        if (sessionOwner) {
+          const error = new Error('runtime session is already bound to a different assistant request');
+          error.code = 'ASSISTANT_RUN_BINDING_CONFLICT';
+          throw error;
+        }
+        const current = clock();
+        const events = [];
+        if (request.status === 'started') {
+          const progress = appendEvent(
+            request,
+            'ProgressUpdated',
+            RUNTIME_ANALYSIS_PROGRESS,
+            `runtime:${runtimeSessionId}:analyze`,
+          );
+          events.push(progress.event);
+        }
+        database.prepare(`
+          UPDATE assistant_requests
+          SET runtime_session_id = ?, updated_at = ?
+          WHERE request_id = ?
+            AND status IN ('queued', 'started')
+            AND runtime_session_id IS NULL
+        `).run(runtimeSessionId, current, requestId);
+        return {
+          request: toRequest(selectRequest.get(requestId)),
+          events,
+          replayed: false,
+        };
+      }
+
       case 'BindNextRun': {
         const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
         const existing = database.prepare(`
@@ -346,21 +400,29 @@ export function openAssistantResponseStream({
                  status, runtime_session_id, next_sequence, output_text,
                  accepted_at, updated_at, terminal_at
           FROM assistant_requests
-          WHERE runtime_session_id = ? AND status = 'started'
+          WHERE runtime_session_id = ? AND status IN ('queued', 'started')
           ORDER BY updated_at DESC, accepted_at DESC
           LIMIT 1
         `).get(runtimeSessionId);
         if (existing) return { request: toRequest(existing), events: [], replayed: true };
-        const request = database.prepare(`
+        const candidates = database.prepare(`
           SELECT request_id, conversation_id, route_channel, route_endpoint, source_id,
                  status, runtime_session_id, next_sequence, output_text,
                  accepted_at, updated_at, terminal_at
           FROM assistant_requests
           WHERE status = 'started' AND runtime_session_id IS NULL
           ORDER BY accepted_at ASC, request_id ASC
-          LIMIT 1
-        `).get();
-        if (!request) return { request: null, events: [], replayed: false };
+          LIMIT 2
+        `).all();
+        if (candidates.length !== 1) {
+          return {
+            request: null,
+            events: [],
+            replayed: false,
+            ambiguous: candidates.length > 1,
+          };
+        }
+        const [request] = candidates;
         const current = clock();
         const progress = appendEvent(
           request,
@@ -665,6 +727,10 @@ export function openAssistantResponseStream({
           ['type', 'requestId', 'route', 'sourceId', 'conversation'],
         ],
         StartRun: [['type', 'requestId'], ['type', 'requestId']],
+        BindRun: [
+          ['type', 'requestId', 'runtimeSessionId'],
+          ['type', 'requestId', 'runtimeSessionId'],
+        ],
         BindNextRun: [['type', 'runtimeSessionId'], ['type', 'runtimeSessionId']],
         ReportProgress: [
           ['type', 'runtimeSessionId', 'stage', 'idempotencyKey'],
