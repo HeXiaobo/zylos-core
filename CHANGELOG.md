@@ -5,6 +5,21 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.1] - 2026-08-26
+
+### Added
+- Runtime-neutral Agent/Deployment Profile selection. The default loads no organization-specific governance; managed deployments can explicitly opt in through `.zylos/config.json` or environment variables.
+- Stable C4 outbound delivery identities let channel components update one proactive message instead of creating mixed card/plain-text replies.
+
+### Changed
+- Mylos/3AI Memory Sync governance is packaged as the optional `3ai` Deployment Profile instead of changing the Core default for every local, Codex, Claude, or COCO-hosted agent.
+- Fork release metadata now uses a runtime-neutral release-candidate name.
+
+### Fixed
+- Claude and Codex streamed replies bind to the exact assistant request for the active turn and fail closed for unknown, terminal, conflicting, ambiguous, or unmarked follow-up turns.
+- Component upgrades enforce capability checks before mutation and roll back code, configuration, data, Caddy, PM2, and installed-finalizer failures within the supported transaction boundary.
+- Work intake resolves Agent identity from deployment configuration instead of embedding a 玥然-specific default.
+
 ## [0.7.2-3ai.6] - 2026-08-26
 
 ### Fixed

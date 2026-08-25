@@ -250,6 +250,11 @@ graph TB
 | Activity Monitor | Crash recovery, heartbeat, health checks | PM2, multi-layer protection |
 | HTTP Layer | Web access, file sharing, component routes | Caddy, auto-HTTPS |
 
+Agent identity and deployment-specific operating policy are selected through
+explicit [Agent/Deployment Profiles](docs/agent-deployment-profiles.md). The
+default Core build loads no organization-specific governance, so the same
+candidate can run locally or on managed hosting with either Claude or Codex.
+
 ---
 
 ## Features
