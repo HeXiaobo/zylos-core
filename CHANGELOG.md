@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zylos-hxa-connect@1.7.3` source from the user fork without replacing its data
   or configuration, then verifies a real PM2 PID/executable and live profile and
   peer API access.
+- A second immutable SS recovery runner restores only the two code trees that
+  block Core step 12: WeChat `0.3.2@67f5142` and WeCom
+  `0.1.5@781a51f`. It stages and installs both before mutation, preserves their
+  data/config hashes, keeps HXA genuinely online, and rejects PM2 fake-online
+  states after restart.
 
 ### Fixed
 - Self-upgrade rejects a target or post-sync deployment that lacks a critical

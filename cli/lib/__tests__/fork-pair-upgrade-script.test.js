@@ -17,6 +17,13 @@ import {
   validateHxaSource,
   validatePinnedHxaRecoveryTarget,
 } from '../../../scripts/restore-hxa-connect.js';
+import {
+  SS_BLOCKER_TARGETS,
+  validatePinnedBlockerRecoveryTarget,
+  validateRequiredComponentPm2,
+  validateRequiredComponentRegistry,
+  validateRequiredComponentSource,
+} from '../../../scripts/restore-ss-upgrade-blockers.js';
 
 const CORE_SHA = '0123456789abcdef0123456789abcdef01234567';
 const FEISHU_SHA = '89abcdef0123456789abcdef0123456789abcdef';
@@ -244,4 +251,77 @@ describe('pinned HXA recovery contract', () => {
       { name: 'peers', args: ['/opt/hxa/scripts/cli.js', 'peers'] },
     ]);
   });
+});
+
+describe('SS upgrade-blocker recovery contract', () => {
+  it('pins the exact historic WeChat and WeCom releases', () => {
+    assert.deepEqual(SS_BLOCKER_TARGETS.map((target) => ({
+      component: target.component,
+      version: target.version,
+      sha: target.sha,
+    })), [
+      {
+        component: 'wechat',
+        version: '0.3.2',
+        sha: '67f5142b92e0d67563ac00e3c9e245350e58b280',
+      },
+      {
+        component: 'wecom',
+        version: '0.1.5',
+        sha: '781a51f957ee38bdfa48939b4e3d1c52d70f0722',
+      },
+    ]);
+    assert.equal(validatePinnedBlockerRecoveryTarget({
+      coreSha: CORE_SHA,
+      agent: 'ss',
+    }).ok, true);
+    assert.equal(validatePinnedBlockerRecoveryTarget({
+      coreSha: 'main',
+      agent: 'ss',
+    }).ok, false);
+  });
+
+  for (const target of SS_BLOCKER_TARGETS) {
+    it(`validates the exact ${target.component} archive, registry, and PM2 entry`, () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `zylos-${target.component}-`));
+      try {
+        fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+          name: target.packageName,
+          version: target.version,
+        }));
+        for (const relativePath of ['SKILL.md', target.entry, 'ecosystem.config.cjs']) {
+          const filePath = path.join(root, relativePath);
+          fs.mkdirSync(path.dirname(filePath), { recursive: true });
+          fs.writeFileSync(filePath, 'fixture\n');
+        }
+        assert.equal(validateRequiredComponentSource(root, target).ok, true);
+
+        const zylosDir = '/home/cocoai/zylos';
+        assert.equal(validateRequiredComponentRegistry({
+          repo: target.repo,
+          version: target.version,
+          skillDir: `${zylosDir}/.claude/skills/${target.component}`,
+          dataDir: `${zylosDir}/components/${target.component}`,
+        }, target, zylosDir).ok, true);
+        assert.equal(validateRequiredComponentRegistry({
+          repo: target.repo,
+          version: 'wrong',
+        }, target, zylosDir).ok, false);
+
+        const expectedExecPath = path.join(root, target.entry);
+        assert.equal(validateRequiredComponentPm2({
+          status: 'online',
+          pid: 456,
+          execPath: expectedExecPath,
+        }, target, expectedExecPath).ok, true);
+        assert.equal(validateRequiredComponentPm2({
+          status: 'online',
+          pid: null,
+          execPath: expectedExecPath,
+        }, target, expectedExecPath).ok, false);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 });

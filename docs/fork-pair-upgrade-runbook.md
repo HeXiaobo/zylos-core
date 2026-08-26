@@ -146,6 +146,33 @@ profile/peers 探针不写死 org 名，由 HXA CLI 选择配置里的 default �
 org；若前次已落地完全相同的 source marker 与关键文件，恢复器会安全续跑后置门，
 不会再次覆盖代码。
 
+### 3.2 SS 的 Core step 12 阻断组件恢复
+
+只有 HXA 已经真在线后才运行。脚本固定恢复原登记版本，不追 `main`：
+
+```bash
+CORE_SHA='<40-hex-core-sha>'
+
+curl -fsSL \
+  "https://raw.githubusercontent.com/HeXiaobo/zylos-core/${CORE_SHA}/scripts/restore-ss-upgrade-blockers.sh" \
+  | bash -s -- \
+      --core-sha "${CORE_SHA}" \
+      --agent 'ss' \
+      --execute
+```
+
+内置目标只有两项：
+
+- WeChat：`zylos-ai/zylos-wechat`，`0.3.2`，
+  `67f5142b92e0d67563ac00e3c9e245350e58b280`；
+- WeCom：`zylos-ai/zylos-wecom`，`0.1.5`，
+  `781a51f957ee38bdfa48939b4e3d1c52d70f0722`。
+
+WeCom 的 `main` 已在 `0.1.5` 之后，禁止以 `main` 代替固定提交。脚本在修改前把
+两项依赖都装进 staging，保留原 data/config，启动后要求两个 PM2 服务均具有真实
+PID 和正确 executable，并在前后都复核 HXA 真在线。OpenMax/Browser 不属于本次
+Core step 12 的阻断，不在这个脚本中顺手恢复。
+
 ## 4. Agent 唯一执行命令
 
 把已经审核并推送的 Core SHA 填入 `CORE_SHA`，不要使用分支名、短 SHA、`main`
