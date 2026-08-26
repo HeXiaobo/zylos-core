@@ -69,7 +69,7 @@ describe('self-upgrade durable conflict backups (#717)', () => {
   test('old launcher prints every nested conflict path and success cleanup preserves durable backups', () => {
     prepareThreeWayConflictFixture();
 
-    const { result, launcherOutput, npmCommands, stoppedServices, transactionBackupDir } = runScenario('success');
+    const { result, launcherOutput, npmCommands, stoppedServices, transactionBackupDir, globalCoreVersion } = runScenario('success');
 
     expect(result.success).toBe(true);
     expect(result.mergeConflicts).toHaveLength(2);
@@ -77,6 +77,8 @@ describe('self-upgrade durable conflict backups (#717)', () => {
     expect(npmCommands).toHaveLength(2);
     expect(npmCommands[0]).toMatch(/^npm pack/);
     expect(npmCommands[1]).toMatch(/^npm install -g/);
+    expect(npmCommands[1]).toContain('--ignore-scripts');
+    expect(globalCoreVersion).toBe('0.5.4-test');
     expect(fs.existsSync(transactionBackupDir)).toBe(false);
 
     for (const conflict of result.mergeConflicts) {
@@ -106,17 +108,19 @@ describe('self-upgrade durable conflict backups (#717)', () => {
   test('later finalizer failure rolls back deployed skills and retains recovery backups', () => {
     prepareThreeWayConflictFixture();
 
-    const { result, restartedServices, transactionBackupDir } = runScenario('later-failure');
+    const { result, restartedServices, transactionBackupDir, globalCoreVersion } = runScenario('later-failure');
 
     expect(result.success).toBe(false);
     expect(result.failedStep).toBe(6);
     expect(result.rollback).toEqual({
       performed: true,
       steps: [
+        { action: 'restore_global_core_package', success: true },
         { action: 'restore_core_skills', success: true },
         { action: 'restart_fixture-service', success: true },
       ],
     });
+    expect(globalCoreVersion).toBe('0.5.3');
     expect(restartedServices).toEqual(['fixture-service']);
     expect(fs.existsSync(transactionBackupDir)).toBe(true);
     expect(readFile(path.join(skillsDir, 'demo-skill', 'SKILL.md'))).toContain('value=local');

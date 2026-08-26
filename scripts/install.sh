@@ -314,13 +314,13 @@ install_zylos() {
   local npm_prefix
   npm_prefix="$(npm config get prefix 2>/dev/null || echo "")"
   if [ -n "$npm_prefix" ] && [ -w "$npm_prefix" ]; then
-    npm install -g --install-links "$install_url"
+    npm install -g --install-links --ignore-scripts "$install_url"
   else
     warn "npm global directory (${npm_prefix:-unknown}) requires elevated permissions, using sudo..."
     if [ "$(id -u)" -eq 0 ]; then
-      npm install -g --install-links "$install_url"
+      npm install -g --install-links --ignore-scripts "$install_url"
     else
-      sudo npm install -g --install-links "$install_url"
+      sudo npm install -g --install-links --ignore-scripts "$install_url"
     fi
   fi
 

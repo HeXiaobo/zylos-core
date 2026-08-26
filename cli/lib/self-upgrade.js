@@ -53,6 +53,18 @@ const UPGRADE_REQUIRED_CORE_SERVICES = [
   },
 ];
 
+const DEFAULT_FINALIZER_TIMEOUT_MS = 900_000;
+const MIN_FINALIZER_TIMEOUT_MS = 180_000;
+
+export function resolveSelfUpgradeFinalizerTimeoutMs(processEnv = process.env) {
+  const raw = String(processEnv.ZYLOS_SELF_UPGRADE_FINALIZER_TIMEOUT_MS || '').trim();
+  if (!raw) return DEFAULT_FINALIZER_TIMEOUT_MS;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FINALIZER_TIMEOUT_MS;
+  return Math.max(Math.trunc(parsed), MIN_FINALIZER_TIMEOUT_MS);
+}
+
 // Patch #6 (3AI fork layer): allow self-upgrade to target an alternate repo
 // (e.g. the 3AI fork) via the ZYLOS_SELF_UPGRADE_REPO env var. Value is an
 // `owner/repo` slug (e.g. `HeXiaobo/zylos-core`). Default stays canonical, so
@@ -596,6 +608,20 @@ export function step1_backupCoreSkills(ctx, deps = {}) {
   try {
     fsApi.mkdirSync(backupDir, { recursive: true });
 
+    const mustBackupCorePackage = Boolean(deps.corePackageDir || ctx.globalCoreDir || ctx.coreDir);
+    const resolveInstalledCorePackageDir = deps.resolveInstalledCorePackageDir
+      ?? (() => resolveInstalledPackageScript());
+    const corePackageDir = deps.corePackageDir
+      ?? ctx.globalCoreDir
+      ?? (mustBackupCorePackage ? resolveInstalledCorePackageDir() : null);
+    if (mustBackupCorePackage) {
+      if (!corePackageDir || !fsApi.existsSync(corePackageDir)) {
+        throw new Error('Installed global Core package not found');
+      }
+      copyTreeFn(corePackageDir, path.join(backupDir, 'core-package'));
+      ctx.globalCoreDir = corePackageDir;
+    }
+
     // Backup the skills directory (include .zylos manifests — needed for correct rollback)
     if (fsApi.existsSync(skillsDir)) {
       copyTreeFn(skillsDir, path.join(backupDir, 'skills'), { excludes: ['node_modules'] });
@@ -711,7 +737,7 @@ function step4_npmInstallGlobal(ctx, deps = {}) {
     const tarballPath = path.join(ctx.tempDir, tarballName);
 
     // Install from tarball — npm copies files into global node_modules
-    execSyncFn(`npm install -g "${tarballPath}"`, {
+    execSyncFn(`npm install -g --ignore-scripts "${tarballPath}"`, {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ZYLOS_SKIP_POSTINSTALL: '1' },  // Skip postinstall — we sync skills ourselves
@@ -1546,6 +1572,22 @@ export function rollbackSelf(ctx, deps = {}) {
   const skillsDir = deps.skillsDir ?? SKILLS_DIR;
   const ecosystemPath = deps.ecosystemPath ?? getCoreEcosystemPath();
 
+  const backupCorePackage = ctx.backupDir
+    ? path.join(ctx.backupDir, 'core-package')
+    : null;
+  const corePackageDir = deps.corePackageDir
+    ?? ctx.globalCoreDir
+    ?? resolveInstalledPackageScript();
+  if (backupCorePackage && fsApi.existsSync(backupCorePackage)) {
+    try {
+      if (!corePackageDir) throw new Error('Installed global Core package not found');
+      syncTreeFn(backupCorePackage, corePackageDir);
+      results.push({ action: 'restore_global_core_package', success: true });
+    } catch (err) {
+      results.push({ action: 'restore_global_core_package', success: false, error: err.message });
+    }
+  }
+
   // Restore Core Skills from backup (include .zylos manifests to keep them in sync with files)
   if (ctx.backupDir && fsApi.existsSync(path.join(ctx.backupDir, 'skills'))) {
     try {
@@ -1657,6 +1699,7 @@ export function createFinalizeState(ctx) {
     schemaVersion: 1,
     tempDir: ctx.tempDir,
     backupDir: ctx.backupDir,
+    ...(ctx.globalCoreDir ? { globalCoreDir: ctx.globalCoreDir } : {}),
     servicesWereRunning: ctx.servicesWereRunning,
     from: ctx.from,
     to: ctx.to,
@@ -1674,7 +1717,7 @@ function writeFinalizeState(ctx) {
   return statePath;
 }
 
-function runInstalledFinalizer(ctx) {
+function runInstalledFinalizer(ctx, { timeoutMs = resolveSelfUpgradeFinalizerTimeoutMs() } = {}) {
   const finalizeScript = resolveInstalledPackageScript('cli', 'lib', 'self-upgrade-finalize.js');
   if (!finalizeScript) {
     throw new Error('newly installed self-upgrade finalizer not found');
@@ -1684,7 +1727,7 @@ function runInstalledFinalizer(ctx) {
   const result = spawnSync(process.execPath, [finalizeScript, statePath], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 180000,
+    timeout: timeoutMs,
   });
 
   if (result.error) {
@@ -1726,6 +1769,7 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
     mode: state.mode,
   });
   ctx.backupDir = state.backupDir || null;
+  ctx.globalCoreDir = state.globalCoreDir || null;
   ctx.servicesWereRunning = Array.isArray(state.servicesWereRunning) ? [...state.servicesWereRunning] : [];
   ctx.from = state.from || null;
   ctx.to = state.to || state.newVersion || null;
@@ -1804,9 +1848,13 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
     return buildSelfUpgradeResult(ctx, failedStep, rollbackResults);
   }
 
+  const now = deps.now ?? Date.now;
+  const finalizerTimeoutMs = deps.finalizerTimeoutMs ?? resolveSelfUpgradeFinalizerTimeoutMs();
+  const finalizerStartedAt = now();
+
   try {
     const finalizerFn = deps.runInstalledFinalizer ?? runInstalledFinalizer;
-    const finalizeResult = finalizerFn(ctx);
+    const finalizeResult = finalizerFn(ctx, { timeoutMs: finalizerTimeoutMs });
     const finalizeSteps = Array.isArray(finalizeResult.steps) ? finalizeResult.steps : [];
     for (const step of finalizeSteps) {
       ctx.steps.push(step);
@@ -1819,14 +1867,19 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
       backupDir: finalizeResult.backupDir || ctx.backupDir,
     };
   } catch (err) {
-    const error = err.stderr?.toString().trim() || err.message;
+    const elapsed = Math.max(0, now() - finalizerStartedAt);
+    const detail = err.stderr?.toString().trim() || err.message;
+    const timedOut = err.code === 'ETIMEDOUT' || /\bETIMEDOUT\b|timed?\s*out/i.test(detail || '');
+    const error = timedOut
+      ? `Self-upgrade finalizer timed out after ${Math.ceil(finalizerTimeoutMs / 1000)}s: ${detail}`
+      : detail;
     failedStep = {
       step: 5,
       name: 'run_new_upgrade_finalizer',
       status: 'failed',
       error,
       total,
-      duration: 0,
+      duration: elapsed,
     };
     ctx.steps.push(failedStep);
     if (onStep) onStep(failedStep);

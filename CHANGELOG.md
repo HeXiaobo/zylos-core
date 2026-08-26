@@ -5,6 +5,13 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.2] - 2026-08-26
+
+### Fixed
+- Self-upgrade and bootstrap installs now suppress npm lifecycle scripts before the transaction owns live state; `ZYLOS_SKIP_POSTINSTALL=1` is also a strict zero-write guard.
+- The installed finalizer has a 15-minute default timeout with a three-minute minimum, and timeout failures report their real elapsed duration instead of zero.
+- Self-upgrade snapshots and restores the complete globally installed Core package on both partial npm-install failures and later finalizer failures.
+
 ## [0.7.2-rc.1] - 2026-08-26
 
 ### Added

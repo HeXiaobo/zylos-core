@@ -15,6 +15,7 @@ const {
   step13_verifyCommunicationContinuity,
   step7_syncInstructions,
   rollbackSelf,
+  resolveSelfUpgradeFinalizerTimeoutMs,
   step10_ensureCodexConfig,
 } = await import('../self-upgrade.js');
 const { generateMigrationHints, applyMigrationHints } = await import('../self-upgrade.js');
@@ -112,10 +113,23 @@ describe('self-upgrade repository routing', () => {
 });
 
 describe('self-upgrade finalizer handoff', () => {
+  it('never accepts a zero or undersized finalizer timeout budget', () => {
+    assert.equal(resolveSelfUpgradeFinalizerTimeoutMs({
+      ZYLOS_SELF_UPGRADE_FINALIZER_TIMEOUT_MS: '0',
+    }), 900_000);
+    assert.equal(resolveSelfUpgradeFinalizerTimeoutMs({
+      ZYLOS_SELF_UPGRADE_FINALIZER_TIMEOUT_MS: '1',
+    }), 180_000);
+    assert.equal(resolveSelfUpgradeFinalizerTimeoutMs({
+      ZYLOS_SELF_UPGRADE_FINALIZER_TIMEOUT_MS: '600000',
+    }), 600_000);
+  });
+
   it('serializes the state needed by the newly installed finalizer', () => {
     assert.deepEqual(createFinalizeState({
       tempDir: '/tmp/new-core',
       backupDir: '/tmp/backup',
+      globalCoreDir: '/opt/node/lib/node_modules/zylos',
       servicesWereRunning: ['activity-monitor', 'c4-dispatcher'],
       from: '0.4.12',
       to: '0.4.13',
@@ -125,6 +139,7 @@ describe('self-upgrade finalizer handoff', () => {
       schemaVersion: 1,
       tempDir: '/tmp/new-core',
       backupDir: '/tmp/backup',
+      globalCoreDir: '/opt/node/lib/node_modules/zylos',
       servicesWereRunning: ['activity-monitor', 'c4-dispatcher'],
       from: '0.4.12',
       to: '0.4.13',
@@ -139,6 +154,7 @@ describe('self-upgrade finalizer handoff', () => {
       schemaVersion: 1,
       tempDir: '/tmp/new-core',
       backupDir: '/tmp/backup',
+      globalCoreDir: '/opt/node/lib/node_modules/zylos',
       servicesStopped: ['activity-monitor'],
       servicesWereRunning: ['activity-monitor'],
       from: '0.4.12',
@@ -150,6 +166,7 @@ describe('self-upgrade finalizer handoff', () => {
           calls.push({
             tempDir: ctx.tempDir,
             backupDir: ctx.backupDir,
+            globalCoreDir: ctx.globalCoreDir,
             servicesWereRunning: ctx.servicesWereRunning,
             mode: ctx.mode,
           });
@@ -166,6 +183,7 @@ describe('self-upgrade finalizer handoff', () => {
     assert.deepEqual(calls, [{
       tempDir: '/tmp/new-core',
       backupDir: '/tmp/backup',
+      globalCoreDir: '/opt/node/lib/node_modules/zylos',
       servicesWereRunning: ['activity-monitor'],
       mode: 'merge',
     }]);
@@ -228,6 +246,32 @@ describe('self-upgrade finalizer handoff', () => {
     assert.match(result.error, /finalizer crashed/);
     assert.deepEqual(rollbackCalls, ['/tmp/backup']);
     assert.equal(result.rollback.performed, true);
+  });
+
+  it('reports the real elapsed duration and bounded budget when the finalizer times out', () => {
+    const moments = [1_000, 13_345];
+    const timeout = new Error('spawnSync node ETIMEDOUT');
+    timeout.code = 'ETIMEDOUT';
+
+    const result = runSelfUpgrade({
+      tempDir: '/tmp/new-core',
+      newVersion: '0.4.13',
+    }, {
+      getCurrentVersion: () => ({ success: true, version: '0.4.12' }),
+      preInstallSteps: [
+        () => ({ step: 4, name: 'npm_install_global', status: 'done' }),
+      ],
+      now: () => moments.shift(),
+      runInstalledFinalizer: (_ctx, { timeoutMs }) => {
+        assert.equal(timeoutMs, 900_000);
+        throw timeout;
+      },
+      rollbackSelf: () => [],
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.steps.at(-1).duration, 12_345);
+    assert.match(result.error, /timed out after 900s/);
   });
 });
 
@@ -340,6 +384,111 @@ describe('step10_ensureCodexConfig', () => {
 });
 
 describe('self-upgrade backup and rollback', () => {
+  it('fails closed instead of backing up the bootstrap source when the global package cannot be resolved', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-package-missing-'));
+    const coreDir = path.join(tmpDir, 'target-bootstrap-source');
+    const backupDir = path.join(tmpDir, 'backup');
+    fs.mkdirSync(coreDir, { recursive: true });
+    fs.writeFileSync(path.join(coreDir, 'package.json'), '{"name":"zylos","version":"0.7.2-rc.1"}\n');
+
+    const result = step1_backupCoreSkills({ coreDir }, {
+      zylosDir: path.join(tmpDir, 'zylos'),
+      skillsDir: path.join(tmpDir, 'skills'),
+      backupDir,
+      resolveInstalledCorePackageDir: () => null,
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /global Core package not found/);
+    assert.equal(fs.existsSync(path.join(backupDir, 'core-package')), false);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('restores the complete global Core package after any later upgrade failure', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-package-rollback-'));
+    const zylosDir = path.join(tmpDir, 'zylos');
+    const skillsDir = path.join(tmpDir, 'skills');
+    const coreDir = path.join(tmpDir, 'global', 'node_modules', 'zylos');
+    const backupDir = path.join(tmpDir, 'backup');
+
+    fs.mkdirSync(path.join(coreDir, 'cli'), { recursive: true });
+    fs.mkdirSync(path.join(coreDir, 'node_modules', 'fixture-dep'), { recursive: true });
+    fs.mkdirSync(skillsDir, { recursive: true });
+    fs.writeFileSync(path.join(coreDir, 'package.json'), '{"name":"zylos","version":"0.7.0"}\n');
+    fs.writeFileSync(path.join(coreDir, 'cli', 'zylos.js'), 'old cli\n');
+    fs.writeFileSync(path.join(coreDir, 'node_modules', 'fixture-dep', 'index.js'), 'old dep\n');
+
+    const ctx = { coreDir };
+    const backup = step1_backupCoreSkills(ctx, {
+      zylosDir,
+      skillsDir,
+      backupDir,
+      corePackageDir: coreDir,
+    });
+    assert.equal(backup.status, 'done');
+
+    fs.writeFileSync(path.join(coreDir, 'package.json'), '{"name":"zylos","version":"0.7.2-rc.1"}\n');
+    fs.writeFileSync(path.join(coreDir, 'cli', 'zylos.js'), 'new cli\n');
+    fs.rmSync(path.join(coreDir, 'node_modules', 'fixture-dep'), { recursive: true, force: true });
+    fs.writeFileSync(path.join(coreDir, 'new-release-only.js'), 'new only\n');
+
+    const results = rollbackSelf({ ...ctx, backupDir, servicesWereRunning: [] }, {
+      zylosDir,
+      skillsDir,
+      corePackageDir: coreDir,
+    });
+
+    assert.equal(JSON.parse(fs.readFileSync(path.join(coreDir, 'package.json'), 'utf8')).version, '0.7.0');
+    assert.equal(fs.readFileSync(path.join(coreDir, 'cli', 'zylos.js'), 'utf8'), 'old cli\n');
+    assert.equal(fs.readFileSync(path.join(coreDir, 'node_modules', 'fixture-dep', 'index.js'), 'utf8'), 'old dep\n');
+    assert.equal(fs.existsSync(path.join(coreDir, 'new-release-only.js')), false);
+    assert.equal(results.some((item) => item.action === 'restore_global_core_package' && item.success), true);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('restores the global package when npm install fails after partial mutation', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-install-rollback-'));
+    const zylosDir = path.join(tmpDir, 'zylos');
+    const skillsDir = path.join(tmpDir, 'skills');
+    const coreDir = path.join(tmpDir, 'global', 'node_modules', 'zylos');
+    const backupDir = path.join(tmpDir, 'backup');
+    fs.mkdirSync(coreDir, { recursive: true });
+    fs.mkdirSync(skillsDir, { recursive: true });
+    fs.writeFileSync(path.join(coreDir, 'package.json'), '{"name":"zylos","version":"0.7.0"}\n');
+
+    const result = runSelfUpgrade({ tempDir: tmpDir, newVersion: '0.7.2-rc.2' }, {
+      getCurrentVersion: () => ({ success: true, version: '0.7.0' }),
+      preInstallSteps: [
+        (ctx) => step1_backupCoreSkills(ctx, {
+          zylosDir,
+          skillsDir,
+          backupDir,
+          corePackageDir: coreDir,
+        }),
+        () => {
+          fs.writeFileSync(path.join(coreDir, 'package.json'), '{"name":"zylos","version":"partial"}\n');
+          fs.writeFileSync(path.join(coreDir, 'partial-only.js'), 'partial\n');
+          return { step: 4, name: 'npm_install_global', status: 'failed', error: 'injected partial install' };
+        },
+      ],
+      rollbackSelf: (ctx) => rollbackSelf(ctx, {
+        zylosDir,
+        skillsDir,
+        corePackageDir: coreDir,
+      }),
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.failedStep, 4);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(coreDir, 'package.json'), 'utf8')).version, '0.7.0');
+    assert.equal(fs.existsSync(path.join(coreDir, 'partial-only.js')), false);
+    assert.equal(result.rollback.steps.some((item) => item.action === 'restore_global_core_package' && item.success), true);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   it('backs up the deployed core ecosystem file', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-backup-'));
     const zylosDir = path.join(tmpDir, 'zylos');
