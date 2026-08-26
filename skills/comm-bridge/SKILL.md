@@ -57,6 +57,11 @@ deprecation telemetry. Do not add new argv callers. See
 [c4-send](references/c4-send.md) for the compatibility and recovery policy.
 Treat the heredoc wrapper as fixed shell syntax: only the message body goes between the start line and the closing terminator line, and the terminator itself must never be copied into the actual outgoing message.
 
+For a fixed launcher that cannot pipe stdin, write the body to a private file
+and pass exactly one `--body-file=/absolute/path` option. This is the only
+non-stdin body transport permitted by strict mode; never append message content
+as a positional argument.
+
 ### Streamed reply exception
 
 When an inbound message ends with `---- streamed reply:`, reply directly as

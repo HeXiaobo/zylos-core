@@ -12,6 +12,19 @@ EOF
 
 New callers pipe messages via stdin using a heredoc. This bypasses shell argument parsing entirely, so any content (quotes, variables, markdown) is delivered verbatim.
 
+Launchers that cannot pipe stdin may write the body to a private temporary file
+and pass one content-free option. The option is safe in strict mode and is part
+of the published Core capability contract:
+
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js \
+  <channel> <endpoint_id> --body-file=/absolute/path/to/reply.txt
+```
+
+Use exactly one `--body-file=<path>` option. Do not combine it with `--stdin` or
+a positional message. An unreadable or empty file fails before dispatch. The
+body itself never appears in argv.
+
 The exact endpoint-addressed legacy form remains accepted by default during
 the compatibility phase. It exists to keep older HXA/OpenMAX/channel callers
 working during rolling upgrades; do not use it for new calls.
@@ -38,11 +51,12 @@ immediately; it takes precedence over strict mode:
 C4_LEGACY_ARG_MODE=1
 ```
 
-Self-upgrade runs a hermetic reply-path canary for both stdin and exact legacy
-calls. Under explicit strict mode, the legacy check temporarily applies the
-break-glass override only inside the canary to prove recovery remains possible.
-A failed canary restores the backed-up Core Skills and restarts the previously
-running services.
+Self-upgrade runs a hermetic reply-path canary. Compatibility mode proves stdin
+and the exact legacy call. Explicit strict mode proves stdin and body-file
+delivery, then proves that a positional body is rejected without dispatch.
+Before mutation, the target must declare both `c4.reply.argv-compat:1` and
+`c4.reply.body-file:1`. A failed canary restores the backed-up Core Skills and
+restarts the previously running services.
 
 ### Important safety rule
 
@@ -52,8 +66,9 @@ running services.
 
 ### How it works
 
-1. When stdin is piped, c4-send.js reads the full message from stdin.
-2. The heredoc content is raw bytes — no shell escaping needed.
+1. When stdin is piped, c4-send.js reads the full message from stdin; when
+   `--body-file=<path>` is present, it reads that file instead.
+2. Neither safe transport places the body in argv.
 3. c4-send.js passes the message to the channel's `send.js` script via `spawn()`.
    The child receives `C4_DELIVERY_ID=c4.outbound.<conversation-id>`, derived
    from the persisted outbound C4 row before dispatch. Channel adapters may

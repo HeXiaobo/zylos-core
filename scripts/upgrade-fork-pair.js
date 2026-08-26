@@ -23,6 +23,7 @@ const MIN_AVAILABLE_KB = 5 * 1024 * 1024;
 const CORE_PROTOCOLS = Object.freeze({
   'c4.reply': 2,
   'c4.reply.argv-compat': 1,
+  'c4.reply.body-file': 1,
   'external-task-adapter': 1,
   'task-reminder': 1,
 });

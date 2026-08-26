@@ -300,7 +300,7 @@ describe('self-upgrade communication continuity gate', () => {
       fs.writeFileSync(path.join(tempDir, 'capabilities.json'), JSON.stringify({
         schemaVersion: 1,
         product: 'zylos-core',
-        protocols: { 'c4.reply.argv-compat': 1 },
+        protocols: { 'c4.reply.argv-compat': 1, 'c4.reply.body-file': 1 },
       }));
       writeTargetCommunicationAssets(tempDir);
 
@@ -330,13 +330,32 @@ describe('self-upgrade communication continuity gate', () => {
     }
   });
 
-  it('rejects a target that omits a critical receive entrypoint before mutation', () => {
+  it('rejects a target without the safe body-file reply transport before mutation', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-target-'));
     try {
       fs.writeFileSync(path.join(tempDir, 'capabilities.json'), JSON.stringify({
         schemaVersion: 1,
         product: 'zylos-core',
         protocols: { 'c4.reply.argv-compat': 1 },
+      }));
+      writeTargetCommunicationAssets(tempDir);
+
+      const result = step0_verifyTargetCommunicationCompatibility({ tempDir });
+
+      assert.equal(result.status, 'failed');
+      assert.match(result.error, /c4\.reply\.body-file requires >= 1, found missing/);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a target that omits a critical receive entrypoint before mutation', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-target-'));
+    try {
+      fs.writeFileSync(path.join(tempDir, 'capabilities.json'), JSON.stringify({
+        schemaVersion: 1,
+        product: 'zylos-core',
+        protocols: { 'c4.reply.argv-compat': 1, 'c4.reply.body-file': 1 },
       }));
       writeTargetCommunicationAssets(
         tempDir,

@@ -558,8 +558,8 @@ function createContext({ tempDir, newVersion, mode } = {}) {
 }
 
 /**
- * Step 0: fail closed before mutation unless the target release declares that
- * rolling upgrades remain compatible with exact legacy reply callers.
+ * Step 0: fail closed before mutation unless the target release declares both
+ * the rolling legacy compatibility seam and the safe file-backed reply seam.
  */
 export function step0_verifyTargetCommunicationCompatibility(ctx, deps = {}) {
   const startTime = Date.now();
@@ -568,15 +568,20 @@ export function step0_verifyTargetCommunicationCompatibility(ctx, deps = {}) {
 
   try {
     const target = JSON.parse(fsApi.readFileSync(manifestPath, 'utf8'));
-    const actual = target?.protocols?.['c4.reply.argv-compat'];
-    if (!Number.isInteger(actual) || actual < 1) {
-      return {
-        step: 0,
-        name: 'verify_target_communication_compatibility',
-        status: 'failed',
-        error: `Protocol c4.reply.argv-compat requires >= 1, found ${actual ?? 'missing'}`,
-        duration: Date.now() - startTime,
-      };
+    const requiredProtocols = ['c4.reply.argv-compat', 'c4.reply.body-file'];
+    const protocolVersions = {};
+    for (const protocol of requiredProtocols) {
+      const actual = target?.protocols?.[protocol];
+      if (!Number.isInteger(actual) || actual < 1) {
+        return {
+          step: 0,
+          name: 'verify_target_communication_compatibility',
+          status: 'failed',
+          error: `Protocol ${protocol} requires >= 1, found ${actual ?? 'missing'}`,
+          duration: Date.now() - startTime,
+        };
+      }
+      protocolVersions[protocol] = actual;
     }
     const assets = verifyCommunicationAssets({
       skillsDir: path.join(ctx.tempDir || '', 'skills'),
@@ -595,7 +600,10 @@ export function step0_verifyTargetCommunicationCompatibility(ctx, deps = {}) {
       step: 0,
       name: 'verify_target_communication_compatibility',
       status: 'done',
-      message: `c4.reply.argv-compat=${actual}; ${assets.checked.length} critical assets`,
+      message: requiredProtocols
+        .map((protocol) => `${protocol}=${protocolVersions[protocol]}`)
+        .concat(`${assets.checked.length} critical assets`)
+        .join('; '),
       duration: Date.now() - startTime,
     };
   } catch (err) {

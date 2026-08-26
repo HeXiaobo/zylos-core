@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0.1.5@781a51f`. It stages and installs both before mutation, preserves their
   data/config hashes, keeps HXA genuinely online, and rejects PM2 fake-online
   states after restart.
+- `c4-send` now provides a canonical `--body-file=<path>` transport for strict
+  runtimes and advertises it as `c4.reply.body-file:1`; launchers that cannot
+  pipe stdin no longer depend on an untracked per-host patch.
 
 ### Fixed
 - Self-upgrade rejects a target or post-sync deployment that lacks a critical
@@ -51,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is normally stopped between successful runs, but still requires a real
   executable, `autorestart: false`, a cron expression, exit code zero, and zero
   unstable restarts; long-running daemons still must be online.
+- Both self-upgrade step 0 and the immutable fork-pair runner reject a target
+  that does not declare the body-file reply contract, preventing a late
+  rollback after a host-local copy silently loses that historical patch.
 
 ## [0.7.2-rc.4] - 2026-08-26
 

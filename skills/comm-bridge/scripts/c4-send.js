@@ -8,6 +8,9 @@
  *     message with "quotes", $vars, and special chars
  *     EOF
  *
+ * Safe file-backed usage for launchers that cannot pipe stdin:
+ *     node c4-send.js <channel> <endpoint_id> --body-file=/absolute/path
+ *
  * The exact legacy channel + endpoint + message form remains accepted during
  * the compatibility phase and emits a content-free deprecation event. Set
  * C4_STRICT_STDIN_ONLY=1 only after every caller has migrated. If strict mode
@@ -37,6 +40,7 @@ function printUsage() {
   console.log('  node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
   console.log('  message content');
   console.log('  EOF');
+  console.log('  node c4-send.js <channel> <endpoint_id> --body-file=/absolute/path');
   console.log('Example:');
   console.log('  node c4-send.js telegram 8101553026 <<\'EOF\'');
   console.log('  Hello!');
@@ -48,11 +52,20 @@ function parseArgs(args) {
   const positional = [];
   let requestId = null;
   let hasStdinFlag = false;
+  let bodyFile = null;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === '--stdin') {
       hasStdinFlag = true;
+      continue;
+    }
+    if (arg.startsWith('--body-file=')) {
+      const value = arg.slice('--body-file='.length);
+      if (bodyFile !== null || !value) {
+        return { error: '--body-file requires exactly one non-empty =path value' };
+      }
+      bodyFile = value;
       continue;
     }
     if (arg === '--request-id') {
@@ -66,7 +79,10 @@ function parseArgs(args) {
     if (arg.startsWith('--')) return { error: `Unknown option: ${arg}` };
     positional.push(arg);
   }
-  return { positional, requestId, hasStdinFlag };
+  if (bodyFile !== null && hasStdinFlag) {
+    return { error: '--body-file and --stdin are mutually exclusive' };
+  }
+  return { positional, requestId, hasStdinFlag, bodyFile };
 }
 
 /**
@@ -123,6 +139,7 @@ async function main() {
 
   const cleanArgs = parsed.positional;
   const hasStdinFlag = parsed.hasStdinFlag;
+  const bodyFile = parsed.bodyFile;
   const stdinAvailable = !process.stdin.isTTY;
   const legacyArgMode = legacyArgModeEnabled();
 
@@ -130,7 +147,18 @@ async function main() {
   let endpoint = null;
   let message = null;
 
-  if (cleanArgs.length === 3 && legacyArgMode && cleanArgs[0] !== 'void') {
+  if (bodyFile !== null && cleanArgs.length <= 2) {
+    endpoint = cleanArgs[1] ?? null;
+    try {
+      message = fs.readFileSync(bodyFile, 'utf8').trimEnd();
+    } catch {
+      console.error('Error: Unable to read body file');
+      process.exit(1);
+    }
+  } else if (bodyFile !== null) {
+    console.error('Error: --body-file cannot be combined with a positional message');
+    process.exit(1);
+  } else if (cleanArgs.length === 3 && legacyArgMode && cleanArgs[0] !== 'void') {
     endpoint = cleanArgs[1];
     message = cleanArgs[2];
     console.error(`[c4-send] ${JSON.stringify({
@@ -158,6 +186,10 @@ async function main() {
   }
 
   if (!message) {
+    if (bodyFile !== null) {
+      console.error('[c4-send] Message is required, but the body file was empty.');
+      process.exit(2);
+    }
     if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
       console.error('[c4-send] Message is required, but stdin was empty.');
       console.error('  CLI message arguments are disabled; pipe the body via stdin/heredoc.');

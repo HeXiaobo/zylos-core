@@ -57,7 +57,7 @@ beforeEach(() => {
   fs.writeFileSync(path.join(packageDir, 'capabilities.json'), JSON.stringify({
     schemaVersion: 1,
     product: 'zylos-core',
-    protocols: { 'c4.reply.argv-compat': 1 },
+    protocols: { 'c4.reply.argv-compat': 1, 'c4.reply.body-file': 1 },
   }));
   for (const relativePath of [
     'skills/comm-bridge/scripts/c4-send.js',

@@ -41,6 +41,7 @@ function writeCoreFixture(root) {
     protocols: {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
+      'c4.reply.body-file': 1,
       'external-task-adapter': 1,
       'task-reminder': 1,
     },
@@ -110,6 +111,24 @@ describe('fork-pair upgrade target contract', () => {
 
       assert.equal(result.ok, false);
       assert.match(result.error, /c4-receive\.js/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails source validation when the immutable Core archive omits the body-file reply contract', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
+    try {
+      writeCoreFixture(root);
+      const capabilitiesPath = path.join(root, 'capabilities.json');
+      const capabilities = JSON.parse(fs.readFileSync(capabilitiesPath, 'utf8'));
+      delete capabilities.protocols['c4.reply.body-file'];
+      fs.writeFileSync(capabilitiesPath, JSON.stringify(capabilities));
+
+      const result = validateCoreSource(root, '0.7.2-rc.5');
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, /c4\.reply\.body-file requires >= 1, found missing/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

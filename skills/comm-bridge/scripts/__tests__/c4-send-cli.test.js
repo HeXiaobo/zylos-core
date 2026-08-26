@@ -117,6 +117,24 @@ describe('c4-send basic', () => {
     });
   });
 
+  it('sends an exact body file under strict stdin-only policy', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const bodyFile = path.join(tmpDir, 'reply-body.txt');
+      const body = 'body-file reply with "quotes", $vars, and\nmultiple lines';
+      fs.writeFileSync(bodyFile, body);
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1', `--body-file=${bodyFile}`],
+        { ...env, C4_STRICT_STDIN_ONLY: '1' },
+      );
+
+      assert.equal(status, 0, stderr);
+      const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
+      assert.deepEqual(sent, ['endpoint1', body]);
+    });
+  });
+
   it('passes the persisted outbound conversation identity to the channel adapter', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupDeliveryIdentityChannel(tmpDir, 'identity-channel');
@@ -304,6 +322,22 @@ describe('c4-send validation', () => {
 
       assert.equal(status, 1);
       assert.match(stderr, /Unknown option: --skip-guard/);
+      assert.equal(fs.existsSync(sentFile), false);
+    });
+  });
+
+  it('rejects an unreadable body file before dispatch without falling back to stdin', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+
+      const { stderr, status } = cli([
+        'mock-channel',
+        'endpoint1',
+        `--body-file=${path.join(tmpDir, 'missing.txt')}`,
+      ], env);
+
+      assert.equal(status, 1);
+      assert.match(stderr, /Unable to read body file/);
       assert.equal(fs.existsSync(sentFile), false);
     });
   });
