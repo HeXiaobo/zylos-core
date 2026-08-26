@@ -706,12 +706,27 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
       console.log(`Upgrading ${bold(component)}...`);
     }
 
-    // 6. Execute upgrade (5 steps) — show progress in real time
+    const installedComponent = loadComponents()[component] || {};
+    const source = {
+      type: 'github-release',
+      repo,
+      ref: branch || check.latest,
+      refType: branch
+        ? (/^[0-9a-f]{40}$/i.test(branch) ? 'commit' : 'branch')
+        : 'tag',
+      ...(installedComponent.installedAt
+        ? { installedAt: installedComponent.installedAt }
+        : {}),
+    };
+
+    // 6. Execute upgrade — show progress in real time
     const result = runUpgrade(component, {
       tempDir,
       newVersion: check.latest,
       mode,
       jsonOutput,
+      source,
+      registryEntry: installedComponent,
       onStep: !jsonOutput ? printStep : undefined,
     });
 
@@ -720,9 +735,6 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
       // Update components.json
       const components = loadComponents();
       if (components[component]) {
-        components[component].version = result.to || components[component].version;
-        components[component].upgradedAt = new Date().toISOString();
-
         // Update bin symlinks (remove old, create new)
         const oldBin = components[component].bin;
         if (oldBin) unlinkBins(oldBin);

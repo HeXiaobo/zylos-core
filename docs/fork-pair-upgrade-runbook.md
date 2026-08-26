@@ -52,6 +52,11 @@ Agent turn，自然不会回复。此前只校验出站 `c4-send`，没有校验
 释放约 5.32 GiB；固定脚本现在要求至少 5 GiB 可用空间，防止真正的磁盘问题与
 代码问题混在一起。
 
+同日后续升级中根分区一度被观察到 99%，由管理员 2342 处理。该现象与 16:49
+首次失联不是同一时间段，不能倒推为首次根因；但 99% 本身足以让下载、npm、
+SQLite、日志和临时备份进入不可预测状态。任何升级前后只要低于 5 GiB 门槛，
+统一 `HOLD`，先由管理员清理并复核 `df -Pk` 与 inode，再重跑固定脚本。
+
 ### 2.6 严格 stdin 策略与旧 canary 的契约冲突
 
 旧连续性门禁会强制测试 legacy argv，而运行时可能显式设置
@@ -170,6 +175,52 @@ request 的 Codex 消息固定回退到 request-scoped `c4-send --request-id` �
 发布验收必须交错发送“飞书 nonce A → HXA nonce B → 飞书 nonce C”，逐一核对
 回复通道、内容、源消息卡片和终止顺序。仅验证每个通道各自能收发不足以发现串线。
 
+### 2.13 HXA 的“已发送”与双向通信是两件事
+
+HXA 失联包含两个独立缺口，必须分开修复和验收：
+
+1. 发送端返回 delivered 只能证明 Hub 接受消息，不能证明 SS 的长连接已收取。
+   HXA `1.7.4` 增加 15 秒 authoritative inbox reconciliation、restart-safe C4
+   spool 与去重 seen 集合，修复 WebSocket 漏帧和停机消息补拉。
+2. SS 收到请求并完成 assistant turn，也不等于回复会回到 Hub。旧安装缺少
+   `scripts/stream.js`，出现 assistant request `bound → closed` 但没有任何 HXA
+   出站。HXA `1.7.5` 增加 response-stream adapter 和持久化的 per-request
+   delivery ledger；普通 final 与显式 `c4-send --request-id` 共用同一账本，
+   并发或重启也只能投递一次。
+
+HXA 发布至少要跑四类真实 canary：自然 final、显式路径与 final 双触发去重、
+停机期间写入后自动补拉、重启 overlap 重扫不重放。终验必须同时核对 Hub
+message ID、C4 inbound ID、ledger `attempts=1` 和 spool=0；只看回复正文计数会把
+引用 nonce 的对账消息误算成重放。
+
+### 2.14 组件已升级但 source marker 仍旧
+
+SS 的 HXA 已逐文件匹配 `1.7.5@182d7b3...`，但标准 `zylos upgrade` 连续两次
+都没有更新 `.zylos-source.json`，仍显示 `1.7.3@160dbae...`。手工改 JSON 会让
+代码、merge baseline 与注册表失去共同事务边界，因此禁止作为修复。
+
+Core `0.7.2-rc.9` 用持久 journal 把来源标记绑定到最终 baseline commit：精确
+提交会记录 repo、完整 SHA、ref type、实际安装版本、原 installedAt 与 upgradedAt。
+baseline commit 之后崩溃会自动向前补齐 marker 与 registry；commit 之前崩溃时，
+业务回滚状态无法由 metadata 单独证明，因此保留 journal 并明确 `HOLD`，禁止静默
+删除证据或假报成功。正常失败只有在代码、data、Caddy 与 service 回滚全部成功后
+才删除未提交 journal。
+
+`components.json` 的所有写入和 metadata finalize 共用带 process-start identity 与
+fencing token 的全局事务；不同组件并发升级不会互相覆盖。commit point 使用
+`COMMITTED / PROVABLY_UNCOMMITTED / UNKNOWN` 三态判断，损坏、无权限或 I/O
+异常一律保留 journal 并 fail closed。成功后 `components.json.source` 与 branch
+更新到同一不可变 ref；`.zylos-source.json` 属于运行时 provenance，已从业务文件
+manifest 与本地修改检测中排除。
+
+### 2.15 回复卡片时间不能单独证明运行轮次顺序
+
+飞书 assistant card 会先创建再异步更新，HXA 回复也有独立的 Hub 投递延迟。
+因此 A/B/C 的外部 `create_time` 或 `update_time` 只能证明送达，不能单独证明
+runtime turn 的先后。若外部顺序与预期不一致，必须读取 C4 conversation、
+runtime-turn admission、assistant binding-events 和 HXA delivery ledger 的持久化
+时间线；缺少终止字段时结论是 `UNKNOWN/HOLD`，不能用“可能是卡片延迟”猜 PASS。
+
 ## 3. 发布前准备
 
 发布负责人在本机完成以下检查，并记录两端的完整 SHA：
@@ -257,6 +308,59 @@ WeCom 的 `main` 已在 `0.1.5` 之后，禁止以 `main` 代替固定提交。�
 PID 和正确 executable，并在前后都复核 HXA 真在线。OpenMax/Browser 不属于本次
 Core step 12 的阻断，不在这个脚本中顺手恢复。
 
+### 3.3 HXA 固定 SHA 升级与 source marker 回填
+
+必须先让 Core 达到 `0.7.2-rc.9` 或更高，再用标准组件事务升级 HXA；禁止覆盖
+Skill 目录或手工改 marker：
+
+```bash
+HXA_SHA='182d7b3ed55fd758981c8edc7ae923e3bc03614b'
+
+~/zylos/cli/zylos.js upgrade hxa-connect \
+  --branch "${HXA_SHA}" \
+  --yes \
+  --skip-eval \
+  --json
+```
+
+成功后同时核对：安装版本 `1.7.5`、`components.json.source.ref` 与
+`.zylos-source.json.sha` 都等于 `HXA_SHA`、PM2 executable 存在、四组织 WS
+恢复、Feishu PID/restart 未变化。再跑 2.13 的真实 HXA canary；CLI 退出 0 不能
+代替外部双向通信。
+
+### 3.4 registry lock 崩溃后的安全处理
+
+若 CLI 报 `components registry lock recovery required`，先停止同一 Agent 上所有
+component add/remove/upgrade 操作，禁止直接 `rm` lock。用已部署 Core 的同一套
+process-start identity 只读判定 owner：
+
+```bash
+CORE_IDENTITY="$HOME/zylos/cli/lib/process-identity.js"
+OWNER_FILE="$HOME/zylos/.zylos/locks/components-registry.lock/owner.json"
+
+CORE_IDENTITY="$CORE_IDENTITY" OWNER_FILE="$OWNER_FILE" \
+  node --input-type=module - <<'NODE'
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const { inspectProcessIdentity } = await import(pathToFileURL(process.env.CORE_IDENTITY));
+const owner = JSON.parse(fs.readFileSync(process.env.OWNER_FILE, 'utf8'));
+process.stdout.write(`${JSON.stringify({ owner, status: inspectProcessIdentity(owner.process) }, null, 2)}\n`);
+NODE
+```
+
+`ALIVE` 表示仍有写者，继续 `HOLD`；`UNKNOWN` 也必须保留现场并交管理员。
+只有结果精确为 `DEAD`，且再次确认没有 component CLI 在运行，才把准确的 lock
+目录移动到带时间戳的隔离名（可恢复，不删除），然后从固定脚本开头重跑：
+
+```bash
+LOCK_DIR="$HOME/zylos/.zylos/locks/components-registry.lock"
+LOCK_QUARANTINE="${LOCK_DIR}.stale-$(date -u +%Y%m%dT%H%M%SZ)"
+mv -- "$LOCK_DIR" "$LOCK_QUARANTINE"
+```
+
+把 identity 输出与隔离路径写入升级报告。该步骤只处理 registry mutex，不代表
+业务升级已成功；仍需执行全部 preflight、pair upgrade 和外部通信门禁。
+
 ## 4. Agent 唯一执行命令
 
 把已经审核并推送的 Core SHA 填入 `CORE_SHA`，不要使用分支名、短 SHA、`main`
@@ -271,7 +375,7 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.8' \
+      --core-version '0.7.2-rc.9' \
       --feishu-version '0.3.7-rc.6' \
       --agent '<agent-id>' \
       --execute
@@ -339,11 +443,14 @@ Feishu 随后失败，报告会明确写
 
 ## 6. 外部闭环验收
 
-脚本 PASS 后，升级负责人必须完成两层外部验收：
+脚本 PASS 后，升级负责人必须完成三层外部验收：
 
 1. 由任务负责人向 Agent 发送带唯一标识的飞书消息；Agent 必须回复同一标识。
    同时确认 `c4.db` 有对应入站记录，PM2 restart/unstable 计数没有异常增长。
-2. 若本次发布启用飞书原生任务能力，使用预先准备、包含明确 task/comment/member
+2. 交错发送飞书 A → HXA B → 飞书 C 三个唯一 nonce。三条都必须精确回复到原
+   通道；再按 2.15 的持久化证据核对运行轮次终止顺序。HXA 还必须覆盖自然回复、
+   停机补拉和重启重放去重，不能只测在线收发。
+3. 若本次发布启用飞书原生任务能力，使用预先准备、包含明确 task/comment/member
    ID 的 gate 输入运行：
 
    ```bash
@@ -366,6 +473,8 @@ Feishu 随后失败，报告会明确写
 - 四个 PM2 关键进程的状态与执行路径是否存在；
 - 双向通信 canary 的每项结果；
 - 外部消息往返的唯一标识。
+- 每个精确提交组件在 `components.json.source` 与 `.zylos-source.json` 中的完整
+  SHA、版本和一致性结果。
 
 Agent 不应重新设计流程。出现 `HOLD` 时，原样返回 `code` 和 `error`，由发布负责人
 处理根因后重跑；不要改脚本、换分支、降级门禁或调用旧恢复脚本。

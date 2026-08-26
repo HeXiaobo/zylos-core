@@ -22,6 +22,14 @@ import { applyCaddyRoutes, removeCaddyRoutes } from './caddy.js';
 import { smartSync, formatMergeResult } from './smart-merge.js';
 import { restartFromEcosystem, restartManagedProcess } from './pm2.js';
 import { verifyTargetCapabilities } from './capability-compatibility.js';
+import {
+  abortUpgradeMetadataTransaction,
+  beginUpgradeMetadataTransaction,
+  buildUpgradeMetadata,
+  finalizeUpgradeMetadataTransaction,
+  recoverUpgradeMetadataTransactions,
+  validateUpgradeSource,
+} from './upgrade-metadata.js';
 
 // ---------------------------------------------------------------------------
 // Version helpers
@@ -334,7 +342,7 @@ export function cleanupTemp(tempDir) {
 // Internal: create upgrade context
 // ---------------------------------------------------------------------------
 
-function createContext(component, { tempDir, newVersion, mode, jsonOutput } = {}) {
+function createContext(component, { tempDir, newVersion, mode, jsonOutput, source, registryEntry } = {}) {
   const skillDir = path.join(SKILLS_DIR, component);
   const dataDir = path.join(COMPONENTS_DIR, component);
 
@@ -346,6 +354,12 @@ function createContext(component, { tempDir, newVersion, mode, jsonOutput } = {}
     newVersion: newVersion || null,
     mode: mode || 'merge',
     jsonOutput: Boolean(jsonOutput),
+    source: source || null,
+    registryEntry: registryEntry || null,
+    sourceMarker: null,
+    targetRegistryEntry: null,
+    metadataRecoveryPending: false,
+    metadataTransaction: null,
     // State tracking
     backupDir: null,
     dataBackupRoot: null,
@@ -564,10 +578,61 @@ function step6_generateManifest(ctx) {
  */
 function step10_commitBaseline(ctx) {
   const startTime = Date.now();
+  let metadataTransaction = null;
+  let baselineCommitted = false;
   try {
-    saveMergeBaseline(ctx.skillDir, ctx.tempDir, ctx.nextManifest);
-    return { step: 10, name: 'commit_baseline', status: 'done', message: 'authoritative source baseline committed', duration: Date.now() - startTime };
+    let manifest = ctx.nextManifest;
+    if (ctx.source) {
+      const updatedVersion = getLocalVersion(ctx.skillDir);
+      const metadata = buildUpgradeMetadata({
+        component: ctx.component,
+        skillDir: ctx.skillDir,
+        version: updatedVersion.success ? updatedVersion.version : ctx.newVersion,
+        source: ctx.source,
+        registryEntry: ctx.registryEntry,
+      });
+      const begun = beginUpgradeMetadataTransaction({
+        component: ctx.component,
+        skillDir: ctx.skillDir,
+        marker: metadata.marker,
+        targetRegistryEntry: metadata.targetRegistryEntry,
+        manifest,
+      });
+      metadataTransaction = begun.journal;
+      ctx.metadataTransaction = begun.journal;
+      manifest = begun.manifest;
+    }
+    saveMergeBaseline(ctx.skillDir, ctx.tempDir, manifest);
+    baselineCommitted = true;
+    if (metadataTransaction) {
+      const finalized = finalizeUpgradeMetadataTransaction(metadataTransaction);
+      ctx.sourceMarker = finalized.marker;
+      ctx.targetRegistryEntry = finalized.targetRegistryEntry;
+    }
+    return {
+      step: 10,
+      name: 'commit_baseline',
+      status: 'done',
+      message: ctx.sourceMarker
+        ? 'authoritative source marker and baseline committed'
+        : 'authoritative source baseline committed',
+      duration: Date.now() - startTime,
+    };
   } catch (err) {
+    if (metadataTransaction && baselineCommitted) {
+      ctx.sourceMarker = metadataTransaction.marker;
+      ctx.targetRegistryEntry = metadataTransaction.targetRegistryEntry;
+      ctx.metadataRecoveryPending = true;
+      return {
+        step: 10,
+        name: 'commit_baseline',
+        status: 'done',
+        message: 'baseline committed; source metadata recovery pending',
+        warning: err.message,
+        metadataRecoveryPending: true,
+        duration: Date.now() - startTime,
+      };
+    }
     return { step: 10, name: 'commit_baseline', status: 'failed', error: `Baseline commit failed: ${err.message}`, duration: Date.now() - startTime };
   }
 }
@@ -877,11 +942,12 @@ function cleanupDataBackup(ctx) {
  * Lock must be acquired by caller (component.js).
  *
  * @param {string} component
- * @param {{ tempDir: string, newVersion: string }} opts
+ * @param {{ tempDir: string, newVersion: string, source?: object, registryEntry?: object }} opts
  * @returns {object} Upgrade result
  */
-export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, onStep } = {}) {
-  const ctx = createContext(component, { tempDir, newVersion, mode, jsonOutput });
+export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, onStep, source, registryEntry } = {}) {
+  recoverUpgradeMetadataTransactions({ component });
+  const ctx = createContext(component, { tempDir, newVersion, mode, jsonOutput, source, registryEntry });
 
   if (!fs.existsSync(ctx.skillDir)) {
     return {
@@ -891,6 +957,20 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
       error: `Component directory not found: ${ctx.skillDir}`,
       steps: [],
     };
+  }
+
+  if (source) {
+    try {
+      validateUpgradeSource(source);
+    } catch (err) {
+      return {
+        action: 'upgrade',
+        component,
+        success: false,
+        error: `Invalid upgrade source: ${err.message}`,
+        steps: [],
+      };
+    }
   }
 
   // Record current version
@@ -935,6 +1015,28 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
     const rollbackNeeded = ctx.serviceStopped || ctx.mutationStarted;
     const dataRollback = !rollbackNeeded ? rollbackComponentData(ctx) : [];
     const rollbackResults = rollbackNeeded ? rollback(ctx) : dataRollback;
+    if (ctx.metadataTransaction) {
+      const rollbackComplete = rollbackResults.length > 0
+        && rollbackResults.every(result => result.success === true);
+      if (rollbackComplete) {
+        try {
+          abortUpgradeMetadataTransaction(ctx.metadataTransaction);
+          rollbackResults.push({ action: 'abort_source_metadata_transaction', success: true });
+        } catch (err) {
+          rollbackResults.push({
+            action: 'preserve_source_metadata_transaction',
+            success: false,
+            error: err.message,
+          });
+        }
+      } else {
+        rollbackResults.push({
+          action: 'preserve_source_metadata_transaction',
+          success: false,
+          error: 'business rollback was not fully successful; manual recovery required',
+        });
+      }
+    }
     const rollbackPerformed = rollbackNeeded || dataRollback.length > 0;
     return {
       action: 'upgrade',
@@ -977,6 +1079,9 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
     to: ctx.to,
     steps: ctx.steps,
     backupDir: ctx.backupDir,
+    source: ctx.sourceMarker,
+    targetRegistryEntry: ctx.targetRegistryEntry,
+    metadataRecoveryPending: ctx.metadataRecoveryPending,
     skill: {
       hooks: Object.keys(hooks).length > 0 ? hooks : null,
       config: Object.keys(config).length > 0 ? config : null,

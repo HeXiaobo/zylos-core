@@ -5,6 +5,23 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.9] - 2026-08-27
+
+### Fixed
+- Component upgrades now commit `.zylos-source.json` from the actual immutable
+  ref through a durable journal tied to the authoritative baseline commit.
+  Exact commits persist `repo`, full `sha`, ref type, installed version, and
+  upgrade time. A crash after the baseline commit rolls metadata forward; a
+  crash before it preserves the journal and fails closed instead of erasing
+  evidence while business rollback is unknown.
+- `components.json` source routing is updated under one process-identity and
+  fencing-token protected registry transaction, so concurrent component
+  writers cannot lose one another's updates. Commit-point recovery distinguishes
+  committed, provably uncommitted, and unknown/corrupt baseline states; unknown
+  state is always retained for recovery. Runtime provenance is excluded from
+  business-file change detection and no longer appears as a local modification
+  on the next upgrade.
+
 ## [0.7.2-rc.8] - 2026-08-27
 
 ### Added
