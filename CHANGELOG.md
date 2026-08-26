@@ -38,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of being rejected as an unexpected existing directory.
 - GitHub component and Core downloads accept full commit SHAs through immutable
   archive URLs, so a checked target cannot drift with a movable branch.
+- Failed self-upgrades now remove target-only PM2 services before restoring the
+  baseline, restart the original services, and persist the final rollback
+  process list. This prevents a new-release daemon from surviving with an
+  executable that the restored release no longer contains.
+- The immutable pair runner can repair that exact historical response-supervisor
+  rollback orphan when its canonical live entrypoint is absent and the pinned
+  target contains the replacement. All path drift and unrelated broken
+  processes remain fail-closed.
+- Core upgrade and rollback now preserve PM2 cron one-shots through their own
+  process definitions. Service verification accepts a scheduled task while it
+  is normally stopped between successful runs, but still requires a real
+  executable, `autorestart: false`, a cron expression, exit code zero, and zero
+  unstable restarts; long-running daemons still must be online.
 
 ## [0.7.2-rc.4] - 2026-08-26
 

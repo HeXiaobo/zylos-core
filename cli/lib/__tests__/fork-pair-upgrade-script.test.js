@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 
 import {
   buildUpgradeCommands,
+  planPm2PreflightRepairs,
   validateCoreSource,
   validatePm2Snapshot,
   validatePinnedTarget,
@@ -158,6 +159,58 @@ describe('fork-pair upgrade target contract', () => {
       assert.deepEqual(validatePm2Snapshot(snapshot), [
         `zylos-wechat reports online but has no live executable at ${path.join(root, 'missing-wechat.js')}`,
       ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('repairs only the exact rollback orphan that exists in the pinned target', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-orphan-'));
+    try {
+      const zylosDir = path.join(root, 'zylos');
+      const stagedCoreDir = path.join(root, 'target');
+      const expectedLivePath = path.join(
+        zylosDir,
+        '.claude',
+        'skills',
+        'comm-bridge',
+        'scripts',
+        'c4-response-stream-supervisor.js',
+      );
+      const targetPath = path.join(
+        stagedCoreDir,
+        'skills',
+        'comm-bridge',
+        'scripts',
+        'c4-response-stream-supervisor.js',
+      );
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, '#!/usr/bin/env node\n');
+
+      assert.deepStrictEqual(planPm2PreflightRepairs([{
+        name: 'c4-response-stream-supervisor',
+        status: 'online',
+        execPath: expectedLivePath,
+      }], { zylosDir, stagedCoreDir }), [{
+        action: 'delete_rollback_orphan',
+        name: 'c4-response-stream-supervisor',
+        execPath: expectedLivePath,
+        targetPath,
+      }]);
+
+      assert.deepStrictEqual(planPm2PreflightRepairs([{
+        name: 'c4-response-stream-supervisor',
+        status: 'online',
+        execPath: path.join(root, 'unexpected.js'),
+      }], { zylosDir, stagedCoreDir }), []);
+
+      fs.mkdirSync(path.dirname(expectedLivePath), { recursive: true });
+      fs.writeFileSync(expectedLivePath, '#!/usr/bin/env node\n');
+      assert.deepStrictEqual(planPm2PreflightRepairs([{
+        name: 'c4-response-stream-supervisor',
+        status: 'online',
+        execPath: expectedLivePath,
+      }], { zylosDir, stagedCoreDir }), []);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

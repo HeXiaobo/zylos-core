@@ -147,6 +147,7 @@ describe('self-upgrade finalizer handoff', () => {
       backupDir: '/tmp/backup',
       globalCoreDir: '/opt/node/lib/node_modules/zylos',
       servicesWereRunning: ['activity-monitor', 'c4-dispatcher'],
+      cronServicesWereRunning: ['task-comment-bridge'],
       from: '0.4.12',
       to: '0.4.13',
       newVersion: '0.4.13',
@@ -157,6 +158,7 @@ describe('self-upgrade finalizer handoff', () => {
       backupDir: '/tmp/backup',
       globalCoreDir: '/opt/node/lib/node_modules/zylos',
       servicesWereRunning: ['activity-monitor', 'c4-dispatcher'],
+      cronServicesWereRunning: ['task-comment-bridge'],
       from: '0.4.12',
       to: '0.4.13',
       newVersion: '0.4.13',
@@ -650,6 +652,50 @@ describe('self-upgrade backup and rollback', () => {
     assert.equal(results.some((item) => item.action === 'restore_pm2_ecosystem' && item.success), true);
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('removes target-only services introduced by a failed upgrade before saving rollback state', () => {
+    const calls = [];
+
+    const results = rollbackSelf({
+      servicesWereRunning: ['activity-monitor'],
+      servicesStartedByUpgrade: [
+        'c4-response-stream-supervisor',
+        'activity-monitor',
+        'c4-response-stream-supervisor',
+      ],
+    }, {
+      restartManagedProcess: (name) => calls.push(`restart:${name}`),
+      removeManagedProcess: (name) => calls.push(`remove:${name}`),
+      savePm2: () => calls.push('save'),
+    });
+
+    assert.deepStrictEqual(calls, [
+      'remove:c4-response-stream-supervisor',
+      'restart:activity-monitor',
+      'save',
+    ]);
+    assert.equal(results.some((item) =>
+      item.action === 'remove_target_only_c4-response-stream-supervisor' && item.success
+    ), true);
+    assert.equal(results.some((item) => item.action === 'save_pm2_rollback_state' && item.success), true);
+  });
+
+  it('reactivates a baseline cron one-shot with its preserved PM2 definition during rollback', () => {
+    const calls = [];
+
+    rollbackSelf({
+      servicesWereRunning: ['task-comment-bridge', 'activity-monitor'],
+      cronServicesWereRunning: ['task-comment-bridge'],
+    }, {
+      restartScheduledProcess: (name) => calls.push(`cron:${name}`),
+      restartManagedProcess: (name) => calls.push(`daemon:${name}`),
+    });
+
+    assert.deepStrictEqual(calls, [
+      'cron:task-comment-bridge',
+      'daemon:activity-monitor',
+    ]);
   });
 
   it('falls back to plain restart when the backup has no ecosystem file', () => {

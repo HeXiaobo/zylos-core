@@ -21,7 +21,7 @@
 
 ### 2.1 主故障：收消息入口在同步中被删除
 
-2026-08-27 16:49–16:54，Skills 同步删除了
+2026-08-26 16:49–16:54，Skills 同步删除了
 `skills/comm-bridge/scripts/c4-receive.js`。飞书 WebSocket 仍在收包，但连续六次
 调用 C4 时都报 `Cannot find module`。因此消息没有进入 `c4.db`，也没有触发
 Agent turn，自然不会回复。此前只校验出站 `c4-send`，没有校验入站入口与持久化，
@@ -85,6 +85,35 @@ HXA 是升级期间的备用通信面，恢复优先级高于继续重放升级�
 固定为 `HeXiaobo/zylos-hxa-connect` 的 `1.7.3` 提交
 `160dbaeac86f503b2d1889343354c5aee3b57785`；脚本只补回缺失代码、保留数据和
 配置、持久化 fork 路由，并要求 PM2 真进程、profile 和 peers 三门通过。
+
+### 2.10 回滚遗漏新服务会制造下一轮升级的幽灵进程
+
+一次旧版升级已经启动了新目标才有的
+`c4-response-stream-supervisor`，随后 step 12 失败并回滚到 Core `0.7.0`。旧回滚
+恢复了 Skills 和 ecosystem，却没有删除升级过程中新增的 PM2 条目，也没有重新
+`pm2 save`。结果是进程仍显示 `online`，PID 真实存在，但入口文件已随旧 Skills
+恢复而消失。下一次严格 preflight 正确地在任何升级写操作前将其拦下。
+
+Core 回滚现在会记录“由本次升级新增、原基线未运行”的服务：失败时精确删除这些
+PM2 条目，恢复原服务后再保存最终进程清单。为兼容已经被旧实现污染的机器，固定
+pair runner 只对一个可证明的历史残留做自愈：进程名必须是
+`c4-response-stream-supervisor`，路径必须是标准 live 路径、live 文件必须缺失，且
+不可变目标中必须存在同一路径的替代入口。任何路径漂移或其他坏进程仍然 `HOLD`。
+
+### 2.11 周期任务不能用常驻 daemon 的 `online` 标准判活
+
+SS 的 `task-comment-bridge` 是 PM2 cron one-shot：
+`autorestart=false`、`cron_restart="*/3 * * * *"`、最近退出码 0、
+`unstable_restarts=0`。它每三分钟启动一次，完成后在两次触发之间正常处于
+`stopped`；`restart_time=3690` 表示历史触发次数，不是崩溃 3690 次。旧 step 12
+要求所有升级前恰好 online 的进程在 30 秒后仍 online，因此把正常周期任务误判为
+坏 daemon。
+
+新事务会单独记录 cron one-shot，停止后使用它自己的 PM2 定义重新激活，不套用
+Core daemon ecosystem；升级和回滚两条路径都如此。健康门允许它在成功运行之间
+处于 `stopped`，但仍强制要求 cron 配置存在、`autorestart=false`、最近退出码为
+0、`unstable_restarts=0`，且 executable 是真实文件。常驻服务仍必须持续
+`online`，两类进程不会再共用一个模糊判据。
 
 ## 3. 发布前准备
 
@@ -202,12 +231,16 @@ curl -fsSL \
 - 现有关键 PM2 进程在线且执行文件真实存在。
 - 所有声称 online 的 PM2 进程都有真实 executable；组件代码缺失会在事务前
   `HOLD`，不会等 Core step 12 再回滚。
+- 若检测到旧回滚留下的、路径和目标均完全匹配的 response supervisor 幽灵条目，
+  execute 模式会先精确删除并保存 PM2 清单，再回读确认；dry-run 只报告
+  `WOULD_APPLY`，不会修改机器。除此之外不自动删除任何进程。
 
 随后脚本按固定顺序升级 Core 和 Feishu，并执行：
 
 - 安装版本与目标版本复核；
 - 四个关键通信入口复核；
 - PM2 真在线复核，包括 response stream supervisor；
+- cron one-shot 以“有效 cron + 成功退出 + 真实入口”判活，并显式恢复其调度；
 - hermetic 出站 stdin/策略兼容 canary；
 - hermetic 入站 `c4-receive` 与 `c4.db` 持久化 canary。
 

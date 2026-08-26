@@ -543,6 +543,7 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     backupDir: null,
     servicesStopped: [],
     servicesWereRunning: [],
+    cronServicesWereRunning: [],
     servicesExpectedAfterUpgrade: [],
     servicesStartedByUpgrade: [],
     mergeConflicts: [],
@@ -670,7 +671,8 @@ function step2_preUpgradeHook(ctx) {
  * Find PM2 services running from SKILLS_DIR by matching exec paths.
  * This catches ALL zylos-managed services regardless of SKILL.md declarations.
  *
- * @returns {{ name: string, status: string }[]} PM2 processes whose scripts are under SKILLS_DIR
+ * @returns {{ name: string, status: string, autorestart: boolean|null, cronRestart: string|null }[]}
+ * PM2 processes whose scripts are under SKILLS_DIR
  */
 function getSkillsServices(deps = {}) {
   const execSyncFn = deps.execSync ?? execSync;
@@ -684,7 +686,12 @@ function getSkillsServices(deps = {}) {
         const execPath = proc.pm2_env?.pm_exec_path || '';
         return execPath.startsWith(resolved + '/');
       })
-      .map(proc => ({ name: proc.name, status: proc.pm2_env?.status }));
+      .map(proc => ({
+        name: proc.name,
+        status: proc.pm2_env?.status,
+        autorestart: proc.pm2_env?.autorestart ?? null,
+        cronRestart: proc.pm2_env?.cron_restart ?? null,
+      }));
   } catch {
     return [];
   }
@@ -693,7 +700,7 @@ function getSkillsServices(deps = {}) {
 /**
  * Step 3: stop core services
  */
-function step3_stopCoreServices(ctx, deps = {}) {
+export function step3_stopCoreServices(ctx, deps = {}) {
   const startTime = Date.now();
   const execSyncFn = deps.execSync ?? execSync;
   const getServices = deps.getSkillsServices ?? (() => getSkillsServices(deps));
@@ -704,6 +711,9 @@ function step3_stopCoreServices(ctx, deps = {}) {
   // Find all PM2 services running from skills directory
   const services = getServices();
   const onlineServices = services.filter(s => s.status === 'online');
+  ctx.cronServicesWereRunning = Array.isArray(ctx.cronServicesWereRunning)
+    ? ctx.cronServicesWereRunning
+    : [];
 
   if (services.length === 0) {
     return { step: 3, name: 'stop_core_services', status: 'skipped', message: 'no services found', duration: Date.now() - startTime };
@@ -715,6 +725,9 @@ function step3_stopCoreServices(ctx, deps = {}) {
 
   for (const svc of onlineServices) {
     ctx.servicesWereRunning.push(svc.name);
+    if (svc.autorestart === false && String(svc.cronRestart || '').trim()) {
+      ctx.cronServicesWereRunning.push(svc.name);
+    }
     try {
       stopService(svc.name);
       ctx.servicesStopped.push(svc.name);
@@ -1362,6 +1375,9 @@ export function step11_startCoreServices(ctx, deps = {}) {
   const fsApi = deps.fs ?? fs;
   const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
   const exec = deps.execSync ?? execSync;
+  const restartScheduledFn = deps.restartScheduledProcess ?? ((name) => {
+    exec(`pm2 restart ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
+  });
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
   const skillsDir = deps.skillsDir ?? SKILLS_DIR;
 
@@ -1434,14 +1450,21 @@ export function step11_startCoreServices(ctx, deps = {}) {
 
   const started = [];
   const failed = [];
+  const scheduledServices = new Set(ctx.cronServicesWereRunning || []);
 
   for (const name of servicesToStart) {
     try {
-      restartFn(name, {
-        ecosystemPath,
-        stdio: 'pipe',
-        fallbackToPlainRestartOnError: true,
-      });
+      if (scheduledServices.has(name)) {
+        // Preserve the process's own cron_restart/autorestart definition.
+        // The Core ecosystem does not necessarily declare component one-shots.
+        restartScheduledFn(name);
+      } else {
+        restartFn(name, {
+          ecosystemPath,
+          stdio: 'pipe',
+          fallbackToPlainRestartOnError: true,
+        });
+      }
       started.push(name);
     } catch {
       failed.push(name);
@@ -1485,9 +1508,10 @@ export function step11_startCoreServices(ctx, deps = {}) {
 /**
  * Step 12: verify services
  *
- * Polls up to 30 seconds (every 2 s) for all services to come online.
- * Some services (e.g. component bots) take longer than 2 s to start after
- * PM2 restarts them — a one-shot check caused spurious rollbacks.
+ * Polls up to 30 seconds (every 2 s) for all runtime processes to become
+ * healthy. Daemons must be online. A PM2 cron one-shot (`autorestart: false`
+ * plus `cron_restart`) is also healthy while stopped between successful runs;
+ * treating that expected idle state as a dead daemon causes false rollbacks.
  */
 export function step12_verifyServices(ctx, deps = {}) {
   const startTime = Date.now();
@@ -1514,15 +1538,30 @@ export function step12_verifyServices(ctx, deps = {}) {
       const output = exec('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
       const processes = JSON.parse(output);
 
+      const isHealthyScheduledIdle = (proc) => {
+        const pm2Env = proc?.pm2_env || {};
+        const cronRestart = String(pm2Env.cron_restart || '').trim();
+        const unstableRestarts = Number(pm2Env.unstable_restarts || 0);
+        return pm2Env.status === 'stopped'
+          && pm2Env.autorestart === false
+          && cronRestart.length > 0
+          && Number(pm2Env.exit_code) === 0
+          && unstableRestarts === 0;
+      };
+
       const notOnline = servicesToVerify.filter(name => {
         const proc = processes.find(p => p.name === name);
-        return !proc || proc.pm2_env?.status !== 'online';
+        return !proc
+          || (proc.pm2_env?.status !== 'online' && !isHealthyScheduledIdle(proc));
       });
 
       const invalidExecutables = [];
       for (const name of servicesToVerify) {
         const proc = processes.find((candidate) => candidate.name === name);
-        if (!proc || proc.pm2_env?.status !== 'online') continue;
+        if (!proc) continue;
+        const runtimeIsHealthy = proc.pm2_env?.status === 'online'
+          || isHealthyScheduledIdle(proc);
+        if (!runtimeIsHealthy) continue;
         const execPath = proc.pm2_env?.pm_exec_path;
         let isFile = false;
         try {
@@ -1651,6 +1690,16 @@ export function rollbackSelf(ctx, deps = {}) {
   const fsApi = deps.fs ?? fs;
   const syncTreeFn = deps.syncTree ?? syncTree;
   const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
+  const execSyncFn = deps.execSync ?? execSync;
+  const removeFn = deps.removeManagedProcess ?? ((name) => {
+    execSyncFn(`pm2 delete ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
+  });
+  const savePm2Fn = deps.savePm2 ?? (() => {
+    execSyncFn('pm2 save 2>/dev/null', { stdio: 'pipe' });
+  });
+  const restartScheduledFn = deps.restartScheduledProcess ?? ((name) => {
+    execSyncFn(`pm2 restart ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
+  });
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
   const skillsDir = deps.skillsDir ?? SKILLS_DIR;
   const ecosystemPath = deps.ecosystemPath ?? getCoreEcosystemPath();
@@ -1694,17 +1743,52 @@ export function rollbackSelf(ctx, deps = {}) {
     }
   }
 
-  // Restart services if they were running
-  for (const name of ctx.servicesWereRunning) {
+  // A failed target may have introduced a PM2 service that did not exist in
+  // the baseline (for example c4-response-stream-supervisor). Restoring the
+  // old skills removes its entrypoint, so retaining that process would leave
+  // a fake-online/orphan service and poison the next upgrade preflight.
+  const originallyRunning = new Set(ctx.servicesWereRunning || []);
+  const targetOnlyServices = [...new Set(ctx.servicesStartedByUpgrade || [])]
+    .filter((name) => !originallyRunning.has(name));
+  let removedTargetOnlyService = false;
+  for (const name of targetOnlyServices) {
     try {
-      restartFn(name, {
-        ecosystemPath,
-        stdio: 'pipe',
-        fallbackToPlainRestartOnError: true,
-      });
+      removeFn(name);
+      removedTargetOnlyService = true;
+      results.push({ action: `remove_target_only_${name}`, success: true });
+    } catch (err) {
+      results.push({ action: `remove_target_only_${name}`, success: false, error: err.message });
+    }
+  }
+
+  // Restart services if they were running
+  const scheduledServices = new Set(ctx.cronServicesWereRunning || []);
+  for (const name of ctx.servicesWereRunning || []) {
+    try {
+      if (scheduledServices.has(name)) {
+        restartScheduledFn(name);
+      } else {
+        restartFn(name, {
+          ecosystemPath,
+          stdio: 'pipe',
+          fallbackToPlainRestartOnError: true,
+        });
+      }
       results.push({ action: `restart_${name}`, success: true });
     } catch (err) {
       results.push({ action: `restart_${name}`, success: false, error: err.message });
+    }
+  }
+
+  // Persist only after the baseline services have been restarted. Otherwise
+  // a reboot could resurrect the removed target-only process from the PM2 dump
+  // or retain a snapshot in which baseline services are still stopped.
+  if (removedTargetOnlyService) {
+    try {
+      savePm2Fn();
+      results.push({ action: 'save_pm2_rollback_state', success: true });
+    } catch (err) {
+      results.push({ action: 'save_pm2_rollback_state', success: false, error: err.message });
     }
   }
 
@@ -1784,6 +1868,7 @@ export function createFinalizeState(ctx) {
     backupDir: ctx.backupDir,
     ...(ctx.globalCoreDir ? { globalCoreDir: ctx.globalCoreDir } : {}),
     servicesWereRunning: ctx.servicesWereRunning,
+    cronServicesWereRunning: ctx.cronServicesWereRunning || [],
     from: ctx.from,
     to: ctx.to,
     newVersion: ctx.newVersion,
@@ -1854,6 +1939,9 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
   ctx.backupDir = state.backupDir || null;
   ctx.globalCoreDir = state.globalCoreDir || null;
   ctx.servicesWereRunning = Array.isArray(state.servicesWereRunning) ? [...state.servicesWereRunning] : [];
+  ctx.cronServicesWereRunning = Array.isArray(state.cronServicesWereRunning)
+    ? [...state.cronServicesWereRunning]
+    : [];
   ctx.from = state.from || null;
   ctx.to = state.to || state.newVersion || null;
 

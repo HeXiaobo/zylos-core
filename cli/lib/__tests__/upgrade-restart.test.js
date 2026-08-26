@@ -5,7 +5,11 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 const { rollback, step7_runPostUpgradeHook, step8_startService } = await import('../upgrade.js');
-const { step11_startCoreServices, step12_verifyServices } = await import('../self-upgrade.js');
+const {
+  step3_stopCoreServices,
+  step11_startCoreServices,
+  step12_verifyServices,
+} = await import('../self-upgrade.js');
 const { restartRuntimeServices } = await import('../../commands/runtime.js');
 
 function makeSkillDir(frontmatter) {
@@ -368,7 +372,64 @@ describe('component upgrade rollback', () => {
   });
 });
 
+describe('step3_stopCoreServices', () => {
+  it('records PM2 cron one-shots separately from long-running daemons', () => {
+    const stopped = [];
+    const ctx = {
+      servicesWereRunning: [],
+      servicesStopped: [],
+      cronServicesWereRunning: [],
+    };
+
+    const result = step3_stopCoreServices(ctx, {
+      getSkillsServices: () => [{
+        name: 'task-comment-bridge',
+        status: 'online',
+        autorestart: false,
+        cronRestart: '*/3 * * * *',
+      }, {
+        name: 'c4-dispatcher',
+        status: 'online',
+        autorestart: true,
+        cronRestart: null,
+      }],
+      stopService: (name) => stopped.push(name),
+    });
+
+    assert.equal(result.status, 'done');
+    assert.deepStrictEqual(stopped, ['task-comment-bridge', 'c4-dispatcher']);
+    assert.deepStrictEqual(ctx.servicesWereRunning, ['task-comment-bridge', 'c4-dispatcher']);
+    assert.deepStrictEqual(ctx.cronServicesWereRunning, ['task-comment-bridge']);
+  });
+});
+
 describe('step11_startCoreServices', () => {
+  it('reactivates cron one-shots through their preserved PM2 definition', () => {
+    const calls = [];
+    const result = step11_startCoreServices({
+      tempDir: null,
+      servicesWereRunning: ['task-comment-bridge', 'c4-dispatcher'],
+      cronServicesWereRunning: ['task-comment-bridge'],
+    }, {
+      fs: {
+        existsSync: () => false,
+        mkdirSync: () => {},
+        copyFileSync: () => {},
+      },
+      requiredCoreServices: [],
+      restartScheduledProcess: (name) => calls.push(`cron:${name}`),
+      restartManagedProcess: (name) => calls.push(`daemon:${name}`),
+      execSync: (cmd) => calls.push(`exec:${cmd}`),
+    });
+
+    assert.equal(result.status, 'done');
+    assert.deepStrictEqual(calls, [
+      'cron:task-comment-bridge',
+      'daemon:c4-dispatcher',
+      'exec:pm2 save 2>/dev/null',
+    ]);
+  });
+
   it('starts a newly introduced required Core service that is absent from PM2', () => {
     const calls = [];
     const ctx = {
@@ -615,6 +676,67 @@ describe('step12_verifyServices', () => {
             pm2_env: {
               status: 'online',
               pm_exec_path: '/tmp/zylos-missing-skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+            },
+          }]);
+        }
+        return '';
+      },
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /missing executable/);
+  });
+
+  it('accepts a healthy cron one-shot while it is normally stopped between runs', () => {
+    const result = step12_verifyServices({
+      servicesWereRunning: ['task-comment-bridge'],
+      servicesExpectedAfterUpgrade: ['task-comment-bridge'],
+    }, {
+      fs: {
+        statSync: () => ({ isFile: () => true }),
+      },
+      execSync: (cmd) => {
+        if (cmd.startsWith('pm2 jlist')) {
+          return JSON.stringify([{
+            name: 'task-comment-bridge',
+            pm2_env: {
+              status: 'stopped',
+              pm_exec_path: '/tmp/skills/task-comment-bridge.js',
+              autorestart: false,
+              cron_restart: '*/3 * * * *',
+              unstable_restarts: 0,
+              exit_code: 0,
+            },
+          }]);
+        }
+        return '';
+      },
+    });
+
+    assert.equal(result.status, 'done');
+  });
+
+  it('still rejects a stopped cron one-shot whose executable disappeared', () => {
+    const result = step12_verifyServices({
+      servicesWereRunning: ['task-comment-bridge'],
+      servicesExpectedAfterUpgrade: ['task-comment-bridge'],
+    }, {
+      fs: {
+        statSync: () => {
+          throw new Error('missing');
+        },
+      },
+      execSync: (cmd) => {
+        if (cmd.startsWith('pm2 jlist')) {
+          return JSON.stringify([{
+            name: 'task-comment-bridge',
+            pm2_env: {
+              status: 'stopped',
+              pm_exec_path: '/tmp/skills/missing-task-comment-bridge.js',
+              autorestart: false,
+              cron_restart: '*/3 * * * *',
+              unstable_restarts: 0,
+              exit_code: 0,
             },
           }]);
         }

@@ -332,6 +332,74 @@ export function validatePm2Snapshot(snapshot, { requireSupervisor = false } = {}
   return errors;
 }
 
+/**
+ * Plan the one safe preflight repair needed after an older Core rollback.
+ *
+ * The repair is deliberately exact: the known target-only service name must
+ * point at its canonical live path, that path must be absent in the restored
+ * baseline, and the immutable target must contain the replacement entrypoint.
+ * Anything else remains a HOLD for human diagnosis.
+ */
+export function planPm2PreflightRepairs(snapshot, {
+  zylosDir,
+  stagedCoreDir,
+  fsApi = fs,
+} = {}) {
+  if (!zylosDir || !stagedCoreDir) return [];
+  const name = 'c4-response-stream-supervisor';
+  const expectedLivePath = path.join(
+    path.resolve(zylosDir),
+    '.claude',
+    'skills',
+    'comm-bridge',
+    'scripts',
+    'c4-response-stream-supervisor.js',
+  );
+  const targetPath = path.join(
+    path.resolve(stagedCoreDir),
+    'skills',
+    'comm-bridge',
+    'scripts',
+    'c4-response-stream-supervisor.js',
+  );
+  const proc = snapshot.find((candidate) => candidate.name === name);
+  if (
+    proc?.status !== 'online'
+    || !proc.execPath
+    || path.resolve(proc.execPath) !== expectedLivePath
+    || fileIsRegular(expectedLivePath, fsApi)
+    || !fileIsRegular(targetPath, fsApi)
+  ) {
+    return [];
+  }
+  return [{
+    action: 'delete_rollback_orphan',
+    name,
+    execPath: expectedLivePath,
+    targetPath,
+  }];
+}
+
+function applyPm2PreflightRepairs(repairs) {
+  const applied = [];
+  for (const repair of repairs) {
+    requireSuccess(
+      run('pm2', ['delete', repair.name]),
+      `failed to delete rollback orphan ${repair.name}`,
+      'PREFLIGHT_REPAIR_FAILED',
+    );
+    applied.push({ ...repair, status: 'APPLIED' });
+  }
+  if (applied.length > 0) {
+    requireSuccess(
+      run('pm2', ['save']),
+      'failed to persist repaired PM2 process list',
+      'PREFLIGHT_REPAIR_FAILED',
+    );
+  }
+  return applied;
+}
+
 function availableDiskKb(targetPath) {
   const result = requireSuccess(run('df', ['-Pk', targetPath]), 'disk inspection failed');
   const lines = result.stdout.trim().split(/\r?\n/);
@@ -499,9 +567,39 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
         'DISK_LOW',
       );
     }
-    const beforePm2 = pm2Snapshot();
-    const beforePm2Errors = validatePm2Snapshot(beforePm2);
+    let beforePm2 = pm2Snapshot();
+    const plannedPm2Repairs = planPm2PreflightRepairs(beforePm2, {
+      zylosDir,
+      stagedCoreDir,
+    });
+    const repairNames = new Set(plannedPm2Repairs.map((repair) => repair.name));
+    const beforePm2Errors = validatePm2Snapshot(
+      beforePm2.filter((proc) => !repairNames.has(proc.name)),
+    );
     if (beforePm2Errors.length > 0) throw new HoldError(beforePm2Errors.join('; '));
+
+    if (plannedPm2Repairs.length > 0 && args.execute) {
+      const applied = applyPm2PreflightRepairs(plannedPm2Repairs);
+      beforePm2 = pm2Snapshot();
+      const repairVerificationErrors = validatePm2Snapshot(beforePm2);
+      for (const repair of plannedPm2Repairs) {
+        if (beforePm2.some((proc) => proc.name === repair.name)) {
+          repairVerificationErrors.push(`${repair.name} still exists after rollback-orphan repair`);
+        }
+      }
+      if (repairVerificationErrors.length > 0) {
+        throw new HoldError(
+          repairVerificationErrors.join('; '),
+          'PREFLIGHT_REPAIR_FAILED',
+        );
+      }
+      summary.preflightRepairs = { status: 'PASS', applied };
+    } else {
+      summary.preflightRepairs = {
+        status: plannedPm2Repairs.length > 0 ? 'WOULD_APPLY' : 'NOT_REQUIRED',
+        planned: plannedPm2Repairs,
+      };
+    }
 
     summary.preflight = {
       status: 'PASS',
