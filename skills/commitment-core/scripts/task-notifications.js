@@ -59,8 +59,8 @@ function audienceForTask(task, conversation, subscriptions) {
   add(task.ownerId, 'owner');
   add(task.acceptorId, 'acceptor');
   add(task.assigneeId, 'assignee');
-  for (const comment of conversation.query({ taskId: task.id })) {
-    add(comment.authorId, 'participant');
+  for (const { participantId } of conversation.participants({ taskId: task.id })) {
+    add(participantId, 'participant');
   }
   for (const subscription of subscriptions.resolve({ taskId: task.id })) {
     add(subscription.subscriberId, 'subscriber');

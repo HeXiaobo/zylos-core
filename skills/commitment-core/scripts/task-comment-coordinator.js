@@ -57,7 +57,9 @@ export function createTaskCommentCoordinator({ core, publishNotification }) {
           taskId: command.taskId,
           commentId: command.replyToCommentId,
         });
-        targetIds = parent && !isAgentIdentity(parent.authorId) ? [parent.authorId] : [];
+        targetIds = parent?.authorId && !isAgentIdentity(parent.authorId)
+          ? [parent.authorId]
+          : [];
       } else {
         targetIds = canonical.audience.resolve({ taskId: command.taskId })
           .filter(isTaskSubscriber)

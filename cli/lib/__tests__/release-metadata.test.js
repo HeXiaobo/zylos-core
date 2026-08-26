@@ -16,6 +16,7 @@ describe('fork release metadata', () => {
     assert.equal(lock.packages[''].version, pkg.version);
     assert.equal(capabilities.release, pkg.version);
     assert.equal(capabilities.protocols['c4.outbound-delivery-id'], 1);
+    assert.equal(capabilities.protocols['external-task-adapter'], 1);
     assert.equal(pkg.repository.url, 'https://github.com/HeXiaobo/zylos-core.git');
   });
 });

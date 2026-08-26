@@ -180,6 +180,32 @@ test('TaskAudience merges business roles without treating followers as domain fa
   }
 });
 
+test('TaskAudience resolves every canonical participant beyond the conversation view limit', () => {
+  const harness = createHarness();
+  try {
+    for (let index = 0; index < 120; index += 1) {
+      harness.core.conversation.record({
+        type: 'AddComment',
+        taskId: 'task-comments-1',
+        commentId: `comment-participant-${index}`,
+        actorId: `participant-${index}`,
+        body: `Comment ${index}`,
+        occurredAt: `2026-08-25T10:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z`,
+        idempotencyKey: `comment:add:participant:${index}`,
+      });
+    }
+
+    const audience = harness.core.audience.resolve({ taskId: 'task-comments-1' });
+    assert.equal(audience.filter(({ roles }) => roles.includes('participant')).length, 120);
+    assert.deepEqual(
+      audience.find(({ recipientId }) => recipientId === 'participant-119'),
+      { recipientId: 'participant-119', roles: ['participant'] },
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('NotificationPolicy routes critical work, suppresses progress and never notifies the actor', () => {
   const harness = createHarness();
   try {

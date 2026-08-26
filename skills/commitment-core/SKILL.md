@@ -179,7 +179,9 @@ events and never updates or deletes comment history.
   current comment views and, when requested, their immutable event history.
   A comment view exposes stable `authorId` separately from the actor that made
   its latest revision or deletion, so an exact reply can retain its original
-  human destination.
+  human destination. Only `CommentAdded` establishes authorship; `authorId` is
+  null when a revision/deletion arrives first, and exact replies fail closed
+  until the Add event is reconciled.
 - Each comment event and exact-replay receipt commits in one transaction.
   Reusing a key with different normalized content returns
   `IDEMPOTENCY_CONFLICT`.
@@ -201,10 +203,10 @@ events and never updates or deletes comment history.
 `core.audience.resolve({ taskId })` returns unique business participants and
 their merged `owner`, `acceptor`, `assignee`, `subscriber`, and `participant`
 roles. Conversation participants are Core facts derived from canonical comment
-authors; ordinary new-comment broadcasts use business/explicit subscriber
-roles, not every prior commenter. `core.audience.contains(...)` performs an
-unbounded membership check for exact-reply authorization without depending on
-the bounded audience listing.
+authors, and the resolved list is complete rather than capped by the ordinary
+conversation-view limit. Ordinary new-comment broadcasts use business/explicit
+subscriber roles, not every prior commenter. `core.audience.contains(...)`
+performs the corresponding exact membership check for reply authorization.
 
 `core.notifications.decide({ taskId, eventId, kind, actorId?, targetIds? })`
 returns channel-neutral deliveries with `recipientId`, `reason`, `urgency`,

@@ -155,6 +155,60 @@ test('an Agent reply keeps the original commenter when an Adapter revised the pa
   }
 });
 
+test('an Agent reply waits for a late Add event instead of freezing a revision actor as author', async () => {
+  const harness = createHarness();
+  const publications = [];
+  try {
+    harness.core.conversation.record({
+      type: 'ReviseComment',
+      taskId: harness.task.id,
+      commentId: 'external-comment:out-of-order-parent',
+      actorId: 'external:feishu-sync',
+      body: 'Edited question delivered before its Add event',
+      occurredAt: '2026-08-25T11:58:00.000Z',
+      idempotencyKey: 'feishu-comment-effect:out-of-order-parent:revise',
+    });
+    const coordinator = createTaskCommentCoordinator({
+      core: harness.core,
+      async publishNotification(publication) {
+        publications.push(publication);
+      },
+    });
+    const reply = {
+      type: 'AddComment',
+      taskId: harness.task.id,
+      commentId: 'external-comment:out-of-order-reply',
+      actorId: 'agent:yueran',
+      body: 'Answer while the parent Add event is still in flight.',
+      replyToCommentId: 'external-comment:out-of-order-parent',
+      occurredAt: '2026-08-25T12:00:00.000Z',
+      idempotencyKey: 'feishu-comment-effect:out-of-order-reply',
+    };
+
+    await coordinator.record(reply);
+    assert.deepEqual(publications, []);
+
+    harness.core.conversation.record({
+      type: 'AddComment',
+      taskId: harness.task.id,
+      commentId: 'external-comment:out-of-order-parent',
+      actorId: 'ou_requester',
+      body: 'Original question delivered late',
+      occurredAt: '2026-08-25T11:57:00.000Z',
+      idempotencyKey: 'feishu-comment-effect:out-of-order-parent:add',
+    });
+    await coordinator.record(reply);
+
+    assert.deepEqual(
+      publications.flatMap(({ decision }) => decision.deliveries)
+        .map(({ recipientId }) => recipientId),
+      ['ou_requester'],
+    );
+  } finally {
+    harness.core.close();
+  }
+});
+
 test('a human comment notifies business and explicit subscribers but not its author, Agent, or prior commenters', async () => {
   const harness = createHarness();
   const publications = [];
@@ -240,7 +294,7 @@ test('comment replay republishes the persisted decision when subscribers changed
   }
 });
 
-test('an exact reply can target a commenter outside the bounded audience listing', async () => {
+test('an exact reply can target a commenter beyond the ordinary conversation query limit', async () => {
   const harness = createHarness();
   const publications = [];
   try {

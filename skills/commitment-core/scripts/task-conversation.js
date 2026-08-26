@@ -135,6 +135,14 @@ function normalizeParticipantQuery(rawQuery) {
   };
 }
 
+function normalizeParticipantsQuery(rawQuery) {
+  const query = requireRecord(rawQuery, 'conversation participants query');
+  rejectUnknownFields(query, new Set(['taskId']), 'conversation participants query');
+  return {
+    taskId: requireText(query.taskId, 'conversation participants query.taskId'),
+  };
+}
+
 function toEventView(row) {
   if (!row) return null;
   return {
@@ -150,7 +158,7 @@ function toEventView(row) {
   };
 }
 
-function toCommentView(row, authorId = row?.actor_id) {
+function toCommentView(row, authorId = null) {
   if (!row) return null;
   return {
     id: row.comment_id,
@@ -264,9 +272,16 @@ export function createTaskConversationModule({
   const selectCommentAuthor = database.prepare(`
     SELECT actor_id
     FROM commitment_conversation_events
-    WHERE task_id = ? AND comment_id = ?
-    ORDER BY (event_type = 'CommentAdded') DESC, occurred_at, recorded_at, id
+    WHERE task_id = ? AND comment_id = ? AND event_type = 'CommentAdded'
+    ORDER BY occurred_at, recorded_at, id
     LIMIT 1
+  `);
+  const selectParticipants = database.prepare(`
+    SELECT actor_id
+    FROM commitment_conversation_events
+    WHERE task_id = ? AND event_type = 'CommentAdded'
+    GROUP BY actor_id
+    ORDER BY MIN(occurred_at), MIN(recorded_at), MIN(id)
   `);
   const selectCommentEvents = database.prepare(`
     SELECT id, event_type, task_id, comment_id, actor_id, body,
@@ -295,19 +310,9 @@ export function createTaskConversationModule({
     ORDER BY occurred_at, recorded_at, id
   `);
   const selectParticipant = database.prepare(`
-    WITH ranked_authors AS (
-      SELECT actor_id,
-             ROW_NUMBER() OVER (
-               PARTITION BY comment_id
-               ORDER BY (event_type = 'CommentAdded') DESC,
-                        occurred_at, recorded_at, id
-             ) AS position
-      FROM commitment_conversation_events
-      WHERE task_id = ?
-    )
     SELECT 1 AS found
-    FROM ranked_authors
-    WHERE position = 1 AND actor_id = ?
+    FROM commitment_conversation_events
+    WHERE task_id = ? AND event_type = 'CommentAdded' AND actor_id = ?
     LIMIT 1
   `);
 
@@ -404,6 +409,15 @@ export function createTaskConversationModule({
         throw domainError('TASK_NOT_FOUND', `task not found: ${query.taskId}`);
       }
       return Boolean(selectParticipant.get(query.taskId, query.participantId));
+    },
+    participants(rawQuery) {
+      const query = normalizeParticipantsQuery(rawQuery);
+      if (!taskStore.get(query.taskId)) {
+        throw domainError('TASK_NOT_FOUND', `task not found: ${query.taskId}`);
+      }
+      return selectParticipants.all(query.taskId).map(({ actor_id: participantId }) => ({
+        participantId,
+      }));
     },
   });
 }
