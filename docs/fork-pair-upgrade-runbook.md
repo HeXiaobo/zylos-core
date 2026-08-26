@@ -315,8 +315,10 @@ Skill 目录或手工改 marker：
 
 ```bash
 HXA_SHA='182d7b3ed55fd758981c8edc7ae923e3bc03614b'
+CORE_CLI="$(npm root -g)/zylos/cli/zylos.js"
 
-~/zylos/cli/zylos.js upgrade hxa-connect \
+test -f "${CORE_CLI}" || { echo 'HOLD: installed Core CLI missing'; exit 1; }
+node "${CORE_CLI}" upgrade hxa-connect \
   --branch "${HXA_SHA}" \
   --yes \
   --skip-eval \
