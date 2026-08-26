@@ -43,6 +43,11 @@ function writeCoreFixture(root) {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
       'c4.reply.body-file': 1,
+      'c4.assistant-response-stream': 3,
+      'c4.outbound-delivery-id': 1,
+      'work-intake': 1,
+      'commitment-core': 1,
+      'projection-outbox': 1,
       'external-task-adapter': 1,
       'task-reminder': 1,
     },
@@ -52,6 +57,7 @@ function writeCoreFixture(root) {
     'skills/comm-bridge/scripts/c4-receive.js',
     'skills/comm-bridge/scripts/c4-dispatcher.js',
     'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+    'skills/activity-monitor/scripts/assistant-turn-binding.js',
     'scripts/upgrade-fork-pair.js',
     'scripts/upgrade-fork-pair.sh',
   ]) {
@@ -75,6 +81,11 @@ function writeFeishuFixture(root) {
         protocols: {
           'c4.reply': 2,
           'c4.reply.argv-compat': 1,
+          'c4.assistant-response-stream': 3,
+          'c4.outbound-delivery-id': 1,
+          'work-intake': 1,
+          'commitment-core': 1,
+          'projection-outbox': 1,
           'external-task-adapter': 1,
           'task-reminder': 1,
         },
@@ -152,6 +163,21 @@ describe('fork-pair upgrade target contract', () => {
     }
   });
 
+  it('fails source validation when the shared binding projector is missing', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
+    try {
+      writeCoreFixture(root);
+      fs.rmSync(path.join(root, 'skills/activity-monitor/scripts/assistant-turn-binding.js'));
+
+      const result = validateCoreSource(root, '0.7.2-rc.5');
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, /assistant-turn-binding\.js/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('fails source validation when the immutable Core archive omits the body-file reply contract', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
     try {
@@ -165,6 +191,24 @@ describe('fork-pair upgrade target contract', () => {
 
       assert.equal(result.ok, false);
       assert.match(result.error, /c4\.reply\.body-file requires >= 1, found missing/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails source validation when the Core archive omits runtime-turn admission', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
+    try {
+      writeCoreFixture(root);
+      const capabilitiesPath = path.join(root, 'capabilities.json');
+      const capabilities = JSON.parse(fs.readFileSync(capabilitiesPath, 'utf8'));
+      delete capabilities.protocols['c4.assistant-response-stream'];
+      fs.writeFileSync(capabilitiesPath, JSON.stringify(capabilities));
+
+      const result = validateCoreSource(root, '0.7.2-rc.5');
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, /c4\.assistant-response-stream requires >= 3, found missing/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

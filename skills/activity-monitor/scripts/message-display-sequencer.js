@@ -76,6 +76,7 @@ export function sequenceMessageDisplayBatch({
   batchIndex,
   final,
   delta,
+  observedAtMs = null,
   emit,
   nowMs = Date.now(),
 }) {
@@ -87,6 +88,9 @@ export function sequenceMessageDisplayBatch({
   }
   if (typeof final !== 'boolean') throw new TypeError('final must be a boolean');
   if (typeof delta !== 'string' || delta.length === 0) throw new TypeError('delta is required');
+  if (observedAtMs !== null && (!Number.isSafeInteger(observedAtMs) || observedAtMs < 0)) {
+    throw new TypeError('observedAtMs must be a non-negative safe integer');
+  }
   if (typeof emit !== 'function') throw new TypeError('emit is required');
 
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -125,7 +129,10 @@ export function sequenceMessageDisplayBatch({
     if (existing && (existing.delta !== delta || existing.final !== final)) {
       throw new Error('MessageDisplay batch index belongs to different content');
     }
-    state.batches[String(batchIndex)] = { delta, final };
+    // A hook retry is the same causal event. Preserve the first observation
+    // timestamp instead of letting a later retry move old output past newer
+    // tool activity.
+    if (!existing) state.batches[String(batchIndex)] = { delta, final, observedAtMs };
     if (final) state.finalIndex = batchIndex;
     atomicWrite(stateFile, state);
 
@@ -133,7 +140,12 @@ export function sequenceMessageDisplayBatch({
     while (Object.hasOwn(state.batches, String(state.nextIndex))) {
       const index = state.nextIndex;
       const batch = state.batches[String(index)];
-      emit({ index, delta: batch.delta, final: batch.final });
+      emit({
+        index,
+        delta: batch.delta,
+        final: batch.final,
+        observedAtMs: Number.isSafeInteger(batch.observedAtMs) ? batch.observedAtMs : null,
+      });
       delete state.batches[String(index)];
       state.nextIndex += 1;
       emitted += 1;

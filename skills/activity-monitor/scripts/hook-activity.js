@@ -23,10 +23,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { getClaudePid } from './claude-pid.js';
 import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
 import { sequenceMessageDisplayBatch } from './message-display-sequencer.js';
+import {
+  readAssistantTurnBinding,
+  writeAssistantTurnBinding,
+} from './assistant-turn-binding.js';
 import { openAssistantResponseStream } from '../../comm-bridge/scripts/assistant-response-stream.js';
 import {
   sanitizePublicReasoningDelta,
@@ -39,8 +43,6 @@ const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const TOOL_EVENTS_FILE = path.join(MONITOR_DIR, 'tool-events.jsonl');
 const HOOK_ERROR_LOG = path.join(MONITOR_DIR, 'hook-activity-errors.log');
 const MESSAGE_DISPLAY_BUFFER_DIR = path.join(MONITOR_DIR, 'message-display-buffers');
-const TURN_BINDING_DIR = path.join(MONITOR_DIR, 'assistant-turn-bindings');
-const TURN_BINDING_AUDIT_FILE = path.join(MONITOR_DIR, 'assistant-turn-binding-events.jsonl');
 const ASSISTANT_REQUEST_MARKER = /assistant request:\s*"([A-Za-z0-9][A-Za-z0-9._:-]*)"\s*$/;
 const ANY_ASSISTANT_REQUEST_MARKER = /assistant request:\s*"/;
 // Capture observation time before an async hook can be delayed on stdin or
@@ -83,48 +85,20 @@ function promptContainsAssistantRequestMarker(hookData) {
   return ANY_ASSISTANT_REQUEST_MARKER.test(prompt);
 }
 
-function turnBindingFile(sessionId) {
-  const key = createHash('sha256').update(sessionId).digest('hex');
-  return path.join(TURN_BINDING_DIR, `${key}.json`);
-}
-
 function readTurnBinding(sessionId) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(turnBindingFile(sessionId), 'utf8'));
-    if (
-      parsed?.version === 1
-      && parsed.sessionId === sessionId
-      && ['bound', 'rejected', 'closed'].includes(parsed.mode)
-      && (parsed.requestId === null || typeof parsed.requestId === 'string')
-    ) {
-      return parsed;
-    }
-  } catch {
-    // A missing/corrupt best-effort state is handled as an unbound legacy hook.
-  }
-  return null;
+  return readAssistantTurnBinding(sessionId);
 }
 
 function writeTurnBinding(sessionId, { mode, requestId = null, reason = null, nowMs = Date.now() }) {
-  fs.mkdirSync(TURN_BINDING_DIR, { recursive: true });
-  const file = turnBindingFile(sessionId);
-  const temp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  const state = {
-    version: 1,
-    sessionId,
+  return writeAssistantTurnBinding(sessionId, {
     mode,
     requestId,
     reason,
-    updatedAt: nowMs,
-  };
-  fs.writeFileSync(temp, `${JSON.stringify(state)}\n`, 'utf8');
-  fs.renameSync(temp, file);
-  try {
-    fs.appendFileSync(TURN_BINDING_AUDIT_FILE, `${JSON.stringify(state)}\n`, 'utf8');
-  } catch (error) {
-    appendError(`assistant_binding_audit ${error?.message || 'append_failed'}`);
-  }
-  return state;
+    nowMs,
+    onAuditError(error) {
+      appendError(`assistant_binding_audit ${error?.message || 'append_failed'}`);
+    },
+  });
 }
 
 function bindingFromResult(sessionId, result, nowMs) {
@@ -141,16 +115,33 @@ function bindingFromResult(sessionId, result, nowMs) {
   });
 }
 
+function rejectTurnBinding(responseStream, record, reason) {
+  try {
+    responseStream.rejectRuntimeTurnBinding({
+      runtimeSessionId: record.session_id,
+      reason,
+      observedAtMs: record.ts,
+    });
+  } catch (error) {
+    appendError(`assistant_binding_rejection_persist ${error?.message || 'failed'}`);
+  }
+  return writeTurnBinding(record.session_id, {
+    mode: 'rejected',
+    reason,
+    nowMs: record.ts,
+  });
+}
+
 function bindPromptTurn(responseStream, record, hookData) {
   const requestId = assistantRequestIdFromPrompt(hookData);
   if (!requestId) {
-    return writeTurnBinding(record.session_id, {
-      mode: 'rejected',
-      reason: promptContainsAssistantRequestMarker(hookData)
+    return rejectTurnBinding(
+      responseStream,
+      record,
+      promptContainsAssistantRequestMarker(hookData)
         ? 'non_terminal_marker'
         : 'missing_terminal_marker',
-      nowMs: record.ts,
-    });
+    );
   }
   try {
     const result = responseStream.execute({
@@ -161,11 +152,7 @@ function bindPromptTurn(responseStream, record, hookData) {
     return bindingFromResult(record.session_id, result, record.ts);
   } catch (error) {
     appendError(`assistant_binding_rejected ${error?.code || 'invalid_request'}`);
-    return writeTurnBinding(record.session_id, {
-      mode: 'rejected',
-      reason: error?.code || 'invalid_request',
-      nowMs: record.ts,
-    });
+    return rejectTurnBinding(responseStream, record, error?.code || 'invalid_request');
   }
 }
 
@@ -179,14 +166,13 @@ function resolveTurnBinding(responseStream, record, { allowLegacyFallback = fals
       runtimeSessionId: record.session_id,
     });
     const binding = bindingFromResult(record.session_id, result, record.ts);
+    if (binding.mode !== 'bound') {
+      rejectTurnBinding(responseStream, record, binding.reason || 'legacy_fallback_unbound');
+    }
     return binding.mode === 'bound' ? binding : null;
   } catch (error) {
     appendError(`assistant_binding_rejected ${error?.code || 'legacy_fallback_failed'}`);
-    writeTurnBinding(record.session_id, {
-      mode: 'rejected',
-      reason: error?.code || 'legacy_fallback_failed',
-      nowMs: record.ts,
-    });
+    rejectTurnBinding(responseStream, record, error?.code || 'legacy_fallback_failed');
     return null;
   }
 }
@@ -293,16 +279,20 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       const status = record.event === 'pre_tool'
         ? 'started'
         : (record.event === 'post_tool' ? 'completed' : 'failed');
+      const activityId = `hook:${record.event}:${record.event_id || record.ts}`;
       return responseStream.execute({
         type: 'ReportRequestToolProgress',
         requestId: binding.requestId,
+        runtimeSessionId: record.session_id,
+        observedAtMs: record.ts,
+        activityId,
         toolName: record.tool,
         status,
         // The Core maps tool identity to fixed public progress. Tool input and
         // the monitor's diagnostic summary are deliberately excluded, so
         // secrets, paths, queries, and hidden parameters never enter the
         // user-visible stream ledger.
-        idempotencyKey: `hook:${record.event}:${record.event_id || record.ts}`,
+        idempotencyKey: activityId,
       });
     }
     if (record.event === 'message_display') {
@@ -331,8 +321,17 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
         batchIndex: record.batch_index,
         final: record.final === true,
         delta,
+        observedAtMs: record.ts,
         emit: batch => {
           const separated = splitPublicReasoningText(batch.delta);
+          const activityId = `display-activity:${record.message_id}:${batch.index}`;
+          const runtimeScope = Number.isSafeInteger(batch.observedAtMs)
+            ? {
+              runtimeSessionId: record.session_id,
+              observedAtMs: batch.observedAtMs,
+              activityId,
+            }
+            : {};
           for (const [index, publicDelta] of separated.publicReasoningDeltas.entries()) {
             const safeDelta = sanitizePublicReasoningDelta(publicDelta);
             if (!safeDelta) continue;
@@ -341,6 +340,7 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
               requestId: binding.requestId,
               delta: safeDelta,
               idempotencyKey: `display-reasoning:${record.message_id}:${batch.index}:${index}`,
+              ...runtimeScope,
             });
           }
           if (separated.answer.length > 0) {
@@ -349,6 +349,17 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
               requestId: binding.requestId,
               delta: separated.answer,
               idempotencyKey: `display:${record.message_id}:${batch.index}`,
+              ...runtimeScope,
+            });
+          }
+          if (batch.final === true && Number.isSafeInteger(batch.observedAtMs)) {
+            responseStream.execute({
+              type: 'MarkFinalOutputCandidate',
+              requestId: binding.requestId,
+              runtimeSessionId: record.session_id,
+              messageId: record.message_id,
+              observedAtMs: batch.observedAtMs,
+              activityId,
             });
           }
         },
@@ -366,54 +377,71 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       return null;
     }
     if (record.event === 'stop') {
+      const binding = resolveTurnBinding(responseStream, record);
+      const finalization = { requestId: binding?.requestId || null };
+      const lastMessage = typeof hookData?.last_assistant_message === 'string'
+        ? hookData.last_assistant_message
+        : '';
+      const output = stripPublicReasoningLines(lastMessage).trim();
+      if (output) {
+        finalization.output = output;
+      } else {
+        finalization.failureCode = 'RESPONSE_NOT_DELIVERED';
+        finalization.retryable = true;
+      }
       const admission = responseStream.finishRuntimeTurn({
         runtimeSessionId: record.session_id,
         reason: 'stop',
         observedAtMs: record.ts,
+        ...finalization,
       });
+      if (admission.reason === 'no_active_admission' && binding) {
+        const legacyResult = Object.hasOwn(finalization, 'output')
+          ? responseStream.execute({
+            type: 'CompleteRun',
+            requestId: binding.requestId,
+            output: finalization.output,
+          })
+          : responseStream.execute({
+            type: 'FailRun',
+            requestId: binding.requestId,
+            code: finalization.failureCode,
+            retryable: finalization.retryable,
+          });
+        writeTurnBinding(record.session_id, {
+          mode: 'closed',
+          requestId: binding.requestId,
+          reason: 'legacy_stop_without_admission',
+          nowMs: record.ts,
+        });
+        return legacyResult;
+      }
       if (admission.reason === 'runtime_session_conflict') {
         appendError('runtime_turn_admission stop_session_conflict');
         return null;
       }
-      if (['runtime_session_conflict', 'runtime_turn_not_started', 'runtime_turn_observation_stale']
-        .includes(admission.reason)) return null;
-      const binding = resolveTurnBinding(responseStream, record);
-      if (!binding) return null;
-      let result;
-      if (
-        typeof hookData?.last_assistant_message === 'string'
-        && hookData.last_assistant_message.trim()
-      ) {
-        const output = stripPublicReasoningLines(hookData.last_assistant_message).trim();
-        if (!output) {
-          result = responseStream.execute({
-            type: 'FailRun',
-            requestId: binding.requestId,
-            code: 'RESPONSE_NOT_DELIVERED',
-            retryable: true,
-          });
-        } else {
-          result = responseStream.execute({
-            type: 'CompleteRun',
-            requestId: binding.requestId,
-            output,
-          });
-        }
-      } else {
-        result = responseStream.execute({
-          type: 'FailRun',
-          requestId: binding.requestId,
-          code: 'RESPONSE_NOT_DELIVERED',
-          retryable: true,
+      if (['runtime_turn_not_started', 'runtime_turn_observation_stale']
+        .includes(admission.reason)) {
+        appendError(`runtime_turn_admission stop_${admission.reason}`);
+        return null;
+      }
+      if (admission.reason === 'runtime_request_conflict') {
+        appendError('runtime_turn_admission stop_runtime_request_conflict');
+        return null;
+      }
+      const closedRequestId = admission.request?.requestId || binding?.requestId || null;
+      if (closedRequestId && admission.finished) {
+        writeTurnBinding(record.session_id, {
+          mode: 'closed',
+          requestId: closedRequestId,
+          reason: 'stop',
+          nowMs: record.ts,
+        });
+        responseStream.ackRuntimeTurnBindingProjection({
+          admissionId: admission.admission.admissionId,
         });
       }
-      writeTurnBinding(record.session_id, {
-        mode: 'closed',
-        requestId: binding.requestId,
-        reason: 'stop',
-        nowMs: record.ts,
-      });
-      return result;
+      return admission;
     }
     return null;
   } finally {

@@ -38,6 +38,7 @@ const {
   findBlockingAssistantRun,
   shouldDeferConversationForRuntime,
   shouldRecoverRuntimeTurnAdmission,
+  projectPendingAssistantTurnBindings,
   runtimeTurnAdmissionsEnabled,
   readJsonFileWithRetry,
   getDeliveryContent
@@ -47,6 +48,69 @@ describe('runtime turn admission scope', () => {
   it('enables hook-fenced admissions only for Claude', () => {
     assert.equal(runtimeTurnAdmissionsEnabled('claude'), true);
     assert.equal(runtimeTurnAdmissionsEnabled('codex'), false);
+  });
+});
+
+describe('durable assistant binding projection', () => {
+  const projection = {
+    admissionId: 17,
+    runtimeSessionId: 'recovered-session',
+    requestId: 'assistant.feishu.recovered-request',
+    bindingReason: 'completed_from_final_output',
+    bindingProjectionObservedAtMs: 12_345,
+  };
+
+  it('closes and acknowledges the exact pending admission', () => {
+    const calls = [];
+    const responseStream = {
+      queryPendingRuntimeTurnBindingProjections: () => [projection],
+      ackRuntimeTurnBindingProjection(input) {
+        calls.push(['ack', input]);
+        return { acknowledged: true };
+      },
+    };
+    const result = projectPendingAssistantTurnBindings(responseStream, {
+      writeBinding(sessionId, state) {
+        calls.push(['write', sessionId, state]);
+        return { sessionId, ...state };
+      },
+    });
+
+    assert.equal(result.projected, 1);
+    assert.deepEqual(calls, [[
+      'write',
+      'recovered-session',
+      {
+        mode: 'closed',
+        requestId: 'assistant.feishu.recovered-request',
+        reason: 'completed_from_final_output',
+        nowMs: 12_345,
+      },
+    ], ['ack', { admissionId: 17 }]]);
+  });
+
+  it('leaves the durable row pending when the file projection fails, then retries it', () => {
+    let acknowledgements = 0;
+    const responseStream = {
+      queryPendingRuntimeTurnBindingProjections: () => [projection],
+      ackRuntimeTurnBindingProjection() {
+        acknowledgements += 1;
+        return { acknowledged: true };
+      },
+    };
+    assert.throws(
+      () => projectPendingAssistantTurnBindings(responseStream, {
+        writeBinding() { throw new Error('injected projection failure'); },
+      }),
+      /injected projection failure/,
+    );
+    assert.equal(acknowledgements, 0);
+
+    const retried = projectPendingAssistantTurnBindings(responseStream, {
+      writeBinding(sessionId, state) { return { sessionId, ...state }; },
+    });
+    assert.equal(retried.projected, 1);
+    assert.equal(acknowledgements, 1);
   });
 });
 

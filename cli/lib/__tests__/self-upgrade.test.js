@@ -47,6 +47,7 @@ const TARGET_COMMUNICATION_ASSETS = [
   'skills/comm-bridge/scripts/c4-receive.js',
   'skills/comm-bridge/scripts/c4-dispatcher.js',
   'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+  'skills/activity-monitor/scripts/assistant-turn-binding.js',
 ];
 
 function writeTargetCommunicationAssets(root, assets = TARGET_COMMUNICATION_ASSETS) {

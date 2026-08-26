@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, beforeEach, describe, it } from 'node:test';
 
+import { sequenceMessageDisplayBatch } from '../message-display-sequencer.js';
+
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-activity-test-'));
 const monitorDir = path.join(tmpDir, 'activity-monitor');
 const eventsFile = path.join(monitorDir, 'tool-events.jsonl');
@@ -39,7 +41,53 @@ function readEvents() {
     .map((line) => JSON.parse(line));
 }
 
+function closeActiveTestTurn(stream) {
+  const active = stream.getActiveRuntimeTurn();
+  assert.equal(active?.status, 'started');
+  const result = stream.finishRuntimeTurn({
+    runtimeSessionId: active.runtimeSessionId,
+    requestId: active.requestId,
+    reason: 'test_cleanup',
+    observedAtMs: testObservationBaseMs + 100_000,
+    failureCode: 'TEST_CLEANUP',
+    retryable: false,
+  });
+  assert.equal(result.finished, true);
+  stream.ackRuntimeTurnBindingProjection({ admissionId: result.admission.admissionId });
+}
+
 describe('hook-activity', () => {
+  it('preserves the first causal timestamp when a pending display batch is replayed', () => {
+    const directory = path.join(tmpDir, 'sequencer-replay');
+    const emitted = [];
+    const input = {
+      directory,
+      sessionId: 'sequencer-session',
+      messageId: 'sequencer-message',
+      batchIndex: 1,
+      final: true,
+      delta: 'second batch',
+      emit: batch => emitted.push(batch),
+    };
+    sequenceMessageDisplayBatch({ ...input, observedAtMs: 1_000 });
+    sequenceMessageDisplayBatch({ ...input, observedAtMs: 2_000 });
+    sequenceMessageDisplayBatch({
+      ...input,
+      batchIndex: 0,
+      final: false,
+      delta: 'first batch',
+      observedAtMs: 900,
+    });
+
+    assert.deepEqual(emitted.map(batch => ({
+      index: batch.index,
+      observedAtMs: batch.observedAtMs,
+    })), [
+      { index: 0, observedAtMs: 900 },
+      { index: 1, observedAtMs: 1_000 },
+    ]);
+  });
+
   it('uses Claude tool_use_id as event_id when present', async () => {
     await runHook({
       hook_event_name: 'PreToolUse',
@@ -421,6 +469,453 @@ describe('hook-activity', () => {
     stream.close();
   });
 
+  it('closes the current turn when Stop was observed before a later same-turn display persisted', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.same-turn-stop-order',
+      sourceId: 'om_same_turn_stop_order',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_same_turn_stop_order' },
+      conversation: {
+        content: '[Feishu DM] same-turn Stop ordering',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'same-turn-stop-session',
+      prompt: 'same turn ---- streamed reply: assistant request: "assistant.feishu.same-turn-stop-order"',
+    }, 7_000);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'same-turn-stop-session',
+      message_id: 'same-turn-stop-message',
+      index: 0,
+      final: true,
+      delta: 'streamed answer',
+    }, 7_300);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'same-turn-stop-session',
+      last_assistant_message: 'canonical answer',
+    }, 7_200);
+
+    const result = stream.query({ requestId: accepted.request.requestId });
+    assert.equal(result.request.status, 'completed');
+    assert.equal(result.request.output, 'canonical answer');
+    assert.equal(
+      stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })[0].status,
+      'consumed',
+    );
+    assert.equal(stream.getActiveRuntimeTurn(), null);
+    const bindingAudit = fs.readFileSync(bindingAuditFile, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    assert.equal(bindingAudit.at(-1).mode, 'closed');
+    assert.equal(bindingAudit.at(-1).reason, 'stop');
+    stream.close();
+  });
+
+  it('marks a final displayed answer for safe idle recovery when Stop is lost', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.final-display-recovery',
+      sourceId: 'om_final_display_recovery',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_final_display_recovery' },
+      conversation: {
+        content: '[Feishu DM] final display recovery',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'final-display-recovery-session',
+      prompt: 'recover ---- streamed reply: assistant request: "assistant.feishu.final-display-recovery"',
+    }, 8_000);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'final-display-recovery-session',
+      message_id: 'final-display-recovery-message',
+      index: 0,
+      final: true,
+      delta: 'complete displayed answer',
+    }, 8_100);
+
+    assert.equal(
+      stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })[0].status,
+      'active',
+    );
+    const active = stream.getActiveRuntimeTurn();
+    const recovered = stream.recoverRuntimeTurn({
+      admissionId: active.admissionId,
+      expectedLifecycleVersion: active.lifecycleVersion,
+      reason: 'runtime_sustained_idle',
+    });
+    assert.equal(recovered.disposition, 'completed_from_final_output');
+    assert.equal(recovered.request.status, 'completed');
+    assert.equal(recovered.request.output, 'complete displayed answer');
+    assert.deepEqual(recovered.events.map(event => event.type), ['RunCompleted']);
+    stream.close();
+  });
+
+  it('invalidates final-output recovery after subsequent tool activity', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.final-display-then-tool',
+      sourceId: 'om_final_display_then_tool',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_final_display_then_tool' },
+      conversation: {
+        content: '[Feishu DM] final display then tool',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'final-display-then-tool-session',
+      prompt: 'continue ---- streamed reply: assistant request: "assistant.feishu.final-display-then-tool"',
+    }, 8_200);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'final-display-then-tool-session',
+      message_id: 'final-display-then-tool-message',
+      index: 0,
+      final: true,
+      delta: 'not actually terminal',
+    }, 8_300);
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 'final-display-then-tool-session',
+      tool_name: 'Read',
+      tool_use_id: 'toolu_after_final_display',
+    }, 8_400);
+
+    assert.equal(
+      stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })[0].status,
+      'invalidated',
+    );
+    const active = stream.getActiveRuntimeTurn();
+    const recovered = stream.recoverRuntimeTurn({
+      admissionId: active.admissionId,
+      expectedLifecycleVersion: active.lifecycleVersion,
+      reason: 'runtime_sustained_idle',
+    });
+    assert.equal(recovered.disposition, 'failed_without_final_output');
+    assert.equal(recovered.request.status, 'failed');
+    stream.close();
+  });
+
+  it('does not revive an older final display persisted after logically later tool activity', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.inverted-final-tool-order',
+      sourceId: 'om_inverted_final_tool_order',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_inverted_final_tool_order' },
+      conversation: {
+        content: '[Feishu DM] inverted final/tool persistence order',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'inverted-final-tool-session',
+      prompt: 'order ---- streamed reply: assistant request: "assistant.feishu.inverted-final-tool-order"',
+    }, 9_000);
+
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 'inverted-final-tool-session',
+      tool_name: 'Read',
+      tool_use_id: 'toolu_logically_after_old_final',
+    }, 9_200);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'inverted-final-tool-session',
+      message_id: 'inverted-final-tool-message',
+      index: 0,
+      final: true,
+      delta: 'tool 前的中间回答',
+    }, 9_100);
+
+    assert.equal(
+      stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })
+        .some(candidate => candidate.status === 'active'),
+      false,
+    );
+    const active = stream.getActiveRuntimeTurn();
+    const recovered = stream.recoverRuntimeTurn({
+      admissionId: active.admissionId,
+      expectedLifecycleVersion: active.lifecycleVersion,
+      reason: 'runtime_sustained_idle',
+    });
+    assert.equal(recovered.disposition, 'failed_without_final_output');
+    assert.equal(recovered.request.status, 'failed');
+    stream.close();
+  });
+
+  it('marks accumulated answer output when the final display batch contains only public reasoning', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.answer-before-final-reasoning',
+      sourceId: 'om_answer_before_final_reasoning',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_answer_before_final_reasoning' },
+      conversation: {
+        content: '[Feishu DM] answer before final reasoning batch',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'answer-before-final-reasoning-session',
+      prompt: 'batches ---- streamed reply: assistant request: "assistant.feishu.answer-before-final-reasoning"',
+    }, 9_300);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'answer-before-final-reasoning-session',
+      message_id: 'answer-before-final-reasoning-message',
+      index: 0,
+      final: false,
+      delta: '完整答案',
+    }, 9_400);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'answer-before-final-reasoning-session',
+      message_id: 'answer-before-final-reasoning-message',
+      index: 1,
+      final: true,
+      delta: '[PUBLIC_REASONING] 已完成整理。',
+    }, 9_500);
+
+    assert.equal(
+      stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })[0].status,
+      'active',
+    );
+    const active = stream.getActiveRuntimeTurn();
+    const recovered = stream.recoverRuntimeTurn({
+      admissionId: active.admissionId,
+      expectedLifecycleVersion: active.lifecycleVersion,
+      reason: 'runtime_sustained_idle',
+    });
+    assert.equal(recovered.disposition, 'completed_from_final_output');
+    assert.equal(recovered.request.output, '完整答案');
+    stream.close();
+  });
+
+  it('finalizes from the durable admission when the best-effort binding file is missing', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.missing-binding-stop',
+      sourceId: 'om_missing_binding_stop',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_missing_binding_stop' },
+      conversation: {
+        content: '[Feishu DM] missing binding Stop',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'missing-binding-stop-session',
+      prompt: 'missing binding ---- streamed reply: assistant request: "assistant.feishu.missing-binding-stop"',
+    }, 9_600);
+    fs.rmSync(path.join(monitorDir, 'assistant-turn-bindings'), { recursive: true, force: true });
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'missing-binding-stop-session',
+      last_assistant_message: 'completed despite missing cache',
+    }, 9_700);
+
+    const result = stream.query({ requestId: accepted.request.requestId });
+    assert.equal(result.request.status, 'completed');
+    assert.equal(result.request.output, 'completed despite missing cache');
+    assert.equal(stream.getActiveRuntimeTurn(), null);
+    assert.equal(
+      stream.queryPendingRuntimeTurnBindingProjections()
+        .some(item => item.requestId === accepted.request.requestId),
+      false,
+    );
+    stream.close();
+  });
+
+  it('uses a valid final-output candidate when Stop has no assistant message', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.empty-stop-after-final',
+      sourceId: 'om_empty_stop_after_final',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_empty_stop_after_final' },
+      conversation: {
+        content: '[Feishu DM] empty Stop after final display',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'empty-stop-after-final-session',
+      prompt: 'empty Stop ---- streamed reply: assistant request: "assistant.feishu.empty-stop-after-final"',
+    }, 9_800);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'empty-stop-after-final-session',
+      message_id: 'empty-stop-after-final-message',
+      index: 0,
+      final: true,
+      delta: 'durably displayed answer',
+    }, 9_900);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'empty-stop-after-final-session',
+      last_assistant_message: '',
+    }, 10_000);
+
+    const result = stream.query({ requestId: accepted.request.requestId });
+    assert.equal(result.request.status, 'completed');
+    assert.equal(result.request.output, 'durably displayed answer');
+    stream.close();
+  });
+
+  it('does not create a recovery candidate from public reasoning without an answer', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.reasoning-only-final',
+      sourceId: 'om_reasoning_only_final',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_reasoning_only_final' },
+      conversation: {
+        content: '[Feishu DM] reasoning-only final display',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'reasoning-only-final-session',
+      prompt: 'reasoning ---- streamed reply: assistant request: "assistant.feishu.reasoning-only-final"',
+    }, 8_500);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: 'reasoning-only-final-session',
+      message_id: 'reasoning-only-final-message',
+      index: 0,
+      final: true,
+      delta: '[PUBLIC_REASONING] 仍在处理中。',
+    }, 8_600);
+
+    assert.deepEqual(
+      stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId }),
+      [],
+    );
+    const active = stream.getActiveRuntimeTurn();
+    stream.recoverRuntimeTurn({
+      admissionId: active.admissionId,
+      expectedLifecycleVersion: active.lifecycleVersion,
+      reason: 'test_cleanup',
+    });
+    stream.close();
+  });
+
   it('advances the lifecycle generation when idle_prompt is observed', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     const { openAssistantResponseStream } = await import(
@@ -563,7 +1058,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.hook-progress',
       sourceId: 'om_hook_progress',
@@ -574,6 +1069,11 @@ describe('hook-activity', () => {
         priority: 3,
         requireIdle: false,
       },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
     });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.hook-progress' });
 
@@ -622,6 +1122,7 @@ describe('hook-activity', () => {
     const serialized = JSON.stringify(progress);
     assert.equal(serialized.includes('private customer'), false);
     assert.equal(serialized.includes('WebSearch'), false);
+    closeActiveTestTurn(stream);
     stream.close();
   });
 
@@ -631,7 +1132,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.tool-bind-fallback',
       sourceId: 'om_tool_bind_fallback',
@@ -642,6 +1143,11 @@ describe('hook-activity', () => {
         priority: 3,
         requireIdle: false,
       },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
     });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.tool-bind-fallback' });
 
@@ -666,6 +1172,7 @@ describe('hook-activity', () => {
     ]);
     assert.equal(JSON.stringify(events).includes('private query must not escape'), false);
     assert.equal(JSON.stringify(events).includes('WebSearch'), false);
+    closeActiveTestTurn(stream);
     stream.close();
   });
 
@@ -675,7 +1182,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.display-delta',
       sourceId: 'om_display_delta',
@@ -687,8 +1194,19 @@ describe('hook-activity', () => {
         requireIdle: false,
       },
     });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.display-delta' });
 
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-display-delta',
+      prompt: 'display delta test ---- streamed reply: assistant request: "assistant.feishu.display-delta"',
+    }, 9290);
+    const monitorEventCountBeforeDisplay = readEvents().length;
     await runHook({
       hook_event_name: 'MessageDisplay',
       session_id: 'session-display-delta',
@@ -710,7 +1228,9 @@ describe('hook-activity', () => {
       occurredAt: result.events.at(-1).occurredAt,
       payload: { delta: '这是公开回答的第一段。\n' },
     });
-    assert.equal(fs.existsSync(eventsFile), false);
+    assert.equal(readEvents().length, monitorEventCountBeforeDisplay);
+    assert.equal(JSON.stringify(readEvents()).includes('这是公开回答的第一段'), false);
+    closeActiveTestTurn(stream);
     stream.close();
   });
 
@@ -791,6 +1311,12 @@ describe('hook-activity', () => {
       });
       stream.execute({ type: 'StartRun', requestId });
     }
+    const targetBeforeHook = stream.query({ requestId: 'assistant.feishu.explicit-target' });
+    stream.acquireRuntimeTurn({
+      conversationId: targetBeforeHook.request.conversationId,
+      requestId: targetBeforeHook.request.requestId,
+      routeChannel: 'feishu',
+    });
 
     await runHook({
       hook_event_name: 'UserPromptSubmit',
@@ -814,6 +1340,7 @@ describe('hook-activity', () => {
     assert.equal(target.request.runtimeSessionId, 'session-explicit-target');
     assert.equal(target.request.output, 'Only the explicitly named card may receive this answer.');
 
+    closeActiveTestTurn(stream);
     stream.execute({
       type: 'FailRun',
       requestId: 'assistant.feishu.explicit-older',
@@ -836,7 +1363,7 @@ describe('hook-activity', () => {
     );
     const stream = openAssistantResponseStream();
     const liveRequestId = 'assistant.feishu.explicit-unknown-live';
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: liveRequestId,
       sourceId: 'om_explicit_unknown_live',
@@ -902,7 +1429,7 @@ describe('hook-activity', () => {
     );
     const stream = openAssistantResponseStream();
     const requestId = 'assistant.feishu.non-terminal-marker';
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId,
       sourceId: 'om_non_terminal_marker',
@@ -1288,7 +1815,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.public-reasoning-line',
       sourceId: 'om_public_reasoning_line',
@@ -1300,8 +1827,18 @@ describe('hook-activity', () => {
         requireIdle: false,
       },
     });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.public-reasoning-line' });
 
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-public-reasoning-line',
+      prompt: 'reasoning line ---- streamed reply: assistant request: "assistant.feishu.public-reasoning-line"',
+    }, 9345);
     await runHook({
       hook_event_name: 'MessageDisplay',
       session_id: 'session-public-reasoning-line',
@@ -1326,6 +1863,7 @@ describe('hook-activity', () => {
       },
     ]);
     assert.equal(result.request.output, '这是给用户的答案。\n');
+    closeActiveTestTurn(stream);
     stream.close();
   });
 
@@ -1335,7 +1873,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.public-reasoning-redact',
       sourceId: 'om_public_reasoning_redact',
@@ -1347,7 +1885,17 @@ describe('hook-activity', () => {
         requireIdle: false,
       },
     });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.public-reasoning-redact' });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-public-reasoning-redact',
+      prompt: 'reasoning redact ---- streamed reply: assistant request: "assistant.feishu.public-reasoning-redact"',
+    }, 9370);
     await runHook({
       hook_event_name: 'MessageDisplay',
       session_id: 'session-public-reasoning-redact',
@@ -1364,6 +1912,7 @@ describe('hook-activity', () => {
     assert.equal(serialized.includes('secret-value'), false);
     assert.match(serialized, /\[local path\]/);
     assert.match(serialized, /\[redacted\]/);
+    closeActiveTestTurn(stream);
     stream.close();
   });
 
@@ -1373,7 +1922,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.display-order',
       sourceId: 'om_display_order',
@@ -1385,8 +1934,18 @@ describe('hook-activity', () => {
         requireIdle: false,
       },
     });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.display-order' });
 
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-display-order',
+      prompt: 'display order ---- streamed reply: assistant request: "assistant.feishu.display-order"',
+    }, 9378);
     await runHook({
       hook_event_name: 'MessageDisplay',
       session_id: 'session-display-order',
@@ -1419,6 +1978,7 @@ describe('hook-activity', () => {
         { type: 'OutputDelta', delta: '最终答案。' },
       ],
     );
+    closeActiveTestTurn(stream);
     stream.close();
   });
 
@@ -1428,7 +1988,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.stop-complete',
       sourceId: 'om_stop_complete',
@@ -1440,8 +2000,18 @@ describe('hook-activity', () => {
         requireIdle: false,
       },
     });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.stop-complete' });
 
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-stop-complete',
+      prompt: 'stop completion ---- streamed reply: assistant request: "assistant.feishu.stop-complete"',
+    }, 9395);
     await runHook({
       hook_event_name: 'MessageDisplay',
       session_id: 'session-stop-complete',
@@ -1472,7 +2042,7 @@ describe('hook-activity', () => {
       '../../../comm-bridge/scripts/assistant-response-stream.js'
     );
     const stream = openAssistantResponseStream();
-    stream.execute({
+    const accepted = stream.execute({
       type: 'AcceptAssistantRequest',
       requestId: 'assistant.feishu.stop-filter-reasoning',
       sourceId: 'om_stop_filter_reasoning',
@@ -1483,6 +2053,11 @@ describe('hook-activity', () => {
         priority: 3,
         requireIdle: false,
       },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
     });
     stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.stop-filter-reasoning' });
     await runHook({

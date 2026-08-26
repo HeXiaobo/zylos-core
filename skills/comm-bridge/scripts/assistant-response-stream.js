@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -90,6 +90,10 @@ function boundedUtf8(value, field, maxBytes) {
   return value;
 }
 
+function outputHash(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
 function toEvent(row) {
   if (!row) return null;
   if (!EVENT_TYPE_SET.has(row.event_type)) {
@@ -140,6 +144,31 @@ function toRuntimeTurnAdmission(row) {
     updatedAt: row.updated_at,
     lifecycleVersion: row.lifecycle_version,
     lifecycleObservedAtMs: row.lifecycle_observed_at_ms,
+    recoveryActivityObservedAtMs: row.recovery_activity_observed_at_ms,
+    recoveryActivityId: row.recovery_activity_id,
+    bindingMode: row.binding_mode,
+    bindingReason: row.binding_reason,
+    bindingProjectionPending: row.binding_projection_pending === 1,
+    bindingProjectionObservedAtMs: row.binding_projection_observed_at_ms,
+    bindingProjectedAt: row.binding_projected_at,
+    terminalReason: row.terminal_reason,
+  };
+}
+
+function toFinalOutputCandidate(row) {
+  if (!row) return null;
+  return {
+    candidateId: row.id,
+    requestId: row.request_id,
+    admissionId: row.admission_id,
+    runtimeSessionId: row.runtime_session_id,
+    messageId: row.message_id,
+    activityId: row.activity_id,
+    outputHash: row.output_hash,
+    observedAtMs: row.observed_at_ms,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
     terminalReason: row.terminal_reason,
   };
 }
@@ -234,7 +263,11 @@ export function openAssistantResponseStream({
   const selectActiveRuntimeTurnAdmission = database.prepare(`
     SELECT id, conversation_id, request_id, route_channel, status,
            runtime_session_id, acquired_at, started_at, terminal_at,
-           updated_at, lifecycle_version, lifecycle_observed_at_ms, terminal_reason
+           updated_at, lifecycle_version, lifecycle_observed_at_ms,
+           recovery_activity_observed_at_ms, recovery_activity_id,
+           binding_mode, binding_reason,
+           binding_projection_pending, binding_projection_observed_at_ms,
+           binding_projected_at, terminal_reason
     FROM runtime_turn_admissions
     WHERE status IN ('submitted', 'started')
     ORDER BY id ASC
@@ -243,9 +276,53 @@ export function openAssistantResponseStream({
   const selectRuntimeTurnAdmissionById = database.prepare(`
     SELECT id, conversation_id, request_id, route_channel, status,
            runtime_session_id, acquired_at, started_at, terminal_at,
-           updated_at, lifecycle_version, lifecycle_observed_at_ms, terminal_reason
+           updated_at, lifecycle_version, lifecycle_observed_at_ms,
+           recovery_activity_observed_at_ms, recovery_activity_id,
+           binding_mode, binding_reason,
+           binding_projection_pending, binding_projection_observed_at_ms,
+           binding_projected_at, terminal_reason
     FROM runtime_turn_admissions
     WHERE id = ?
+  `);
+  const selectActiveFinalOutputCandidate = database.prepare(`
+    SELECT id, request_id, admission_id, runtime_session_id, message_id,
+           activity_id, output_hash, observed_at_ms, status,
+           created_at, updated_at, terminal_reason
+    FROM assistant_final_output_candidates
+    WHERE request_id = ? AND status = 'active'
+    ORDER BY id DESC
+    LIMIT 1
+  `);
+  const selectFinalOutputCandidates = database.prepare(`
+    SELECT id, request_id, admission_id, runtime_session_id, message_id,
+           activity_id, output_hash, observed_at_ms, status,
+           created_at, updated_at, terminal_reason
+    FROM assistant_final_output_candidates
+    WHERE request_id = ?
+    ORDER BY id DESC
+  `);
+  const selectExactFinalOutputCandidate = database.prepare(`
+    SELECT id, request_id, admission_id, runtime_session_id, message_id,
+           activity_id, output_hash, observed_at_ms, status,
+           created_at, updated_at, terminal_reason
+    FROM assistant_final_output_candidates
+    WHERE request_id = ? AND admission_id = ? AND message_id = ?
+    LIMIT 1
+  `);
+  const selectPendingRuntimeTurnBindingProjections = database.prepare(`
+    SELECT id, conversation_id, request_id, route_channel, status,
+           runtime_session_id, acquired_at, started_at, terminal_at,
+           updated_at, lifecycle_version, lifecycle_observed_at_ms,
+           recovery_activity_observed_at_ms, recovery_activity_id,
+           binding_mode, binding_reason,
+           binding_projection_pending, binding_projection_observed_at_ms,
+           binding_projected_at, terminal_reason
+    FROM runtime_turn_admissions
+    WHERE binding_projection_pending = 1
+      AND binding_mode = 'closed'
+      AND runtime_session_id IS NOT NULL
+      AND request_id IS NOT NULL
+    ORDER BY id ASC
   `);
   const selectEvents = database.prepare(`
     SELECT id, request_id, sequence, event_type, payload_json, created_at
@@ -296,6 +373,156 @@ export function openAssistantResponseStream({
       `).get(requestRow.request_id, sequence)),
       replayed: false,
     };
+  }
+
+  function closeActiveFinalOutputCandidate(requestId, status, terminalReason) {
+    const current = clock();
+    return database.prepare(`
+      UPDATE assistant_final_output_candidates
+      SET status = ?, updated_at = ?, terminal_reason = ?
+      WHERE request_id = ? AND status = 'active'
+    `).run(status, current, terminalReason, requestId).changes;
+  }
+
+  function verifyRuntimeMutationOwnership({
+    requestId,
+    runtimeSessionId,
+    observedAtMs,
+  }) {
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (
+      !active
+      || active.status !== 'started'
+      || active.request_id !== requestId
+      || active.runtime_session_id !== runtimeSessionId
+    ) {
+      return {
+        verified: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_admission_conflict',
+      };
+    }
+    if (active.binding_mode !== 'bound') {
+      return {
+        verified: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_binding_not_verified',
+      };
+    }
+    if (
+      active.lifecycle_observed_at_ms !== null
+      && observedAtMs < active.lifecycle_observed_at_ms
+    ) {
+      return {
+        verified: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_observation_stale',
+      };
+    }
+    return {
+      verified: true,
+      admission: toRuntimeTurnAdmission(active),
+      row: active,
+    };
+  }
+
+  function runtimeMutationScope(command, idempotencyKey) {
+    const hasSession = Object.hasOwn(command, 'runtimeSessionId');
+    const hasObservation = Object.hasOwn(command, 'observedAtMs');
+    const hasActivity = Object.hasOwn(command, 'activityId');
+    if (!hasObservation && !hasActivity) return null;
+    if (!hasSession || !hasObservation) {
+      throw new TypeError('scoped runtime mutation requires runtimeSessionId and observedAtMs');
+    }
+    return {
+      runtimeSessionId: requireIdentifier(command.runtimeSessionId, 'runtimeSessionId'),
+      observedAtMs: requireInteger(command.observedAtMs, 'observedAtMs', { minimum: 0 }),
+      activityId: requireText(command.activityId ?? idempotencyKey, 'activityId'),
+    };
+  }
+
+  function recordRecoveryActivity({
+    requestId,
+    runtimeSessionId,
+    observedAtMs,
+    activityId,
+    reason,
+  }) {
+    const safeActivityId = requireText(activityId, 'activityId');
+    const ownership = verifyRuntimeMutationOwnership({
+      requestId,
+      runtimeSessionId,
+      observedAtMs,
+    });
+    if (!ownership.verified) return { recorded: false, reason: ownership.reason };
+    const active = ownership.row;
+    const current = clock();
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET recovery_activity_observed_at_ms = CASE
+            WHEN recovery_activity_observed_at_ms IS NULL
+              OR recovery_activity_observed_at_ms < ? THEN ?
+            ELSE recovery_activity_observed_at_ms
+          END,
+          recovery_activity_id = CASE
+            WHEN recovery_activity_observed_at_ms IS NULL
+              OR recovery_activity_observed_at_ms < ? THEN ?
+            WHEN recovery_activity_observed_at_ms = ?
+              AND recovery_activity_id = ? THEN recovery_activity_id
+            WHEN recovery_activity_observed_at_ms = ? THEN NULL
+            ELSE recovery_activity_id
+          END,
+          updated_at = ?, lifecycle_version = lifecycle_version + 1
+      WHERE id = ? AND status = 'started'
+    `).run(
+      observedAtMs,
+      observedAtMs,
+      observedAtMs,
+      safeActivityId,
+      observedAtMs,
+      safeActivityId,
+      observedAtMs,
+      current,
+      active.id,
+    );
+    const candidate = selectActiveFinalOutputCandidate.get(requestId);
+    if (
+      candidate
+      && (
+        observedAtMs > candidate.observed_at_ms
+        || (
+          observedAtMs === candidate.observed_at_ms
+          && safeActivityId !== candidate.activity_id
+        )
+      )
+    ) {
+      closeActiveFinalOutputCandidate(requestId, 'invalidated', reason);
+    }
+    return {
+      recorded: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+    };
+  }
+
+  function validFinalOutputCandidate(request, admission) {
+    const candidate = selectActiveFinalOutputCandidate.get(request.request_id);
+    if (!candidate) return null;
+    const valid = (
+      candidate.admission_id === admission.id
+      && candidate.runtime_session_id === admission.runtime_session_id
+      && request.runtime_session_id === admission.runtime_session_id
+      && request.output_text.trim()
+      && candidate.output_hash === outputHash(request.output_text)
+      && (
+        admission.recovery_activity_observed_at_ms === null
+        || candidate.observed_at_ms > admission.recovery_activity_observed_at_ms
+        || (
+          candidate.observed_at_ms === admission.recovery_activity_observed_at_ms
+          && candidate.activity_id === admission.recovery_activity_id
+        )
+      )
+    );
+    return valid ? candidate : null;
   }
 
   const acceptTransaction = database.transaction(command => {
@@ -462,6 +689,24 @@ export function openAssistantResponseStream({
       case 'BindTurn': {
         const requestId = requireIdentifier(command.requestId, 'requestId');
         const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const admission = selectActiveRuntimeTurnAdmission.get();
+        if (
+          admission
+          && (
+            admission.status !== 'started'
+            || admission.runtime_session_id !== runtimeSessionId
+            || admission.request_id !== requestId
+          )
+        ) {
+          const error = new Error('assistant request does not own the active runtime admission');
+          error.code = 'ASSISTANT_ADMISSION_OWNERSHIP_CONFLICT';
+          throw error;
+        }
+        if (admission?.binding_mode === 'rejected') {
+          const error = new Error('active runtime admission has already rejected request binding');
+          error.code = 'ASSISTANT_ADMISSION_BINDING_REJECTED';
+          throw error;
+        }
         const request = selectRequest.get(requestId);
         if (!request) throw new Error(`assistant request not found: ${requestId}`);
         if (!['queued', 'started'].includes(request.status)) {
@@ -470,6 +715,15 @@ export function openAssistantResponseStream({
           throw error;
         }
         if (request.runtime_session_id === runtimeSessionId) {
+          if (admission) {
+            const current = clock();
+            database.prepare(`
+              UPDATE runtime_turn_admissions
+              SET binding_mode = 'bound', binding_reason = NULL,
+                  updated_at = ?, lifecycle_version = lifecycle_version + 1
+              WHERE id = ? AND status = 'started'
+            `).run(current, admission.id);
+          }
           return { request: toRequest(request), events: [], replayed: true };
         }
         if (request.runtime_session_id !== null) {
@@ -514,6 +768,14 @@ export function openAssistantResponseStream({
             AND status IN ('queued', 'started')
             AND runtime_session_id IS NULL
         `).run(runtimeSessionId, current, requestId);
+        if (admission) {
+          database.prepare(`
+            UPDATE runtime_turn_admissions
+            SET binding_mode = 'bound', binding_reason = NULL,
+                updated_at = ?, lifecycle_version = lifecycle_version + 1
+            WHERE id = ? AND status = 'started'
+          `).run(current, admission.id);
+        }
         return {
           request: toRequest(selectRequest.get(requestId)),
           events,
@@ -524,6 +786,38 @@ export function openAssistantResponseStream({
       case 'BeginNextRun':
       case 'BindNextRun': {
         const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const admission = selectActiveRuntimeTurnAdmission.get();
+        if (admission) {
+          if (
+            admission.status !== 'started'
+            || admission.runtime_session_id !== runtimeSessionId
+          ) {
+            const error = new Error('runtime session does not own the active admission');
+            error.code = 'ASSISTANT_ADMISSION_OWNERSHIP_CONFLICT';
+            throw error;
+          }
+          if (admission.request_id === null) {
+            return {
+              request: null,
+              events: [],
+              replayed: false,
+              unownedAdmission: true,
+            };
+          }
+          if (command.type === 'BeginNextRun') {
+            return {
+              request: null,
+              events: [],
+              replayed: false,
+              conflict: true,
+            };
+          }
+          return executeTransaction({
+            type: 'BindTurn',
+            requestId: admission.request_id,
+            runtimeSessionId,
+          });
+        }
         const existing = database.prepare(`
           SELECT request_id, conversation_id, route_channel, route_endpoint, source_id,
                  status, runtime_session_id, next_sequence, output_text,
@@ -623,7 +917,37 @@ export function openAssistantResponseStream({
           LIMIT 1
         `).get(runtimeSessionId);
         if (!request) return { request: null, events: [], replayed: false };
+        const scope = runtimeMutationScope(command, idempotencyKey);
+        if (scope) {
+          const ownership = verifyRuntimeMutationOwnership({
+            requestId: request.request_id,
+            ...scope,
+          });
+          if (!ownership.verified) {
+            return {
+              request: toRequest(request),
+              events: [],
+              replayed: false,
+              reason: ownership.reason,
+            };
+          }
+        }
         const emitted = appendEvent(request, 'ProgressUpdated', progress, idempotencyKey);
+        if (command.status === 'started' && !emitted.replayed) {
+          if (scope) {
+            recordRecoveryActivity({
+              requestId: request.request_id,
+              ...scope,
+              reason: 'SUBSEQUENT_TOOL_ACTIVITY',
+            });
+          } else {
+            closeActiveFinalOutputCandidate(
+              request.request_id,
+              'invalidated',
+              'SUBSEQUENT_TOOL_ACTIVITY',
+            );
+          }
+        }
         return {
           request: toRequest(selectRequest.get(request.request_id)),
           events: [emitted.event],
@@ -642,7 +966,34 @@ export function openAssistantResponseStream({
         if (!request || request.status !== 'started') {
           return { request: request ? toRequest(request) : null, events: [], replayed: false };
         }
+        const scope = runtimeMutationScope(command, idempotencyKey);
+        if (scope) {
+          const ownership = verifyRuntimeMutationOwnership({ requestId, ...scope });
+          if (!ownership.verified) {
+            return {
+              request: toRequest(request),
+              events: [],
+              replayed: false,
+              reason: ownership.reason,
+            };
+          }
+        }
         const emitted = appendEvent(request, 'ProgressUpdated', progress, idempotencyKey);
+        if (command.status === 'started' && !emitted.replayed) {
+          if (scope) {
+            recordRecoveryActivity({
+              requestId: request.request_id,
+              ...scope,
+              reason: 'SUBSEQUENT_TOOL_ACTIVITY',
+            });
+          } else {
+            closeActiveFinalOutputCandidate(
+              request.request_id,
+              'invalidated',
+              'SUBSEQUENT_TOOL_ACTIVITY',
+            );
+          }
+        }
         return {
           request: toRequest(selectRequest.get(request.request_id)),
           events: [emitted.event],
@@ -660,6 +1011,18 @@ export function openAssistantResponseStream({
         if (request.status !== 'started') {
           throw new Error(`cannot append public reasoning while assistant request is ${request.status}`);
         }
+        const scope = runtimeMutationScope(command, idempotencyKey);
+        if (scope) {
+          const ownership = verifyRuntimeMutationOwnership({ requestId, ...scope });
+          if (!ownership.verified) {
+            return {
+              request: toRequest(request),
+              events: [],
+              replayed: false,
+              reason: ownership.reason,
+            };
+          }
+        }
         const existing = selectEventByKey.get(requestId, idempotencyKey);
         if (existing) {
           const persisted = toEvent(existing);
@@ -676,6 +1039,13 @@ export function openAssistantResponseStream({
           { delta },
           idempotencyKey,
         );
+        if (scope) {
+          recordRecoveryActivity({
+            requestId,
+            ...scope,
+            reason: 'MESSAGE_DISPLAY_CONTINUED',
+          });
+        }
         return {
           request: toRequest(selectRequest.get(requestId)),
           events: [emitted.event],
@@ -711,6 +1081,18 @@ export function openAssistantResponseStream({
         if (request.status !== 'started') {
           throw new Error(`cannot append output while assistant request is ${request.status}`);
         }
+        const scope = runtimeMutationScope(command, idempotencyKey);
+        if (scope) {
+          const ownership = verifyRuntimeMutationOwnership({ requestId, ...scope });
+          if (!ownership.verified) {
+            return {
+              request: toRequest(request),
+              events: [],
+              replayed: false,
+              reason: ownership.reason,
+            };
+          }
+        }
         const existing = selectEventByKey.get(requestId, idempotencyKey);
         if (existing) {
           const persisted = toEvent(existing);
@@ -727,6 +1109,19 @@ export function openAssistantResponseStream({
         database.prepare(`
           UPDATE assistant_requests SET output_text = ?, updated_at = ? WHERE request_id = ?
         `).run(output, clock(), requestId);
+        if (scope) {
+          recordRecoveryActivity({
+            requestId,
+            ...scope,
+            reason: 'OUTPUT_EXTENDED_AFTER_FINAL',
+          });
+        } else {
+          closeActiveFinalOutputCandidate(
+            requestId,
+            'invalidated',
+            'OUTPUT_EXTENDED_AFTER_FINAL',
+          );
+        }
         return {
           request: toRequest(selectRequest.get(requestId)),
           events: [emitted.event],
@@ -750,6 +1145,128 @@ export function openAssistantResponseStream({
           delta: command.delta,
           idempotencyKey: command.idempotencyKey,
         });
+      }
+
+      case 'MarkFinalOutputCandidate': {
+        const requestId = requireIdentifier(command.requestId, 'requestId');
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const messageId = requireText(command.messageId, 'messageId');
+        const observedAtMs = requireInteger(command.observedAtMs, 'observedAtMs', { minimum: 0 });
+        const activityId = requireText(command.activityId ?? messageId, 'activityId');
+        const request = selectRequest.get(requestId);
+        if (!request) throw new Error(`assistant request not found: ${requestId}`);
+        if (request.status !== 'started') {
+          return { marked: false, reason: 'request_not_started', candidate: null };
+        }
+        if (request.runtime_session_id !== runtimeSessionId) {
+          return { marked: false, reason: 'runtime_session_conflict', candidate: null };
+        }
+        const ownership = verifyRuntimeMutationOwnership({
+          requestId,
+          runtimeSessionId,
+          observedAtMs,
+        });
+        if (!ownership.verified) {
+          return { marked: false, reason: ownership.reason, candidate: null };
+        }
+        const admission = ownership.row;
+        const hash = outputHash(request.output_text);
+        const exact = selectExactFinalOutputCandidate.get(requestId, admission.id, messageId);
+        if (exact) {
+          const exactReplay = (
+            exact.runtime_session_id === runtimeSessionId
+            && exact.activity_id === activityId
+            && exact.output_hash === hash
+            && exact.observed_at_ms === observedAtMs
+          );
+          return {
+            marked: exactReplay && exact.status === 'active',
+            replayed: true,
+            reason: exactReplay ? null : 'candidate_event_conflict',
+            candidate: toFinalOutputCandidate(exact),
+          };
+        }
+        const causallyStale = (
+          admission.recovery_activity_observed_at_ms !== null
+          && (
+            observedAtMs < admission.recovery_activity_observed_at_ms
+            || (
+              observedAtMs === admission.recovery_activity_observed_at_ms
+              && activityId !== admission.recovery_activity_id
+            )
+          )
+        );
+        recordRecoveryActivity({
+          requestId,
+          runtimeSessionId,
+          observedAtMs,
+          activityId,
+          reason: 'MESSAGE_DISPLAY_CONTINUED',
+        });
+        if (!request.output_text.trim()) {
+          return { marked: false, reason: 'empty_output', candidate: null };
+        }
+        closeActiveFinalOutputCandidate(requestId, 'invalidated', 'SUPERSEDED_FINAL_OUTPUT');
+        const current = clock();
+        const status = causallyStale ? 'invalidated' : 'active';
+        const terminalReason = causallyStale ? 'RECOVERY_ACTIVITY_AFTER_OUTPUT' : null;
+        const inserted = database.prepare(`
+          INSERT INTO assistant_final_output_candidates (
+            request_id, admission_id, runtime_session_id, message_id,
+            activity_id, output_hash, observed_at_ms, status,
+            created_at, updated_at, terminal_reason
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          requestId,
+          admission.id,
+          runtimeSessionId,
+          messageId,
+          activityId,
+          hash,
+          observedAtMs,
+          status,
+          current,
+          current,
+          terminalReason,
+        );
+        return {
+          marked: status === 'active',
+          replayed: false,
+          reason: terminalReason,
+          candidate: toFinalOutputCandidate(database.prepare(`
+            SELECT id, request_id, admission_id, runtime_session_id, message_id,
+                   activity_id, output_hash, observed_at_ms, status,
+                   created_at, updated_at, terminal_reason
+            FROM assistant_final_output_candidates
+            WHERE id = ?
+          `).get(Number(inserted.lastInsertRowid))),
+        };
+      }
+
+      case 'InvalidateFinalOutputCandidate': {
+        const requestId = requireIdentifier(command.requestId, 'requestId');
+        const runtimeSessionId = requireIdentifier(command.runtimeSessionId, 'runtimeSessionId');
+        const reason = safeErrorCode(command.reason);
+        const existing = selectActiveFinalOutputCandidate.get(requestId);
+        if (!existing) return { invalidated: false, candidate: null };
+        if (existing.runtime_session_id !== runtimeSessionId) {
+          return {
+            invalidated: false,
+            reason: 'runtime_session_conflict',
+            candidate: toFinalOutputCandidate(existing),
+          };
+        }
+        closeActiveFinalOutputCandidate(requestId, 'invalidated', reason);
+        return {
+          invalidated: true,
+          candidate: toFinalOutputCandidate(database.prepare(`
+            SELECT id, request_id, admission_id, runtime_session_id, message_id,
+                   activity_id, output_hash, observed_at_ms, status,
+                   created_at, updated_at, terminal_reason
+            FROM assistant_final_output_candidates
+            WHERE id = ?
+          `).get(existing.id)),
+        };
       }
 
       case 'CompleteRun': {
@@ -782,6 +1299,11 @@ export function openAssistantResponseStream({
           SET status = 'completed', output_text = ?, updated_at = ?, terminal_at = ?
           WHERE request_id = ? AND status IN ('queued', 'started')
         `).run(output, current, current, requestId);
+        closeActiveFinalOutputCandidate(
+          requestId,
+          'consumed',
+          'CANONICAL_RUN_COMPLETED',
+        );
         return {
           request: toRequest(selectRequest.get(requestId)),
           events: emitted,
@@ -842,6 +1364,11 @@ export function openAssistantResponseStream({
           SET status = 'failed', updated_at = ?, terminal_at = ?
           WHERE request_id = ? AND status IN ('queued', 'started')
         `).run(current, current, request.request_id);
+        closeActiveFinalOutputCandidate(
+          request.request_id,
+          'invalidated',
+          code,
+        );
         return {
           request: toRequest(selectRequest.get(request.request_id)),
           events: [failed.event],
@@ -954,12 +1481,14 @@ export function openAssistantResponseStream({
     if (active.status === 'started') {
       if (active.runtime_session_id === safeRuntimeSessionId) {
         const current = clock();
+        // lifecycle_observed_at_ms is the immutable start fence for this
+        // admission. Same-turn hook processes may persist out of timestamp
+        // order, so activity must advance only the recovery generation.
         database.prepare(`
           UPDATE runtime_turn_admissions
-          SET updated_at = ?, lifecycle_version = lifecycle_version + 1,
-              lifecycle_observed_at_ms = COALESCE(?, lifecycle_observed_at_ms)
+          SET updated_at = ?, lifecycle_version = lifecycle_version + 1
           WHERE id = ? AND status = 'started' AND runtime_session_id = ?
-        `).run(current, safeObservedAtMs, active.id, safeRuntimeSessionId);
+        `).run(current, active.id, safeRuntimeSessionId);
         return {
           started: true,
           admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
@@ -977,7 +1506,8 @@ export function openAssistantResponseStream({
     database.prepare(`
       UPDATE runtime_turn_admissions
       SET status = 'started', runtime_session_id = ?, started_at = ?, updated_at = ?,
-          lifecycle_version = lifecycle_version + 1, lifecycle_observed_at_ms = ?
+          lifecycle_version = lifecycle_version + 1,
+          lifecycle_observed_at_ms = COALESCE(?, lifecycle_observed_at_ms)
       WHERE id = ? AND status = 'submitted'
     `).run(safeRuntimeSessionId, current, current, safeObservedAtMs, active.id);
     return {
@@ -1024,14 +1554,80 @@ export function openAssistantResponseStream({
     }
 
     const current = clock();
+    // Keep the turn-start observation fence stable. A later MessageDisplay or
+    // async tool hook must not make the logically terminal Stop look stale.
     database.prepare(`
       UPDATE runtime_turn_admissions
-      SET updated_at = ?, lifecycle_version = lifecycle_version + 1,
-          lifecycle_observed_at_ms = COALESCE(?, lifecycle_observed_at_ms)
+      SET updated_at = ?, lifecycle_version = lifecycle_version + 1
       WHERE id = ? AND status = 'started' AND runtime_session_id = ?
-    `).run(current, safeObservedAtMs, active.id, safeRuntimeSessionId);
+    `).run(current, active.id, safeRuntimeSessionId);
     return {
       touched: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+    };
+  });
+
+  const rejectRuntimeTurnBindingTransaction = database.transaction(({
+    runtimeSessionId,
+    reason,
+    observedAtMs = null,
+  }) => {
+    const safeRuntimeSessionId = requireIdentifier(runtimeSessionId, 'runtimeSessionId');
+    const safeReason = requireText(reason, 'reason', 64);
+    const safeObservedAtMs = observedAtMs === null
+      ? null
+      : requireInteger(observedAtMs, 'observedAtMs', { minimum: 0 });
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (!active || active.status !== 'started') {
+      return {
+        rejected: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_not_started',
+      };
+    }
+    if (active.runtime_session_id !== safeRuntimeSessionId) {
+      return {
+        rejected: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_session_conflict',
+      };
+    }
+    if (
+      safeObservedAtMs !== null
+      && active.lifecycle_observed_at_ms !== null
+      && safeObservedAtMs < active.lifecycle_observed_at_ms
+    ) {
+      return {
+        rejected: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_observation_stale',
+      };
+    }
+    if (active.binding_mode === 'bound') {
+      return {
+        rejected: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_already_bound',
+      };
+    }
+    if (active.binding_mode === 'rejected') {
+      return {
+        rejected: true,
+        replayed: true,
+        admission: toRuntimeTurnAdmission(active),
+        reason: active.binding_reason === safeReason
+          ? null
+          : 'runtime_turn_binding_already_rejected',
+      };
+    }
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET binding_mode = 'rejected', binding_reason = ?,
+          updated_at = ?, lifecycle_version = lifecycle_version + 1
+      WHERE id = ? AND status = 'started'
+    `).run(safeReason, clock(), active.id);
+    return {
+      rejected: true,
       admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
     };
   });
@@ -1040,12 +1636,30 @@ export function openAssistantResponseStream({
     runtimeSessionId,
     reason = 'stop',
     observedAtMs = null,
+    requestId = null,
+    output = null,
+    failureCode = null,
+    retryable = null,
   }) => {
     const safeRuntimeSessionId = requireIdentifier(runtimeSessionId, 'runtimeSessionId');
     const safeReason = requireText(reason, 'reason', 64);
     const safeObservedAtMs = observedAtMs === null
       ? null
       : requireInteger(observedAtMs, 'observedAtMs', { minimum: 0 });
+    const safeRequestId = requestId === null
+      ? null
+      : requireIdentifier(requestId, 'requestId');
+    const hasFinalization = output !== null || failureCode !== null || retryable !== null;
+    if (hasFinalization && (output === null) === (failureCode === null)) {
+      throw new TypeError('runtime turn finalization requires exactly one of output or failureCode');
+    }
+    const safeOutput = output === null
+      ? null
+      : boundedUtf8(output, 'output', MAX_OUTPUT_BYTES);
+    const safeFailureCode = failureCode === null ? null : safeErrorCode(failureCode);
+    if (safeFailureCode !== null && typeof retryable !== 'boolean') {
+      throw new TypeError('retryable must be a boolean for failed runtime finalization');
+    }
     const active = selectActiveRuntimeTurnAdmission.get();
     if (!active) return { finished: false, admission: null, reason: 'no_active_admission' };
     if (active.status !== 'started') {
@@ -1077,17 +1691,94 @@ export function openAssistantResponseStream({
       };
     }
 
+    if (safeRequestId !== null && active.request_id !== safeRequestId) {
+      return {
+        finished: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_request_conflict',
+      };
+    }
+
+    const effectiveRequestId = active.request_id;
+    let finalization = { request: null, events: [] };
+    let finalizationDisposition = effectiveRequestId === null
+      ? 'requestless_runtime_turn'
+      : 'request_not_finalized';
+    if (effectiveRequestId !== null) {
+      const request = selectRequest.get(effectiveRequestId);
+      if (
+        !request
+        || (
+          active.binding_mode === 'bound'
+          && request.runtime_session_id !== safeRuntimeSessionId
+        )
+      ) {
+        return {
+          finished: false,
+          admission: toRuntimeTurnAdmission(active),
+          reason: 'runtime_request_conflict',
+        };
+      }
+      const candidate = active.binding_mode === 'bound' && safeOutput === null
+        ? validFinalOutputCandidate(request, active)
+        : null;
+      if (active.binding_mode === 'bound' && (safeOutput !== null || candidate)) {
+        finalization = executeTransaction({
+          type: 'CompleteRun',
+          requestId: effectiveRequestId,
+          output: safeOutput ?? request.output_text,
+        });
+        finalizationDisposition = candidate
+          ? 'completed_from_final_output'
+          : 'completed_from_stop';
+      } else {
+        const terminalCode = active.binding_mode !== 'bound'
+          ? 'RUNTIME_TURN_BINDING_NOT_VERIFIED'
+          : (hasFinalization ? safeFailureCode : 'RUNTIME_TURN_FINISHED_WITHOUT_RESPONSE');
+        finalization = executeTransaction({
+          type: 'FailRun',
+          requestId: effectiveRequestId,
+          code: terminalCode,
+          retryable: hasFinalization && active.binding_mode === 'bound' ? retryable : true,
+        });
+        finalizationDisposition = active.binding_mode === 'bound'
+          ? 'failed_from_stop'
+          : 'failed_unverified_binding';
+      }
+    }
+
     const current = clock();
+    const projectionObservedAtMs = safeObservedAtMs ?? requireInteger(
+      observationClock(),
+      'observationClock result',
+      { minimum: 0 },
+    );
     database.prepare(`
       UPDATE runtime_turn_admissions
       SET status = 'completed', runtime_session_id = COALESCE(runtime_session_id, ?),
           terminal_at = ?, updated_at = ?, lifecycle_version = lifecycle_version + 1,
-          lifecycle_observed_at_ms = COALESCE(?, lifecycle_observed_at_ms), terminal_reason = ?
+          binding_mode = CASE WHEN request_id IS NULL THEN binding_mode ELSE 'closed' END,
+          binding_reason = CASE WHEN request_id IS NULL THEN binding_reason ELSE ? END,
+          binding_projection_pending = CASE WHEN request_id IS NULL THEN 0 ELSE 1 END,
+          binding_projection_observed_at_ms = CASE
+            WHEN request_id IS NULL THEN binding_projection_observed_at_ms ELSE ? END,
+          terminal_reason = ?
       WHERE id = ? AND status = 'started'
-    `).run(safeRuntimeSessionId, current, current, safeObservedAtMs, safeReason, active.id);
+    `).run(
+      safeRuntimeSessionId,
+      current,
+      current,
+      finalizationDisposition,
+      projectionObservedAtMs,
+      safeReason,
+      active.id,
+    );
     return {
       finished: true,
+      disposition: finalizationDisposition,
       admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+      request: finalization.request,
+      events: finalization.events,
     };
   });
 
@@ -1152,34 +1843,112 @@ export function openAssistantResponseStream({
     }
 
     const events = [];
+    let disposition = active.request_id
+      ? 'failed_without_final_output'
+      : 'released_without_request';
+    let admissionTerminalReason = safeReason;
     if (active.request_id) {
       const request = selectRequest.get(active.request_id);
+      if (request && TERMINAL_STATUSES.has(request.status)) {
+        disposition = `released_after_${request.status}_request`;
+      }
       if (request && !TERMINAL_STATUSES.has(request.status)) {
-        const failed = appendEvent(request, 'RunFailed', {
-          code: 'RUNTIME_TURN_RECOVERED_AFTER_IDLE',
-          retryable: true,
-        });
-        const terminalAt = clock();
-        database.prepare(`
-          UPDATE assistant_requests
-          SET status = 'failed', updated_at = ?, terminal_at = ?
-          WHERE request_id = ? AND status IN ('queued', 'started')
-        `).run(terminalAt, terminalAt, request.request_id);
-        events.push(failed.event);
+        const candidate = active.binding_mode === 'bound'
+          ? validFinalOutputCandidate(request, active)
+          : null;
+        const canCompleteFromFinalOutput = Boolean(candidate);
+        if (canCompleteFromFinalOutput) {
+          const completed = appendEvent(request, 'RunCompleted', {
+            output: request.output_text,
+          });
+          const terminalAt = clock();
+          database.prepare(`
+            UPDATE assistant_requests
+            SET status = 'completed', updated_at = ?, terminal_at = ?
+            WHERE request_id = ? AND status IN ('queued', 'started')
+          `).run(terminalAt, terminalAt, request.request_id);
+          closeActiveFinalOutputCandidate(
+            request.request_id,
+            'consumed',
+            'RUNTIME_IDLE_FINAL_OUTPUT_RECOVERY',
+          );
+          admissionTerminalReason = safeReason === 'runtime_sustained_idle'
+            ? 'runtime_sustained_idle_final_output'
+            : 'runtime_final_output_recovery';
+          disposition = 'completed_from_final_output';
+          events.push(completed.event);
+        } else {
+          const failed = appendEvent(request, 'RunFailed', {
+            code: 'RUNTIME_TURN_RECOVERED_AFTER_IDLE',
+            retryable: true,
+          });
+          const terminalAt = clock();
+          database.prepare(`
+            UPDATE assistant_requests
+            SET status = 'failed', updated_at = ?, terminal_at = ?
+            WHERE request_id = ? AND status IN ('queued', 'started')
+          `).run(terminalAt, terminalAt, request.request_id);
+          closeActiveFinalOutputCandidate(
+            request.request_id,
+            'invalidated',
+            'RUNTIME_TURN_RECOVERED_AFTER_IDLE',
+          );
+          events.push(failed.event);
+        }
       }
     }
 
     const current = clock();
+    const projectionObservedAtMs = requireInteger(
+      observationClock(),
+      'observationClock result',
+      { minimum: 0 },
+    );
     database.prepare(`
       UPDATE runtime_turn_admissions
-      SET status = 'released', terminal_at = ?, updated_at = ?, terminal_reason = ?
+      SET status = 'released', terminal_at = ?, updated_at = ?, terminal_reason = ?,
+          binding_mode = CASE WHEN request_id IS NULL THEN binding_mode ELSE 'closed' END,
+          binding_reason = CASE WHEN request_id IS NULL THEN binding_reason ELSE ? END,
+          binding_projection_pending = CASE WHEN request_id IS NULL THEN 0 ELSE 1 END,
+          binding_projection_observed_at_ms = CASE
+            WHEN request_id IS NULL THEN binding_projection_observed_at_ms ELSE ? END
       WHERE id = ? AND status = 'started'
-    `).run(current, current, safeReason, active.id);
+    `).run(
+      current,
+      current,
+      admissionTerminalReason,
+      disposition,
+      projectionObservedAtMs,
+      active.id,
+    );
     return {
       recovered: true,
+      disposition,
       admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
       request: active.request_id ? toRequest(selectRequest.get(active.request_id)) : null,
       events,
+    };
+  });
+
+  const ackRuntimeTurnBindingProjectionTransaction = database.transaction(({
+    admissionId,
+  }) => {
+    const safeAdmissionId = requireInteger(admissionId, 'admissionId', { minimum: 1 });
+    const admission = selectRuntimeTurnAdmissionById.get(safeAdmissionId);
+    if (!admission || admission.binding_projection_pending !== 1) {
+      return {
+        acknowledged: false,
+        admission: toRuntimeTurnAdmission(admission),
+      };
+    }
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET binding_projection_pending = 0, binding_projected_at = ?, updated_at = ?
+      WHERE id = ? AND binding_projection_pending = 1 AND binding_mode = 'closed'
+    `).run(clock(), clock(), safeAdmissionId);
+    return {
+      acknowledged: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(safeAdmissionId)),
     };
   });
 
@@ -1208,15 +1977,24 @@ export function openAssistantResponseStream({
           ['type', 'runtimeSessionId', 'stage', 'idempotencyKey'],
         ],
         ReportToolProgress: [
-          ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
+          [
+            'type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey',
+            'observedAtMs', 'activityId',
+          ],
           ['type', 'runtimeSessionId', 'toolName', 'status', 'idempotencyKey'],
         ],
         ReportRequestToolProgress: [
-          ['type', 'requestId', 'toolName', 'status', 'idempotencyKey'],
+          [
+            'type', 'requestId', 'runtimeSessionId', 'observedAtMs',
+            'activityId', 'toolName', 'status', 'idempotencyKey',
+          ],
           ['type', 'requestId', 'toolName', 'status', 'idempotencyKey'],
         ],
         AppendPublicReasoningDelta: [
-          ['type', 'requestId', 'delta', 'idempotencyKey'],
+          [
+            'type', 'requestId', 'delta', 'idempotencyKey',
+            'runtimeSessionId', 'observedAtMs', 'activityId',
+          ],
           ['type', 'requestId', 'delta', 'idempotencyKey'],
         ],
         AppendRuntimePublicReasoningDelta: [
@@ -1224,12 +2002,26 @@ export function openAssistantResponseStream({
           ['type', 'runtimeSessionId', 'delta', 'idempotencyKey'],
         ],
         AppendOutputDelta: [
-          ['type', 'requestId', 'delta', 'idempotencyKey'],
+          [
+            'type', 'requestId', 'delta', 'idempotencyKey',
+            'runtimeSessionId', 'observedAtMs', 'activityId',
+          ],
           ['type', 'requestId', 'delta', 'idempotencyKey'],
         ],
         AppendRuntimeOutputDelta: [
           ['type', 'runtimeSessionId', 'delta', 'idempotencyKey'],
           ['type', 'runtimeSessionId', 'delta', 'idempotencyKey'],
+        ],
+        MarkFinalOutputCandidate: [
+          [
+            'type', 'requestId', 'runtimeSessionId', 'messageId',
+            'observedAtMs', 'activityId',
+          ],
+          ['type', 'requestId', 'runtimeSessionId', 'messageId', 'observedAtMs'],
+        ],
+        InvalidateFinalOutputCandidate: [
+          ['type', 'requestId', 'runtimeSessionId', 'reason'],
+          ['type', 'requestId', 'runtimeSessionId', 'reason'],
         ],
         CompleteRun: [['type', 'requestId', 'output'], ['type', 'requestId', 'output']],
         CompleteRuntimeRun: [
@@ -1258,6 +2050,21 @@ export function openAssistantResponseStream({
       };
     },
 
+    queryFinalOutputCandidates({ requestId } = {}) {
+      const id = requireIdentifier(requestId, 'requestId');
+      return selectFinalOutputCandidates.all(id).map(toFinalOutputCandidate);
+    },
+
+    queryPendingRuntimeTurnBindingProjections() {
+      return selectPendingRuntimeTurnBindingProjections.all().map(toRuntimeTurnAdmission);
+    },
+
+    ackRuntimeTurnBindingProjection(input = {}) {
+      return ackRuntimeTurnBindingProjectionTransaction.immediate(
+        requireRecord(input, 'runtime turn binding projection acknowledgement'),
+      );
+    },
+
     findStartedRequest({ excludingRequestId = null } = {}) {
       const excluded = excludingRequestId === null
         ? null
@@ -1278,6 +2085,12 @@ export function openAssistantResponseStream({
 
     touchRuntimeTurn(input = {}) {
       return touchRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn activity'));
+    },
+
+    rejectRuntimeTurnBinding(input = {}) {
+      return rejectRuntimeTurnBindingTransaction.immediate(
+        requireRecord(input, 'runtime turn binding rejection'),
+      );
     },
 
     finishRuntimeTurn(input = {}) {

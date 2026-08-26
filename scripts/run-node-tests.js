@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -47,8 +48,29 @@ if (testFiles.length === 0) {
 }
 
 console.log(`Running ${testFiles.length} Node test files`);
-const result = spawnSync(process.execPath, ['--experimental-test-module-mocks', '--test', ...testFiles], {
-  stdio: 'inherit',
-});
+// Some CLI modules resolve ~/zylos eagerly at import time and their rollback
+// tests intentionally remove installation files. Never let an ordinary test
+// invocation inherit the live runtime directory.
+const isolatedHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-node-tests-home-'));
+const isolatedZylosDir = path.join(isolatedHomeDir, 'zylos');
+fs.mkdirSync(isolatedZylosDir, { recursive: true });
+let result;
+try {
+  result = spawnSync(
+    process.execPath,
+    ['--experimental-test-module-mocks', '--test', ...testFiles],
+    {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        HOME: isolatedHomeDir,
+        ZYLOS_DIR: isolatedZylosDir,
+        ZYLOS_TEST_ISOLATED: '1',
+      },
+    },
+  );
+} finally {
+  fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
+}
 
-process.exit(result.status ?? 1);
+process.exit(result?.status ?? 1);

@@ -64,6 +64,7 @@ beforeEach(() => {
     'skills/comm-bridge/scripts/c4-receive.js',
     'skills/comm-bridge/scripts/c4-dispatcher.js',
     'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+    'skills/activity-monitor/scripts/assistant-turn-binding.js',
   ]) {
     writeFile(packageDir, relativePath, '#!/usr/bin/env node\n');
   }

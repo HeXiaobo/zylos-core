@@ -23,6 +23,11 @@ const MIN_AVAILABLE_KB = 5 * 1024 * 1024;
 const FEISHU_REQUIRED_CORE_PROTOCOLS = Object.freeze({
   'c4.reply': 2,
   'c4.reply.argv-compat': 1,
+  'c4.assistant-response-stream': 3,
+  'c4.outbound-delivery-id': 1,
+  'work-intake': 1,
+  'commitment-core': 1,
+  'projection-outbox': 1,
   'external-task-adapter': 1,
   'task-reminder': 1,
 });
@@ -37,6 +42,7 @@ const CORE_ASSETS = Object.freeze([
   'skills/comm-bridge/scripts/c4-receive.js',
   'skills/comm-bridge/scripts/c4-dispatcher.js',
   'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+  'skills/activity-monitor/scripts/assistant-turn-binding.js',
   'scripts/upgrade-fork-pair.js',
   'scripts/upgrade-fork-pair.sh',
 ]);

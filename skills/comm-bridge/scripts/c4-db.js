@@ -250,6 +250,20 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       lifecycle_version INTEGER NOT NULL DEFAULT 0 CHECK (lifecycle_version >= 0),
       lifecycle_observed_at_ms INTEGER
         CHECK (lifecycle_observed_at_ms IS NULL OR lifecycle_observed_at_ms >= 0),
+      recovery_activity_observed_at_ms INTEGER
+        CHECK (recovery_activity_observed_at_ms IS NULL OR recovery_activity_observed_at_ms >= 0),
+      recovery_activity_id TEXT,
+      binding_mode TEXT NOT NULL DEFAULT 'pending'
+        CHECK (binding_mode IN ('pending', 'bound', 'rejected', 'closed')),
+      binding_reason TEXT,
+      binding_projection_pending INTEGER NOT NULL DEFAULT 0
+        CHECK (binding_projection_pending IN (0, 1)),
+      binding_projection_observed_at_ms INTEGER
+        CHECK (
+          binding_projection_observed_at_ms IS NULL
+          OR binding_projection_observed_at_ms >= 0
+        ),
+      binding_projected_at INTEGER,
       terminal_reason TEXT,
       FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT,
       FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
@@ -262,6 +276,32 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       ON runtime_turn_admissions(conversation_id, id);
     CREATE INDEX IF NOT EXISTS idx_runtime_turn_admissions_session
       ON runtime_turn_admissions(runtime_session_id, status, id);
+
+    CREATE TABLE IF NOT EXISTS assistant_final_output_candidates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL,
+      admission_id INTEGER NOT NULL,
+      runtime_session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      activity_id TEXT NOT NULL,
+      output_hash TEXT NOT NULL CHECK (length(output_hash) = 64),
+      observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+      status TEXT NOT NULL
+        CHECK (status IN ('active', 'consumed', 'invalidated')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_reason TEXT,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+      FOREIGN KEY (admission_id) REFERENCES runtime_turn_admissions(id) ON DELETE RESTRICT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_final_output_one_active
+      ON assistant_final_output_candidates(request_id)
+      WHERE status = 'active';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_final_output_exact_event
+      ON assistant_final_output_candidates(request_id, admission_id, message_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_final_output_request
+      ON assistant_final_output_candidates(request_id, id);
   `);
 
   const eventColumns = getColumnNames(database, 'assistant_response_events');
@@ -271,6 +311,27 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       ADD COLUMN redrive_count INTEGER NOT NULL DEFAULT 0
         CHECK (redrive_count >= 0)
     `);
+  }
+
+  const finalOutputColumns = getColumnNames(database, 'assistant_final_output_candidates');
+  if (!finalOutputColumns.has('observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE assistant_final_output_candidates
+      ADD COLUMN observed_at_ms INTEGER CHECK (observed_at_ms IS NULL OR observed_at_ms >= 0)
+    `);
+    database.prepare(`
+      UPDATE assistant_final_output_candidates
+      SET observed_at_ms = ?
+      WHERE observed_at_ms IS NULL
+    `).run(observationClock());
+  }
+  if (!finalOutputColumns.has('activity_id')) {
+    database.exec('ALTER TABLE assistant_final_output_candidates ADD COLUMN activity_id TEXT');
+    database.prepare(`
+      UPDATE assistant_final_output_candidates
+      SET activity_id = 'legacy-candidate:' || id
+      WHERE activity_id IS NULL
+    `).run();
   }
 
   const runtimeTurnColumns = getColumnNames(database, 'runtime_turn_admissions');
@@ -287,6 +348,46 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       ADD COLUMN lifecycle_observed_at_ms INTEGER
         CHECK (lifecycle_observed_at_ms IS NULL OR lifecycle_observed_at_ms >= 0)
     `);
+  }
+  if (!runtimeTurnColumns.has('recovery_activity_observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN recovery_activity_observed_at_ms INTEGER
+        CHECK (recovery_activity_observed_at_ms IS NULL OR recovery_activity_observed_at_ms >= 0)
+    `);
+  }
+  if (!runtimeTurnColumns.has('recovery_activity_id')) {
+    database.exec('ALTER TABLE runtime_turn_admissions ADD COLUMN recovery_activity_id TEXT');
+  }
+  if (!runtimeTurnColumns.has('binding_mode')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN binding_mode TEXT NOT NULL DEFAULT 'pending'
+        CHECK (binding_mode IN ('pending', 'bound', 'rejected', 'closed'))
+    `);
+  }
+  if (!runtimeTurnColumns.has('binding_reason')) {
+    database.exec('ALTER TABLE runtime_turn_admissions ADD COLUMN binding_reason TEXT');
+  }
+  if (!runtimeTurnColumns.has('binding_projection_pending')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN binding_projection_pending INTEGER NOT NULL DEFAULT 0
+        CHECK (binding_projection_pending IN (0, 1))
+    `);
+  }
+  if (!runtimeTurnColumns.has('binding_projection_observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN binding_projection_observed_at_ms INTEGER
+        CHECK (
+          binding_projection_observed_at_ms IS NULL
+          OR binding_projection_observed_at_ms >= 0
+        )
+    `);
+  }
+  if (!runtimeTurnColumns.has('binding_projected_at')) {
+    database.exec('ALTER TABLE runtime_turn_admissions ADD COLUMN binding_projected_at INTEGER');
   }
   // A NULL observation baseline would let the first delayed hook after an
   // upgrade define the new generation. Conservatively fence every active

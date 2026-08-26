@@ -85,6 +85,15 @@ test('migrates existing runtime admissions with lifecycle fences', (t) => {
   const columns = migrated.prepare('PRAGMA table_info(runtime_turn_admissions)').all();
   assert.equal(columns.some(column => column.name === 'lifecycle_version'), true);
   assert.equal(columns.some(column => column.name === 'lifecycle_observed_at_ms'), true);
+  assert.equal(columns.some(column => column.name === 'recovery_activity_observed_at_ms'), true);
+  assert.equal(columns.some(column => column.name === 'recovery_activity_id'), true);
+  assert.equal(columns.some(column => column.name === 'binding_mode'), true);
+  assert.equal(columns.some(column => column.name === 'binding_projection_pending'), true);
+  const candidateColumns = migrated.prepare(
+    'PRAGMA table_info(assistant_final_output_candidates)',
+  ).all();
+  assert.equal(candidateColumns.some(column => column.name === 'observed_at_ms'), true);
+  assert.equal(candidateColumns.some(column => column.name === 'activity_id'), true);
   migrated.close();
 });
 
@@ -221,6 +230,331 @@ test('serializes every runtime conversation from submission through terminal hoo
   assert.equal(released.released, true);
   assert.equal(released.admission.status, 'released');
   assert.equal(stream.getActiveRuntimeTurn(), null);
+  stream.close();
+});
+
+test('atomically finalizes the bound request with its runtime admission', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.atomic-stop',
+    sourceId: 'om_atomic_stop',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_atomic_stop' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'atomic-stop-session',
+    observedAtMs: 1_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'atomic-stop-session',
+  });
+
+  const finished = stream.finishRuntimeTurn({
+    runtimeSessionId: 'atomic-stop-session',
+    reason: 'stop',
+    observedAtMs: 1_100,
+    requestId: accepted.request.requestId,
+    output: 'atomic canonical answer',
+  });
+
+  assert.equal(finished.finished, true);
+  assert.equal(finished.admission.status, 'completed');
+  assert.equal(finished.request.status, 'completed');
+  assert.equal(finished.request.output, 'atomic canonical answer');
+  assert.deepEqual(finished.events.map(event => event.type), ['RunCompleted']);
+  assert.equal(stream.getActiveRuntimeTurn(), null);
+  stream.close();
+});
+
+test('rolls back request finalization when admission terminalization aborts', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-atomic-stop-rollback-'));
+  const dbPath = path.join(directory, 'c4.db');
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const stream = openAssistantResponseStream({
+    dbPath,
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.atomic-stop-rollback',
+    sourceId: 'om_atomic_stop_rollback',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_atomic_stop_rollback' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'atomic-stop-rollback-session',
+    observedAtMs: 1_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'atomic-stop-rollback-session',
+  });
+
+  const faultDatabase = new Database(dbPath);
+  faultDatabase.exec(`
+    CREATE TRIGGER fail_runtime_admission_terminalization
+    BEFORE UPDATE OF status ON runtime_turn_admissions
+    WHEN NEW.status = 'completed'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected admission terminalization failure');
+    END;
+  `);
+  faultDatabase.close();
+
+  assert.throws(
+    () => stream.finishRuntimeTurn({
+      runtimeSessionId: 'atomic-stop-rollback-session',
+      reason: 'stop',
+      observedAtMs: 1_100,
+      requestId: accepted.request.requestId,
+      output: 'must roll back with admission',
+    }),
+    /injected admission terminalization failure/,
+  );
+
+  const requestAfterFailure = stream.query({ requestId: accepted.request.requestId });
+  assert.equal(requestAfterFailure.request.status, 'started');
+  assert.equal(
+    requestAfterFailure.events.some(event => event.type === 'RunCompleted'),
+    false,
+  );
+  const admissionAfterFailure = stream.getActiveRuntimeTurn();
+  assert.equal(admissionAfterFailure.status, 'started');
+  assert.equal(admissionAfterFailure.bindingMode, 'bound');
+  assert.equal(admissionAfterFailure.bindingProjectionPending, false);
+  stream.close();
+});
+
+test('derives a missing best-effort binding from the durable admission owner', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.durable-stop-owner',
+    sourceId: 'om_durable_stop_owner',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_durable_stop_owner' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'durable-stop-owner-session',
+    observedAtMs: 1_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'durable-stop-owner-session',
+  });
+
+  const finished = stream.finishRuntimeTurn({
+    runtimeSessionId: 'durable-stop-owner-session',
+    reason: 'stop',
+    observedAtMs: 1_100,
+    output: 'answer recovered from durable ownership',
+  });
+
+  assert.equal(finished.finished, true);
+  assert.equal(finished.request.requestId, accepted.request.requestId);
+  assert.equal(finished.request.status, 'completed');
+  assert.equal(finished.request.output, 'answer recovered from durable ownership');
+  stream.close();
+});
+
+test('a requestless HXA admission cannot bind or finalize an unrelated assistant request', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.must-not-belong-to-hxa',
+    sourceId: 'om_must_not_belong_to_hxa',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_must_not_belong_to_hxa' },
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: null,
+    routeChannel: 'hxa-connect',
+  });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'requestless-hxa-session',
+    observedAtMs: 1_000,
+  });
+
+  assert.throws(
+    () => stream.execute({
+      type: 'BindTurn',
+      requestId: accepted.request.requestId,
+      runtimeSessionId: 'requestless-hxa-session',
+    }),
+    error => error.code === 'ASSISTANT_ADMISSION_OWNERSHIP_CONFLICT',
+  );
+  const legacy = stream.execute({
+    type: 'BindNextRun',
+    runtimeSessionId: 'requestless-hxa-session',
+  });
+  assert.equal(legacy.request, null);
+
+  const finished = stream.finishRuntimeTurn({
+    runtimeSessionId: 'requestless-hxa-session',
+    reason: 'stop',
+    observedAtMs: 1_100,
+    requestId: accepted.request.requestId,
+    output: 'HXA output must not complete Feishu',
+  });
+  assert.equal(finished.finished, false);
+  assert.equal(finished.reason, 'runtime_request_conflict');
+  assert.equal(stream.getActiveRuntimeTurn().status, 'started');
+  assert.equal(stream.query({ requestId: accepted.request.requestId }).request.status, 'started');
+  stream.close();
+});
+
+test('a durable rejected binding cannot be rebound by a later fallback hook', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.binding-rejected',
+    sourceId: 'om_binding_rejected',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_binding_rejected' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'binding-rejected-session',
+    observedAtMs: 1_000,
+  });
+  const rejected = stream.rejectRuntimeTurnBinding({
+    runtimeSessionId: 'binding-rejected-session',
+    reason: 'missing_terminal_marker',
+    observedAtMs: 1_010,
+  });
+  assert.equal(rejected.rejected, true);
+  assert.equal(rejected.admission.bindingMode, 'rejected');
+
+  assert.throws(
+    () => stream.execute({
+      type: 'BindTurn',
+      requestId: accepted.request.requestId,
+      runtimeSessionId: 'binding-rejected-session',
+    }),
+    error => error.code === 'ASSISTANT_ADMISSION_BINDING_REJECTED',
+  );
+  const replayedRejection = stream.rejectRuntimeTurnBinding({
+    runtimeSessionId: 'binding-rejected-session',
+    reason: 'missing_terminal_marker',
+    observedAtMs: 1_020,
+  });
+  assert.equal(replayedRejection.rejected, true);
+  assert.equal(replayedRejection.replayed, true);
+  assert.equal(stream.getActiveRuntimeTurn().bindingMode, 'rejected');
+  assert.equal(stream.query({ requestId: accepted.request.requestId }).request.runtimeSessionId, null);
+  stream.close();
+});
+
+test('rejects misrouted request-scoped mutations before writing any event or output', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const requestA = accept(stream, {
+    requestId: 'assistant.feishu.sqlite-owner-a',
+    sourceId: 'om_sqlite_owner_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_sqlite_owner_a' },
+  });
+  stream.execute({ type: 'StartRun', requestId: requestA.request.requestId });
+  const requestB = accept(stream, {
+    requestId: 'assistant.feishu.sqlite-owner-b',
+    sourceId: 'om_sqlite_owner_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_sqlite_owner_b' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: requestB.request.conversationId,
+    requestId: requestB.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: requestB.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'sqlite-owner-session-b',
+    observedAtMs: 1_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: requestB.request.requestId,
+    runtimeSessionId: 'sqlite-owner-session-b',
+  });
+
+  const attempts = [
+    {
+      type: 'ReportRequestToolProgress',
+      requestId: requestA.request.requestId,
+      runtimeSessionId: 'sqlite-owner-session-b',
+      observedAtMs: 1_100,
+      activityId: 'misrouted-tool',
+      toolName: 'Read',
+      status: 'started',
+      idempotencyKey: 'misrouted-tool',
+    },
+    {
+      type: 'AppendPublicReasoningDelta',
+      requestId: requestA.request.requestId,
+      runtimeSessionId: 'sqlite-owner-session-b',
+      observedAtMs: 1_110,
+      activityId: 'misrouted-reasoning',
+      delta: 'must not persist',
+      idempotencyKey: 'misrouted-reasoning',
+    },
+    {
+      type: 'AppendOutputDelta',
+      requestId: requestA.request.requestId,
+      runtimeSessionId: 'sqlite-owner-session-b',
+      observedAtMs: 1_120,
+      activityId: 'misrouted-output',
+      delta: 'misrouted secret',
+      idempotencyKey: 'misrouted-output',
+    },
+  ];
+  for (const command of attempts) {
+    const result = stream.execute(command);
+    assert.equal(result.reason, 'runtime_admission_conflict');
+    assert.deepEqual(result.events, []);
+  }
+
+  const unchanged = stream.query({ requestId: requestA.request.requestId });
+  assert.equal(unchanged.request.output, '');
+  assert.equal(
+    unchanged.events.some(event => [
+      'ProgressUpdated',
+      'PublicReasoningDelta',
+      'OutputDelta',
+    ].includes(event.type)),
+    false,
+  );
   stream.close();
 });
 
@@ -364,6 +698,321 @@ test('never age-expires a started turn and requires explicit idle reconciliation
   stream.close();
 });
 
+test('idle recovery completes a fenced final-output candidate when Stop is lost', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    clock: () => now++,
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.final-output-recovery',
+    sourceId: 'om_final_output_recovery',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_final_output_recovery' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'final-output-recovery-session',
+    observedAtMs: 1_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'final-output-recovery-session',
+  });
+  stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: accepted.request.requestId,
+    delta: 'durable final answer',
+    idempotencyKey: 'display:final-output-recovery:0',
+  });
+  const candidate = stream.execute({
+    type: 'MarkFinalOutputCandidate',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'final-output-recovery-session',
+    messageId: 'message-final-output-recovery',
+    observedAtMs: 1_100,
+  });
+  assert.equal(candidate.marked, true);
+
+  const active = stream.getActiveRuntimeTurn();
+  const recovered = stream.recoverRuntimeTurn({
+    admissionId: active.admissionId,
+    expectedLifecycleVersion: active.lifecycleVersion,
+    reason: 'runtime_sustained_idle',
+  });
+
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.disposition, 'completed_from_final_output');
+  assert.equal(recovered.request.status, 'completed');
+  assert.equal(recovered.request.output, 'durable final answer');
+  assert.deepEqual(recovered.events.map(event => event.type), ['RunCompleted']);
+  assert.equal(recovered.admission.status, 'released');
+  assert.equal(recovered.admission.terminalReason, 'runtime_sustained_idle_final_output');
+  assert.equal(stream.getActiveRuntimeTurn(), null);
+  assert.equal(stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })[0].status, 'consumed');
+  const [projection] = stream.queryPendingRuntimeTurnBindingProjections();
+  assert.equal(projection.admissionId, recovered.admission.admissionId);
+  assert.equal(projection.bindingMode, 'closed');
+  assert.equal(projection.bindingProjectionPending, true);
+  assert.equal(stream.ackRuntimeTurnBindingProjection({
+    admissionId: projection.admissionId,
+  }).acknowledged, true);
+  assert.deepEqual(stream.queryPendingRuntimeTurnBindingProjections(), []);
+  stream.close();
+});
+
+test('idle recovery fails when later activity invalidates a final-output candidate', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.invalidated-final-output',
+    sourceId: 'om_invalidated_final_output',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_invalidated_final_output' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'invalidated-final-output-session',
+    observedAtMs: 2_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'invalidated-final-output-session',
+  });
+  stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: accepted.request.requestId,
+    delta: 'intermediate answer',
+    idempotencyKey: 'display:invalidated-final-output:0',
+  });
+  stream.execute({
+    type: 'MarkFinalOutputCandidate',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'invalidated-final-output-session',
+    messageId: 'message-invalidated-final-output',
+    observedAtMs: 2_100,
+  });
+  stream.execute({
+    type: 'InvalidateFinalOutputCandidate',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'invalidated-final-output-session',
+    reason: 'SUBSEQUENT_TOOL_ACTIVITY',
+  });
+
+  const active = stream.getActiveRuntimeTurn();
+  const recovered = stream.recoverRuntimeTurn({
+    admissionId: active.admissionId,
+    expectedLifecycleVersion: active.lifecycleVersion,
+    reason: 'runtime_sustained_idle',
+  });
+  assert.equal(recovered.disposition, 'failed_without_final_output');
+  assert.equal(recovered.request.status, 'failed');
+  assert.deepEqual(recovered.events.map(event => event.type), ['RunFailed']);
+  assert.equal(stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })[0].status, 'invalidated');
+  stream.close();
+});
+
+test('a replayed older tool event does not invalidate a newer final-output candidate', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.replayed-tool-before-final',
+    sourceId: 'om_replayed_tool_before_final',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_replayed_tool_before_final' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'replayed-tool-before-final-session',
+    observedAtMs: 3_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'replayed-tool-before-final-session',
+  });
+  const toolProgress = {
+    type: 'ReportRequestToolProgress',
+    requestId: accepted.request.requestId,
+    toolName: 'Read',
+    status: 'started',
+    idempotencyKey: 'hook:pre_tool:toolu_before_final',
+  };
+  stream.execute(toolProgress);
+  stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: accepted.request.requestId,
+    delta: 'answer after tool',
+    idempotencyKey: 'display:replayed-tool-before-final:0',
+  });
+  stream.execute({
+    type: 'MarkFinalOutputCandidate',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'replayed-tool-before-final-session',
+    messageId: 'message-replayed-tool-before-final',
+    observedAtMs: 3_100,
+  });
+
+  const replay = stream.execute(toolProgress);
+  assert.equal(replay.replayed, true);
+  assert.equal(
+    stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId })[0].status,
+    'active',
+  );
+  stream.close();
+});
+
+test('an invalidated final-output event cannot be replayed into a new active candidate', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.final-candidate-exact-replay',
+    sourceId: 'om_final_candidate_exact_replay',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_final_candidate_exact_replay' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'final-candidate-exact-replay-session',
+    observedAtMs: 4_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'final-candidate-exact-replay-session',
+  });
+  stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'final-candidate-exact-replay-session',
+    observedAtMs: 4_100,
+    delta: 'answer before a later tool',
+    idempotencyKey: 'display:final-candidate-exact-replay:0',
+  });
+  const mark = {
+    type: 'MarkFinalOutputCandidate',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'final-candidate-exact-replay-session',
+    messageId: 'message-final-candidate-exact-replay',
+    observedAtMs: 4_100,
+    activityId: 'display:final-candidate-exact-replay:0',
+  };
+  assert.equal(stream.execute(mark).marked, true);
+  stream.execute({
+    type: 'ReportRequestToolProgress',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'final-candidate-exact-replay-session',
+    observedAtMs: 4_200,
+    toolName: 'Read',
+    status: 'started',
+    idempotencyKey: 'hook:pre_tool:final-candidate-exact-replay',
+  });
+
+  const replay = stream.execute(mark);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.marked, false);
+  const candidates = stream.queryFinalOutputCandidates({ requestId: accepted.request.requestId });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].status, 'invalidated');
+  stream.close();
+});
+
+test('fails closed when final output and different tool activity share one timestamp', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.same-ms-causality',
+    sourceId: 'om_same_ms_causality',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_same_ms_causality' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'same-ms-causality-session',
+    observedAtMs: 1_000,
+  });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'same-ms-causality-session',
+  });
+  stream.execute({
+    type: 'ReportRequestToolProgress',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'same-ms-causality-session',
+    observedAtMs: 1_100,
+    activityId: 'tool:same-ms',
+    toolName: 'Read',
+    status: 'started',
+    idempotencyKey: 'tool:same-ms',
+  });
+  stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'same-ms-causality-session',
+    observedAtMs: 1_100,
+    activityId: 'display:same-ms',
+    delta: 'ambiguous final answer',
+    idempotencyKey: 'display:same-ms',
+  });
+  const candidate = stream.execute({
+    type: 'MarkFinalOutputCandidate',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'same-ms-causality-session',
+    messageId: 'message-same-ms',
+    observedAtMs: 1_100,
+    activityId: 'display:same-ms',
+  });
+  assert.equal(candidate.marked, false);
+  assert.equal(candidate.reason, 'RECOVERY_ACTIVITY_AFTER_OUTPUT');
+  assert.equal(candidate.candidate.status, 'invalidated');
+
+  const active = stream.getActiveRuntimeTurn();
+  const recovered = stream.recoverRuntimeTurn({
+    admissionId: active.admissionId,
+    expectedLifecycleVersion: active.lifecycleVersion,
+  });
+  assert.equal(recovered.disposition, 'failed_without_final_output');
+  assert.equal(recovered.request.status, 'failed');
+  assert.equal(
+    stream.query({ requestId: accepted.request.requestId }).events
+      .some(event => event.type === 'RunCompleted'),
+    false,
+  );
+  stream.close();
+});
+
 test('idle recovery is fenced by lifecycle activity after the status snapshot', () => {
   let now = 100;
   const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });
@@ -495,6 +1144,45 @@ test('observation time fences delayed lifecycle hooks after the next turn starts
   assert.equal(active.status, 'started');
   assert.equal(active.lifecycleVersion, started.admission.lifecycleVersion);
   assert.equal(active.lifecycleObservedAtMs, 2_000);
+  stream.close();
+});
+
+test('the turn-start fence accepts a Stop observed before a later same-turn hook persists', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.same-turn-stop-order',
+    sourceId: 'om_same_turn_stop_order',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_same_turn_stop_order' },
+  });
+
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  const started = stream.startRuntimeTurn({
+    runtimeSessionId: 'same-turn-stop-session',
+    observedAtMs: 1_000,
+  });
+  assert.equal(started.started, true);
+
+  const laterPersistedHook = stream.touchRuntimeTurn({
+    runtimeSessionId: 'same-turn-stop-session',
+    observedAtMs: 1_300,
+  });
+  assert.equal(laterPersistedHook.touched, true);
+
+  const stop = stream.finishRuntimeTurn({
+    runtimeSessionId: 'same-turn-stop-session',
+    reason: 'stop',
+    observedAtMs: 1_200,
+  });
+  assert.equal(stop.finished, true);
+  assert.equal(stop.admission.status, 'completed');
+  assert.equal(stream.getActiveRuntimeTurn(), null);
   stream.close();
 });
 

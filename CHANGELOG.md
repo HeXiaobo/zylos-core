@@ -5,6 +5,42 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.10] - 2026-08-27
+
+### Fixed
+- Claude runtime admissions now keep an immutable turn-start observation
+  fence while lifecycle activity advances a separate recovery generation.
+  Same-turn hook processes may persist out of timestamp order without causing
+  a valid `Stop` to be silently rejected, while hooks observed before the next
+  turn began remain fenced out.
+- A bound request and its runtime admission now reach terminal state in one
+  SQLite transaction. Binding ownership and its pending/bound/rejected/closed
+  lifecycle are admission-scoped durable state, so a requestless HXA turn can
+  never bind or finalize an unrelated Feishu request. Request-scoped tool,
+  public-reasoning, and output mutations now verify that exact active
+  request/session and bound admission before any event or output write; a
+  stale or misrouted hook is a zero-write conflict.
+- A durable, admission- and session-fenced final-output candidate provides a
+  conservative idle-recovery fallback when a real final display was recorded
+  but `Stop` is lost. Exact display events are idempotent, an observation-time
+  plus exact activity-identity high-water fence prevents a late old final from
+  becoming active, and later output or tool activity invalidates the
+  candidate. Different activities observed in the same millisecond are
+  intentionally ambiguous and fail closed. Pending out-of-order display
+  batches retain their first causal timestamp when replayed. Normal `Stop`
+  remains the canonical answer.
+- Closed binding projection is now a retryable SQLite outbox. Stop or idle
+  recovery commits request/admission terminal state first, then atomically
+  projects the content-free binding JSON; the dispatcher will not admit the
+  next conversation until any pending projection succeeds. Rejected Stop
+  fences are written to diagnostics instead of failing silently.
+- The Node test runner always creates an isolated temporary `HOME` and
+  `ZYLOS_DIR`, preventing rollback-path tests from deleting or overwriting the
+  live `~/zylos/.env`.
+- The pinned fork-pair orchestrator now verifies the complete Feishu/Core
+  protocol contract and treats the shared binding projector as a critical
+  communication asset, so an incomplete archive is held before mutation.
+
 ## [0.7.2-rc.9] - 2026-08-27
 
 ### Fixed

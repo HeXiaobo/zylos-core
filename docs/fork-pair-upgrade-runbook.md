@@ -10,8 +10,8 @@
 - Core 与 Feishu 必须作为一组审核，但按 **Core → Feishu** 顺序升级。
 - Core fork 是必需的：固定编排器、双向 C4 门禁、关键通信文件门禁和 PM2
   真在线校验都属于 Core 升级基础设施。
-- 当前 Feishu 目标不需要为本流程再改代码；使用已经通过测试的
-  `0.3.7-rc.6` 提交 `d97604d86c15eef7f0851cf6d285fb9e9942dad7`。
+- 当前 Feishu 目标使用已经通过测试的 `0.3.7-rc.7` 提交
+  `f26ac9b69ebb697a926668c154ff317613d5c8e2`。
 - `upstream` 只用于读取和同步；发布只允许推送到 `origin` 对应的
   `HeXiaobo/*` fork。
 - 只有结构化报告为 `status: "PASS"` 且外部消息往返验收成功，才可宣告升级
@@ -155,11 +155,12 @@ Claude 的 `UserPromptSubmit`、兼容用 `PreToolUse`、`Stop` 和 idle Notific
 同步边界；PostTool/MessageDisplay 等非启动事件只能触碰已经 started 的 admission，
 不能把下一条 submitted 消息提前晋级。每次可信 lifecycle 活动都会推进持久化
 generation；sustained-idle 恢复必须同时匹配 generation，并且最后一次活动也已超过
-30 秒。monitor 与 durable admission 事务都会拒绝 observation time 早于当前
-generation 的迟到 idle/Stop/PostTool；因此即使升级前遗留的 async hook 在下一轮
-已经 started 后才恢复，也不能结束新 admission、发布错误工具进度或用旧答案完成
-新请求。新 admission 在取得锁时就写入 observation 下界；旧库中 active 且为空的
-基线会在迁移时保守回填，首个迟到 hook 也不能借空值抢占新一轮。
+30 秒。generation 只用于保护恢复快照；observation 下界固定为本轮开始时间，不能被
+本轮稍后落库的 MessageDisplay/PostTool 继续抬高。事务只拒绝 observation time 早于
+本轮开始的迟到 idle/Stop/PostTool；因此升级前遗留的 async hook 不能结束下一轮，
+而同一轮内进程启动与 SQLite 落库顺序轻微反转时，合法 Stop 仍可完成当前请求。新
+admission 在取得锁时先写下界，Prompt/兼容 PreTool 开始轮次时更新一次后保持不变；
+旧库中 active 且为空的基线会在迁移时保守回填。
 
 该 runtime-turn admission 只在 Claude 启用。Codex 当前没有等价的
 MessageDisplay 完成边界，因此不会创建无法可靠关闭的 admission；带 assistant
@@ -175,7 +176,43 @@ request 的 Codex 消息固定回退到 request-scoped `c4-send --request-id` �
 发布验收必须交错发送“飞书 nonce A → HXA nonce B → 飞书 nonce C”，逐一核对
 回复通道、内容、源消息卡片和终止顺序。仅验证每个通道各自能收发不足以发现串线。
 
-### 2.13 HXA 的“已发送”与双向通信是两件事
+### 2.13 正文已经显示，但 Stop 被静默拒绝后卡片仍会失败
+
+SS 在 `0.7.2-rc.9` 验收中出现过一条“正文完全正确，卡片最终却显示本次处理未完成”。
+持久时间线证明 `Stop` 已触发，但没有 `closed` binding；34 秒后下一条消息触发
+`RUNTIME_TURN_RECOVERED_AFTER_IDLE`。根因是同一轮的 hook 进程可能按 A→B 启动、
+却按 B→A 取得 SQLite 写锁。旧逻辑把“最后落库的 observation time”误作轮次边界，
+于是较早启动但逻辑上终止本轮的 Stop 被当成旧轮次静默丢弃。
+
+Core `0.7.2-rc.10` 固定执行五层闭环：
+
+1. observation fence 只表示本轮开始，不再随同轮活动上移；恢复 CAS 继续使用独立的
+   lifecycle generation，因此修 Stop 误拒绝不会放宽 30 秒恢复竞态门。
+2. binding 所有权与 pending/bound/rejected/closed 状态都归属于 SQLite admission；
+   JSON binding 只是可重建的投影。缺失或损坏 JSON 时只能从当前 admission 的精确
+   request/session owner 恢复，requestless HXA admission 禁止猜测或绑定飞书请求。
+   request-scoped tool、公开 reasoning 与 output 在任何事件/正文写入前都必须通过
+   SQLite 中 active + started + exact request/session + bound 校验；不匹配必须零写入。
+3. 带 binding 的 Stop 在同一个 SQLite 事务里同时写入 `RunCompleted/RunFailed` 和
+   admission 终态；任一写入失败必须整体回滚，不得先释放 admission 再补 request。
+4. `MessageDisplay final=true` 会对本轮累计公开正文记录 admission、session、message
+   ID、observation time、精确 activity ID 与 output hash，不立即宣告成功。完全相同
+   的 display event 只能生效一次；比已观察工具/输出活动更早的迟到 final 会直接
+   失效。同一毫秒出现不同 activity 时无法证明因果先后，必须按歧义 fail-closed；
+   out-of-order batch 重放必须保留第一次观察时间，不得用重放时间覆盖。若 Stop 正常
+   到达，仍以 `last_assistant_message` 为 canonical；仅在 Stop 真丢失、持续空闲且
+   hash/causal fence 全部匹配时，recovery 才允许写 `RunCompleted`。
+5. Stop/recovery 在事务内写入 closed-binding outbox；投影成功后才 ack。进程崩溃或
+   写文件失败会保留 pending，dispatcher 必须重试成功后才接纳下一条消息。Stop 的
+   `observation_stale`、`not_started`、session/request conflict 必须留诊断，禁止无声
+   early return。
+
+升级后的通信验收不能只看回复正文。每个 nonce 必须同时满足：request 终态为
+`completed`、binding 为 `bound→closed`、卡片为成功终态、下一条消息未触发上一条的
+idle recovery。交错 A/B/C 门禁至少重复三轮；任一轮出现“正文正确＋失败横幅”都应
+HOLD，先查 `RunFailed.payload.code`、binding audit 与 Stop 诊断。
+
+### 2.14 HXA 的“已发送”与双向通信是两件事
 
 HXA 失联包含两个独立缺口，必须分开修复和验收：
 
@@ -193,7 +230,7 @@ HXA 发布至少要跑四类真实 canary：自然 final、显式路径与 final
 message ID、C4 inbound ID、ledger `attempts=1` 和 spool=0；只看回复正文计数会把
 引用 nonce 的对账消息误算成重放。
 
-### 2.14 组件已升级但 source marker 仍旧
+### 2.15 组件已升级但 source marker 仍旧
 
 SS 的 HXA 已逐文件匹配 `1.7.5@182d7b3...`，但标准 `zylos upgrade` 连续两次
 都没有更新 `.zylos-source.json`，仍显示 `1.7.3@160dbae...`。手工改 JSON 会让
@@ -213,13 +250,31 @@ fencing token 的全局事务；不同组件并发升级不会互相覆盖。com
 更新到同一不可变 ref；`.zylos-source.json` 属于运行时 provenance，已从业务文件
 manifest 与本地修改检测中排除。
 
-### 2.15 回复卡片时间不能单独证明运行轮次顺序
+### 2.16 回复卡片时间不能单独证明运行轮次顺序
 
 飞书 assistant card 会先创建再异步更新，HXA 回复也有独立的 Hub 投递延迟。
 因此 A/B/C 的外部 `create_time` 或 `update_time` 只能证明送达，不能单独证明
 runtime turn 的先后。若外部顺序与预期不一致，必须读取 C4 conversation、
 runtime-turn admission、assistant binding-events 和 HXA delivery ledger 的持久化
 时间线；缺少终止字段时结论是 `UNKNOWN/HOLD`，不能用“可能是卡片延迟”猜 PASS。
+
+### 2.17 fork 测试不得触碰真实 `~/zylos/.env`
+
+本次升级窗口内真实 `.env` 三次消失；现有证据把嫌疑收敛到未隔离的 fork CLI
+测试/回滚路径，但没有抓到删除调用当场，因此事件结论保持“高置信嫌疑，未定案”。
+已确认的危险机制是：部分 rollback 分支在快照认为原文件不存在时会执行删除；若
+测试进程继承真实 `ZYLOS_DIR`，测试夹具就可能把生产安装目录当成沙盒。
+
+Core `0.7.2-rc.10` 的 `scripts/run-node-tests.js` 不再信任调用者是否记得传环境变量：
+它为每次 Node 套件创建临时 `HOME`，并固定令 `ZYLOS_DIR=$HOME/zylos`，结束时只删除
+该临时根目录。测试前后仍须比对真实 `.env` 的 SHA-256、mtime、mode 与 flags；任一
+变化立即 `HOLD`。`chflags uchg` 可作为 macOS 事故期的可逆保护和抓现行手段，但不
+替代隔离；凭据轮换或合法升级需要写入该文件时，必须先显式解锁，操作后立即复核并
+恢复保护。
+
+事故取证必须只读，至少保留 `captured_at`、窗口起止、文件 hash/mtime、目录 mtime、
+磁盘与 inode 使用率、当前 flags，以及“查过但不存在”的预期项。flags 是取证时状态，
+不能倒推为事发时状态；例如 05:19 才设置的 `uchg` 不能用于证明更早窗口已经上锁。
 
 ## 3. 发布前准备
 
@@ -247,9 +302,11 @@ git diff --check
 
 1. 两个 worktree 都无未提交改动；本地 HEAD 与 `origin` 分支头一致。
 2. 版本分别与参数完全一致，不能用“版本差不多”代替。
-3. Core 目标包含四个关键通信入口以及本手册的一键编排器。
+3. Core 目标包含五个关键通信资产（含共享 binding projector）以及本手册的一键编排器。
 4. Feishu 目标通过 native task 评论闭环与完成闭环的测试套件。
 5. 不从 `upstream` 直接部署，也不向 `upstream` 推送。
+6. Core Node 测试由仓库 runner 创建隔离 `HOME/ZYLOS_DIR`，且测试前后真实
+   `~/zylos/.env` 的 hash、mtime、mode 与 flags 完全一致。
 
 ### 3.1 SS 的 HXA 代码目录缺失时先恢复通信
 
@@ -327,7 +384,7 @@ node "${CORE_CLI}" upgrade hxa-connect \
 
 成功后同时核对：安装版本 `1.7.5`、`components.json.source.ref` 与
 `.zylos-source.json.sha` 都等于 `HXA_SHA`、PM2 executable 存在、四组织 WS
-恢复、Feishu PID/restart 未变化。再跑 2.13 的真实 HXA canary；CLI 退出 0 不能
+恢复、Feishu PID/restart 未变化。再跑 2.14 的真实 HXA canary；CLI 退出 0 不能
 代替外部双向通信。
 
 ### 3.4 registry lock 崩溃后的安全处理
@@ -370,15 +427,15 @@ mv -- "$LOCK_DIR" "$LOCK_QUARANTINE"
 
 ```bash
 CORE_SHA='<40-hex-core-sha>'
-FEISHU_SHA='d97604d86c15eef7f0851cf6d285fb9e9942dad7'
+FEISHU_SHA='f26ac9b69ebb697a926668c154ff317613d5c8e2'
 
 curl -fsSL \
   "https://raw.githubusercontent.com/HeXiaobo/zylos-core/${CORE_SHA}/scripts/upgrade-fork-pair.sh" \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.9' \
-      --feishu-version '0.3.7-rc.6' \
+      --core-version '0.7.2-rc.10' \
+      --feishu-version '0.3.7-rc.7' \
       --agent '<agent-id>' \
       --execute
 ```
@@ -399,7 +456,7 @@ curl -fsSL \
 随后脚本按固定顺序升级 Core 和 Feishu，并执行：
 
 - 安装版本与目标版本复核；
-- 四个关键通信入口复核；
+- 五个关键通信资产复核；
 - PM2 真在线复核，包括 response stream supervisor；
 - cron one-shot 以“有效 cron + 成功退出 + 真实入口”判活，并显式恢复其调度；
 - hermetic 出站 stdin/策略兼容 canary；
@@ -450,7 +507,7 @@ Feishu 随后失败，报告会明确写
 1. 由任务负责人向 Agent 发送带唯一标识的飞书消息；Agent 必须回复同一标识。
    同时确认 `c4.db` 有对应入站记录，PM2 restart/unstable 计数没有异常增长。
 2. 交错发送飞书 A → HXA B → 飞书 C 三个唯一 nonce。三条都必须精确回复到原
-   通道；再按 2.15 的持久化证据核对运行轮次终止顺序。HXA 还必须覆盖自然回复、
+   通道；再按 2.16 的持久化证据核对运行轮次终止顺序。HXA 还必须覆盖自然回复、
    停机补拉和重启重放去重，不能只测在线收发。
 3. 若本次发布启用飞书原生任务能力，使用预先准备、包含明确 task/comment/member
    ID 的 gate 输入运行：

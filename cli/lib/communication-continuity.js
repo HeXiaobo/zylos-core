@@ -18,6 +18,7 @@ export const COMMUNICATION_CRITICAL_ASSETS = Object.freeze([
   'comm-bridge/scripts/c4-receive.js',
   'comm-bridge/scripts/c4-dispatcher.js',
   'comm-bridge/scripts/c4-response-stream-supervisor.js',
+  'activity-monitor/scripts/assistant-turn-binding.js',
 ]);
 const STRICT_ARG_REJECTIONS = new Set([
   '[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.',

@@ -65,6 +65,7 @@ import {
   truncateForDelivery,
 } from './c4-utils.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
+import { writeAssistantTurnBinding } from '../../activity-monitor/scripts/assistant-turn-binding.js';
 
 let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
@@ -678,6 +679,30 @@ export function runtimeTurnAdmissionsEnabled(activeRuntime = ACTIVE_RUNTIME) {
   return activeRuntime === 'claude';
 }
 
+export function projectPendingAssistantTurnBindings(
+  responseStream,
+  { writeBinding = writeAssistantTurnBinding } = {},
+) {
+  const projections = responseStream.queryPendingRuntimeTurnBindingProjections();
+  const projected = [];
+  for (const admission of projections) {
+    const state = writeBinding(admission.runtimeSessionId, {
+      mode: 'closed',
+      requestId: admission.requestId,
+      reason: admission.bindingReason || admission.terminalReason || 'runtime_turn_terminal',
+      nowMs: admission.bindingProjectionObservedAtMs,
+    });
+    const acknowledgement = responseStream.ackRuntimeTurnBindingProjection({
+      admissionId: admission.admissionId,
+    });
+    if (!acknowledgement.acknowledged) {
+      throw new Error(`binding projection ${admission.admissionId} was not acknowledged`);
+    }
+    projected.push({ admission, state });
+  }
+  return { projected: projected.length, projections: projected };
+}
+
 function blockingAssistantRun(item) {
   if (item.type !== 'conversation') return null;
   const responseStream = openAssistantResponseStream();
@@ -715,6 +740,15 @@ function reconcileRuntimeTurnAdmission(item, agentState) {
       expectedLifecycleVersion: active.lifecycleVersion,
       reason: 'runtime_sustained_idle',
     });
+  } finally {
+    responseStream.close();
+  }
+}
+
+function flushPendingRuntimeTurnBindingProjections() {
+  const responseStream = openAssistantResponseStream();
+  try {
+    return projectPendingAssistantTurnBindings(responseStream);
   } finally {
     responseStream.close();
   }
@@ -844,6 +878,14 @@ async function processNextMessage() {
       `Recovered runtime admission ${recoveredRuntimeTurn.admission.admissionId} `
         + `after ${agentState.idleSeconds}s sustained idle`,
     );
+  }
+
+  try {
+    flushPendingRuntimeTurnBindingProjections();
+  } catch (error) {
+    releaseItem(item);
+    log(`Deferring conversation id=${item.id}: binding projection failed (${error.message})`);
+    return { delivered: false, state: agentState.state };
   }
 
   const blockingRun = blockingAssistantRun(item);

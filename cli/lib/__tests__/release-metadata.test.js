@@ -11,7 +11,7 @@ describe('fork release metadata', () => {
     const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
     const capabilities = JSON.parse(fs.readFileSync(path.join(ROOT, 'capabilities.json'), 'utf8'));
 
-    assert.equal(pkg.version, '0.7.2-rc.9');
+    assert.equal(pkg.version, '0.7.2-rc.10');
     assert.equal(lock.version, pkg.version);
     assert.equal(lock.packages[''].version, pkg.version);
     assert.equal(capabilities.release, pkg.version);
@@ -24,5 +24,13 @@ describe('fork release metadata', () => {
       'explicit-c4-send',
     );
     assert.equal(pkg.repository.url, 'https://github.com/HeXiaobo/zylos-core.git');
+  });
+
+  it('runs destructive rollback tests in an isolated ZYLOS_DIR', () => {
+    const runner = fs.readFileSync(path.join(ROOT, 'scripts', 'run-node-tests.js'), 'utf8');
+    assert.match(runner, /mkdtempSync\(path\.join\(os\.tmpdir\(\), 'zylos-node-tests-home-'\)\)/);
+    assert.match(runner, /HOME:\s*isolatedHomeDir/);
+    assert.match(runner, /ZYLOS_DIR:\s*isolatedZylosDir/);
+    assert.match(runner, /fs\.rmSync\(isolatedHomeDir, \{ recursive: true, force: true \}\)/);
   });
 });
