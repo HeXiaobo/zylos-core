@@ -8,6 +8,7 @@ import {
   buildUpgradeCommands,
   planPm2PreflightRepairs,
   validateCoreSource,
+  validateFeishuSource,
   validatePm2Snapshot,
   validatePinnedTarget,
 } from '../../../scripts/upgrade-fork-pair.js';
@@ -53,6 +54,41 @@ function writeCoreFixture(root) {
     'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
     'scripts/upgrade-fork-pair.js',
     'scripts/upgrade-fork-pair.sh',
+  ]) {
+    const filePath = path.join(root, relativePath);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, '#!/usr/bin/env node\n');
+  }
+}
+
+function writeFeishuFixture(root) {
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+    name: 'zylos-feishu',
+    version: '0.3.7-rc.5',
+  }));
+  fs.writeFileSync(path.join(root, 'capabilities.json'), JSON.stringify({
+    schemaVersion: 1,
+    product: 'zylos-feishu',
+    release: '0.3.7-rc.5',
+    requires: {
+      'zylos-core': {
+        protocols: {
+          'c4.reply': 2,
+          'c4.reply.argv-compat': 1,
+          'external-task-adapter': 1,
+          'task-reminder': 1,
+        },
+      },
+    },
+  }));
+  for (const relativePath of [
+    'src/index.js',
+    'hooks/pre-upgrade.js',
+    'hooks/post-upgrade.js',
+    'scripts/native-task-closure-gate.js',
+    'scripts/native-task-completion-gate.js',
+    'src/lib/task-comment-worker.js',
+    'src/lib/task-v2-projection.js',
   ]) {
     const filePath = path.join(root, relativePath);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -129,6 +165,17 @@ describe('fork-pair upgrade target contract', () => {
 
       assert.equal(result.ok, false);
       assert.match(result.error, /c4\.reply\.body-file requires >= 1, found missing/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not require a Core-provided body-file capability from the Feishu source', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-feishu-source-'));
+    try {
+      writeFeishuFixture(root);
+
+      assert.deepEqual(validateFeishuSource(root, '0.3.7-rc.5').ok, true);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

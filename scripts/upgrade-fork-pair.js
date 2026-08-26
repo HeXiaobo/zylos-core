@@ -20,12 +20,16 @@ const FULL_SHA = /^[0-9a-f]{40}$/i;
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const MIN_AVAILABLE_KB = 5 * 1024 * 1024;
 
-const CORE_PROTOCOLS = Object.freeze({
+const FEISHU_REQUIRED_CORE_PROTOCOLS = Object.freeze({
   'c4.reply': 2,
   'c4.reply.argv-compat': 1,
-  'c4.reply.body-file': 1,
   'external-task-adapter': 1,
   'task-reminder': 1,
+});
+
+const CORE_TARGET_PROTOCOLS = Object.freeze({
+  ...FEISHU_REQUIRED_CORE_PROTOCOLS,
+  'c4.reply.body-file': 1,
 });
 
 const CORE_ASSETS = Object.freeze([
@@ -116,7 +120,7 @@ export function validateCoreSource(root, expectedVersion, fsApi = fs) {
     if (capabilities.release !== expectedVersion) {
       errors.push(`capability release must be ${expectedVersion}, found ${capabilities.release ?? 'missing'}`);
     }
-    errors.push(...validateProtocols(capabilities.protocols, CORE_PROTOCOLS));
+    errors.push(...validateProtocols(capabilities.protocols, CORE_TARGET_PROTOCOLS));
     const missing = validateAssets(root, CORE_ASSETS, fsApi);
     if (missing.length > 0) errors.push(`missing critical Core assets: ${missing.join(', ')}`);
     return errors.length === 0 ? { ok: true, package: pkg, capabilities } : {
@@ -147,7 +151,7 @@ export function validateFeishuSource(root, expectedVersion, fsApi = fs) {
     }
     errors.push(...validateProtocols(
       capabilities.requires?.['zylos-core']?.protocols,
-      CORE_PROTOCOLS,
+      FEISHU_REQUIRED_CORE_PROTOCOLS,
     ));
     const missing = validateAssets(root, FEISHU_ASSETS, fsApi);
     if (missing.length > 0) errors.push(`missing critical Feishu assets: ${missing.join(', ')}`);

@@ -54,9 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is normally stopped between successful runs, but still requires a real
   executable, `autorestart: false`, a cron expression, exit code zero, and zero
   unstable restarts; long-running daemons still must be online.
-- Both self-upgrade step 0 and the immutable fork-pair runner reject a target
+- Both self-upgrade step 0 and the immutable fork-pair runner reject a Core target
   that does not declare the body-file reply contract, preventing a late
   rollback after a host-local copy silently loses that historical patch.
+- The pair runner keeps Core target capabilities separate from the protocols a
+  Feishu release requires from Core, so a new Core-only safety seam cannot be
+  misclassified as a missing capability in an otherwise compatible Feishu SHA.
 
 ## [0.7.2-rc.4] - 2026-08-26
 
