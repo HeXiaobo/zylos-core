@@ -7,8 +7,15 @@ import { describe, it } from 'node:test';
 import {
   buildUpgradeCommands,
   validateCoreSource,
+  validatePm2Snapshot,
   validatePinnedTarget,
 } from '../../../scripts/upgrade-fork-pair.js';
+import {
+  validateHxaPm2Process,
+  validateHxaRegistryEntry,
+  validateHxaSource,
+  validatePinnedHxaRecoveryTarget,
+} from '../../../scripts/restore-hxa-connect.js';
 
 const CORE_SHA = '0123456789abcdef0123456789abcdef01234567';
 const FEISHU_SHA = '89abcdef0123456789abcdef0123456789abcdef';
@@ -122,5 +129,111 @@ describe('fork-pair upgrade target contract', () => {
         '--yes', '--skip-eval', '--json',
       ],
     });
+  });
+
+  it('holds before mutation when any online PM2 process has no real executable', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-pm2-'));
+    try {
+      const livePath = path.join(root, 'live.js');
+      fs.writeFileSync(livePath, '#!/usr/bin/env node\n');
+      const snapshot = [
+        { name: 'activity-monitor', status: 'online', execPath: livePath },
+        { name: 'c4-dispatcher', status: 'online', execPath: livePath },
+        { name: 'zylos-feishu', status: 'online', execPath: livePath },
+        {
+          name: 'zylos-wechat',
+          status: 'online',
+          execPath: path.join(root, 'missing-wechat.js'),
+        },
+      ];
+
+      assert.deepEqual(validatePm2Snapshot(snapshot), [
+        `zylos-wechat reports online but has no live executable at ${path.join(root, 'missing-wechat.js')}`,
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('pinned HXA recovery contract', () => {
+  it('accepts only the SS agent and an immutable Core script SHA', () => {
+    assert.deepEqual(validatePinnedHxaRecoveryTarget({
+      coreSha: CORE_SHA,
+      agent: 'ss',
+    }), { ok: true });
+    assert.equal(validatePinnedHxaRecoveryTarget({
+      coreSha: 'main',
+      agent: 'ss',
+    }).ok, false);
+    assert.equal(validatePinnedHxaRecoveryTarget({
+      coreSha: CORE_SHA,
+      agent: 'other',
+    }).ok, false);
+  });
+
+  it('requires the exact HXA 1.7.3 package and runtime files', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-hxa-source-'));
+    try {
+      fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+        name: 'zylos-hxa-connect',
+        version: '1.7.3',
+      }));
+      for (const relativePath of [
+        'SKILL.md',
+        'src/bot.js',
+        'scripts/cli.js',
+        'ecosystem.config.cjs',
+      ]) {
+        const filePath = path.join(root, relativePath);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, 'fixture\n');
+      }
+
+      assert.equal(validateHxaSource(root).ok, true);
+      fs.rmSync(path.join(root, 'src', 'bot.js'));
+      assert.match(validateHxaSource(root).error, /src\/bot\.js/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts the historic upstream route but rejects version and path drift', () => {
+    const zylosDir = '/home/cocoai/zylos';
+    const valid = {
+      version: '1.7.3',
+      repo: 'coco-xyz/zylos-hxa-connect',
+      skillDir: `${zylosDir}/.claude/skills/hxa-connect`,
+      dataDir: `${zylosDir}/components/hxa-connect`,
+    };
+    assert.equal(validateHxaRegistryEntry(valid, zylosDir).ok, true);
+    assert.equal(validateHxaRegistryEntry({ ...valid, version: '1.7.2' }, zylosDir).ok, false);
+    assert.equal(validateHxaRegistryEntry({ ...valid, dataDir: '/tmp/wrong' }, zylosDir).ok, false);
+  });
+
+  it('rejects PM2 fake-online state and executable drift', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-hxa-pm2-'));
+    try {
+      const entry = path.join(root, 'src', 'bot.js');
+      fs.mkdirSync(path.dirname(entry), { recursive: true });
+      fs.writeFileSync(entry, 'fixture\n');
+      assert.equal(validateHxaPm2Process({
+        status: 'online',
+        pid: 123,
+        execPath: entry,
+      }, entry).ok, true);
+      assert.equal(validateHxaPm2Process({
+        status: 'online',
+        pid: null,
+        execPath: entry,
+      }, entry).ok, false);
+      assert.equal(validateHxaPm2Process({
+        status: 'online',
+        pid: 123,
+        execPath: path.join(root, 'wrong.js'),
+      }, entry).ok, false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

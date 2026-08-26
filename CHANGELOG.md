@@ -14,12 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The communication continuity canary now proves that deployed `c4-receive`
   durably persists a hermetic inbound message as well as proving outbound reply
   contracts.
+- An immutable SS HXA recovery runner restores the exact audited
+  `zylos-hxa-connect@1.7.3` source from the user fork without replacing its data
+  or configuration, then verifies a real PM2 PID/executable and live profile and
+  peer API access.
 
 ### Fixed
 - Self-upgrade rejects a target or post-sync deployment that lacks a critical
   communication entrypoint, including `c4-receive` and the response supervisor.
 - PM2 service verification rejects fake-online processes whose executable is
   missing or whose required service points at the wrong script.
+- The fork-pair preflight now rejects every PM2 process that claims to be online
+  while its executable is missing, preventing a later Core step-12 rollback for
+  already-broken component services.
 - GitHub component and Core downloads accept full commit SHAs through immutable
   archive URLs, so a checked target cannot drift with a movable branch.
 

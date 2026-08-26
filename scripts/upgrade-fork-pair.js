@@ -311,7 +311,7 @@ function pm2Snapshot() {
   })).sort((left, right) => String(left.name).localeCompare(String(right.name)));
 }
 
-function validatePm2Snapshot(snapshot, { requireSupervisor = false } = {}) {
+export function validatePm2Snapshot(snapshot, { requireSupervisor = false } = {}) {
   const required = ['activity-monitor', 'c4-dispatcher', 'zylos-feishu'];
   if (requireSupervisor) required.push('c4-response-stream-supervisor');
   const errors = [];
@@ -319,10 +319,14 @@ function validatePm2Snapshot(snapshot, { requireSupervisor = false } = {}) {
     const proc = snapshot.find((candidate) => candidate.name === name);
     if (!proc || proc.status !== 'online') {
       errors.push(`${name} is not online`);
-      continue;
     }
+  }
+  for (const proc of snapshot) {
+    if (proc.status !== 'online') continue;
     if (!proc.execPath || !fileIsRegular(proc.execPath)) {
-      errors.push(`${name} has no live executable at ${proc.execPath || '(unset)'}`);
+      errors.push(
+        `${proc.name} reports online but has no live executable at ${proc.execPath || '(unset)'}`,
+      );
     }
   }
   return errors;

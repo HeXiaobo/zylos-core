@@ -71,6 +71,21 @@ Agent turn，自然不会回复。此前只校验出站 `c4-send`，没有校验
 新流程只接受 40 位完整 commit SHA；固定脚本在任何写操作前下载并校验两个目标，
 然后统一执行、统一出报告。
 
+### 2.9 组件代码目录缺失会让 Core 升级在服务门回滚
+
+SS 第一次运行固定脚本时，Core step 12 报
+`Not online after 30s: zylos-wechat, zylos-wecom` 并完整回滚。机器证据显示
+`wechat`、`wecom`、`hxa-connect`、`openmax`、`browser` 的数据目录仍在，但
+Skill 代码目录已被恢复操作删除；其中 WeChat/WeCom 在 PM2 中甚至表现为
+`online + pid=null + executable missing`。这不是健康状态。固定脚本现在会在任何
+安装和停服之前扫描全部 online PM2 条目的真实 executable，发现这种矛盾立即
+`HOLD`。
+
+HXA 是升级期间的备用通信面，恢复优先级高于继续重放升级。SS 的 code-only 恢复
+固定为 `HeXiaobo/zylos-hxa-connect` 的 `1.7.3` 提交
+`160dbaeac86f503b2d1889343354c5aee3b57785`；脚本只补回缺失代码、保留数据和
+配置、持久化 fork 路由，并要求 PM2 真进程、profile 和 peers 三门通过。
+
 ## 3. 发布前准备
 
 发布负责人在本机完成以下检查，并记录两端的完整 SHA：
@@ -101,6 +116,33 @@ git diff --check
 4. Feishu 目标通过 native task 评论闭环与完成闭环的测试套件。
 5. 不从 `upstream` 直接部署，也不向 `upstream` 推送。
 
+### 3.1 SS 的 HXA 代码目录缺失时先恢复通信
+
+仅当 SS 的组件登记仍是 HXA `1.7.3`、数据目录存在且 Skill 目录缺失时使用。
+`CORE_SHA` 必须指向包含本恢复器的已审核 Core fork 提交：
+
+```bash
+CORE_SHA='<40-hex-core-sha>'
+
+curl -fsSL \
+  "https://raw.githubusercontent.com/HeXiaobo/zylos-core/${CORE_SHA}/scripts/restore-hxa-connect.sh" \
+  | bash -s -- \
+      --core-sha "${CORE_SHA}" \
+      --agent 'ss' \
+      --execute
+```
+
+恢复器内置并拒绝偏离以下目标：
+
+- repo：`HeXiaobo/zylos-hxa-connect`；
+- commit：`160dbaeac86f503b2d1889343354c5aee3b57785`；
+- version：`1.7.3`；
+- service/entry：`zylos-hxa-connect` / `src/bot.js`。
+
+它不会读取或输出配置内容，不改 HXA 数据目录；只有配置文件 hash 不变、PM2
+具有真实 PID/entry、HXA profile 与 peers API 均成功才给 `PASS`。之后还要用唯一
+nonce 做一轮外部 HXA 双向消息，不能用本地 API 成功代替真正通信。
+
 ## 4. Agent 唯一执行命令
 
 把已经审核并推送的 Core SHA 填入 `CORE_SHA`，不要使用分支名、短 SHA、`main`
@@ -128,6 +170,8 @@ curl -fsSL \
   `HeXiaobo/zylos-feishu`；
 - `c4-receive.js` 仍存在、可用磁盘不少于 5 GiB；
 - 现有关键 PM2 进程在线且执行文件真实存在。
+- 所有声称 online 的 PM2 进程都有真实 executable；组件代码缺失会在事务前
+  `HOLD`，不会等 Core step 12 再回滚。
 
 随后脚本按固定顺序升级 Core 和 Feishu，并执行：
 
