@@ -12,6 +12,7 @@ const {
   runSelfUpgradeFinalize,
   step0_verifyTargetCommunicationCompatibility,
   step1_backupCoreSkills,
+  step5_syncCoreSkills,
   step13_verifyCommunicationContinuity,
   step7_syncInstructions,
   rollbackSelf,
@@ -39,6 +40,21 @@ function writeSplitPackage(pkgRoot) {
   fs.writeFileSync(path.join(templatesDir, 'codex-system.md'), '# Codex system\n');
   fs.writeFileSync(path.join(templatesDir, 'onboarding.md'), '# Onboarding\n');
   fs.copyFileSync(path.resolve('cli/lib/runtime/assembler.mjs'), path.join(runtimeDir, 'assembler.mjs'));
+}
+
+const TARGET_COMMUNICATION_ASSETS = [
+  'skills/comm-bridge/scripts/c4-send.js',
+  'skills/comm-bridge/scripts/c4-receive.js',
+  'skills/comm-bridge/scripts/c4-dispatcher.js',
+  'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+];
+
+function writeTargetCommunicationAssets(root, assets = TARGET_COMMUNICATION_ASSETS) {
+  for (const relativePath of assets) {
+    const filePath = path.join(root, relativePath);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, '#!/usr/bin/env node\n');
+  }
 }
 
 describe('self-upgrade repository routing', () => {
@@ -284,6 +300,7 @@ describe('self-upgrade communication continuity gate', () => {
         product: 'zylos-core',
         protocols: { 'c4.reply.argv-compat': 1 },
       }));
+      writeTargetCommunicationAssets(tempDir);
 
       const result = step0_verifyTargetCommunicationCompatibility({ tempDir });
 
@@ -308,6 +325,51 @@ describe('self-upgrade communication continuity gate', () => {
       assert.match(result.error, /c4\.reply\.argv-compat requires >= 1, found missing/);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a target that omits a critical receive entrypoint before mutation', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-target-'));
+    try {
+      fs.writeFileSync(path.join(tempDir, 'capabilities.json'), JSON.stringify({
+        schemaVersion: 1,
+        product: 'zylos-core',
+        protocols: { 'c4.reply.argv-compat': 1 },
+      }));
+      writeTargetCommunicationAssets(
+        tempDir,
+        TARGET_COMMUNICATION_ASSETS.filter((asset) => !asset.endsWith('/c4-receive.js')),
+      );
+
+      const result = step0_verifyTargetCommunicationCompatibility({ tempDir });
+
+      assert.equal(result.status, 'failed');
+      assert.match(result.error, /c4-receive\.js/);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a skill sync that leaves a critical receive entrypoint undeployed', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-sync-target-'));
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-sync-live-'));
+    const skillsDir = path.join(zylosDir, '.claude', 'skills');
+    try {
+      writeTargetCommunicationAssets(tempDir);
+      const result = step5_syncCoreSkills({ tempDir, mode: 'merge' }, {
+        zylosDir,
+        skillsDir,
+        syncCoreSkills: () => ({
+          synced: [], added: [], merged: [], deleted: [], preserved: [],
+          conflicts: [], errors: [], pendingBaselines: [],
+        }),
+      });
+
+      assert.equal(result.status, 'failed');
+      assert.match(result.error, /c4-receive\.js/);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(zylosDir, { recursive: true, force: true });
     }
   });
 

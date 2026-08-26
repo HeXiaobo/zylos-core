@@ -59,6 +59,14 @@ beforeEach(() => {
     product: 'zylos-core',
     protocols: { 'c4.reply.argv-compat': 1 },
   }));
+  for (const relativePath of [
+    'skills/comm-bridge/scripts/c4-send.js',
+    'skills/comm-bridge/scripts/c4-receive.js',
+    'skills/comm-bridge/scripts/c4-dispatcher.js',
+    'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+  ]) {
+    writeFile(packageDir, relativePath, '#!/usr/bin/env node\n');
+  }
 });
 
 afterEach(() => {

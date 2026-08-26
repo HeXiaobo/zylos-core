@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import { verifyCommunicationContinuity } from '../communication-continuity.js';
 
 const C4_SEND_PATH = path.resolve('skills/comm-bridge/scripts/c4-send.js');
+const C4_RECEIVE_PATH = path.resolve('skills/comm-bridge/scripts/c4-receive.js');
 const STRICT_C4_SEND_FIXTURE = path.resolve(
   'cli/lib/__tests__/fixtures/strict-c4-send.js',
 );
@@ -19,7 +20,20 @@ describe('communication continuity canary', () => {
     assert.deepEqual(result.checks.map(({ name, status }) => ({ name, status })), [
       { name: 'stdin_reply', status: 'passed' },
       { name: 'legacy_argv_reply', status: 'passed' },
+      { name: 'inbound_receive', status: 'passed' },
+      { name: 'inbound_persistence', status: 'passed' },
     ]);
+  });
+
+  it('fails closed when the deployed receive entrypoint is missing', () => {
+    const result = verifyCommunicationContinuity({
+      c4SendPath: C4_SEND_PATH,
+      c4ReceivePath: `${C4_RECEIVE_PATH}.missing`,
+    });
+
+    assert.equal(result.compatible, false);
+    assert.match(result.error, /inbound_receive/);
+    assert.match(result.error, /not found/);
   });
 
   it('uses only safe body transports and proves argv is policy-rejected when strict policy is explicit', () => {
@@ -56,6 +70,8 @@ describe('communication continuity canary', () => {
         { name: 'stdin_reply', status: 'passed', mode: undefined },
         { name: 'body_file_reply', status: 'passed', mode: undefined },
         { name: 'legacy_argv_reply', status: 'passed', mode: 'strict_rejection' },
+        { name: 'inbound_receive', status: 'passed', mode: undefined },
+        { name: 'inbound_persistence', status: 'passed', mode: undefined },
       ]);
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
@@ -69,6 +85,8 @@ describe('communication continuity canary', () => {
 
       const result = verifyCommunicationContinuity({
         c4SendPath: STRICT_C4_SEND_FIXTURE,
+        c4ReceivePath: C4_RECEIVE_PATH,
+        c4DbPath: path.resolve('skills/comm-bridge/scripts/c4-db.js'),
         zylosDir,
       });
 
@@ -77,6 +95,8 @@ describe('communication continuity canary', () => {
         { name: 'stdin_reply', status: 'passed', mode: undefined },
         { name: 'body_file_reply', status: 'passed', mode: undefined },
         { name: 'legacy_argv_reply', status: 'passed', mode: 'strict_rejection' },
+        { name: 'inbound_receive', status: 'passed', mode: undefined },
+        { name: 'inbound_persistence', status: 'passed', mode: undefined },
       ]);
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });

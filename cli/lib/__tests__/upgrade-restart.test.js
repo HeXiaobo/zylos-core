@@ -570,12 +570,28 @@ describe('step12_verifyServices', () => {
       servicesWereRunning: ['c4-dispatcher'],
       servicesExpectedAfterUpgrade: ['c4-dispatcher', 'c4-response-stream-supervisor'],
     }, {
+      skillsDir: '/tmp/skills',
+      fs: {
+        statSync: () => ({ isFile: () => true }),
+      },
       execSync: (cmd) => {
         commands.push(cmd);
         if (cmd.startsWith('pm2 jlist')) {
           return JSON.stringify([
-            { name: 'c4-dispatcher', pm2_env: { status: 'online' } },
-            { name: 'c4-response-stream-supervisor', pm2_env: { status: 'online' } },
+            {
+              name: 'c4-dispatcher',
+              pm2_env: {
+                status: 'online',
+                pm_exec_path: '/tmp/skills/comm-bridge/scripts/c4-dispatcher.js',
+              },
+            },
+            {
+              name: 'c4-response-stream-supervisor',
+              pm2_env: {
+                status: 'online',
+                pm_exec_path: '/tmp/skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+              },
+            },
           ]);
         }
         return '';
@@ -584,6 +600,30 @@ describe('step12_verifyServices', () => {
 
     assert.equal(result.status, 'done');
     assert.equal(commands.some(cmd => cmd.startsWith('pm2 jlist')), true);
+  });
+
+  it('rejects a PM2 process that is online but points at a missing script', () => {
+    const result = step12_verifyServices({
+      servicesWereRunning: ['c4-response-stream-supervisor'],
+      servicesExpectedAfterUpgrade: ['c4-response-stream-supervisor'],
+    }, {
+      skillsDir: '/tmp/zylos-missing-skills',
+      execSync: (cmd) => {
+        if (cmd.startsWith('pm2 jlist')) {
+          return JSON.stringify([{
+            name: 'c4-response-stream-supervisor',
+            pm2_env: {
+              status: 'online',
+              pm_exec_path: '/tmp/zylos-missing-skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+            },
+          }]);
+        }
+        return '';
+      },
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /missing executable/);
   });
 });
 

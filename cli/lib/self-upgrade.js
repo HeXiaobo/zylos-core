@@ -38,7 +38,10 @@ import {
 import { deployManifestTemplate } from './runtime/tmux-env.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
-import { verifyCommunicationContinuity } from './communication-continuity.js';
+import {
+  verifyCommunicationAssets,
+  verifyCommunicationContinuity,
+} from './communication-continuity.js';
 import { readEnvFile } from './env.js';
 
 // Services that must be present for upgraded Core behavior to function. During
@@ -574,11 +577,24 @@ export function step0_verifyTargetCommunicationCompatibility(ctx, deps = {}) {
         duration: Date.now() - startTime,
       };
     }
+    const assets = verifyCommunicationAssets({
+      skillsDir: path.join(ctx.tempDir || '', 'skills'),
+      fsApi,
+    });
+    if (!assets.compatible) {
+      return {
+        step: 0,
+        name: 'verify_target_communication_compatibility',
+        status: 'failed',
+        error: assets.error,
+        duration: Date.now() - startTime,
+      };
+    }
     return {
       step: 0,
       name: 'verify_target_communication_compatibility',
       status: 'done',
-      message: `c4.reply.argv-compat=${actual}`,
+      message: `c4.reply.argv-compat=${actual}; ${assets.checked.length} critical assets`,
       duration: Date.now() - startTime,
     };
   } catch (err) {
@@ -755,6 +771,7 @@ export function step5_syncCoreSkills(ctx, deps = {}) {
   const startTime = Date.now();
   const fsApi = deps.fs ?? fs;
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
   const syncCoreSkillsFn = deps.syncCoreSkills ?? syncCoreSkills;
 
   const newSkillsSrc = path.join(ctx.tempDir, 'skills');
@@ -795,7 +812,24 @@ export function step5_syncCoreSkills(ctx, deps = {}) {
       return { step: 5, name: 'sync_core_skills', status: 'failed', error: syncResult.errors.join('; '), duration: Date.now() - startTime };
     }
 
-    return { step: 5, name: 'sync_core_skills', status: 'done', message: msg, duration: Date.now() - startTime };
+    const assets = verifyCommunicationAssets({ skillsDir, fsApi });
+    if (!assets.compatible) {
+      return {
+        step: 5,
+        name: 'sync_core_skills',
+        status: 'failed',
+        error: assets.error,
+        duration: Date.now() - startTime,
+      };
+    }
+
+    return {
+      step: 5,
+      name: 'sync_core_skills',
+      status: 'done',
+      message: `${msg}; ${assets.checked.length} critical assets verified`,
+      duration: Date.now() - startTime,
+    };
   } catch (err) {
     return { step: 5, name: 'sync_core_skills', status: 'failed', error: err.message, duration: Date.now() - startTime };
   }
@@ -1458,6 +1492,10 @@ export function step11_startCoreServices(ctx, deps = {}) {
 export function step12_verifyServices(ctx, deps = {}) {
   const startTime = Date.now();
   const exec = deps.execSync ?? execSync;
+  const fsApi = deps.fs ?? fs;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
+  const requiredServices = deps.requiredCoreServices ?? UPGRADE_REQUIRED_CORE_SERVICES;
+  const requiredByName = new Map(requiredServices.map((service) => [service.name, service]));
   const servicesToVerify = ctx.servicesExpectedAfterUpgrade?.length > 0
     ? ctx.servicesExpectedAfterUpgrade
     : ctx.servicesWereRunning;
@@ -1480,6 +1518,42 @@ export function step12_verifyServices(ctx, deps = {}) {
         const proc = processes.find(p => p.name === name);
         return !proc || proc.pm2_env?.status !== 'online';
       });
+
+      const invalidExecutables = [];
+      for (const name of servicesToVerify) {
+        const proc = processes.find((candidate) => candidate.name === name);
+        if (!proc || proc.pm2_env?.status !== 'online') continue;
+        const execPath = proc.pm2_env?.pm_exec_path;
+        let isFile = false;
+        try {
+          isFile = Boolean(execPath) && fsApi.statSync(execPath).isFile();
+        } catch {
+          isFile = false;
+        }
+        if (!isFile) {
+          invalidExecutables.push(`${name} missing executable: ${execPath || '(unset)'}`);
+          continue;
+        }
+        const required = requiredByName.get(name);
+        if (required) {
+          const expectedPath = path.resolve(skillsDir, ...required.script);
+          if (path.resolve(execPath) !== expectedPath) {
+            invalidExecutables.push(
+              `${name} executable mismatch: expected ${expectedPath}, found ${path.resolve(execPath)}`,
+            );
+          }
+        }
+      }
+
+      if (invalidExecutables.length > 0) {
+        return {
+          step: 12,
+          name: 'verify_services',
+          status: 'failed',
+          error: invalidExecutables.join('; '),
+          duration: Date.now() - startTime,
+        };
+      }
 
       if (notOnline.length === 0) {
         return { step: 12, name: 'verify_services', status: 'done', duration: Date.now() - startTime };
@@ -1504,9 +1578,18 @@ export function step13_verifyCommunicationContinuity(_ctx, deps = {}) {
   const verify = deps.verify ?? verifyCommunicationContinuity;
   const c4SendPath = deps.c4SendPath
     ?? path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-send.js');
+  const c4ReceivePath = deps.c4ReceivePath
+    ?? path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-receive.js');
+  const c4DbPath = deps.c4DbPath
+    ?? path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-db.js');
 
   try {
-    const result = verify({ c4SendPath, zylosDir: deps.zylosDir ?? ZYLOS_DIR });
+    const result = verify({
+      c4SendPath,
+      c4ReceivePath,
+      c4DbPath,
+      zylosDir: deps.zylosDir ?? ZYLOS_DIR,
+    });
     if (!result.compatible) {
       return {
         step: 13,

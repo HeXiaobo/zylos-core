@@ -5,6 +5,24 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.5] - 2026-08-27
+
+### Added
+- A deterministic Core + Feishu fork-pair upgrade runner stages both targets
+  by immutable commit SHA, validates fork routing and critical assets before
+  mutation, and writes structured `PASS`/`HOLD` evidence for operators.
+- The communication continuity canary now proves that deployed `c4-receive`
+  durably persists a hermetic inbound message as well as proving outbound reply
+  contracts.
+
+### Fixed
+- Self-upgrade rejects a target or post-sync deployment that lacks a critical
+  communication entrypoint, including `c4-receive` and the response supervisor.
+- PM2 service verification rejects fake-online processes whose executable is
+  missing or whose required service points at the wrong script.
+- GitHub component and Core downloads accept full commit SHAs through immutable
+  archive URLs, so a checked target cannot drift with a movable branch.
+
 ## [0.7.2-rc.4] - 2026-08-26
 
 ### Fixed
