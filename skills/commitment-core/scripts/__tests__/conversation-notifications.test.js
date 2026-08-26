@@ -80,6 +80,7 @@ test('TaskConversation keeps add, revision, and deletion as immutable history wi
     assert.deepEqual(deleted.comment, {
       id: 'comment-parent',
       taskId: 'task-comments-1',
+      authorId: 'owner-1',
       actorId: 'external:feishu',
       body: null,
       replyToCommentId: null,
@@ -270,6 +271,148 @@ test('NotificationPolicy routes critical work, suppresses progress and never not
       }),
       (error) => error?.code === 'INVALID_NOTIFICATION_TARGET',
     );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('NotificationPolicy persists one idempotent decision per event across Core restarts', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-notification-decision-'));
+  const dbPath = path.join(directory, 'commitments.db');
+  const input = {
+    taskId: 'task-notification-persistence',
+    eventId: 'comment-event-persistent',
+    kind: 'action_required',
+    actorId: 'owner-1',
+    targetIds: ['acceptor-1'],
+  };
+  let core = openCommitmentCore({
+    dbPath,
+    clock: () => '2026-08-25T10:30:00.000Z',
+    idGenerator: () => 'task-notification-persistence',
+    eventIdGenerator: () => 'task-event-notification-persistence',
+  });
+  try {
+    core.ingest({
+      idempotencyKey: 'source:task-notification-persistence',
+      source: { channel: 'test', externalId: 'source-persistent', senderId: 'owner-1' },
+      task: {
+        title: 'Persist notification routing',
+        ownerId: 'owner-1',
+        acceptorId: 'acceptor-1',
+      },
+    });
+    const first = core.notifications.decide(input);
+    core.close();
+
+    core = openCommitmentCore({
+      dbPath,
+      clock: () => '2026-08-25T10:31:00.000Z',
+    });
+    assert.deepEqual(core.notifications.decide(input), first);
+    assert.throws(
+      () => core.notifications.decide({
+        ...input,
+        targetIds: ['owner-1'],
+      }),
+      (error) => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+  } finally {
+    core.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('TaskSubscriptions persists an explicit subscriber as a channel-neutral audience role', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-subscriptions-'));
+  const dbPath = path.join(directory, 'commitments.db');
+  let core = openCommitmentCore({
+    dbPath,
+    clock: () => '2026-08-25T10:30:00.000Z',
+    idGenerator: () => 'task-subscriptions-1',
+    eventIdGenerator: () => 'task-event-subscriptions-1',
+  });
+  try {
+    core.ingest({
+      idempotencyKey: 'source:task-subscriptions-1',
+      source: { channel: 'test', externalId: 'source-subscriptions', senderId: 'owner-1' },
+      task: {
+        title: 'Track explicit subscribers',
+        ownerId: 'owner-1',
+        acceptorId: 'acceptor-1',
+      },
+    });
+    const command = {
+      taskId: 'task-subscriptions-1',
+      subscriberId: 'person:stakeholder',
+      actorId: 'person:stakeholder',
+      idempotencyKey: 'subscription:add:stakeholder',
+    };
+    const first = core.subscriptions.add(command);
+    assert.deepEqual(core.subscriptions.add(command), first);
+    core.close();
+
+    core = openCommitmentCore({ dbPath });
+    assert.deepEqual(core.subscriptions.resolve({ taskId: 'task-subscriptions-1' }), [{
+      subscriberId: 'person:stakeholder',
+      subscribedAt: '2026-08-25T10:30:00.000Z',
+      subscribedBy: 'person:stakeholder',
+    }]);
+    assert.deepEqual(core.audience.resolve({ taskId: 'task-subscriptions-1' }), [
+      { recipientId: 'owner-1', roles: ['owner'] },
+      { recipientId: 'acceptor-1', roles: ['acceptor'] },
+      { recipientId: 'person:stakeholder', roles: ['subscriber'] },
+    ]);
+  } finally {
+    core.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('TaskSubscriptions removes a subscriber idempotently without changing business roles', () => {
+  const harness = createHarness();
+  try {
+    harness.core.subscriptions.add({
+      taskId: 'task-comments-1',
+      subscriberId: 'person:temporary',
+      actorId: 'person:temporary',
+      idempotencyKey: 'subscription:add:temporary',
+    });
+    const command = {
+      taskId: 'task-comments-1',
+      subscriberId: 'person:temporary',
+      actorId: 'person:temporary',
+      idempotencyKey: 'subscription:remove:temporary',
+    };
+
+    const first = harness.core.subscriptions.remove(command);
+
+    assert.deepEqual(first, { removed: true, subscriberId: 'person:temporary' });
+    assert.deepEqual(harness.core.subscriptions.remove(command), first);
+    assert.deepEqual(harness.core.subscriptions.resolve({ taskId: 'task-comments-1' }), []);
+    assert.deepEqual(harness.core.audience.resolve({ taskId: 'task-comments-1' }), [
+      { recipientId: 'owner-1', roles: ['owner'] },
+      { recipientId: 'acceptor-1', roles: ['acceptor'] },
+      { recipientId: 'agent-1', roles: ['assignee'] },
+    ]);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('TaskSubscriptions gives no implicit authority to a platform Adapter', () => {
+  const harness = createHarness();
+  try {
+    assert.throws(
+      () => harness.core.subscriptions.add({
+        taskId: 'task-comments-1',
+        subscriberId: 'person:follower',
+        actorId: 'external:feishu-sync',
+        idempotencyKey: 'subscription:add:unauthorized-platform-sync',
+      }),
+      (error) => error?.code === 'FORBIDDEN',
+    );
+    assert.deepEqual(harness.core.subscriptions.resolve({ taskId: 'task-comments-1' }), []);
   } finally {
     harness.cleanup();
   }

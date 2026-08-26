@@ -177,14 +177,34 @@ events and never updates or deletes comment history.
   materialized comment view.
 - `conversation.query({ taskId, commentId?, includeHistory?, limit? })` returns
   current comment views and, when requested, their immutable event history.
+  A comment view exposes stable `authorId` separately from the actor that made
+  its latest revision or deletion, so an exact reply can retain its original
+  human destination.
 - Each comment event and exact-replay receipt commits in one transaction.
   Reusing a key with different normalized content returns
   `IDEMPOTENCY_CONFLICT`.
 
-`core.audience.resolve({ taskId })` returns the unique business participants
-and their merged `owner`, `acceptor`, and `assignee` roles. Platform followers
-are deliberately absent: an Adapter may project this audience as followers,
-but follower state is not a Core fact.
+`core.subscriptions` owns explicit, channel-neutral Task subscriptions.
+
+- `subscriptions.add({ taskId, subscriberId, actorId, idempotencyKey })` and
+  `subscriptions.remove(...)` persist one membership change and exact-replay
+  receipt. `subscriptions.resolve({ taskId })` returns current memberships.
+- The subscriber, Task Owner, or Task Acceptor may add or remove a membership.
+  A platform Adapter has no implicit authority to manage another person's
+  subscription. An authenticated platform event may act as the subscriber
+  only when that identity is trustworthy; an event without a trustworthy
+  operator must fail closed until a separate Core capability is introduced.
+- Feishu follower state is not automatically a Core fact. An Adapter may
+  project a Core subscriber outward, but it must not silently import arbitrary
+  follower state or put platform identifiers into this Interface.
+
+`core.audience.resolve({ taskId })` returns unique business participants and
+their merged `owner`, `acceptor`, `assignee`, `subscriber`, and `participant`
+roles. Conversation participants are Core facts derived from canonical comment
+authors; ordinary new-comment broadcasts use business/explicit subscriber
+roles, not every prior commenter. `core.audience.contains(...)` performs an
+unbounded membership check for exact-reply authorization without depending on
+the bounded audience listing.
 
 `core.notifications.decide({ taskId, eventId, kind, actorId?, targetIds? })`
 returns channel-neutral deliveries with `recipientId`, `reason`, `urgency`,
@@ -196,18 +216,24 @@ returns channel-neutral deliveries with `recipientId`, `reason`, `urgency`,
 - `action_required` immediately targets explicit Task-audience members.
 - `progress` produces no direct-message delivery.
 - The event actor is always removed from the recipient set.
+- The first decision for an `eventId` is immutable and persisted. Exact replay
+  returns the original decision even after the Task audience changes; a
+  conflicting payload under that event fails with `IDEMPOTENCY_CONFLICT`.
+  `notifications.query({ eventId })` lets a coordinator recover that durable
+  decision after a crash and republish the same Adapter-consumable dedupe keys.
 
 These Interfaces make no Feishu SDK calls and do not render or deliver
 notifications. Channel Adapters own delivery receipts, rate limits, and UI.
 
 `createTaskCommentCoordinator({ core, publishNotification })` is the production
 coordination seam used after a platform comment has been authenticated. It
-records the canonical comment first, derives `action_required` deliveries for
-non-acting human audience members, and passes the decision to the injected
-publisher. Logical `agent:*` participants are excluded from this notification
-path because the runtime wake seam owns their exact reply context. Replaying a
-comment republishes the same decision, allowing the channel's durable dedupe
-receipt to recover a crash after Core commit.
+records the canonical comment first. A human comment derives `action_required`
+deliveries for non-acting human business/explicit subscribers; an Agent exact
+reply targets only the original human comment author. Logical `agent:*`
+participants are excluded from this notification path because the runtime wake
+seam owns execution and exact reply context. Replaying a comment reads and
+republishes the same persisted decision, allowing the channel's durable dedupe
+receipt to recover a crash after Core commit without audience drift.
 
 ## Transactional projection Outbox
 
@@ -495,6 +521,21 @@ Only `work_started` becomes `StartTask`. `deliverable_submitted`, `delivered`,
 completion is evidence for review, never acceptance: this Adapter never
 produces `AcceptTask`, and unknown or human-acceptance event types fail closed.
 Only an explicit, authorized acceptor action may move a reviewed Task to `done`.
+
+## External native Task Adapter seam
+
+`mapExternalTaskEvent(...)` in `scripts/external-task-adapter.js` is the
+platform-neutral inbound Interface for an authenticated native Task status
+event. Its supported `completed` event maps only to `SubmitForReview` with a
+stable `<backend>:<eventId>:task-command` idempotency key. The returned command
+still passes through the normal Core authorization, version, active-Run, and
+state-transition checks.
+
+Native `accepted`, `approved`, `done`, and `succeeded` event shapes fail
+closed. This Interface cannot construct `AcceptTask`; only a separate explicit
+Acceptor command against a Task already in `review` may do that. Platform
+payload parsing, ExternalLink resolution, and actor authentication remain in
+the platform Adapter.
 
 ## Execution control-plane gate
 

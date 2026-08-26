@@ -22,7 +22,12 @@ import {
 import {
   createNotificationPolicyModule,
   createTaskAudienceModule,
+  initializeTaskNotificationSchema,
 } from './task-notifications.js';
+import {
+  createTaskSubscriptionModule,
+  initializeTaskSubscriptionSchema,
+} from './task-subscriptions.js';
 
 function defaultDbPath() {
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -481,9 +486,9 @@ function initializeSchema(database) {
  * Open the durable Commitment Core Module.
  *
  * Callers interact only through ingest/command/query and the nested runs,
- * evidence, externalLinks, and outbox Interfaces. SQLite transactions, schema
- * migration, deduplication, events, leases, and persistence remain inside the
- * Module.
+ * evidence, externalLinks, conversation, subscriptions, audience,
+ * notifications, and outbox Interfaces. SQLite transactions, schema migration,
+ * deduplication, events, leases, and persistence remain inside the Module.
  */
 export function openCommitmentCore({
   dbPath = defaultDbPath(),
@@ -511,6 +516,8 @@ export function openCommitmentCore({
   initializeEvidenceSchema(database);
   initializeExternalLinkSchema(database);
   initializeTaskConversationSchema(database);
+  initializeTaskSubscriptionSchema(database);
+  initializeTaskNotificationSchema(database);
   const projectionOutboxModule = createProjectionOutboxModule({ database, clock });
   backfillCreationEvents(database, eventIdGenerator, projectionOutboxModule.append);
 
@@ -749,8 +756,18 @@ export function openCommitmentCore({
     eventIdGenerator: conversationEventIdGenerator,
     taskStore,
   });
-  const audienceModule = createTaskAudienceModule({ taskStore });
-  const notificationPolicyModule = createNotificationPolicyModule({ taskStore });
+  const subscriptionModule = createTaskSubscriptionModule({ database, clock, taskStore });
+  const audienceModule = createTaskAudienceModule({
+    taskStore,
+    conversation: conversationModule,
+    subscriptions: subscriptionModule,
+  });
+  const notificationPolicyModule = createNotificationPolicyModule({
+    taskStore,
+    audience: audienceModule,
+    database,
+    clock,
+  });
 
   return Object.freeze({
     ingest(envelope) {
@@ -763,6 +780,7 @@ export function openCommitmentCore({
     evidence: evidenceModule,
     externalLinks: externalLinkModule,
     conversation: conversationModule,
+    subscriptions: subscriptionModule,
     audience: audienceModule,
     notifications: notificationPolicyModule,
     outbox: projectionOutboxModule.publicInterface,

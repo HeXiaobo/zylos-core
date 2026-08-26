@@ -119,6 +119,22 @@ function normalizeQuery(rawQuery) {
   };
 }
 
+function normalizeParticipantQuery(rawQuery) {
+  const query = requireRecord(rawQuery, 'conversation participant query');
+  rejectUnknownFields(
+    query,
+    new Set(['taskId', 'participantId']),
+    'conversation participant query',
+  );
+  return {
+    taskId: requireText(query.taskId, 'conversation participant query.taskId'),
+    participantId: requireText(
+      query.participantId,
+      'conversation participant query.participantId',
+    ),
+  };
+}
+
 function toEventView(row) {
   if (!row) return null;
   return {
@@ -134,11 +150,12 @@ function toEventView(row) {
   };
 }
 
-function toCommentView(row) {
+function toCommentView(row, authorId = row?.actor_id) {
   if (!row) return null;
   return {
     id: row.comment_id,
     taskId: row.task_id,
+    authorId,
     actorId: row.actor_id,
     body: row.body,
     replyToCommentId: row.reply_to_comment_id,
@@ -244,6 +261,13 @@ export function createTaskConversationModule({
     ORDER BY occurred_at, comment_id
     LIMIT ?
   `);
+  const selectCommentAuthor = database.prepare(`
+    SELECT actor_id
+    FROM commitment_conversation_events
+    WHERE task_id = ? AND comment_id = ?
+    ORDER BY (event_type = 'CommentAdded') DESC, occurred_at, recorded_at, id
+    LIMIT 1
+  `);
   const selectCommentEvents = database.prepare(`
     SELECT id, event_type, task_id, comment_id, actor_id, body,
            reply_to_comment_id, occurred_at, recorded_at
@@ -269,6 +293,22 @@ export function createTaskConversationModule({
       LIMIT ?
     )
     ORDER BY occurred_at, recorded_at, id
+  `);
+  const selectParticipant = database.prepare(`
+    WITH ranked_authors AS (
+      SELECT actor_id,
+             ROW_NUMBER() OVER (
+               PARTITION BY comment_id
+               ORDER BY (event_type = 'CommentAdded') DESC,
+                        occurred_at, recorded_at, id
+             ) AS position
+      FROM commitment_conversation_events
+      WHERE task_id = ?
+    )
+    SELECT 1 AS found
+    FROM ranked_authors
+    WHERE position = 1 AND actor_id = ?
+    LIMIT 1
   `);
 
   const recordTransaction = database.transaction((rawCommand) => {
@@ -309,7 +349,10 @@ export function createTaskConversationModule({
       event.occurredAt,
       event.recordedAt,
     );
-    const comment = toCommentView(selectCurrentComment.get(command.taskId, command.commentId));
+    const comment = toCommentView(
+      selectCurrentComment.get(command.taskId, command.commentId),
+      selectCommentAuthor.get(command.taskId, command.commentId)?.actor_id,
+    );
     const result = { event, comment };
     insertReceipt.run(
       command.idempotencyKey,
@@ -331,7 +374,10 @@ export function createTaskConversationModule({
         throw domainError('TASK_NOT_FOUND', `task not found: ${query.taskId}`);
       }
       if (query.commentId) {
-        const comment = toCommentView(selectCurrentComment.get(query.taskId, query.commentId));
+        const comment = toCommentView(
+          selectCurrentComment.get(query.taskId, query.commentId),
+          selectCommentAuthor.get(query.taskId, query.commentId)?.actor_id,
+        );
         if (!query.includeHistory) return comment;
         return {
           comment,
@@ -340,12 +386,24 @@ export function createTaskConversationModule({
             .map(toEventView),
         };
       }
-      const comments = selectCurrentComments.all(query.taskId, query.limit).map(toCommentView);
+      const comments = selectCurrentComments.all(query.taskId, query.limit).map((row) => (
+        toCommentView(
+          row,
+          selectCommentAuthor.get(query.taskId, row.comment_id)?.actor_id,
+        )
+      ));
       if (!query.includeHistory) return comments;
       return {
         comments,
         events: selectTaskEvents.all(query.taskId, query.limit).map(toEventView),
       };
+    },
+    hasParticipant(rawQuery) {
+      const query = normalizeParticipantQuery(rawQuery);
+      if (!taskStore.get(query.taskId)) {
+        throw domainError('TASK_NOT_FOUND', `task not found: ${query.taskId}`);
+      }
+      return Boolean(selectParticipant.get(query.taskId, query.participantId));
     },
   });
 }

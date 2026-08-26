@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 const NOTIFICATION_KINDS = new Set([
   'review',
   'blocked',
@@ -42,7 +44,11 @@ function domainError(code, message) {
   return error;
 }
 
-function audienceForTask(task) {
+function fingerprint(value) {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function audienceForTask(task, conversation, subscriptions) {
   const roles = new Map();
   const add = (recipientId, role) => {
     if (!recipientId) return;
@@ -53,6 +59,12 @@ function audienceForTask(task) {
   add(task.ownerId, 'owner');
   add(task.acceptorId, 'acceptor');
   add(task.assigneeId, 'assignee');
+  for (const comment of conversation.query({ taskId: task.id })) {
+    add(comment.authorId, 'participant');
+  }
+  for (const subscription of subscriptions.resolve({ taskId: task.id })) {
+    add(subscription.subscriberId, 'subscriber');
+  }
   return [...roles.entries()].map(([recipientId, recipientRoles]) => ({
     recipientId,
     roles: recipientRoles,
@@ -63,6 +75,19 @@ function normalizeAudienceQuery(rawQuery) {
   const query = requireRecord(rawQuery, 'audience query');
   rejectUnknownFields(query, new Set(['taskId']), 'audience query');
   return { taskId: requireText(query.taskId, 'audience query.taskId') };
+}
+
+function normalizeAudienceMembershipQuery(rawQuery) {
+  const query = requireRecord(rawQuery, 'audience membership query');
+  rejectUnknownFields(
+    query,
+    new Set(['taskId', 'recipientId']),
+    'audience membership query',
+  );
+  return {
+    taskId: requireText(query.taskId, 'audience membership query.taskId'),
+    recipientId: requireText(query.recipientId, 'audience membership query.recipientId'),
+  };
 }
 
 function normalizeDecision(rawInput) {
@@ -100,6 +125,12 @@ function normalizeDecision(rawInput) {
   };
 }
 
+function normalizeDecisionQuery(rawQuery) {
+  const query = requireRecord(rawQuery, 'notification query');
+  rejectUnknownFields(query, new Set(['eventId']), 'notification query');
+  return { eventId: requireText(query.eventId, 'notification query.eventId') };
+}
+
 function deliveryAttributes(kind) {
   if (kind === 'review') {
     return {
@@ -125,35 +156,102 @@ function deliveryAttributes(kind) {
   };
 }
 
-export function createTaskAudienceModule({ taskStore }) {
+export function createTaskAudienceModule({ taskStore, conversation, subscriptions }) {
   return Object.freeze({
     resolve(rawQuery) {
       const query = normalizeAudienceQuery(rawQuery);
       const task = taskStore.get(query.taskId);
       if (!task) throw domainError('TASK_NOT_FOUND', `task not found: ${query.taskId}`);
-      return audienceForTask(task);
+      return audienceForTask(task, conversation, subscriptions);
+    },
+    contains(rawQuery) {
+      const query = normalizeAudienceMembershipQuery(rawQuery);
+      const task = taskStore.get(query.taskId);
+      if (!task) throw domainError('TASK_NOT_FOUND', `task not found: ${query.taskId}`);
+      if ([task.ownerId, task.acceptorId, task.assigneeId].includes(query.recipientId)) {
+        return true;
+      }
+      if (subscriptions.resolve({ taskId: task.id })
+        .some(({ subscriberId }) => subscriberId === query.recipientId)) {
+        return true;
+      }
+      return conversation.hasParticipant({
+        taskId: task.id,
+        participantId: query.recipientId,
+      });
     },
   });
 }
 
-export function createNotificationPolicyModule({ taskStore }) {
-  return Object.freeze({
-    decide(rawInput) {
-      const input = normalizeDecision(rawInput);
-      const task = taskStore.get(input.taskId);
-      if (!task) throw domainError('TASK_NOT_FOUND', `task not found: ${input.taskId}`);
-      if (input.kind === 'progress') {
-        return { eventId: input.eventId, taskId: input.taskId, kind: input.kind, deliveries: [] };
+export function initializeTaskNotificationSchema(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS commitment_notification_decisions (
+      event_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      request_fingerprint TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (task_id) REFERENCES commitment_tasks(id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_commitment_notification_decisions_task
+      ON commitment_notification_decisions(task_id, created_at, event_id);
+
+    CREATE TRIGGER IF NOT EXISTS commitment_notification_decisions_no_update
+      BEFORE UPDATE ON commitment_notification_decisions
+      BEGIN
+        SELECT RAISE(ABORT, 'notification decisions are immutable');
+      END;
+
+    CREATE TRIGGER IF NOT EXISTS commitment_notification_decisions_no_delete
+      BEFORE DELETE ON commitment_notification_decisions
+      BEGIN
+        SELECT RAISE(ABORT, 'notification decisions are immutable');
+      END;
+  `);
+}
+
+export function createNotificationPolicyModule({ taskStore, audience, database, clock }) {
+  const selectDecision = database.prepare(`
+    SELECT request_fingerprint, result_json
+    FROM commitment_notification_decisions
+    WHERE event_id = ?
+  `);
+  const insertDecision = database.prepare(`
+    INSERT INTO commitment_notification_decisions (
+      event_id, task_id, request_fingerprint, result_json, created_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const decideTransaction = database.transaction((rawInput) => {
+    const input = normalizeDecision(rawInput);
+    const requestFingerprint = fingerprint(input);
+    const receipt = selectDecision.get(input.eventId);
+    if (receipt) {
+      if (receipt.request_fingerprint !== requestFingerprint) {
+        throw domainError(
+          'IDEMPOTENCY_CONFLICT',
+          `notification event already belongs to different content: ${input.eventId}`,
+        );
       }
-      const audience = audienceForTask(task);
-      const audienceIds = new Set(audience.map(({ recipientId }) => recipientId));
+      return JSON.parse(receipt.result_json);
+    }
+    const task = taskStore.get(input.taskId);
+    if (!task) throw domainError('TASK_NOT_FOUND', `task not found: ${input.taskId}`);
+    let result;
+    if (input.kind === 'progress') {
+      result = { eventId: input.eventId, taskId: input.taskId, kind: input.kind, deliveries: [] };
+    } else {
       let recipients;
       if (input.kind === 'review') {
         recipients = [task.acceptorId];
       } else if (input.kind === 'blocked' || input.kind === 'failed' || input.kind === 'overdue') {
         recipients = [task.ownerId, task.assigneeId].filter(Boolean);
       } else {
-        const invalidTarget = input.targetIds.find((targetId) => !audienceIds.has(targetId));
+        const invalidTarget = input.targetIds.find((targetId) => !audience.contains({
+          taskId: task.id,
+          recipientId: targetId,
+        }));
         if (invalidTarget) {
           throw domainError(
             'INVALID_NOTIFICATION_TARGET',
@@ -170,12 +268,31 @@ export function createNotificationPolicyModule({ taskStore }) {
           ...attributes,
           dedupeKey: `${input.eventId}:${recipientId}`,
         }));
-      return {
+      result = {
         eventId: input.eventId,
         taskId: input.taskId,
         kind: input.kind,
         deliveries,
       };
+    }
+    insertDecision.run(
+      input.eventId,
+      input.taskId,
+      requestFingerprint,
+      JSON.stringify(result),
+      requireText(clock(), 'clock result'),
+    );
+    return result;
+  });
+
+  return Object.freeze({
+    decide(rawInput) {
+      return decideTransaction.immediate(rawInput);
+    },
+    query(rawQuery) {
+      const query = normalizeDecisionQuery(rawQuery);
+      const receipt = selectDecision.get(query.eventId);
+      return receipt ? JSON.parse(receipt.result_json) : null;
     },
   });
 }
