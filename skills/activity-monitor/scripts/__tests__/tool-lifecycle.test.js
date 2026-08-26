@@ -63,6 +63,24 @@ describe('tool-lifecycle', () => {
     assert.equal(snapshot.in_prompt, true);
   });
 
+  it('keeps the runtime turn active across tool gaps until Stop', () => {
+    const state = createToolLifecycleState();
+    applyOrderedToolEvents(state, [
+      { ts: 900, pid: 42, session_id: 's1', event: 'prompt' },
+      createPreEvent({ ts: 1000 }),
+      createPostEvent({ ts: 2000 }),
+    ], { nowMs: 2500 });
+
+    const betweenTools = getSessionSnapshot(state, 's1', 's1');
+    assert.equal(betweenTools.running_tools.length, 0);
+    assert.equal(betweenTools.in_prompt, true);
+
+    applyOrderedToolEvents(state, [
+      { ts: 3000, pid: 42, session_id: 's1', event: 'stop' },
+    ], { nowMs: 3000 });
+    assert.equal(getSessionSnapshot(state, 's1', 's1').in_prompt, false);
+  });
+
   it('clears a tool on normal completion', () => {
     const state = createToolLifecycleState();
     applyOrderedToolEvents(state, [

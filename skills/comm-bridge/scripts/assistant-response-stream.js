@@ -124,6 +124,23 @@ function toRequest(row) {
   };
 }
 
+function toRuntimeTurnAdmission(row) {
+  if (!row) return null;
+  return {
+    admissionId: row.id,
+    conversationId: row.conversation_id,
+    requestId: row.request_id,
+    routeChannel: row.route_channel,
+    status: row.status,
+    runtimeSessionId: row.runtime_session_id,
+    acquiredAt: row.acquired_at,
+    startedAt: row.started_at,
+    terminalAt: row.terminal_at,
+    updatedAt: row.updated_at,
+    terminalReason: row.terminal_reason,
+  };
+}
+
 function openDatabase(dbPath) {
   if (!dbPath) return { database: getDb(), ownsDatabase: false };
   if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -182,6 +199,40 @@ export function openAssistantResponseStream({
            accepted_at, updated_at, terminal_at
     FROM assistant_requests
     WHERE request_id = ?
+  `);
+  const selectFirstStartedRequest = database.prepare(`
+    SELECT request_id, conversation_id, route_channel, route_endpoint, source_id,
+           status, runtime_session_id, next_sequence, output_text,
+           accepted_at, updated_at, terminal_at
+    FROM assistant_requests
+    WHERE status = 'started'
+    ORDER BY accepted_at ASC, request_id ASC
+    LIMIT 1
+  `);
+  const selectFirstStartedRequestExcluding = database.prepare(`
+    SELECT request_id, conversation_id, route_channel, route_endpoint, source_id,
+           status, runtime_session_id, next_sequence, output_text,
+           accepted_at, updated_at, terminal_at
+    FROM assistant_requests
+    WHERE status = 'started' AND request_id <> ?
+    ORDER BY accepted_at ASC, request_id ASC
+    LIMIT 1
+  `);
+  const selectActiveRuntimeTurnAdmission = database.prepare(`
+    SELECT id, conversation_id, request_id, route_channel, status,
+           runtime_session_id, acquired_at, started_at, terminal_at,
+           updated_at, terminal_reason
+    FROM runtime_turn_admissions
+    WHERE status IN ('submitted', 'started')
+    ORDER BY id ASC
+    LIMIT 1
+  `);
+  const selectRuntimeTurnAdmissionById = database.prepare(`
+    SELECT id, conversation_id, request_id, route_channel, status,
+           runtime_session_id, acquired_at, started_at, terminal_at,
+           updated_at, terminal_reason
+    FROM runtime_turn_admissions
+    WHERE id = ?
   `);
   const selectEvents = database.prepare(`
     SELECT id, request_id, sequence, event_type, payload_json, created_at
@@ -811,6 +862,125 @@ export function openAssistantResponseStream({
     }
   });
 
+  const acquireRuntimeTurnTransaction = database.transaction(({
+    conversationId,
+    requestId = null,
+    routeChannel,
+  }) => {
+    const safeConversationId = requireInteger(conversationId, 'conversationId', { minimum: 1 });
+    const safeRequestId = requestId === null ? null : requireIdentifier(requestId, 'requestId');
+    const safeRouteChannel = requireText(routeChannel, 'routeChannel');
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (active) {
+      return { acquired: false, admission: toRuntimeTurnAdmission(active) };
+    }
+
+    const current = clock();
+    const inserted = database.prepare(`
+      INSERT INTO runtime_turn_admissions (
+        singleton_key, conversation_id, request_id, route_channel, status,
+        runtime_session_id, acquired_at, started_at, terminal_at, updated_at,
+        terminal_reason
+      ) VALUES (1, ?, ?, ?, 'submitted', NULL, ?, NULL, NULL, ?, NULL)
+    `).run(safeConversationId, safeRequestId, safeRouteChannel, current, current);
+    return {
+      acquired: true,
+      admission: toRuntimeTurnAdmission(
+        selectRuntimeTurnAdmissionById.get(Number(inserted.lastInsertRowid)),
+      ),
+    };
+  });
+
+  const startRuntimeTurnTransaction = database.transaction(({ runtimeSessionId }) => {
+    const safeRuntimeSessionId = requireIdentifier(runtimeSessionId, 'runtimeSessionId');
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (!active) return { started: false, admission: null, reason: 'no_active_admission' };
+    if (active.status === 'started') {
+      if (active.runtime_session_id === safeRuntimeSessionId) {
+        return { started: true, admission: toRuntimeTurnAdmission(active), replayed: true };
+      }
+      return {
+        started: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_session_conflict',
+      };
+    }
+
+    const current = clock();
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET status = 'started', runtime_session_id = ?, started_at = ?, updated_at = ?
+      WHERE id = ? AND status = 'submitted'
+    `).run(safeRuntimeSessionId, current, current, active.id);
+    return {
+      started: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+      replayed: false,
+    };
+  });
+
+  const finishRuntimeTurnTransaction = database.transaction(({
+    runtimeSessionId,
+    reason = 'stop',
+  }) => {
+    const safeRuntimeSessionId = requireIdentifier(runtimeSessionId, 'runtimeSessionId');
+    const safeReason = requireText(reason, 'reason', 64);
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (!active) return { finished: false, admission: null, reason: 'no_active_admission' };
+    if (
+      active.runtime_session_id !== null
+      && active.runtime_session_id !== safeRuntimeSessionId
+    ) {
+      return {
+        finished: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_session_conflict',
+      };
+    }
+
+    const current = clock();
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET status = 'completed', runtime_session_id = COALESCE(runtime_session_id, ?),
+          terminal_at = ?, updated_at = ?, terminal_reason = ?
+      WHERE id = ? AND status IN ('submitted', 'started')
+    `).run(safeRuntimeSessionId, current, current, safeReason, active.id);
+    return {
+      finished: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+    };
+  });
+
+  const releaseRuntimeTurnTransaction = database.transaction(({
+    conversationId,
+    reason = 'delivery_not_submitted',
+  }) => {
+    const safeConversationId = requireInteger(conversationId, 'conversationId', { minimum: 1 });
+    const safeReason = requireText(reason, 'reason', 64);
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (!active || active.conversation_id !== safeConversationId) {
+      return { released: false, admission: toRuntimeTurnAdmission(active) };
+    }
+    if (active.status !== 'submitted') {
+      return {
+        released: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_already_started',
+      };
+    }
+
+    const current = clock();
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET status = 'released', terminal_at = ?, updated_at = ?, terminal_reason = ?
+      WHERE id = ? AND status = 'submitted'
+    `).run(current, current, safeReason, active.id);
+    return {
+      released: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+    };
+  });
+
   return Object.freeze({
     execute(input) {
       const command = requireRecord(input, 'assistant response command');
@@ -884,6 +1054,36 @@ export function openAssistantResponseStream({
         request: toRequest(request),
         events: selectEvents.all(id).map(toEvent),
       };
+    },
+
+    findStartedRequest({ excludingRequestId = null } = {}) {
+      const excluded = excludingRequestId === null
+        ? null
+        : requireIdentifier(excludingRequestId, 'excludingRequestId');
+      const row = excluded === null
+        ? selectFirstStartedRequest.get()
+        : selectFirstStartedRequestExcluding.get(excluded);
+      return toRequest(row);
+    },
+
+    acquireRuntimeTurn(input = {}) {
+      return acquireRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn admission'));
+    },
+
+    startRuntimeTurn(input = {}) {
+      return startRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn start'));
+    },
+
+    finishRuntimeTurn(input = {}) {
+      return finishRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn completion'));
+    },
+
+    releaseRuntimeTurn(input = {}) {
+      return releaseRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn release'));
+    },
+
+    getActiveRuntimeTurn() {
+      return toRuntimeTurnAdmission(selectActiveRuntimeTurnAdmission.get());
     },
 
     queryDeliveries({ requestId = null, status = 'dead_letter', limit = 50 } = {}) {

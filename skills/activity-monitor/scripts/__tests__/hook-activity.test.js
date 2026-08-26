@@ -7,6 +7,7 @@ import { after, beforeEach, describe, it } from 'node:test';
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-activity-test-'));
 const monitorDir = path.join(tmpDir, 'activity-monitor');
 const eventsFile = path.join(monitorDir, 'tool-events.jsonl');
+const bindingAuditFile = path.join(monitorDir, 'assistant-turn-binding-events.jsonl');
 
 after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -136,6 +137,60 @@ describe('hook-activity', () => {
 
     const [event] = readEvents();
     assert.equal(event.event, 'idle');
+  });
+
+  it('holds an unmarked HXA conversation admission until its Stop hook', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.hxa-admission-fixture',
+      sourceId: 'om_hxa_admission_fixture',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_hxa_admission_fixture' },
+      conversation: {
+        content: '[HXA] admission fixture',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: null,
+      routeChannel: 'hxa-connect',
+    });
+
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-hxa-admission',
+      prompt: 'HXA messages intentionally carry no assistant request marker.',
+    }, 4050);
+    const activeAdmission = stream.getActiveRuntimeTurn();
+    assert.equal(activeAdmission.status, 'started');
+    assert.equal(activeAdmission.runtimeSessionId, 'session-hxa-admission');
+    const bindingAudit = fs.readFileSync(bindingAuditFile, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    assert.deepEqual(bindingAudit.at(-1), {
+      version: 1,
+      sessionId: 'session-hxa-admission',
+      mode: 'rejected',
+      requestId: null,
+      reason: 'missing_terminal_marker',
+      updatedAt: 4050,
+    });
+
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'session-hxa-admission',
+      last_assistant_message: 'HXA reply complete.',
+    }, 4060);
+    assert.equal(stream.getActiveRuntimeTurn(), null);
+    stream.close();
   });
 
   it('ignores subagent hook events when agent_id is present', async () => {

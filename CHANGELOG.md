@@ -5,6 +5,33 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.7] - 2026-08-27
+
+### Added
+- C4 now persists a single active runtime-turn admission for every ordinary
+  conversation, including HXA and OpenMax messages that have no assistant
+  request ID. Admission begins before tmux submission and closes only on the
+  matching runtime `Stop`; the durable lifecycle ledger makes cross-channel
+  queueing observable and survives a dispatcher restart. Control-plane items retain
+  their existing bypass behavior.
+- `c4.assistant-response-stream:3` advertises serialized conversation admission
+  so paired deployments can distinguish this release from response streaming
+  that only isolated Feishu request IDs.
+- Assistant turn binding decisions now append a content-free per-turn JSONL
+  audit record while retaining the compact last-known-state file. Future reply
+  attribution incidents can reconstruct marker acceptance and rejection instead
+  of reporting that historical hook visibility is unknowable.
+
+### Fixed
+- Claude prompt activity now remains busy through tool-to-tool gaps until the
+  terminal `Stop` hook. The dispatcher also defers every ordinary conversation
+  behind an older started assistant run. Together these gates prevent a new
+  Feishu, HXA, OpenMax, or other channel message from being inserted into a
+  still-running turn and shifting replies back by one request.
+- A tmux paste that definitely did not submit releases its admission for a safe
+  retry; an ambiguous Enter verification remains fail-closed instead of risking
+  a second prompt in the same runtime turn.
+
 ## [0.7.2-rc.6] - 2026-08-27
 
 ### Fixed

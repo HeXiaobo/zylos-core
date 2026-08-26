@@ -40,6 +40,7 @@ const TOOL_EVENTS_FILE = path.join(MONITOR_DIR, 'tool-events.jsonl');
 const HOOK_ERROR_LOG = path.join(MONITOR_DIR, 'hook-activity-errors.log');
 const MESSAGE_DISPLAY_BUFFER_DIR = path.join(MONITOR_DIR, 'message-display-buffers');
 const TURN_BINDING_DIR = path.join(MONITOR_DIR, 'assistant-turn-bindings');
+const TURN_BINDING_AUDIT_FILE = path.join(MONITOR_DIR, 'assistant-turn-binding-events.jsonl');
 const ASSISTANT_REQUEST_MARKER = /assistant request:\s*"([A-Za-z0-9][A-Za-z0-9._:-]*)"\s*$/;
 const ANY_ASSISTANT_REQUEST_MARKER = /assistant request:\s*"/;
 
@@ -114,6 +115,11 @@ function writeTurnBinding(sessionId, { mode, requestId = null, reason = null, no
   };
   fs.writeFileSync(temp, `${JSON.stringify(state)}\n`, 'utf8');
   fs.renameSync(temp, file);
+  try {
+    fs.appendFileSync(TURN_BINDING_AUDIT_FILE, `${JSON.stringify(state)}\n`, 'utf8');
+  } catch (error) {
+    appendError(`assistant_binding_audit ${error?.message || 'append_failed'}`);
+  }
   return state;
 }
 
@@ -240,6 +246,12 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
   const responseStream = openAssistantResponseStream();
   try {
     if (record.event === 'prompt') {
+      const admission = responseStream.startRuntimeTurn({
+        runtimeSessionId: record.session_id,
+      });
+      if (admission.reason === 'runtime_session_conflict') {
+        appendError('runtime_turn_admission prompt_session_conflict');
+      }
       return bindPromptTurn(responseStream, record, hookData);
     }
     if (['pre_tool', 'post_tool', 'post_tool_failure'].includes(record.event)) {
@@ -307,6 +319,13 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       return result;
     }
     if (record.event === 'stop') {
+      const admission = responseStream.finishRuntimeTurn({
+        runtimeSessionId: record.session_id,
+        reason: 'stop',
+      });
+      if (admission.reason === 'runtime_session_conflict') {
+        appendError('runtime_turn_admission stop_session_conflict');
+      }
       const binding = resolveTurnBinding(responseStream, record);
       if (!binding) return null;
       let result;

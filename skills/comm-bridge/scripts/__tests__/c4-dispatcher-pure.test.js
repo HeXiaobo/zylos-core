@@ -35,6 +35,8 @@ const {
   getHeartbeatPhase,
   isRecoveryHeartbeatPhase,
   shouldAutoAckHeartbeat,
+  findBlockingAssistantRun,
+  shouldDeferConversationForRuntime,
   readJsonFileWithRetry,
   getDeliveryContent
 } = mod;
@@ -584,5 +586,53 @@ describe('isCodexExitLifecycleControl', () => {
       isCodexExitLifecycleControl({ type: 'control', content: '/exit now' }, 'codex'),
       false
     );
+  });
+});
+
+describe('assistant turn admission', () => {
+  it('serializes every conversation while the runtime is in another turn', () => {
+    assert.equal(
+      shouldDeferConversationForRuntime({ type: 'conversation' }, { state: 'busy' }),
+      true,
+    );
+    assert.equal(
+      shouldDeferConversationForRuntime({ type: 'conversation' }, { state: 'idle' }),
+      false,
+    );
+    assert.equal(
+      shouldDeferConversationForRuntime({ type: 'control' }, { state: 'busy' }),
+      false,
+    );
+  });
+
+  it('defers every conversation behind an older started assistant request', () => {
+    const calls = [];
+    const responseStream = {
+      findStartedRequest(options) {
+        calls.push(options);
+        return {
+          requestId: 'assistant.feishu.request-a',
+          sourceId: 'om_a',
+          status: 'started',
+        };
+      },
+    };
+
+    const blocking = findBlockingAssistantRun({
+      type: 'conversation',
+      assistant_request_id: 'assistant.feishu.request-b',
+    }, responseStream);
+
+    assert.equal(blocking.requestId, 'assistant.feishu.request-a');
+    assert.deepEqual(calls, [{ excludingRequestId: 'assistant.feishu.request-b' }]);
+  });
+
+  it('does not apply the conversation gate to control-plane items', () => {
+    const responseStream = {
+      findStartedRequest() {
+        throw new Error('control items must not query assistant admission');
+      },
+    };
+    assert.equal(findBlockingAssistantRun({ type: 'control' }, responseStream), null);
   });
 });

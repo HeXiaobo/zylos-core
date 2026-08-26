@@ -226,6 +226,32 @@ export function ensureAssistantResponseSchema(database) {
       ON assistant_response_events(delivery_status, available_at, id);
     CREATE INDEX IF NOT EXISTS idx_assistant_response_events_request
       ON assistant_response_events(request_id, sequence);
+
+    CREATE TABLE IF NOT EXISTS runtime_turn_admissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      singleton_key INTEGER NOT NULL DEFAULT 1 CHECK (singleton_key = 1),
+      conversation_id INTEGER NOT NULL,
+      request_id TEXT,
+      route_channel TEXT NOT NULL,
+      status TEXT NOT NULL
+        CHECK (status IN ('submitted', 'started', 'completed', 'released')),
+      runtime_session_id TEXT,
+      acquired_at INTEGER NOT NULL,
+      started_at INTEGER,
+      terminal_at INTEGER,
+      updated_at INTEGER NOT NULL,
+      terminal_reason TEXT,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_turn_admissions_one_active
+      ON runtime_turn_admissions(singleton_key)
+      WHERE status IN ('submitted', 'started');
+    CREATE INDEX IF NOT EXISTS idx_runtime_turn_admissions_conversation
+      ON runtime_turn_admissions(conversation_id, id);
+    CREATE INDEX IF NOT EXISTS idx_runtime_turn_admissions_session
+      ON runtime_turn_admissions(runtime_session_id, status, id);
   `);
 
   const eventColumns = getColumnNames(database, 'assistant_response_events');

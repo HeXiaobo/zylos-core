@@ -69,6 +69,9 @@ let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
+let lastAssistantAdmissionBlock = null;
+let lastRuntimeAdmissionBlock = null;
+let lastRuntimeTurnAdmissionBlock = null;
 
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const NOTIFY_DELIVERED_TIMEOUT_MS = 5000;
@@ -632,6 +635,108 @@ function claimNextItem() {
   return null;
 }
 
+export function findBlockingAssistantRun(item, responseStream) {
+  if (item?.type !== 'conversation') return null;
+  if (!responseStream || typeof responseStream.findStartedRequest !== 'function') {
+    throw new TypeError('responseStream.findStartedRequest is required');
+  }
+  return responseStream.findStartedRequest({
+    excludingRequestId: item.assistant_request_id || null,
+  });
+}
+
+export function shouldDeferConversationForRuntime(item, agentState) {
+  return item?.type === 'conversation' && agentState?.state === 'busy';
+}
+
+function blockingAssistantRun(item) {
+  if (item.type !== 'conversation') return null;
+  const responseStream = openAssistantResponseStream();
+  try {
+    return findBlockingAssistantRun(item, responseStream);
+  } finally {
+    responseStream.close();
+  }
+}
+
+function acquireRuntimeTurnAdmission(item) {
+  if (item.type !== 'conversation') return { acquired: true, admission: null };
+  const responseStream = openAssistantResponseStream();
+  try {
+    return responseStream.acquireRuntimeTurn({
+      conversationId: item.id,
+      requestId: item.assistant_request_id || null,
+      routeChannel: item.channel,
+    });
+  } finally {
+    responseStream.close();
+  }
+}
+
+function releaseRuntimeTurnAdmission(item, reason) {
+  if (item.type !== 'conversation') return null;
+  const responseStream = openAssistantResponseStream();
+  try {
+    return responseStream.releaseRuntimeTurn({
+      conversationId: item.id,
+      reason,
+    });
+  } finally {
+    responseStream.close();
+  }
+}
+
+function logAssistantAdmissionBlock(item, blockingRun) {
+  const nowMs = Date.now();
+  if (
+    lastAssistantAdmissionBlock?.conversationId === item.id
+    && lastAssistantAdmissionBlock?.requestId === blockingRun.requestId
+    && nowMs - lastAssistantAdmissionBlock.loggedAt < 60_000
+  ) {
+    return;
+  }
+  lastAssistantAdmissionBlock = {
+    conversationId: item.id,
+    requestId: blockingRun.requestId,
+    loggedAt: nowMs,
+  };
+  log(
+    `Deferring conversation id=${item.id}: assistant request ${blockingRun.requestId} is still started`,
+  );
+}
+
+function logRuntimeAdmissionBlock(item) {
+  const nowMs = Date.now();
+  if (
+    lastRuntimeAdmissionBlock?.conversationId === item.id
+    && nowMs - lastRuntimeAdmissionBlock.loggedAt < 60_000
+  ) {
+    return;
+  }
+  lastRuntimeAdmissionBlock = { conversationId: item.id, loggedAt: nowMs };
+  log(`Deferring conversation id=${item.id}: runtime turn is still busy`);
+}
+
+function logRuntimeTurnAdmissionBlock(item, admission) {
+  const nowMs = Date.now();
+  if (
+    lastRuntimeTurnAdmissionBlock?.conversationId === item.id
+    && lastRuntimeTurnAdmissionBlock?.admissionId === admission.admissionId
+    && nowMs - lastRuntimeTurnAdmissionBlock.loggedAt < 60_000
+  ) {
+    return;
+  }
+  lastRuntimeTurnAdmissionBlock = {
+    conversationId: item.id,
+    admissionId: admission.admissionId,
+    loggedAt: nowMs,
+  };
+  log(
+    `Deferring conversation id=${item.id}: runtime admission ${admission.admissionId} `
+      + `for conversation ${admission.conversationId} is still ${admission.status}`,
+  );
+}
+
 function maybeCleanupControlQueue() {
   const nowMs = Date.now();
   if (lastControlCleanupMs !== 0 && (nowMs - lastControlCleanupMs) < CONTROL_CLEANUP_INTERVAL_MS) {
@@ -680,8 +785,28 @@ async function processNextMessage() {
     return { delivered: false, state: agentState.state };
   }
 
+  if (shouldDeferConversationForRuntime(item, agentState)) {
+    releaseItem(item);
+    logRuntimeAdmissionBlock(item);
+    return { delivered: false, state: agentState.state };
+  }
+
+  const blockingRun = blockingAssistantRun(item);
+  if (blockingRun) {
+    releaseItem(item);
+    logAssistantAdmissionBlock(item, blockingRun);
+    return { delivered: false, state: agentState.state };
+  }
+
   if (item.require_idle === 1 && (agentState.state !== 'idle' || agentState.idleSeconds < REQUIRE_IDLE_MIN_SECONDS)) {
     releaseItem(item);
+    return { delivered: false, state: agentState.state };
+  }
+
+  const runtimeTurnAdmission = acquireRuntimeTurnAdmission(item);
+  if (!runtimeTurnAdmission.acquired) {
+    releaseItem(item);
+    logRuntimeTurnAdmissionBlock(item, runtimeTurnAdmission.admission);
     return { delivered: false, state: agentState.state };
   }
 
@@ -772,6 +897,13 @@ async function processNextMessage() {
   }
 
   const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
+  if (result === 'paste_error' && item.type === 'conversation') {
+    try {
+      releaseRuntimeTurnAdmission(item, 'tmux_paste_failed');
+    } catch (err) {
+      log(`Warning: failed to release runtime admission (${err.message})`);
+    }
+  }
   log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
   logDeliveryFailure(item.type, item.id, reason);
   if (item.type === 'control') {

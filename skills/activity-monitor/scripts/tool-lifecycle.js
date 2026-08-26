@@ -178,7 +178,6 @@ function applyPreTool(state, event) {
     return;
   }
 
-  session.in_prompt = false;
   session.last_event = event.event;
   session.last_event_at = Math.max(session.last_event_at || 0, event.ts || 0);
 
@@ -201,7 +200,6 @@ function applyCompletion(state, event, status) {
   if (!event.session_id || !event.tool) return;
 
   const session = ensureSession(state, event.session_id, event.pid);
-  session.in_prompt = false;
   session.last_event = event.event;
   session.last_event_at = Math.max(session.last_event_at || 0, event.ts || 0);
 

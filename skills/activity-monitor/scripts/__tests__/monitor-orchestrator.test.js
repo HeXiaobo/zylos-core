@@ -1381,4 +1381,39 @@ describe('MonitorOrchestrator', () => {
       }],
     ]);
   });
+
+  it('keeps the runtime busy between tools while the prompt turn is still active', () => {
+    const calls = [];
+    const { orchestrator } = createHarness({
+      engine: {
+        id: 'engine',
+        health: 'ok',
+        enterRateLimited() {},
+        start() {},
+      },
+      taskScheduler: { id: 'taskScheduler', tick() {} },
+    });
+    orchestrator.start();
+
+    const result = orchestrator.handleRunningRuntime({
+      currentTime: 300,
+      currentTimeHuman: '2026-08-27 02:18:00',
+      activity: 200,
+      source: 'api_hook',
+      apiUpdatedSec: 299,
+      activeTools: 0,
+      thinking: true,
+      apiActivity: { active: true, active_tools: 0, in_prompt: true },
+      watchdogStatus: { watchdog_phase: 'idle', watchdog_block_reason: null },
+      foregroundIdentity: { source: 'hook' },
+      lastState: 'busy',
+      idleSince: 0,
+      idleThreshold: 3,
+      buildRunningStatus: payload => ({ state: payload.state }),
+      writeStatusFile: status => calls.push(status),
+    });
+
+    assert.deepEqual(result, { lastState: 'busy', idleSince: 0 });
+    assert.deepEqual(calls, [{ state: 'busy' }]);
+  });
 });

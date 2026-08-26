@@ -51,6 +51,115 @@ test('accepts once and exposes only the runtime-neutral event contract', () => {
   stream.close();
 });
 
+test('finds an older started request without treating queued or excluded work as active', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  accept(stream, {
+    requestId: 'assistant.feishu.request-a',
+    sourceId: 'om_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_a' },
+  });
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.request-a' });
+  accept(stream, {
+    requestId: 'assistant.feishu.request-b',
+    sourceId: 'om_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_b' },
+  });
+
+  assert.equal(
+    stream.findStartedRequest({ excludingRequestId: 'assistant.feishu.request-b' }).requestId,
+    'assistant.feishu.request-a',
+  );
+  stream.execute({
+    type: 'CompleteRun',
+    requestId: 'assistant.feishu.request-a',
+    output: 'A is complete.',
+  });
+  assert.equal(
+    stream.findStartedRequest({ excludingRequestId: 'assistant.feishu.request-b' }),
+    null,
+  );
+
+  stream.execute({ type: 'StartRun', requestId: 'assistant.feishu.request-b' });
+  assert.equal(stream.findStartedRequest().requestId, 'assistant.feishu.request-b');
+  assert.equal(
+    stream.findStartedRequest({ excludingRequestId: 'assistant.feishu.request-b' }),
+    null,
+  );
+  stream.close();
+});
+
+test('serializes every runtime conversation from submission through terminal hook', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now++ });
+  const first = accept(stream, {
+    requestId: 'assistant.feishu.admission-a',
+    sourceId: 'om_admission_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_admission_a' },
+  });
+  const second = accept(stream, {
+    requestId: 'assistant.feishu.admission-b',
+    sourceId: 'om_admission_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_admission_b' },
+  });
+
+  const acquired = stream.acquireRuntimeTurn({
+    conversationId: first.request.conversationId,
+    requestId: first.request.requestId,
+    routeChannel: 'feishu',
+  });
+  assert.equal(acquired.acquired, true);
+  assert.equal(acquired.admission.status, 'submitted');
+  assert.equal(
+    stream.acquireRuntimeTurn({
+      conversationId: second.request.conversationId,
+      requestId: second.request.requestId,
+      routeChannel: 'feishu',
+    }).acquired,
+    false,
+  );
+
+  const started = stream.startRuntimeTurn({ runtimeSessionId: 'session-admission-a' });
+  assert.equal(started.started, true);
+  assert.equal(started.admission.status, 'started');
+  assert.equal(
+    stream.startRuntimeTurn({ runtimeSessionId: 'session-admission-a' }).replayed,
+    true,
+  );
+  assert.equal(
+    stream.startRuntimeTurn({ runtimeSessionId: 'session-other' }).reason,
+    'runtime_session_conflict',
+  );
+  assert.equal(
+    stream.finishRuntimeTurn({ runtimeSessionId: 'session-other', reason: 'stop' }).finished,
+    false,
+  );
+
+  const finished = stream.finishRuntimeTurn({
+    runtimeSessionId: 'session-admission-a',
+    reason: 'stop',
+  });
+  assert.equal(finished.finished, true);
+  assert.equal(finished.admission.status, 'completed');
+  assert.equal(stream.getActiveRuntimeTurn(), null);
+
+  const next = stream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: null,
+    routeChannel: 'hxa-connect',
+  });
+  assert.equal(next.acquired, true);
+  assert.equal(next.admission.requestId, null);
+  assert.equal(next.admission.routeChannel, 'hxa-connect');
+  const released = stream.releaseRuntimeTurn({
+    conversationId: second.request.conversationId,
+    reason: 'tmux_paste_failed',
+  });
+  assert.equal(released.released, true);
+  assert.equal(released.admission.status, 'released');
+  assert.equal(stream.getActiveRuntimeTurn(), null);
+  stream.close();
+});
+
 test('records verified lifecycle, real deltas, and canonical full completion', () => {
   let now = 200;
   const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now++ });

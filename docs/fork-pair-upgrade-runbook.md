@@ -122,20 +122,37 @@ Core daemon ecosystem；升级和回滚两条路径都如此。健康门允许�
 0、`unstable_restarts=0`，且 executable 是真实文件。常驻服务仍必须持续
 `online`，两类进程不会再共用一个模糊判据。
 
-### 2.12 无 request marker 的其他通道轮次会抢占飞书回复卡
+### 2.12 同一运行轮次被误判空闲，造成跨通道回复落后一轮
 
-SS 升级后的外部验收发现了固定“落后一轮”：飞书 B 的答案写入 A 的卡片，随后
-HXA 的工作摘要又写入仍待处理的飞书 C 卡片。根因是 Claude
-`UserPromptSubmit` 在没有识别到消息末尾的 assistant-request marker 时，会按
-“唯一 started 请求”猜测绑定；HXA、OpenMax、本地提示和控制命令本来就没有该
-marker，因此可能抢走一条尚未绑定的飞书响应。
+SS 升级后的外部验收发现固定“落后一轮”：飞书 B 的答案写入 A 的卡片，随后
+HXA 的工作摘要又写入仍待处理的飞书 C 卡片。机器时间线证明 A、B、C 都进入同一个
+Claude session，而且 B 在 A 的 `Stop` 之前、C 在 B 的 `Stop` 之前就已投递。
+根因不是 HXA 掉线，而是工具完成事件把 `in_prompt` 提前清零，监控器在同一轮的
+工具间隙报告 `idle`，dispatcher 因而把下一条普通消息直接塞进仍在运行的旧轮次。
 
-Core `0.7.2-rc.6` 起，出现 `UserPromptSubmit` 就必须带合法且位于末尾的
-assistant-request marker 才能绑定；无 marker 或非末尾 marker 均持久化为
-fail-closed，本轮后续 tool/display/stop hook 不得再回退猜测。只有安装中真的缺失
-`UserPromptSubmit` hook 时，首个后续 lifecycle hook 才保留单候选兼容绑定。发布
-验收必须交错发送“飞书 nonce → HXA nonce → 飞书 nonce”，逐一核对内容和卡片，
-仅验证每个通道各自能收到消息不足以发现串线。
+另有一层次生风险：HXA、OpenMax 和本地提示没有 Feishu assistant-request marker；
+旧 hook 会按“唯一 started 请求”猜测绑定，使无 marker 轮次抢走尚未绑定的飞书
+响应卡。只修 marker 不能阻止消息先进入旧轮次，只修 idle 也不能保证卡片绑定正确。
+
+Core `0.7.2-rc.7` 同时执行三层门禁：
+
+1. 每条普通 conversation 在写入 tmux 前取得唯一、持久化的 runtime-turn
+   admission；无论来自飞书、HXA 还是 OpenMax，都只在同一 session 的 `Stop` 后
+   释放。dispatcher 重启也不会丢失这把锁。
+2. Claude `UserPromptSubmit` 到 `Stop` 始终保持 `in_prompt=true`，tool-to-tool
+   间隙不再被判为空闲；旧版本遗留的 started assistant run 还会作为升级期后备门。
+3. 飞书响应绑定只接受位于消息末尾的合法 assistant-request marker。无 marker 或
+   非末尾 marker 持久化为 fail-closed，后续 tool/display/stop 不得回退猜测；每次
+   bound/rejected/closed 决策还会追加到无正文的 per-turn JSONL 审计轨迹，避免再次
+   因 last-write-wins 状态文件而无法复盘。
+
+控制队列仍保留显式 bypass，不会被普通对话 admission 阻断。只有安装中真的缺失
+`UserPromptSubmit` hook 时，首个后续 lifecycle hook 才保留单候选兼容绑定。
+`SessionStart` 在 settings 中出现三组本身是正确配置，分别对应 `startup`、`clear`、
+`compact`；只有同一 matcher 内的同一命令重复才是异常。
+
+发布验收必须交错发送“飞书 nonce A → HXA nonce B → 飞书 nonce C”，逐一核对
+回复通道、内容、源消息卡片和终止顺序。仅验证每个通道各自能收发不足以发现串线。
 
 ## 3. 发布前准备
 
@@ -238,7 +255,7 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.6' \
+      --core-version '0.7.2-rc.7' \
       --feishu-version '0.3.7-rc.5' \
       --agent '<agent-id>' \
       --execute
