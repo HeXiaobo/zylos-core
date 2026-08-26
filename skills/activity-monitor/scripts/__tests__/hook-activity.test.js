@@ -246,6 +246,7 @@ describe('hook-activity', () => {
     await runHook({
       hook_event_name: 'UserPromptSubmit',
       session_id: 'session-hook-progress',
+      prompt: 'progress test ---- streamed reply: assistant request: "assistant.feishu.hook-progress"',
     }, 9000);
     await runHook({
       hook_event_name: 'PreToolUse',
@@ -754,6 +755,58 @@ describe('hook-activity', () => {
     stream.close();
   });
 
+  it('does not let an unmarked HXA turn claim the only unbound Feishu response', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const requestId = 'assistant.feishu.pending-before-hxa';
+    stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId,
+      sourceId: 'om_pending_before_hxa',
+      route: {
+        channel: 'feishu',
+        endpointId: 'oc_1|type:p2p|msg:om_pending_before_hxa',
+      },
+      conversation: {
+        content: '[Feishu DM] user is waiting on this card',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.execute({ type: 'StartRun', requestId });
+
+    const sessionId = 'session-unmarked-hxa-turn';
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      prompt: '[HXA] health probe ---- reply via: c4-send.js hxa-connect org:hxa|peer',
+    }, 93484);
+    await runHook({
+      hook_event_name: 'MessageDisplay',
+      session_id: sessionId,
+      message_id: 'message-unmarked-hxa-turn',
+      index: 0,
+      final: true,
+      delta: 'HXA-COMMS-OK',
+    }, 93485);
+
+    const result = stream.query({ requestId });
+    assert.equal(result.request.runtimeSessionId, null);
+    assert.equal(result.request.output, '');
+    assert.equal(result.events.some(event => event.type === 'OutputDelta'), false);
+    stream.execute({
+      type: 'FailRun',
+      requestId,
+      code: 'UNMARKED_HXA_TEST_CLEANUP',
+      retryable: true,
+    });
+    stream.close();
+  });
+
   it('switches an explicit new turn from active request A to B without writing B output into A', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     const { openAssistantResponseStream } = await import(
@@ -1101,6 +1154,7 @@ describe('hook-activity', () => {
     await runHook({
       hook_event_name: 'UserPromptSubmit',
       session_id: 'session-stop-filter-reasoning',
+      prompt: 'stop filter test ---- streamed reply: assistant request: "assistant.feishu.stop-filter-reasoning"',
     }, 9600);
     await runHook({
       hook_event_name: 'Stop',

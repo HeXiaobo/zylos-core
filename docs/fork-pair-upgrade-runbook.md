@@ -122,6 +122,21 @@ Core daemon ecosystem；升级和回滚两条路径都如此。健康门允许�
 0、`unstable_restarts=0`，且 executable 是真实文件。常驻服务仍必须持续
 `online`，两类进程不会再共用一个模糊判据。
 
+### 2.12 无 request marker 的其他通道轮次会抢占飞书回复卡
+
+SS 升级后的外部验收发现了固定“落后一轮”：飞书 B 的答案写入 A 的卡片，随后
+HXA 的工作摘要又写入仍待处理的飞书 C 卡片。根因是 Claude
+`UserPromptSubmit` 在没有识别到消息末尾的 assistant-request marker 时，会按
+“唯一 started 请求”猜测绑定；HXA、OpenMax、本地提示和控制命令本来就没有该
+marker，因此可能抢走一条尚未绑定的飞书响应。
+
+Core `0.7.2-rc.6` 起，出现 `UserPromptSubmit` 就必须带合法且位于末尾的
+assistant-request marker 才能绑定；无 marker 或非末尾 marker 均持久化为
+fail-closed，本轮后续 tool/display/stop hook 不得再回退猜测。只有安装中真的缺失
+`UserPromptSubmit` hook 时，首个后续 lifecycle hook 才保留单候选兼容绑定。发布
+验收必须交错发送“飞书 nonce → HXA nonce → 飞书 nonce”，逐一核对内容和卡片，
+仅验证每个通道各自能收到消息不足以发现串线。
+
 ## 3. 发布前准备
 
 发布负责人在本机完成以下检查，并记录两端的完整 SHA：
@@ -223,7 +238,7 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.5' \
+      --core-version '0.7.2-rc.6' \
       --feishu-version '0.3.7-rc.5' \
       --agent '<agent-id>' \
       --execute

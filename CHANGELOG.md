@@ -5,6 +5,17 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.6] - 2026-08-27
+
+### Fixed
+- Claude `UserPromptSubmit` hooks now require the terminal assistant-request
+  marker before binding a turn to a streamed response. Unmarked HXA, OpenMax,
+  local, and control turns fail closed instead of claiming the only pending
+  Feishu response card and shifting every later answer back by one request.
+  The compatibility fallback remains available only when the prompt hook was
+  genuinely absent, where later lifecycle hooks can still bind an unambiguous
+  request.
+
 ## [0.7.2-rc.5] - 2026-08-27
 
 ### Added
