@@ -54,6 +54,10 @@ function installTaskCore(zylosDir) {
     path.join(SOURCE_TASK_CORE, 'scripts', 'task-notifications.js'),
     path.join(destination, 'scripts', 'task-notifications.js'),
   );
+  copyFileSync(
+    path.join(SOURCE_TASK_CORE, 'scripts', 'task-subscriptions.js'),
+    path.join(destination, 'scripts', 'task-subscriptions.js'),
+  );
   symlinkSync(
     path.join(SOURCE_TASK_CORE, 'node_modules'),
     path.join(destination, 'node_modules'),
