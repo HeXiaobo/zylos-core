@@ -39,6 +39,11 @@ Invariants:
 - Supported Chinese relative/calendar deadlines are normalized against the
   immutable inbound timestamp and IANA time zone before Commitment ingestion;
   date-only deadlines default to 18:00 local time.
+- A bounded natural-language offset such as `提前1小时提醒` becomes
+  `TaskDraft.reminderMinutesBeforeDue = 60` only when the same draft has a
+  resolvable deadline. A reminder without a deadline returns `confirm` instead
+  of creating a degraded Task. Persisted TaskDrafts from before this field was
+  introduced remain adaptable with a null reminder.
 - ordinary questions and one-shot information requests return `chat_only`.
 - `sourceKey` is derived from `channel + message_id + intent_revision`.
 - platform SDK/CardKit values never enter this module.

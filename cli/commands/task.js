@@ -131,6 +131,17 @@ function parsePositiveInteger(value, field) {
   return parsed;
 }
 
+function parseNonNegativeInteger(value, field) {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw argumentError(`${field} must be a non-negative integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw argumentError(`${field} must be a safe non-negative integer`);
+  }
+  return parsed;
+}
+
 function parseArgs(args, {
   valueFlags = [],
   booleanFlags = [],
@@ -221,6 +232,8 @@ Create options:
   --assignee <id>        Assignee identity
   --description <text>   Optional description
   --due-at <timestamp>   Optional RFC 3339 deadline
+  --reminder-minutes-before-due <n>
+                         Optional reminder offset from the deadline
   --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
   --json                 JSON output
 
@@ -256,7 +269,8 @@ Run command options:
 function createTask(core, args, makeIdempotencyKey) {
   const { options } = parseArgs(args, {
     valueFlags: [
-      'title', 'owner', 'acceptor', 'assignee', 'description', 'due-at', 'idempotency-key',
+      'title', 'owner', 'acceptor', 'assignee', 'description', 'due-at',
+      'reminder-minutes-before-due', 'idempotency-key',
     ],
     booleanFlags: ['json'],
   });
@@ -279,6 +293,12 @@ function createTask(core, args, makeIdempotencyKey) {
       acceptorId: options.acceptor,
       assigneeId: options.assignee,
       dueAt: options['due-at'],
+      reminderMinutesBeforeDue: options['reminder-minutes-before-due'] === undefined
+        ? undefined
+        : parseNonNegativeInteger(
+          options['reminder-minutes-before-due'],
+          '--reminder-minutes-before-due',
+        ),
     },
   });
 

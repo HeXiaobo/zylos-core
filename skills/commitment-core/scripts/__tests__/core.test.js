@@ -58,6 +58,7 @@ test('replaying one source creates exactly one ready task', () => {
       acceptorId: 'ou_owner',
       assigneeId: 'agent:yueran',
       dueAt: null,
+      reminderMinutesBeforeDue: null,
       version: 1,
       createdAt: '2026-08-24T10:00:00.000Z',
       updatedAt: '2026-08-24T10:00:00.000Z',
@@ -92,6 +93,82 @@ test('normalizes an optional deadline as a channel-neutral Core fact', () => {
       source: { channel: 'lark', externalId: 'om_bad_due_at', senderId: 'ou_owner' },
       task: { title: '非法截止时间', ownerId: 'ou_owner', dueAt: 'tomorrow' },
     }), /RFC 3339/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('persists a reminder in minutes before the canonical deadline', () => {
+  const harness = createHarness();
+
+  try {
+    const result = harness.core.ingest({
+      idempotencyKey: 'lark:om_due_reminder:task-intent',
+      source: {
+        channel: 'lark',
+        externalId: 'om_due_reminder',
+        senderId: 'ou_owner',
+      },
+      task: {
+        title: '在提醒后完成验收',
+        ownerId: 'ou_owner',
+        dueAt: '2026-08-28T18:00:00+08:00',
+        reminderMinutesBeforeDue: 60,
+      },
+    });
+
+    assert.equal(result.task.reminderMinutesBeforeDue, 60);
+    assert.equal(
+      harness.core.query({ taskId: result.task.id }).reminderMinutesBeforeDue,
+      60,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('requires a canonical deadline before accepting a reminder', () => {
+  const harness = createHarness();
+
+  try {
+    assert.throws(() => harness.core.ingest({
+      idempotencyKey: 'lark:om_reminder_without_due:task-intent',
+      source: {
+        channel: 'lark',
+        externalId: 'om_reminder_without_due',
+        senderId: 'ou_owner',
+      },
+      task: {
+        title: '没有截止时间的提醒',
+        ownerId: 'ou_owner',
+        reminderMinutesBeforeDue: 60,
+      },
+    }), /requires task\.dueAt/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('rejects a reminder that is not a non-negative integer', () => {
+  const harness = createHarness();
+
+  try {
+    for (const reminderMinutesBeforeDue of [-1, 1.5, '60']) {
+      assert.throws(() => harness.core.ingest({
+        idempotencyKey: `lark:om_bad_reminder_${reminderMinutesBeforeDue}:task-intent`,
+        source: {
+          channel: 'lark',
+          externalId: `om_bad_reminder_${reminderMinutesBeforeDue}`,
+          senderId: 'ou_owner',
+        },
+        task: {
+          title: '非法提醒',
+          ownerId: 'ou_owner',
+          dueAt: '2026-08-28T18:00:00+08:00',
+          reminderMinutesBeforeDue,
+        },
+      }), /non-negative safe integer/);
+    }
   } finally {
     harness.cleanup();
   }

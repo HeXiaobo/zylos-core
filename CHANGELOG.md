@@ -5,6 +5,22 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.3] - 2026-08-26
+
+### Added
+- Canonical Tasks can persist a `reminderMinutesBeforeDue` policy alongside an
+  RFC 3339 deadline; `task-reminder:1` lets paired components reject an older
+  Core before they start reminder-aware projection.
+- `zylos task create --reminder-minutes-before-due <n>` exposes the same
+  channel-neutral reminder policy through the supported CLI Adapter.
+- Natural-language WorkIntake recognizes offsets such as `提前1小时提醒`,
+  carries them through C4's strict Task envelope, and asks for confirmation
+  instead of dropping a reminder that has no deadline.
+
+### Fixed
+- Existing Task databases add the nullable reminder column in place, preserve
+  older idempotency fingerprints, and keep reminder-free Tasks replayable.
+
 ## [0.7.2-rc.2] - 2026-08-26
 
 ### Fixed

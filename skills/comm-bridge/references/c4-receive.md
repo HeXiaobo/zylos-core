@@ -103,7 +103,9 @@ Its result is returned under `workIntake` in JSON output:
 
 - `chat_only`: store and dispatch as an ordinary message; no task intake row.
 - `create_task`: adapt the `TaskDraft` to Commitment intake using
-  `channel + message_id + intent_revision` as the permanent key.
+  `channel + message_id + intent_revision` as the permanent key. A resolved
+  deadline and its optional `reminderMinutesBeforeDue` offset are preserved
+  together through the strict Task envelope.
 - `confirm`: store the conversation and decision as delivered, do not dispatch,
   and do not create a task. A platform callback later submits only its stable
   `sourceKey`, chosen `action`, authenticated `actorId`, and a short-lived

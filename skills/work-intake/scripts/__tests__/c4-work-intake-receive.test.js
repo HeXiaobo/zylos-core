@@ -177,7 +177,7 @@ test('a clear assignment atomically queues one durable Commitment intake', () =>
 
 test('maps a configured non-Yueran Agent alias to its logical deployment identity', () => {
   withZylosDir((zylosDir) => {
-    const envelope = inbound('请 Mylos 明天整理客户回访记录', 'om_mylos');
+    const envelope = inbound('请 Mylos 明天18:00前整理客户回访记录，提前1小时提醒', 'om_mylos');
     const response = receive(zylosDir, envelope, {
       env: {
         ZYLOS_AGENT_ID: 'agent:mylos',
@@ -189,7 +189,10 @@ test('maps a configured non-Yueran Agent alias to its logical deployment identit
     const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
     try {
       const queued = database.prepare('SELECT payload_json FROM commitment_intake_queue').get();
-      assert.equal(JSON.parse(queued.payload_json).task.assigneeId, 'agent:mylos');
+      const task = JSON.parse(queued.payload_json).task;
+      assert.equal(task.assigneeId, 'agent:mylos');
+      assert.equal(task.dueAt, '2026-08-26T10:00:00.000Z');
+      assert.equal(task.reminderMinutesBeforeDue, 60);
     } finally {
       database.close();
     }

@@ -9,6 +9,7 @@ const DURABLE_ACTION = /(?:整理|跟进|准备|完成|制作|更新|复盘|提�
 const HIGH_RISK_ACTION = /(?:付款|转账|打款|退款|报销|签署|签约|盖章|删除|清空|注销|发布(?!人)|群发|发送邮件|发邮件|发消息|联系客户|提交审批|审批通过|拒绝审批|部署到生产|上线生产|修改权限|开放权限|授权|移除成员|邀请外部|下单|购买|卖出|买入)/u;
 const VAGUE_TIME = /(?:尽快|抓紧|有空(?:时)?|回头|晚点|稍后|抽空|这两天|过几天|改天|近期|下周找时间|月底左右|差不多|合适的时候)/u;
 const DUE_TEXT = /(?:今天|明天|后天|本周[一二三四五六日天]?|下周[一二三四五六日天]?|周[一二三四五六日天]|(?:20\d{2}[年\-/])?\d{1,2}[月\-/]\d{1,2}日?)(?:\s*(?:上午|中午|下午|晚上|凌晨)?\s*\d{1,2}(?::|点)\d{0,2}分?)?\s*(?:之前|以前|前|截止)?/u;
+const REMINDER_TEXT = /提前\s*(\d+)\s*(分钟|小时|天)(?:\s*(?:提醒|通知))?/u;
 const QUESTION = /(?:[?？]\s*$|^(?:什么|为什么|怎么|如何|是否|能否|可以|有没有|哪里|谁|几点|多少|请问|我想(?:知道|了解)|想问(?:一下)?|能告诉我|可否告诉我))/u;
 const ONE_SHOT_REQUEST = /(?:告诉我|解释一下|查一下|查询一下|搜一下|翻译一下|总结这段|看看这张|分析一下|回答一下|推荐一下|计算一下|改写一下|润色一下|生成一段|现在几点|天气怎么样)/u;
 const AMBIGUOUS_REQUEST = /(?:看看(?:这个|这件事|这个事|一下)?|跟一下(?:这个|这件事|这个事)?|处理一下(?:这个|这件事|这个事)?|弄一下|关注一下|推进一下|安排一下|记一下|搞一下|留意一下|盯一下)/u;
@@ -81,6 +82,19 @@ function explicitAgentAssignment(text, profile) {
 
 function extractDueText(text) {
   return text.match(DUE_TEXT)?.[0]?.replace(/\s+/g, '') ?? null;
+}
+
+function extractReminderMinutes(text, dueText) {
+  if (dueText === null) return null;
+  const match = text.match(REMINDER_TEXT);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const multiplier = match[2] === '天' ? 1_440 : (match[2] === '小时' ? 60 : 1);
+  const minutes = amount * multiplier;
+  if (!Number.isSafeInteger(minutes)) {
+    throw new TypeError('reminder offset exceeds the safe integer range');
+  }
+  return minutes;
 }
 
 function taskDirectiveText(text, profile) {
@@ -160,6 +174,7 @@ function buildTaskDraft(envelope, {
   profile = classifierOptions(),
 } = {}) {
   const dueText = extractDueText(directiveText);
+  const reminderMinutesBeforeDue = extractReminderMinutes(directiveText, dueText);
   const title = taskTitle(directiveText, dueText, profile);
   const details = [];
   if (dueText) details.push(`期限：${dueText}`);
@@ -171,6 +186,7 @@ function buildTaskDraft(envelope, {
     acceptorId: envelope.sender.id,
     assigneeId,
     dueText,
+    reminderMinutesBeforeDue,
     riskLevel,
   };
 }
@@ -234,6 +250,15 @@ export function classify(input, options) {
       'confirm',
       'PERSON_AMBIGUOUS',
       taskDraft({ assigneeId: null }),
+    );
+  }
+
+  if (REMINDER_TEXT.test(directiveText) && !DUE_TEXT.test(directiveText)) {
+    return result(
+      envelope,
+      'confirm',
+      'TIME_AMBIGUOUS',
+      taskDraft(),
     );
   }
 

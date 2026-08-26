@@ -5,7 +5,23 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { openCommitmentIntakeQueue } from '../c4-db.js';
+import { validateTaskEnvelope } from '../c4-task-envelope.js';
 import { persistTaskBeforeRoute } from '../c4-task-intake.js';
+
+test('preserves a canonical reminder in the strict C4 Task envelope', () => {
+  const envelope = validateTaskEnvelope({
+    idempotencyKey: 'feishu:om_reminder:task-intent',
+    source: { channel: 'feishu', externalId: 'om_reminder', senderId: 'ou_owner' },
+    task: {
+      title: 'Reminder through C4',
+      ownerId: 'ou_owner',
+      dueAt: '2026-08-27T10:00:00.000Z',
+      reminderMinutesBeforeDue: 60,
+    },
+  });
+
+  assert.equal(envelope.task.reminderMinutesBeforeDue, 60);
+});
 
 test('persists task intake before invoking a failing route dependency', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-task-before-route-'));

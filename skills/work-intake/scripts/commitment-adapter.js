@@ -16,8 +16,12 @@ const TASK_DRAFT_FIELDS = new Set([
   'acceptorId',
   'assigneeId',
   'dueText',
+  'reminderMinutesBeforeDue',
   'riskLevel',
 ]);
+const LEGACY_TASK_DRAFT_FIELDS = new Set(
+  [...TASK_DRAFT_FIELDS].filter(field => field !== 'reminderMinutesBeforeDue'),
+);
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -33,6 +37,20 @@ function requireExactFields(value, fields, field) {
   }
 }
 
+function normalizeTaskDraft(value) {
+  const task = requireRecord(value, 'WorkIntake TaskDraft');
+  const keys = Object.keys(task);
+  const fields = Object.hasOwn(task, 'reminderMinutesBeforeDue')
+    ? TASK_DRAFT_FIELDS
+    : LEGACY_TASK_DRAFT_FIELDS;
+  if (keys.length !== fields.size || keys.some(key => !fields.has(key))) {
+    throw new TypeError('WorkIntake TaskDraft contains unsupported or missing fields');
+  }
+  return fields === TASK_DRAFT_FIELDS
+    ? task
+    : { ...task, reminderMinutesBeforeDue: null };
+}
+
 function requireText(value, field) {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new TypeError(`${field} must be a non-empty string`);
@@ -43,6 +61,14 @@ function requireText(value, field) {
 function optionalText(value, field) {
   if (value === null) return null;
   return requireText(value, field);
+}
+
+function optionalNonNegativeInteger(value, field) {
+  if (value === null) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer or null`);
+  }
+  return value;
 }
 
 /**
@@ -77,8 +103,7 @@ export function toCommitmentEnvelope(input, options = {}) {
   if (decision.decision !== 'create_task' && !(confirmed && decision.decision === 'confirm')) {
     throw new TypeError('WorkIntake decision cannot create a Commitment task');
   }
-  const task = requireRecord(decision.taskDraft, 'WorkIntake TaskDraft');
-  requireExactFields(task, TASK_DRAFT_FIELDS, 'WorkIntake TaskDraft');
+  const task = normalizeTaskDraft(decision.taskDraft);
   const sourceKey = requireText(decision.sourceKey, 'WorkIntake decision.sourceKey');
   const expectedSourceKey = `${envelope.source.channel}:${envelope.source.messageId}:work-intake:r${envelope.intentRevision}`;
   if (sourceKey !== expectedSourceKey) {
@@ -99,6 +124,13 @@ export function toCommitmentEnvelope(input, options = {}) {
     receivedAt: envelope.receivedAt,
     timeZone: envelope.timeZone,
   });
+  const reminderMinutesBeforeDue = optionalNonNegativeInteger(
+    task.reminderMinutesBeforeDue,
+    'WorkIntake TaskDraft.reminderMinutesBeforeDue',
+  );
+  if (reminderMinutesBeforeDue !== null && dueAt === null) {
+    throw new TypeError('WorkIntake reminder requires a resolved deadline');
+  }
 
   return {
     idempotencyKey: sourceKey,
@@ -114,6 +146,7 @@ export function toCommitmentEnvelope(input, options = {}) {
       acceptorId: requireText(task.acceptorId, 'WorkIntake TaskDraft.acceptorId'),
       assigneeId: optionalText(task.assigneeId, 'WorkIntake TaskDraft.assigneeId'),
       ...(dueAt === null ? {} : { dueAt }),
+      ...(reminderMinutesBeforeDue === null ? {} : { reminderMinutesBeforeDue }),
     },
   };
 }

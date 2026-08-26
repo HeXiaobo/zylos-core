@@ -59,6 +59,14 @@ function optionalTimestamp(value, field) {
   return new Date(milliseconds).toISOString();
 }
 
+function optionalNonNegativeInteger(value, field) {
+  if (value === undefined || value === null) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 function toTaskView(row) {
   if (!row) return null;
   return {
@@ -70,6 +78,7 @@ function toTaskView(row) {
     acceptorId: row.acceptor_id,
     assigneeId: row.assignee_id,
     dueAt: row.due_at,
+    reminderMinutesBeforeDue: row.reminder_minutes_before_due,
     version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -100,6 +109,14 @@ function normalizeEnvelope(envelope) {
   if (!task || typeof task !== 'object') throw new TypeError('task must be an object');
 
   const ownerId = requireText(task.ownerId, 'task.ownerId');
+  const dueAt = optionalTimestamp(task.dueAt, 'task.dueAt');
+  const reminderMinutesBeforeDue = optionalNonNegativeInteger(
+    task.reminderMinutesBeforeDue,
+    'task.reminderMinutesBeforeDue',
+  );
+  if (reminderMinutesBeforeDue !== null && dueAt === null) {
+    throw new TypeError('task.reminderMinutesBeforeDue requires task.dueAt');
+  }
   return {
     idempotencyKey: requireText(envelope.idempotencyKey, 'idempotencyKey'),
     source: {
@@ -113,7 +130,8 @@ function normalizeEnvelope(envelope) {
       ownerId,
       acceptorId: optionalText(task.acceptorId, 'task.acceptorId') ?? ownerId,
       assigneeId: optionalText(task.assigneeId, 'task.assigneeId'),
-      dueAt: optionalTimestamp(task.dueAt, 'task.dueAt'),
+      dueAt,
+      reminderMinutesBeforeDue,
     },
   };
 }
@@ -122,10 +140,18 @@ function fingerprintEnvelope(envelope) {
   return createHash('sha256').update(JSON.stringify(envelope)).digest('hex');
 }
 
-function fingerprintLegacyEnvelope(envelope) {
-  if (envelope?.task?.dueAt !== null) return null;
-  const { dueAt: _dueAt, ...legacyTask } = envelope.task;
-  return fingerprintEnvelope({ ...envelope, task: legacyTask });
+function fingerprintLegacyEnvelopes(envelope) {
+  if (envelope?.task?.reminderMinutesBeforeDue !== null) return [];
+
+  const { reminderMinutesBeforeDue: _reminder, ...taskWithoutReminder } = envelope.task;
+  const fingerprints = [
+    fingerprintEnvelope({ ...envelope, task: taskWithoutReminder }),
+  ];
+  if (taskWithoutReminder.dueAt === null) {
+    const { dueAt: _dueAt, ...taskWithoutDue } = taskWithoutReminder;
+    fingerprints.push(fingerprintEnvelope({ ...envelope, task: taskWithoutDue }));
+  }
+  return fingerprints;
 }
 
 function idempotencyConflict(key) {
@@ -295,6 +321,9 @@ const TASK_TABLE_COLUMNS = `
   acceptor_id TEXT NOT NULL,
   assignee_id TEXT,
   due_at TEXT,
+  reminder_minutes_before_due INTEGER CHECK (
+    reminder_minutes_before_due IS NULL OR reminder_minutes_before_due >= 0
+  ),
   version INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -333,15 +362,18 @@ function migrateLegacyTaskStateSchema(database) {
   const legacyHasDueAt = database.pragma('table_info(commitment_tasks)')
     .some((column) => column.name === 'due_at');
   const legacyDueAt = legacyHasDueAt ? 'due_at' : 'NULL';
+  const legacyHasReminder = database.pragma('table_info(commitment_tasks)')
+    .some((column) => column.name === 'reminder_minutes_before_due');
+  const legacyReminder = legacyHasReminder ? 'reminder_minutes_before_due' : 'NULL';
   const migrate = database.transaction(() => {
     database.exec(`
       ${createTaskTableSql('commitment_tasks_migrated')};
       INSERT INTO commitment_tasks_migrated (
         id, title, description, state, owner_id, acceptor_id, assignee_id,
-        due_at, version, created_at, updated_at
+        due_at, reminder_minutes_before_due, version, created_at, updated_at
       )
       SELECT id, title, description, state, owner_id, acceptor_id, assignee_id,
-             ${legacyDueAt}, version, created_at, updated_at
+             ${legacyDueAt}, ${legacyReminder}, version, created_at, updated_at
       FROM commitment_tasks;
       DROP TABLE commitment_tasks;
       ALTER TABLE commitment_tasks_migrated RENAME TO commitment_tasks;
@@ -365,6 +397,20 @@ function migrateTaskDueAtSchema(database) {
   const taskTable = database.pragma('table_info(commitment_tasks)');
   if (taskTable.length === 0 || taskTable.some((column) => column.name === 'due_at')) return;
   database.exec('ALTER TABLE commitment_tasks ADD COLUMN due_at TEXT');
+}
+
+function migrateTaskReminderSchema(database) {
+  const taskTable = database.pragma('table_info(commitment_tasks)');
+  if (
+    taskTable.length === 0
+    || taskTable.some((column) => column.name === 'reminder_minutes_before_due')
+  ) return;
+  database.exec(`
+    ALTER TABLE commitment_tasks
+    ADD COLUMN reminder_minutes_before_due INTEGER CHECK (
+      reminder_minutes_before_due IS NULL OR reminder_minutes_before_due >= 0
+    )
+  `);
 }
 
 function migrateLegacyEventSchema(database) {
@@ -508,6 +554,7 @@ export function openCommitmentCore({
   if (dbPath !== ':memory:') database.pragma('journal_mode = WAL');
   migrateLegacyTaskStateSchema(database);
   migrateTaskDueAtSchema(database);
+  migrateTaskReminderSchema(database);
   migrateLegacyEventSchema(database);
   database.pragma('foreign_keys = ON');
   initializeSchema(database);
@@ -523,6 +570,7 @@ export function openCommitmentCore({
 
   const selectTask = database.prepare(`
     SELECT id, title, description, state, owner_id, acceptor_id, assignee_id, due_at,
+           reminder_minutes_before_due,
            version, created_at, updated_at
     FROM commitment_tasks
     WHERE id = ?
@@ -547,8 +595,9 @@ export function openCommitmentCore({
   const insertTask = database.prepare(`
     INSERT INTO commitment_tasks (
       id, title, description, state, owner_id, acceptor_id, assignee_id, due_at,
+      reminder_minutes_before_due,
       version, created_at, updated_at
-    ) VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, 1, ?, ?)
+    ) VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, 1, ?, ?)
   `);
   const insertSource = database.prepare(`
     INSERT INTO commitment_sources (
@@ -613,7 +662,7 @@ export function openCommitmentCore({
     if (existing) {
       if (
         existing.request_fingerprint !== fingerprint
-        && existing.request_fingerprint !== fingerprintLegacyEnvelope(envelope)
+        && !fingerprintLegacyEnvelopes(envelope).includes(existing.request_fingerprint)
       ) {
         throw idempotencyConflict(envelope.idempotencyKey);
       }
@@ -630,6 +679,7 @@ export function openCommitmentCore({
       envelope.task.acceptorId,
       envelope.task.assigneeId,
       envelope.task.dueAt,
+      envelope.task.reminderMinutesBeforeDue,
       timestamp,
       timestamp,
     );
@@ -812,6 +862,7 @@ export function openCommitmentCore({
         const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
         return database.prepare(`
           SELECT id, title, description, state, owner_id, acceptor_id, assignee_id, due_at,
+                 reminder_minutes_before_due,
                  version, created_at, updated_at
           FROM commitment_tasks
           ${where}

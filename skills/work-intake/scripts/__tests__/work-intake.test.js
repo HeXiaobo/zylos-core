@@ -115,6 +115,34 @@ test('recognizes an explicit task behind a chat label and polite wrapper', () =>
   assert.equal(decision.taskDraft.dueText, '明天18:00前');
 });
 
+test('extracts a one-hour reminder from a natural-language task with a deadline', () => {
+  const decision = classify(inbound(
+    '【Mylos】请创建任务：2026-08-27 18:00 前完成 Fleet A–E 现场验收，负责人 Mylos，提前1小时提醒',
+  ), { agentId: 'agent:mylos', agentAliases: ['Mylos'] });
+
+  assert.equal(decision.decision, 'create_task');
+  assert.equal(decision.taskDraft.dueText, '2026-08-2718:00前');
+  assert.equal(decision.taskDraft.reminderMinutesBeforeDue, 60);
+  assert.equal(toCommitmentEnvelope({
+    envelope: inbound(
+      '【Mylos】请创建任务：2026-08-27 18:00 前完成 Fleet A–E 现场验收，负责人 Mylos，提前1小时提醒',
+    ),
+    decision,
+  }, {
+    agentId: 'agent:mylos',
+    agentAliases: ['Mylos'],
+  }).task.reminderMinutesBeforeDue, 60);
+});
+
+test('does not create a degraded reminder task without a deadline', () => {
+  const decision = classify(inbound(
+    '请 Mylos 整理 Fleet A–E 现场验收，提前1小时提醒',
+  ), { agentId: 'agent:mylos', agentAliases: ['Mylos'] });
+
+  assert.equal(decision.decision, 'confirm');
+  assert.equal(decision.reasonCode, 'TIME_AMBIGUOUS');
+});
+
 test('keeps wrapped risky tasks behind confirmation and task questions in chat', () => {
   assert.equal(
     classify(inbound('【CRM】请创建任务：明天 18:00 前完成客户复盘')).decision,
@@ -165,6 +193,7 @@ test('returns a structured TaskDraft with human owner/acceptor and explicit yuer
     acceptorId: 'ou_sender',
     assigneeId: 'agent:yueran',
     dueText: '周五前',
+    reminderMinutesBeforeDue: null,
     riskLevel: 'normal',
   });
 });
@@ -313,4 +342,17 @@ test('the Commitment adapter accepts automatic create and explicit confirmation 
       taskDraft: { ...automatic.taskDraft, assigneeId: 'agent:yueran' },
     },
   }), /explicit assignment/);
+});
+
+test('the Commitment adapter accepts a persisted pre-reminder TaskDraft', () => {
+  const envelope = inbound('任务：整理客户记录');
+  const decision = classify(envelope);
+  const { reminderMinutesBeforeDue: _reminder, ...legacyTaskDraft } = decision.taskDraft;
+
+  const adapted = toCommitmentEnvelope({
+    envelope,
+    decision: { ...decision, taskDraft: legacyTaskDraft },
+  });
+
+  assert.equal(Object.hasOwn(adapted.task, 'reminderMinutesBeforeDue'), false);
 });

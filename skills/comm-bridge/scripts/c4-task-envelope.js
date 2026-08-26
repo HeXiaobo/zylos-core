@@ -27,6 +27,14 @@ function optionalTimestamp(value, field) {
   return new Date(milliseconds).toISOString();
 }
 
+function optionalNonNegativeInteger(value, field) {
+  if (value === undefined || value === null) return undefined;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`task envelope ${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 export function validateTaskEnvelope(envelope) {
   if (!isRecord(envelope)) {
     throw new TypeError('task envelope must be an object');
@@ -40,6 +48,13 @@ export function validateTaskEnvelope(envelope) {
 
   const ownerId = requireText(envelope.task.ownerId, 'task.ownerId');
   const dueAt = optionalTimestamp(envelope.task.dueAt, 'task.dueAt');
+  const reminderMinutesBeforeDue = optionalNonNegativeInteger(
+    envelope.task.reminderMinutesBeforeDue,
+    'task.reminderMinutesBeforeDue',
+  );
+  if (reminderMinutesBeforeDue !== undefined && dueAt === undefined) {
+    throw new TypeError('task envelope reminderMinutesBeforeDue requires task.dueAt');
+  }
   return {
     idempotencyKey: requireText(envelope.idempotencyKey, 'idempotencyKey'),
     source: {
@@ -54,6 +69,7 @@ export function validateTaskEnvelope(envelope) {
       acceptorId: optionalText(envelope.task.acceptorId, 'task.acceptorId') ?? ownerId,
       assigneeId: optionalText(envelope.task.assigneeId, 'task.assigneeId'),
       ...(dueAt === undefined ? {} : { dueAt }),
+      ...(reminderMinutesBeforeDue === undefined ? {} : { reminderMinutesBeforeDue }),
     },
   };
 }

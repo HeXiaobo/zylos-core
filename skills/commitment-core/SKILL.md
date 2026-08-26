@@ -158,6 +158,13 @@ Task snapshots expose an optional canonical RFC 3339 `dueAt`. It is a Core
 business fact shared by every projection; platform Adapters translate it to
 their own deadline representation. Existing databases migrate with `dueAt =
 null` and task creation remains backward compatible when it is omitted.
+An optional non-negative integer `reminderMinutesBeforeDue` belongs to the same
+canonical Task snapshot and is valid only when `dueAt` is present. It expresses
+an offset before that deadline (for example, `60` means one hour before), not a
+platform reminder ID. Existing databases migrate it as `null`; replay also
+accepts fingerprints written before either optional field existed. Platform
+Adapters must write the native reminder through their supported API and verify
+the resulting offset by authoritative readback.
 
 Evidence rows, ExternalLink rows, and their receipts commit in their respective
 single SQLite transactions. Callers must use these Interfaces instead of the

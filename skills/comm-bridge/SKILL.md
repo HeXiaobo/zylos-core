@@ -103,6 +103,9 @@ continues through ordinary C4 dispatch, `create_task` is atomically adapted to
 the same durable Commitment intake above, and `confirm` is recorded with
 `delivery_action=work-intake-confirmation-required` without dispatch or task
 creation. The two envelope flags are mutually exclusive.
+The strict Task envelope preserves optional canonical `dueAt` and
+`reminderMinutesBeforeDue`; a reminder without a deadline fails before queue
+persistence.
 
 Confirmation callbacks use `--work-intake-confirmation-json <json>` with exact
 fields `sourceKey`, `action`, authenticated `actorId`, and `capability`. The

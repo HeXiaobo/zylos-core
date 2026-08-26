@@ -91,6 +91,7 @@ test('zylos task completes create through acceptance and filters the resulting t
       '--acceptor', 'acceptor-1',
       '--assignee', 'agent-1',
       '--due-at', '2026-08-28T18:00:00+08:00',
+      '--reminder-minutes-before-due', '60',
       '--json',
     ]);
     assert.equal(createdResult.status, 0, createdResult.stderr);
@@ -98,6 +99,7 @@ test('zylos task completes create through acceptance and filters the resulting t
     assert.equal(created.created, true);
     assert.equal(created.task.state, 'ready');
     assert.equal(created.task.dueAt, '2026-08-28T10:00:00.000Z');
+    assert.equal(created.task.reminderMinutesBeforeDue, 60);
     const taskId = created.task.id;
 
     const startedResult = runTask(zylosDir, [
