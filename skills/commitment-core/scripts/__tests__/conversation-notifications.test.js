@@ -206,6 +206,46 @@ test('TaskAudience resolves every canonical participant beyond the conversation 
   }
 });
 
+test('TaskAudience authorizes only the earliest canonical Add actor for one comment ID', () => {
+  const harness = createHarness();
+  try {
+    harness.core.conversation.record({
+      type: 'AddComment',
+      taskId: 'task-comments-1',
+      commentId: 'comment-duplicate-add',
+      actorId: 'participant-canonical',
+      body: 'Canonical Add',
+      occurredAt: '2026-08-25T10:01:00.000Z',
+      idempotencyKey: 'comment:add:duplicate:canonical',
+    });
+    harness.core.conversation.record({
+      type: 'AddComment',
+      taskId: 'task-comments-1',
+      commentId: 'comment-duplicate-add',
+      actorId: 'participant-late-duplicate',
+      body: 'Late duplicate Add',
+      occurredAt: '2026-08-25T10:02:00.000Z',
+      idempotencyKey: 'comment:add:duplicate:late',
+    });
+
+    assert.equal(harness.core.audience.contains({
+      taskId: 'task-comments-1',
+      recipientId: 'participant-canonical',
+    }), true);
+    assert.equal(harness.core.audience.contains({
+      taskId: 'task-comments-1',
+      recipientId: 'participant-late-duplicate',
+    }), false);
+    assert.deepEqual(
+      harness.core.audience.resolve({ taskId: 'task-comments-1' })
+        .filter(({ roles }) => roles.includes('participant')),
+      [{ recipientId: 'participant-canonical', roles: ['participant'] }],
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('NotificationPolicy routes critical work, suppresses progress and never notifies the actor', () => {
   const harness = createHarness();
   try {

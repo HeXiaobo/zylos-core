@@ -277,9 +277,18 @@ export function createTaskConversationModule({
     LIMIT 1
   `);
   const selectParticipants = database.prepare(`
+    WITH ranked_authors AS (
+      SELECT actor_id, occurred_at, recorded_at, id,
+             ROW_NUMBER() OVER (
+               PARTITION BY comment_id
+               ORDER BY occurred_at, recorded_at, id
+             ) AS position
+      FROM commitment_conversation_events
+      WHERE task_id = ? AND event_type = 'CommentAdded'
+    )
     SELECT actor_id
-    FROM commitment_conversation_events
-    WHERE task_id = ? AND event_type = 'CommentAdded'
+    FROM ranked_authors
+    WHERE position = 1
     GROUP BY actor_id
     ORDER BY MIN(occurred_at), MIN(recorded_at), MIN(id)
   `);
@@ -310,9 +319,18 @@ export function createTaskConversationModule({
     ORDER BY occurred_at, recorded_at, id
   `);
   const selectParticipant = database.prepare(`
+    WITH ranked_authors AS (
+      SELECT actor_id,
+             ROW_NUMBER() OVER (
+               PARTITION BY comment_id
+               ORDER BY occurred_at, recorded_at, id
+             ) AS position
+      FROM commitment_conversation_events
+      WHERE task_id = ? AND event_type = 'CommentAdded'
+    )
     SELECT 1 AS found
-    FROM commitment_conversation_events
-    WHERE task_id = ? AND event_type = 'CommentAdded' AND actor_id = ?
+    FROM ranked_authors
+    WHERE position = 1 AND actor_id = ?
     LIMIT 1
   `);
 
