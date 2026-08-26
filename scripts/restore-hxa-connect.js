@@ -17,6 +17,13 @@ const HXA_TARGET = Object.freeze({
   service: 'zylos-hxa-connect',
   entry: 'src/bot.js',
 });
+const HXA_CRITICAL_PATHS = Object.freeze([
+  'package.json',
+  'SKILL.md',
+  HXA_TARGET.entry,
+  'scripts/cli.js',
+  'ecosystem.config.cjs',
+]);
 
 class HoldError extends Error {
   constructor(message, code = 'RECOVERY_HOLD') {
@@ -116,12 +123,19 @@ export function validateHxaSource(root, fsApi = fs) {
       error: `expected ${HXA_TARGET.packageName}@${HXA_TARGET.version}, found ${packageJson.name}@${packageJson.version}`,
     };
   }
-  for (const relativePath of ['SKILL.md', HXA_TARGET.entry, 'scripts/cli.js', 'ecosystem.config.cjs']) {
+  for (const relativePath of HXA_CRITICAL_PATHS.slice(1)) {
     if (!fileIsRegular(path.join(root, relativePath), fsApi)) {
       return { ok: false, error: `HXA source is missing ${relativePath}` };
     }
   }
   return { ok: true, package: packageJson };
+}
+
+function criticalHxaHashes(root) {
+  return Object.fromEntries(HXA_CRITICAL_PATHS.map((relativePath) => [
+    relativePath,
+    hashFile(path.join(root, relativePath)),
+  ]));
 }
 
 export function validateHxaRegistryEntry(entry, zylosDir) {
@@ -201,15 +215,23 @@ function availableDiskKb(targetPath) {
   return value;
 }
 
+export function buildHxaProbeCommands(cliPath) {
+  return [
+    { name: 'profile', args: [cliPath, 'profile'] },
+    { name: 'peers', args: [cliPath, 'peers'] },
+  ];
+}
+
 function checkNetwork(skillDir) {
   const cli = path.join(skillDir, 'scripts', 'cli.js');
+  const [profileCommand, peersCommand] = buildHxaProbeCommands(cli);
   const profile = requireSuccess(
-    run(process.execPath, [cli, '--org', 'hxa', 'profile'], { timeout: 30_000 }),
+    run(process.execPath, profileCommand.args, { timeout: 30_000 }),
     'HXA profile probe failed',
     'CHANNEL_UNVERIFIED',
   );
   const peers = requireSuccess(
-    run(process.execPath, [cli, '--org', 'hxa', 'peers'], { timeout: 30_000 }),
+    run(process.execPath, peersCommand.args, { timeout: 30_000 }),
     'HXA peers probe failed',
     'CHANNEL_UNVERIFIED',
   );
@@ -272,8 +294,23 @@ export function runHxaRecovery(argv = process.argv.slice(2)) {
     if (!directoryExists(registry.dataDir)) {
       throw new HoldError(`HXA data directory is missing: ${registry.dataDir}`, 'PREFLIGHT_FAILED');
     }
-    if (fs.existsSync(registry.skillDir)) {
-      throw new HoldError(`HXA skill directory already exists: ${registry.skillDir}`, 'PREFLIGHT_FAILED');
+    const skillDirExists = fs.existsSync(registry.skillDir);
+    let existingSourceMarker = null;
+    if (skillDirExists) {
+      const installedSource = validateHxaSource(registry.skillDir);
+      if (!installedSource.ok) throw new HoldError(installedSource.error, 'PREFLIGHT_FAILED');
+      try {
+        existingSourceMarker = readJson(path.join(registry.skillDir, '.zylos-source.json'));
+      } catch (error) {
+        throw new HoldError(`existing HXA source marker is invalid: ${error.message}`, 'PREFLIGHT_FAILED');
+      }
+      if (
+        existingSourceMarker.repo !== HXA_TARGET.repo
+        || existingSourceMarker.sha !== HXA_TARGET.sha
+        || existingSourceMarker.version !== HXA_TARGET.version
+      ) {
+        throw new HoldError('existing HXA source marker does not match the pinned target', 'PREFLIGHT_FAILED');
+      }
     }
     const diskAvailableKb = availableDiskKb(zylosDir);
     if (diskAvailableKb < 1_048_576) {
@@ -284,6 +321,13 @@ export function runHxaRecovery(argv = process.argv.slice(2)) {
     stageArchive(stagedDir);
     const source = validateHxaSource(stagedDir);
     if (!source.ok) throw new HoldError(source.error, 'SOURCE_INVALID');
+    if (skillDirExists) {
+      const stagedHashes = criticalHxaHashes(stagedDir);
+      const installedHashes = criticalHxaHashes(registry.skillDir);
+      if (JSON.stringify(stagedHashes) !== JSON.stringify(installedHashes)) {
+        throw new HoldError('existing HXA critical files differ from the pinned archive', 'PREFLIGHT_FAILED');
+      }
+    }
 
     const configPath = path.join(registry.dataDir, 'config.json');
     const beforePm2 = pm2Process(HXA_TARGET.service);
@@ -292,7 +336,7 @@ export function runHxaRecovery(argv = process.argv.slice(2)) {
       diskAvailableKb,
       registryRepo: components[HXA_TARGET.component].repo,
       registryVersion: components[HXA_TARGET.component].version,
-      skillDirState: 'MISSING',
+      skillDirState: skillDirExists ? 'PRESENT_PINNED' : 'MISSING',
       dataDirState: 'PRESENT',
       hashes: {
         components: hashFile(componentsPath),
@@ -311,17 +355,23 @@ export function runHxaRecovery(argv = process.argv.slice(2)) {
       return 0;
     }
 
-    requireSuccess(run('npm', [
-      'install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund',
-    ], { cwd: stagedDir, timeout: 300_000 }), 'HXA dependency install failed');
-    atomicWriteJson(path.join(stagedDir, '.zylos-source.json'), {
-      repo: HXA_TARGET.repo,
-      sha: HXA_TARGET.sha,
-      version: HXA_TARGET.version,
-      installedAt: new Date().toISOString(),
-    });
-    fs.mkdirSync(path.dirname(registry.skillDir), { recursive: true });
-    fs.renameSync(stagedDir, registry.skillDir);
+    if (!skillDirExists) {
+      requireSuccess(run('npm', [
+        'install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund',
+      ], { cwd: stagedDir, timeout: 300_000 }), 'HXA dependency install failed');
+      atomicWriteJson(path.join(stagedDir, '.zylos-source.json'), {
+        repo: HXA_TARGET.repo,
+        sha: HXA_TARGET.sha,
+        version: HXA_TARGET.version,
+        installedAt: new Date().toISOString(),
+      });
+      fs.mkdirSync(path.dirname(registry.skillDir), { recursive: true });
+      fs.renameSync(stagedDir, registry.skillDir);
+    } else {
+      requireSuccess(run('npm', [
+        'install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund',
+      ], { cwd: registry.skillDir, timeout: 300_000 }), 'existing HXA dependency verification failed');
+    }
 
     const updatedComponents = readJson(componentsPath);
     updatedComponents[HXA_TARGET.component] = {
@@ -331,11 +381,18 @@ export function runHxaRecovery(argv = process.argv.slice(2)) {
       upgradedAt: new Date().toISOString(),
     };
     atomicWriteJson(componentsPath, updatedComponents);
+    const persistedComponent = readJson(componentsPath)[HXA_TARGET.component];
+    if (
+      persistedComponent?.repo !== HXA_TARGET.repo
+      || persistedComponent?.version !== HXA_TARGET.version
+    ) {
+      throw new HoldError('HXA fork routing did not persist', 'ROUTING_NOT_PERSISTED');
+    }
 
     const ecosystemPath = path.join(registry.skillDir, 'ecosystem.config.cjs');
     requireSuccess(run('pm2', [
       'startOrRestart', ecosystemPath, '--only', HXA_TARGET.service, '--update-env',
-    ]), 'HXA PM2 start failed');
+    ], { env: { ...process.env, ZYLOS_DIR: zylosDir } }), 'HXA PM2 start failed');
     requireSuccess(run('pm2', ['save']), 'PM2 save failed');
 
     const expectedExecPath = path.join(registry.skillDir, HXA_TARGET.entry);
@@ -354,6 +411,7 @@ export function runHxaRecovery(argv = process.argv.slice(2)) {
       status: 'PASS',
       version: readJson(path.join(registry.skillDir, 'package.json')).version,
       source: readJson(path.join(registry.skillDir, '.zylos-source.json')),
+      registryRepo: readJson(componentsPath)[HXA_TARGET.component]?.repo,
       hashes: {
         components: hashFile(componentsPath),
         config: hashFile(configPath),
@@ -391,4 +449,3 @@ export function runHxaRecovery(argv = process.argv.slice(2)) {
 const isMain = process.argv[1]
   && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) process.exitCode = runHxaRecovery();
-

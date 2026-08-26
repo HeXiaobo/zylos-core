@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The fork-pair preflight now rejects every PM2 process that claims to be online
   while its executable is missing, preventing a later Core step-12 rollback for
   already-broken component services.
+- HXA recovery probes no longer assume an org label named `hxa`; the component
+  CLI selects its configured default (or first enabled) org. A recovery that
+  already installed the exact pinned code can safely resume postchecks instead
+  of being rejected as an unexpected existing directory.
 - GitHub component and Core downloads accept full commit SHAs through immutable
   archive URLs, so a checked target cannot drift with a movable branch.
 

@@ -142,6 +142,9 @@ curl -fsSL \
 它不会读取或输出配置内容，不改 HXA 数据目录；只有配置文件 hash 不变、PM2
 具有真实 PID/entry、HXA profile 与 peers API 均成功才给 `PASS`。之后还要用唯一
 nonce 做一轮外部 HXA 双向消息，不能用本地 API 成功代替真正通信。
+profile/peers 探针不写死 org 名，由 HXA CLI 选择配置里的 default 或首个 enabled
+org；若前次已落地完全相同的 source marker 与关键文件，恢复器会安全续跑后置门，
+不会再次覆盖代码。
 
 ## 4. Agent 唯一执行命令
 

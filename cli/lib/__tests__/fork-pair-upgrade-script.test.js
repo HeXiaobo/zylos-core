@@ -11,6 +11,7 @@ import {
   validatePinnedTarget,
 } from '../../../scripts/upgrade-fork-pair.js';
 import {
+  buildHxaProbeCommands,
   validateHxaPm2Process,
   validateHxaRegistryEntry,
   validateHxaSource,
@@ -235,5 +236,12 @@ describe('pinned HXA recovery contract', () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('lets the HXA CLI select the configured default org for live probes', () => {
+    assert.deepEqual(buildHxaProbeCommands('/opt/hxa/scripts/cli.js'), [
+      { name: 'profile', args: ['/opt/hxa/scripts/cli.js', 'profile'] },
+      { name: 'peers', args: ['/opt/hxa/scripts/cli.js', 'peers'] },
+    ]);
   });
 });
