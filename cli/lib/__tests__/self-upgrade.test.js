@@ -311,19 +311,20 @@ describe('self-upgrade communication continuity gate', () => {
     }
   });
 
-  it('passes only when both reply contracts are compatible', () => {
+  it('passes a strict runtime when safe transports and argv rejection are verified', () => {
     const result = step13_verifyCommunicationContinuity({}, {
       verify: () => ({
         compatible: true,
         checks: [
           { name: 'stdin_reply', status: 'passed' },
-          { name: 'legacy_argv_reply', status: 'passed' },
+          { name: 'body_file_reply', status: 'passed' },
+          { name: 'legacy_argv_reply', status: 'passed', mode: 'strict_rejection' },
         ],
       }),
     });
 
     assert.equal(result.status, 'done');
-    assert.match(result.message, /stdin_reply, legacy_argv_reply/);
+    assert.equal(result.message, 'stdin_reply, body_file_reply, legacy_argv_reply');
   });
 
   it('fails the upgrade when a reply contract is broken', () => {

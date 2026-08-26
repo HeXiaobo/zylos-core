@@ -2,8 +2,8 @@
  * Hermetic C4 reply-path canary.
  *
  * Runs the deployed c4-send executable against a local temporary channel, so
- * an upgrade can prove both the preferred stdin contract and the exact legacy
- * argv contract without sending anything to a real external channel.
+ * an upgrade can prove the safe body contracts and the deployment's exact
+ * legacy argv policy without sending anything to a real external channel.
  */
 
 import fs from 'node:fs';
@@ -12,6 +12,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const POLICY_FLAGS = ['C4_STRICT_STDIN_ONLY', 'C4_LEGACY_ARG_MODE'];
+const STRICT_ARG_REJECTIONS = new Set([
+  '[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.',
+  '[c4-send] arg-mode disabled by strict stdin-only policy: pass the message via stdin/heredoc.',
+]);
 
 function readPolicyFlags(zylosDir, fsApi) {
   const values = {};
@@ -51,8 +55,19 @@ function readDeliveredArgs(outputPath, fsApi) {
   }
 }
 
+function isStrictArgPolicyRejection(result) {
+  if (!Number.isInteger(result.status) || result.status === 0) return false;
+  const firstLine = String(result.stderr || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return STRICT_ARG_REJECTIONS.has(firstLine);
+}
+
 /**
- * Verify that c4-send can deliver both supported direct-reply call shapes.
+ * Verify the active c4-send reply policy. Compatibility mode must preserve
+ * argv delivery. Explicit strict mode must preserve stdin and body-file
+ * delivery while returning the known policy rejection for argv bodies.
  * Returns structured, content-free diagnostics suitable for upgrade output.
  */
 export function verifyCommunicationContinuity({
@@ -64,6 +79,7 @@ export function verifyCommunicationContinuity({
   const checks = [];
   const canaryRoot = fsApi.mkdtempSync(path.join(os.tmpdir(), 'zylos-c4-continuity-'));
   const outputPath = path.join(canaryRoot, 'delivered.json');
+  const bodyFilePath = path.join(canaryRoot, 'body.txt');
   const channel = 'continuity-canary';
   const endpoint = 'local-loopback';
   const channelDir = path.join(canaryRoot, '.claude', 'skills', channel, 'scripts');
@@ -78,23 +94,33 @@ export function verifyCommunicationContinuity({
       "fs.writeFileSync(process.env.C4_CANARY_OUTPUT, JSON.stringify(process.argv.slice(2)));",
     ].join('\n'));
 
+    const bodyFileCanary = 'body-file canary with "quotes" and $vars';
+    fsApi.writeFileSync(bodyFilePath, bodyFileCanary);
+
     const cases = [
       {
         name: 'stdin_reply',
         args: [channel, endpoint],
         input: 'stdin canary with "quotes" and $vars',
+        expected: 'delivery',
       },
+      ...(strictPolicy ? [{
+        name: 'body_file_reply',
+        args: [channel, endpoint, `--body-file=${bodyFilePath}`],
+        body: bodyFileCanary,
+        expected: 'delivery',
+      }] : []),
       {
         name: 'legacy_argv_reply',
         args: [channel, endpoint, 'legacy canary with "quotes" and $vars'],
-        mode: strictPolicy ? 'break_glass' : 'compatibility',
-        env: strictPolicy ? { C4_LEGACY_ARG_MODE: '1' } : {},
+        expected: strictPolicy ? 'strict_rejection' : 'delivery',
+        mode: strictPolicy ? 'strict_rejection' : 'compatibility',
       },
     ];
 
     for (const check of cases) {
       fsApi.rmSync(outputPath, { force: true });
-      const expectedBody = check.input ?? check.args[2];
+      const expectedBody = check.input ?? check.body ?? check.args[2];
       const result = spawnSyncFn(process.execPath, [c4SendPath, ...check.args], {
         encoding: 'utf8',
         timeout: 10000,
@@ -102,22 +128,27 @@ export function verifyCommunicationContinuity({
         env: {
           ...process.env,
           ...policyEnv,
-          ...check.env,
           ZYLOS_DIR: canaryRoot,
           C4_CANARY_OUTPUT: outputPath,
         },
       });
       const delivered = readDeliveredArgs(outputPath, fsApi);
-      const passed = result.status === 0
-        && Array.isArray(delivered)
-        && delivered[0] === endpoint
-        && delivered[1] === expectedBody;
+      const deliveryAttempted = fsApi.existsSync(outputPath);
+      const passed = check.expected === 'strict_rejection'
+        ? isStrictArgPolicyRejection(result) && !deliveryAttempted
+        : result.status === 0
+          && Array.isArray(delivered)
+          && delivered[0] === endpoint
+          && delivered[1] === expectedBody;
+      const error = check.expected === 'strict_rejection' && deliveryAttempted
+        ? 'strict policy rejection still produced a delivery'
+        : failureDetail(result);
 
       checks.push({
         name: check.name,
         status: passed ? 'passed' : 'failed',
         ...(check.mode ? { mode: check.mode } : {}),
-        ...(passed ? {} : { error: failureDetail(result) }),
+        ...(passed ? {} : { error }),
       });
     }
   } catch (err) {
