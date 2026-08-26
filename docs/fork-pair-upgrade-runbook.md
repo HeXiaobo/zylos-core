@@ -170,6 +170,19 @@ request 的 Codex 消息固定回退到 request-scoped `c4-send --request-id` �
 发布验收必须交错发送“飞书 nonce A → HXA nonce B → 飞书 nonce C”，逐一核对
 回复通道、内容、源消息卡片和终止顺序。仅验证每个通道各自能收发不足以发现串线。
 
+### 2.13 组件附加 worker 不能由 Core ecosystem 强行重建
+
+玥然的第一次 rc.7/rc.8 配对尝试还暴露了另一条升级边界：飞书除了主服务外还有
+任务投影、Task v2 投影和评论三个独立 PM2 worker，它们由组件自己的 ecosystem
+登记，不在 Core ecosystem 中。旧 self-upgrade 把所有位于 Skills 目录的进程名都
+传给 Core ecosystem；PM2 对不存在的 `--only` 名称没有给出可用的失败信号，三个
+worker 因而一直停在 `stopped`，step 12 在 30 秒后正确回滚。
+
+Core `0.7.2-rc.9` 明确分离进程定义所有权：Core 自有服务用新 Core ecosystem
+重建，组件 daemon 和 cron one-shot 都复用各自已登记的 PM2 定义；成功升级和失败
+回滚使用相同规则。发布前预检仍要求这些进程最初真实在线且入口存在，不能借此跳过
+坏组件。
+
 ## 3. 发布前准备
 
 发布负责人在本机完成以下检查，并记录两端的完整 SHA：
@@ -264,15 +277,15 @@ Core step 12 的阻断，不在这个脚本中顺手恢复。
 
 ```bash
 CORE_SHA='<40-hex-core-sha>'
-FEISHU_SHA='d97604d86c15eef7f0851cf6d285fb9e9942dad7'
+FEISHU_SHA='f26ac9b69ebb697a926668c154ff317613d5c8e2'
 
 curl -fsSL \
   "https://raw.githubusercontent.com/HeXiaobo/zylos-core/${CORE_SHA}/scripts/upgrade-fork-pair.sh" \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.8' \
-      --feishu-version '0.3.7-rc.6' \
+      --core-version '0.7.2-rc.9' \
+      --feishu-version '0.3.7-rc.7' \
       --agent '<agent-id>' \
       --execute
 ```

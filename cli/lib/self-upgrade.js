@@ -56,6 +56,20 @@ const UPGRADE_REQUIRED_CORE_SERVICES = [
   },
 ];
 
+// Only these process definitions are owned by Core's ecosystem file. Other
+// services discovered under SKILLS_DIR belong to installed components and
+// must be restarted from their existing PM2 definition; forcing a component
+// name through the Core ecosystem can silently leave it stopped.
+const CORE_ECOSYSTEM_SERVICE_NAMES = Object.freeze([
+  'scheduler',
+  'web-console',
+  'c4-dispatcher',
+  'c4-intake-supervisor',
+  'c4-response-stream-supervisor',
+  'activity-monitor',
+  'caddy',
+]);
+
 const DEFAULT_FINALIZER_TIMEOUT_MS = 900_000;
 const MIN_FINALIZER_TIMEOUT_MS = 180_000;
 
@@ -1386,6 +1400,14 @@ export function step11_startCoreServices(ctx, deps = {}) {
   const restartScheduledFn = deps.restartScheduledProcess ?? ((name) => {
     exec(`pm2 restart ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
   });
+  const restartExistingFn = deps.restartExistingProcess
+    ?? deps.restartManagedProcess
+    ?? ((name) => {
+      exec(`pm2 restart ${JSON.stringify(name)} --update-env 2>/dev/null`, { stdio: 'pipe' });
+    });
+  const coreEcosystemServiceNames = new Set(
+    deps.coreEcosystemServiceNames ?? CORE_ECOSYSTEM_SERVICE_NAMES,
+  );
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
   const skillsDir = deps.skillsDir ?? SKILLS_DIR;
 
@@ -1466,6 +1488,10 @@ export function step11_startCoreServices(ctx, deps = {}) {
         // Preserve the process's own cron_restart/autorestart definition.
         // The Core ecosystem does not necessarily declare component one-shots.
         restartScheduledFn(name);
+      } else if (!coreEcosystemServiceNames.has(name)) {
+        // Component daemons can use additional ecosystem files that are not
+        // loaded by Core. Preserve their already-registered PM2 definition.
+        restartExistingFn(name);
       } else {
         restartFn(name, {
           ecosystemPath,
@@ -1708,6 +1734,14 @@ export function rollbackSelf(ctx, deps = {}) {
   const restartScheduledFn = deps.restartScheduledProcess ?? ((name) => {
     execSyncFn(`pm2 restart ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
   });
+  const restartExistingFn = deps.restartExistingProcess
+    ?? deps.restartManagedProcess
+    ?? ((name) => {
+      execSyncFn(`pm2 restart ${JSON.stringify(name)} --update-env 2>/dev/null`, { stdio: 'pipe' });
+    });
+  const coreEcosystemServiceNames = new Set(
+    deps.coreEcosystemServiceNames ?? CORE_ECOSYSTEM_SERVICE_NAMES,
+  );
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
   const skillsDir = deps.skillsDir ?? SKILLS_DIR;
   const ecosystemPath = deps.ecosystemPath ?? getCoreEcosystemPath();
@@ -1775,6 +1809,8 @@ export function rollbackSelf(ctx, deps = {}) {
     try {
       if (scheduledServices.has(name)) {
         restartScheduledFn(name);
+      } else if (!coreEcosystemServiceNames.has(name)) {
+        restartExistingFn(name);
       } else {
         restartFn(name, {
           ecosystemPath,

@@ -5,6 +5,15 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.9] - 2026-08-27
+
+### Fixed
+- Core self-upgrade and rollback now restart component-owned daemons from their
+  existing PM2 definitions instead of forcing their names through the Core
+  ecosystem. Additional Feishu projection and comment workers therefore remain
+  online across a Core upgrade while Core-owned services still receive the new
+  ecosystem configuration.
+
 ## [0.7.2-rc.8] - 2026-08-27
 
 ### Added

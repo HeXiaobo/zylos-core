@@ -404,6 +404,33 @@ describe('step3_stopCoreServices', () => {
 });
 
 describe('step11_startCoreServices', () => {
+  it('restarts component daemons from their preserved PM2 definition', () => {
+    const calls = [];
+    const result = step11_startCoreServices({
+      tempDir: null,
+      servicesWereRunning: ['zylos-feishu-task-projection', 'c4-dispatcher'],
+      cronServicesWereRunning: [],
+    }, {
+      fs: {
+        existsSync: () => false,
+        mkdirSync: () => {},
+        copyFileSync: () => {},
+      },
+      requiredCoreServices: [],
+      coreEcosystemServiceNames: ['c4-dispatcher'],
+      restartExistingProcess: (name) => calls.push(`component:${name}`),
+      restartManagedProcess: (name) => calls.push(`core:${name}`),
+      execSync: (cmd) => calls.push(`exec:${cmd}`),
+    });
+
+    assert.equal(result.status, 'done');
+    assert.deepStrictEqual(calls, [
+      'component:zylos-feishu-task-projection',
+      'core:c4-dispatcher',
+      'exec:pm2 save 2>/dev/null',
+    ]);
+  });
+
   it('reactivates cron one-shots through their preserved PM2 definition', () => {
     const calls = [];
     const result = step11_startCoreServices({
