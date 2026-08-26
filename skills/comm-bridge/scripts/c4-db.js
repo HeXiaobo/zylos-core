@@ -174,7 +174,14 @@ function ensureCommitmentIntakeSchema(database) {
   }
 }
 
-export function ensureAssistantResponseSchema(database) {
+export function ensureAssistantResponseSchema(database, { observationClock = Date.now } = {}) {
+  if (typeof observationClock !== 'function') {
+    throw new TypeError('observationClock must be a function');
+  }
+  const migrationObservedAtMs = observationClock();
+  if (!Number.isSafeInteger(migrationObservedAtMs) || migrationObservedAtMs < 0) {
+    throw new TypeError('observationClock result must be a non-negative safe integer');
+  }
   database.exec(`
     CREATE TABLE IF NOT EXISTS assistant_requests (
       request_id TEXT PRIMARY KEY,
@@ -240,6 +247,9 @@ export function ensureAssistantResponseSchema(database) {
       started_at INTEGER,
       terminal_at INTEGER,
       updated_at INTEGER NOT NULL,
+      lifecycle_version INTEGER NOT NULL DEFAULT 0 CHECK (lifecycle_version >= 0),
+      lifecycle_observed_at_ms INTEGER
+        CHECK (lifecycle_observed_at_ms IS NULL OR lifecycle_observed_at_ms >= 0),
       terminal_reason TEXT,
       FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT,
       FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
@@ -262,6 +272,31 @@ export function ensureAssistantResponseSchema(database) {
         CHECK (redrive_count >= 0)
     `);
   }
+
+  const runtimeTurnColumns = getColumnNames(database, 'runtime_turn_admissions');
+  if (!runtimeTurnColumns.has('lifecycle_version')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 0
+        CHECK (lifecycle_version >= 0)
+    `);
+  }
+  if (!runtimeTurnColumns.has('lifecycle_observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN lifecycle_observed_at_ms INTEGER
+        CHECK (lifecycle_observed_at_ms IS NULL OR lifecycle_observed_at_ms >= 0)
+    `);
+  }
+  // A NULL observation baseline would let the first delayed hook after an
+  // upgrade define the new generation. Conservatively fence every active
+  // legacy admission at migration time; a hook process observed before this
+  // point must not mutate it.
+  database.prepare(`
+    UPDATE runtime_turn_admissions
+    SET lifecycle_observed_at_ms = ?
+    WHERE status IN ('submitted', 'started') AND lifecycle_observed_at_ms IS NULL
+  `).run(migrationObservedAtMs);
 }
 
 function toCommitmentIntakeView(row) {

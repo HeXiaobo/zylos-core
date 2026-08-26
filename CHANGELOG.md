@@ -5,6 +5,38 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.8] - 2026-08-27
+
+### Added
+- The capability manifest now declares runtime modes explicitly: Claude uses
+  display-hook response streaming and runtime-turn admission, while Codex uses
+  request-scoped `c4-send` completion until it has an equivalent display/turn
+  completion boundary.
+
+### Fixed
+- Submitted admissions abandoned by a failed or ambiguous tmux verification
+  can be reclaimed after 60 seconds. Started turns never expire by age; they
+  recover only after 30 seconds of both healthy monitor idle and lifecycle
+  inactivity, with a persisted generation compare-and-swap preventing a new
+  Prompt or tool event from racing an old idle snapshot.
+- Claude prompt, legacy PreTool, Stop, and idle-notification hooks are
+  synchronous lifecycle fences. Tool completion and display events can touch only an already
+  started admission, so late events from turn A cannot start, bind, or finish
+  turn B. Missing/corrupt best-effort binding state remains fail-closed while B
+  is still submitted. Every durable lifecycle mutation also compares its
+  process observation time inside the admission transaction, so an upgrade-era
+  asynchronous Stop or PostTool from A cannot finish or publish progress into
+  B after B has started. New admissions establish that lower bound at
+  acquisition, and active legacy rows receive a conservative migration-time
+  baseline before any hook may mutate them.
+- Long-running tools remain busy even when their hook timestamp exceeds the
+  short freshness window. Prompt-only state has a bounded one-hour lifetime so
+  a missing Stop cannot keep the runtime busy forever, and legacy installs
+  missing UserPromptSubmit can still start safely at synchronous PreToolUse.
+- Codex no longer creates Claude-only runtime admissions that would remain
+  submitted. Assistant requests use the explicit `--request-id` reply command,
+  preserving durable completion without claiming unsupported display hooks.
+
 ## [0.7.2-rc.7] - 2026-08-27
 
 ### Added
@@ -14,9 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching runtime `Stop`; the durable lifecycle ledger makes cross-channel
   queueing observable and survives a dispatcher restart. Control-plane items retain
   their existing bypass behavior.
-- `c4.assistant-response-stream:3` advertises serialized conversation admission
-  so paired deployments can distinguish this release from response streaming
-  that only isolated Feishu request IDs.
+- `c4.assistant-response-stream:3` advertises serialized Claude conversation
+  admission so paired deployments can distinguish this release from response
+  streaming that only isolated Feishu request IDs.
 - Assistant turn binding decisions now append a content-free per-turn JSONL
   audit record while retaining the compact last-known-state file. Future reply
   attribution incidents can reconstruct marker acceptance and rejection instead

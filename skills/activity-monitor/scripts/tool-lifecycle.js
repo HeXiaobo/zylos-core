@@ -263,6 +263,9 @@ function clearSessionEpisodes(state, event) {
   if (!event.session_id) return;
 
   const session = ensureSession(state, event.session_id, event.pid);
+  // Async hook processes can append an older idle/Stop after a newer prompt.
+  // Never let an event observed before the current prompt clear that turn.
+  if (session.in_prompt && (event.ts || 0) < (session.last_prompt_at || 0)) return;
   session.in_prompt = false;
   session.last_event = event.event;
   session.last_event_at = Math.max(session.last_event_at || 0, event.ts || 0);
@@ -412,7 +415,9 @@ export function pruneToolLifecycleState(state, { nowMs = Date.now(), livePids = 
     const hasRunningTools = Array.isArray(session?.running_tools) && session.running_tools.length > 0;
     const pid = Number(session?.pid) || 0;
     const pidAlive = pid > 0 ? livePids.has(pid) : false;
-    if (!hasRunningTools && (nowMs - lastEventAt) > sessionTtlMs && !pidAlive) {
+    const expired = (nowMs - lastEventAt) > sessionTtlMs;
+    const orphanedPrompt = expired && session?.in_prompt === true;
+    if (!hasRunningTools && expired && (orphanedPrompt || !pidAlive)) {
       delete nextState.sessions[sessionId];
     }
   }

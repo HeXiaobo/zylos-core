@@ -441,13 +441,30 @@ describe('MonitorOrchestrator', () => {
       currentTime: 200,
       apiActivity: {
         active: true,
+        active_tools: 2,
+        in_prompt: true,
+        updated_at: 100_000,
+      },
+    }), {
+      apiUpdatedSec: 100,
+      activeTools: 2,
+      thinking: true,
+      hookFresh: false,
+      confirmedActive: false,
+    });
+
+    assert.deepEqual(orchestrator.summarizeApiActivity({
+      currentTime: 4_000,
+      apiActivity: {
+        active: true,
         active_tools: 0,
+        in_prompt: true,
         updated_at: 100_000,
       },
     }), {
       apiUpdatedSec: 100,
       activeTools: 0,
-      thinking: true,
+      thinking: false,
       hookFresh: false,
       confirmedActive: false,
     });

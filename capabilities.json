@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "product": "zylos-core",
-  "release": "0.7.2-rc.7",
+  "release": "0.7.2-rc.8",
   "protocols": {
     "c4.reply": 2,
     "c4.reply.argv-compat": 1,
@@ -13,5 +13,14 @@
     "external-task-adapter": 1,
     "projection-outbox": 1,
     "task-reminder": 1
+  },
+  "runtimeModes": {
+    "c4.assistant-response-stream": {
+      "claude": "display-hook",
+      "codex": "explicit-c4-send"
+    },
+    "c4.runtime-turn-admission": [
+      "claude"
+    ]
   }
 }

@@ -8,6 +8,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-activity-test-'));
 const monitorDir = path.join(tmpDir, 'activity-monitor');
 const eventsFile = path.join(monitorDir, 'tool-events.jsonl');
 const bindingAuditFile = path.join(monitorDir, 'assistant-turn-binding-events.jsonl');
+const testObservationBaseMs = Date.now() + 60_000;
 
 after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -24,7 +25,10 @@ async function runHook(payload, nowMs = 1000) {
   process.env.HOOK_ACTIVITY_DISABLE_MAIN = '1';
   const modulePath = new URL('../hook-activity.js', import.meta.url);
   const { handleHookActivity } = await import(`${modulePath.href}?t=${Date.now()}-${Math.random()}`);
-  handleHookActivity(payload, { nowMs, claudePid: 4242 });
+  handleHookActivity(payload, {
+    nowMs: testObservationBaseMs + nowMs,
+    claudePid: 4242,
+  });
 }
 
 function readEvents() {
@@ -181,7 +185,7 @@ describe('hook-activity', () => {
       mode: 'rejected',
       requestId: null,
       reason: 'missing_terminal_marker',
-      updatedAt: 4050,
+      updatedAt: testObservationBaseMs + 4050,
     });
 
     await runHook({
@@ -190,6 +194,281 @@ describe('hook-activity', () => {
       last_assistant_message: 'HXA reply complete.',
     }, 4060);
     assert.equal(stream.getActiveRuntimeTurn(), null);
+    stream.close();
+  });
+
+  it('starts and closes an admission when an older install misses UserPromptSubmit', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.legacy-tool-admission',
+      sourceId: 'om_legacy_tool_admission',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_legacy_tool_admission' },
+      conversation: {
+        content: '[Feishu DM] legacy hook fixture',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+
+    await runHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 'session-legacy-tool-admission',
+      tool_name: 'Read',
+      tool_input: { file_path: '/tmp/fixture' },
+      tool_use_id: 'toolu_legacy_admission',
+    }, 4070);
+    assert.equal(stream.getActiveRuntimeTurn().status, 'started');
+    assert.equal(stream.getActiveRuntimeTurn().runtimeSessionId, 'session-legacy-tool-admission');
+
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'session-legacy-tool-admission',
+      last_assistant_message: 'Legacy hook reply complete.',
+    }, 4080);
+    assert.equal(stream.getActiveRuntimeTurn(), null);
+    stream.close();
+  });
+
+  it('does not let late tool and Stop hooks consume the next submitted admission', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const first = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.late-hook-a',
+      sourceId: 'om_late_hook_a',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_late_hook_a' },
+      conversation: {
+        content: '[Feishu DM] late hook A',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    const second = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.late-hook-b',
+      sourceId: 'om_late_hook_b',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_late_hook_b' },
+      conversation: {
+        content: '[Feishu DM] late hook B',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: first.request.conversationId,
+      requestId: first.request.requestId,
+      routeChannel: 'feishu',
+    });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'shared-late-hook-session',
+      prompt: 'A ---- streamed reply: assistant request: "assistant.feishu.late-hook-a"',
+    }, 4100);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'shared-late-hook-session',
+      last_assistant_message: 'A complete.',
+    }, 4110);
+
+    const next = stream.acquireRuntimeTurn({
+      conversationId: second.request.conversationId,
+      requestId: second.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: second.request.requestId });
+    fs.rmSync(path.join(monitorDir, 'assistant-turn-bindings'), {
+      recursive: true,
+      force: true,
+    });
+    await runHook({
+      hook_event_name: 'PostToolUse',
+      session_id: 'shared-late-hook-session',
+      tool_name: 'Read',
+      tool_use_id: 'toolu_late_from_a',
+    }, 4120);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'shared-late-hook-session',
+      last_assistant_message: 'Duplicate late Stop from A.',
+    }, 4130);
+
+    const active = stream.getActiveRuntimeTurn();
+    assert.equal(active.admissionId, next.admission.admissionId);
+    assert.equal(active.status, 'submitted');
+    assert.equal(stream.query({ requestId: second.request.requestId }).request.status, 'started');
+    stream.releaseRuntimeTurn({
+      conversationId: second.request.conversationId,
+      reason: 'test_cleanup',
+    });
+    stream.execute({
+      type: 'FailRun',
+      requestId: second.request.requestId,
+      code: 'TEST_CLEANUP',
+      retryable: false,
+    });
+    stream.close();
+  });
+
+  it('does not let late tool and Stop hooks mutate the next started turn', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const first = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.late-started-a',
+      sourceId: 'om_late_started_a',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_late_started_a' },
+      conversation: {
+        content: '[Feishu DM] late started A',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    const second = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.late-started-b',
+      sourceId: 'om_late_started_b',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_late_started_b' },
+      conversation: {
+        content: '[Feishu DM] late started B',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: first.request.conversationId,
+      requestId: first.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: first.request.requestId });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'shared-started-session',
+      prompt: 'A ---- streamed reply: assistant request: "assistant.feishu.late-started-a"',
+    }, 5_000);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'shared-started-session',
+      last_assistant_message: 'A complete.',
+    }, 5_100);
+
+    const next = stream.acquireRuntimeTurn({
+      conversationId: second.request.conversationId,
+      requestId: second.request.requestId,
+      routeChannel: 'feishu',
+    });
+    stream.execute({ type: 'StartRun', requestId: second.request.requestId });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'shared-started-session',
+      prompt: 'B ---- streamed reply: assistant request: "assistant.feishu.late-started-b"',
+    }, 6_000);
+    const beforeLateHooks = stream.getActiveRuntimeTurn();
+    const beforeEvents = stream.query({ requestId: second.request.requestId }).events;
+
+    await runHook({
+      hook_event_name: 'PostToolUse',
+      session_id: 'shared-started-session',
+      tool_name: 'Read',
+      tool_use_id: 'toolu_late_started_from_a',
+    }, 5_200);
+    await runHook({
+      hook_event_name: 'Stop',
+      session_id: 'shared-started-session',
+      last_assistant_message: 'Late A output must not complete B.',
+    }, 5_300);
+
+    const active = stream.getActiveRuntimeTurn();
+    assert.equal(active.admissionId, next.admission.admissionId);
+    assert.equal(active.status, 'started');
+    assert.equal(active.lifecycleVersion, beforeLateHooks.lifecycleVersion);
+    assert.equal(stream.query({ requestId: second.request.requestId }).request.status, 'started');
+    assert.deepEqual(
+      stream.query({ requestId: second.request.requestId }).events,
+      beforeEvents,
+    );
+    stream.finishRuntimeTurn({
+      runtimeSessionId: 'shared-started-session',
+      reason: 'test_cleanup',
+      observedAtMs: testObservationBaseMs + 6_100,
+    });
+    stream.execute({
+      type: 'FailRun',
+      requestId: second.request.requestId,
+      code: 'TEST_CLEANUP',
+      retryable: false,
+    });
+    stream.close();
+  });
+
+  it('advances the lifecycle generation when idle_prompt is observed', async () => {
+    process.env.ZYLOS_DIR = tmpDir;
+    const { openAssistantResponseStream } = await import(
+      '../../../comm-bridge/scripts/assistant-response-stream.js'
+    );
+    const stream = openAssistantResponseStream();
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId: 'assistant.feishu.idle-generation',
+      sourceId: 'om_idle_generation',
+      route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_idle_generation' },
+      conversation: {
+        content: '[Feishu DM] idle generation',
+        status: 'pending',
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    stream.acquireRuntimeTurn({
+      conversationId: accepted.request.conversationId,
+      requestId: accepted.request.requestId,
+      routeChannel: 'feishu',
+    });
+    await runHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-idle-generation',
+      prompt: 'idle generation ---- streamed reply: assistant request: "assistant.feishu.idle-generation"',
+    }, 4200);
+    const beforeIdle = stream.getActiveRuntimeTurn();
+
+    await runHook({
+      hook_event_name: 'Notification',
+      notification_type: 'idle_prompt',
+      session_id: 'session-idle-generation',
+    }, 4210);
+
+    const afterIdle = stream.getActiveRuntimeTurn();
+    assert.ok(afterIdle.lifecycleVersion > beforeIdle.lifecycleVersion);
+    stream.finishRuntimeTurn({
+      runtimeSessionId: 'session-idle-generation',
+      reason: 'test_cleanup',
+    });
+    stream.execute({
+      type: 'FailRun',
+      requestId: accepted.request.requestId,
+      code: 'TEST_CLEANUP',
+      retryable: false,
+    });
     stream.close();
   });
 

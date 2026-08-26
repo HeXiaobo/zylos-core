@@ -9,8 +9,8 @@
  *
  * Registered on: UserPromptSubmit, PreToolUse, PostToolUse,
  * PostToolUseFailure, MessageDisplay, Stop, Notification(idle_prompt).
- * UserPromptSubmit and MessageDisplay are synchronous for binding/ordering;
- * the remaining watchdog hooks are async.
+ * UserPromptSubmit, PreToolUse, MessageDisplay, Stop, and idle Notification
+ * are synchronous turn boundaries; tool completion watchdog hooks remain async.
  *
  * Scope: phase 1 watchdog tracks only the root Claude agent. Nested subagent
  * hook payloads carry agent_id and are ignored here because recovery actions
@@ -43,6 +43,10 @@ const TURN_BINDING_DIR = path.join(MONITOR_DIR, 'assistant-turn-bindings');
 const TURN_BINDING_AUDIT_FILE = path.join(MONITOR_DIR, 'assistant-turn-binding-events.jsonl');
 const ASSISTANT_REQUEST_MARKER = /assistant request:\s*"([A-Za-z0-9][A-Za-z0-9._:-]*)"\s*$/;
 const ANY_ASSISTANT_REQUEST_MARKER = /assistant request:\s*"/;
+// Capture observation time before an async hook can be delayed on stdin or
+// scheduling. Both the durable admission and lifecycle reducer use it to
+// reject events older than the current prompt generation.
+const HOOK_PROCESS_OBSERVED_AT_MS = Date.now();
 
 function appendError(message) {
   try {
@@ -248,14 +252,37 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
     if (record.event === 'prompt') {
       const admission = responseStream.startRuntimeTurn({
         runtimeSessionId: record.session_id,
+        observedAtMs: record.ts,
       });
       if (admission.reason === 'runtime_session_conflict') {
         appendError('runtime_turn_admission prompt_session_conflict');
+      }
+      if (['runtime_session_conflict', 'runtime_turn_observation_stale'].includes(admission.reason)) {
+        return null;
       }
       return bindPromptTurn(responseStream, record, hookData);
     }
     if (['pre_tool', 'post_tool', 'post_tool_failure'].includes(record.event)) {
       if (!record.tool) return null;
+      // UserPromptSubmit is the canonical turn boundary. PreToolUse is the
+      // synchronous compatibility boundary for older installs that missed the
+      // prompt hook. Async completion hooks must never promote a newly queued
+      // admission: they can arrive after the prior turn's Stop.
+      const admission = record.event === 'pre_tool'
+        ? responseStream.startRuntimeTurn({
+          runtimeSessionId: record.session_id,
+          observedAtMs: record.ts,
+        })
+        : responseStream.touchRuntimeTurn({
+          runtimeSessionId: record.session_id,
+          observedAtMs: record.ts,
+        });
+      if (admission.reason === 'runtime_session_conflict') {
+        appendError('runtime_turn_admission tool_session_conflict');
+        return null;
+      }
+      if (['runtime_session_conflict', 'runtime_turn_not_started', 'runtime_turn_observation_stale']
+        .includes(admission.reason)) return null;
       // Older installations may omit UserPromptSubmit. In that case only the
       // first observed event may attempt the single-candidate compatibility
       // binding. A prompt-time rejection is sticky and can never fall back.
@@ -279,6 +306,16 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       });
     }
     if (record.event === 'message_display') {
+      const admission = responseStream.touchRuntimeTurn({
+        runtimeSessionId: record.session_id,
+        observedAtMs: record.ts,
+      });
+      if (admission.reason === 'runtime_session_conflict') {
+        appendError('runtime_turn_admission display_session_conflict');
+        return null;
+      }
+      if (['runtime_session_conflict', 'runtime_turn_not_started', 'runtime_turn_observation_stale']
+        .includes(admission.reason)) return null;
       const binding = resolveTurnBinding(responseStream, record, {
         allowLegacyFallback: true,
       });
@@ -318,14 +355,28 @@ export function emitAssistantLifecycle(record, { hookData = null } = {}) {
       });
       return result;
     }
+    if (record.event === 'idle') {
+      const admission = responseStream.touchRuntimeTurn({
+        runtimeSessionId: record.session_id,
+        observedAtMs: record.ts,
+      });
+      if (admission.reason === 'runtime_session_conflict') {
+        appendError('runtime_turn_admission idle_session_conflict');
+      }
+      return null;
+    }
     if (record.event === 'stop') {
       const admission = responseStream.finishRuntimeTurn({
         runtimeSessionId: record.session_id,
         reason: 'stop',
+        observedAtMs: record.ts,
       });
       if (admission.reason === 'runtime_session_conflict') {
         appendError('runtime_turn_admission stop_session_conflict');
+        return null;
       }
+      if (['runtime_session_conflict', 'runtime_turn_not_started', 'runtime_turn_observation_stale']
+        .includes(admission.reason)) return null;
       const binding = resolveTurnBinding(responseStream, record);
       if (!binding) return null;
       let result;
@@ -419,6 +470,18 @@ export function handleHookActivity(hookData, { nowMs = Date.now(), claudePid = g
   if (!fs.existsSync(MONITOR_DIR)) {
     fs.mkdirSync(MONITOR_DIR, { recursive: true });
   }
+  // Close the durable turn before publishing an idle/Stop fact. Otherwise the
+  // dispatcher can observe idle first and a delayed Stop can target the next
+  // admission in the same long-lived runtime session.
+  if (record.event === 'stop') {
+    try {
+      emitAssistantLifecycle(record, { hookData });
+    } catch (err) {
+      appendError(`assistant_stream ${err?.message || 'unknown_error'}`);
+    }
+    appendJsonLine(TOOL_EVENTS_FILE, record);
+    return record;
+  }
   appendJsonLine(TOOL_EVENTS_FILE, record);
   try {
     emitAssistantLifecycle(record, { hookData });
@@ -440,7 +503,7 @@ if (process.env.HOOK_ACTIVITY_DISABLE_MAIN !== '1') {
   process.stdin.on('end', () => {
     try {
       const hookData = JSON.parse(input || '{}');
-      handleHookActivity(hookData);
+      handleHookActivity(hookData, { nowMs: HOOK_PROCESS_OBSERVED_AT_MS });
     } catch (err) {
       appendError(err?.message || 'unknown_error');
     }

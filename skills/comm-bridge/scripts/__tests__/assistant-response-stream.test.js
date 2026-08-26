@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 import {
   ASSISTANT_RESPONSE_EVENT_TYPES,
@@ -23,6 +27,66 @@ function accept(stream, overrides = {}) {
     ...overrides,
   });
 }
+
+test('migrates existing runtime admissions with lifecycle fences', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-runtime-schema-'));
+  const dbPath = path.join(directory, 'c4.db');
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const legacy = new Database(dbPath);
+  legacy.exec(`
+    CREATE TABLE conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      direction TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      content TEXT NOT NULL
+    );
+    CREATE TABLE runtime_turn_admissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      singleton_key INTEGER NOT NULL DEFAULT 1,
+      conversation_id INTEGER NOT NULL,
+      request_id TEXT,
+      route_channel TEXT NOT NULL,
+      status TEXT NOT NULL,
+      runtime_session_id TEXT,
+      acquired_at INTEGER NOT NULL,
+      started_at INTEGER,
+      terminal_at INTEGER,
+      updated_at INTEGER NOT NULL,
+      terminal_reason TEXT
+    );
+    INSERT INTO conversations (direction, channel, content)
+    VALUES ('inbound', 'feishu', 'legacy active turn');
+    INSERT INTO runtime_turn_admissions (
+      conversation_id, request_id, route_channel, status, runtime_session_id,
+      acquired_at, started_at, updated_at, terminal_reason
+    ) VALUES (1, NULL, 'feishu', 'started', 'legacy-session', 1, 2, 3, NULL);
+  `);
+  legacy.close();
+
+  const migrationObservedAtMs = 1_000_900;
+  const stream = openAssistantResponseStream({
+    dbPath,
+    observationClock: () => migrationObservedAtMs,
+  });
+  const migratedAdmission = stream.getActiveRuntimeTurn();
+  assert.equal(migratedAdmission.lifecycleObservedAtMs, migrationObservedAtMs);
+  const sameSecondOldHookMs = 1_000_700;
+  assert.ok(sameSecondOldHookMs > Math.floor(migrationObservedAtMs / 1000) * 1000);
+  const staleStop = stream.finishRuntimeTurn({
+    runtimeSessionId: 'legacy-session',
+    reason: 'stop',
+    observedAtMs: sameSecondOldHookMs,
+  });
+  assert.equal(staleStop.finished, false);
+  assert.equal(staleStop.reason, 'runtime_turn_observation_stale');
+  assert.equal(stream.getActiveRuntimeTurn().status, 'started');
+  stream.close();
+  const migrated = new Database(dbPath, { readonly: true });
+  const columns = migrated.prepare('PRAGMA table_info(runtime_turn_admissions)').all();
+  assert.equal(columns.some(column => column.name === 'lifecycle_version'), true);
+  assert.equal(columns.some(column => column.name === 'lifecycle_observed_at_ms'), true);
+  migrated.close();
+});
 
 test('accepts once and exposes only the runtime-neutral event contract', () => {
   const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => 100 });
@@ -157,6 +221,314 @@ test('serializes every runtime conversation from submission through terminal hoo
   assert.equal(released.released, true);
   assert.equal(released.admission.status, 'released');
   assert.equal(stream.getActiveRuntimeTurn(), null);
+  stream.close();
+});
+
+test('recovers a stale runtime admission before accepting the next conversation', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    clock: () => now,
+    runtimeTurnSubmittedStaleSeconds: 30,
+  });
+  const first = accept(stream, {
+    requestId: 'assistant.feishu.stale-admission-a',
+    sourceId: 'om_stale_admission_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_stale_admission_a' },
+  });
+  const second = accept(stream, {
+    requestId: 'assistant.feishu.stale-admission-b',
+    sourceId: 'om_stale_admission_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_stale_admission_b' },
+  });
+
+  const original = stream.acquireRuntimeTurn({
+    conversationId: first.request.conversationId,
+    requestId: first.request.requestId,
+    routeChannel: 'feishu',
+  });
+  now = 129;
+  assert.equal(stream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: second.request.requestId,
+    routeChannel: 'feishu',
+  }).acquired, false);
+
+  now = 131;
+  const recovered = stream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: second.request.requestId,
+    routeChannel: 'feishu',
+  });
+  assert.equal(recovered.acquired, true);
+  assert.equal(recovered.recoveredAdmission.admissionId, original.admission.admissionId);
+  assert.equal(recovered.recoveredAdmission.status, 'released');
+  assert.equal(recovered.recoveredAdmission.terminalReason, 'stale_before_reacquire');
+  assert.equal(recovered.admission.conversationId, second.request.conversationId);
+  stream.close();
+});
+
+test('recovers a stale runtime admission after the dispatcher database is reopened', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-runtime-admission-'));
+  const dbPath = path.join(directory, 'c4.db');
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let now = 100;
+  const firstStream = openAssistantResponseStream({
+    dbPath,
+    clock: () => now,
+    runtimeTurnSubmittedStaleSeconds: 30,
+  });
+  const first = accept(firstStream, {
+    requestId: 'assistant.feishu.restart-admission-a',
+    sourceId: 'om_restart_admission_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_restart_admission_a' },
+  });
+  const second = accept(firstStream, {
+    requestId: 'assistant.feishu.restart-admission-b',
+    sourceId: 'om_restart_admission_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_restart_admission_b' },
+  });
+  const original = firstStream.acquireRuntimeTurn({
+    conversationId: first.request.conversationId,
+    requestId: first.request.requestId,
+    routeChannel: 'feishu',
+  });
+  firstStream.close();
+
+  now = 131;
+  const restartedStream = openAssistantResponseStream({
+    dbPath,
+    clock: () => now,
+    runtimeTurnSubmittedStaleSeconds: 30,
+  });
+  const recovered = restartedStream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: second.request.requestId,
+    routeChannel: 'feishu',
+  });
+  assert.equal(recovered.acquired, true);
+  assert.equal(recovered.recoveredAdmission.admissionId, original.admission.admissionId);
+  assert.equal(recovered.recoveredAdmission.status, 'released');
+  assert.equal(restartedStream.getActiveRuntimeTurn().conversationId, second.request.conversationId);
+  restartedStream.close();
+});
+
+test('never age-expires a started turn and requires explicit idle reconciliation', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    clock: () => now,
+    runtimeTurnSubmittedStaleSeconds: 30,
+  });
+  const first = accept(stream, {
+    requestId: 'assistant.feishu.long-running-a',
+    sourceId: 'om_long_running_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_long_running_a' },
+  });
+  const second = accept(stream, {
+    requestId: 'assistant.feishu.long-running-b',
+    sourceId: 'om_long_running_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_long_running_b' },
+  });
+  const original = stream.acquireRuntimeTurn({
+    conversationId: first.request.conversationId,
+    requestId: first.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.startRuntimeTurn({ runtimeSessionId: 'long-running-session' });
+
+  now = 10_000;
+  assert.equal(stream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: second.request.requestId,
+    routeChannel: 'feishu',
+  }).acquired, false);
+  assert.equal(stream.getActiveRuntimeTurn().admissionId, original.admission.admissionId);
+  assert.equal(stream.getActiveRuntimeTurn().status, 'started');
+
+  const reconciled = stream.recoverRuntimeTurn({
+    admissionId: original.admission.admissionId,
+    expectedLifecycleVersion: stream.getActiveRuntimeTurn().lifecycleVersion,
+    reason: 'runtime_sustained_idle',
+  });
+  assert.equal(reconciled.recovered, true);
+  assert.equal(reconciled.admission.status, 'released');
+  assert.equal(reconciled.admission.terminalReason, 'runtime_sustained_idle');
+  assert.equal(reconciled.request.status, 'failed');
+  assert.deepEqual(reconciled.events.map(event => event.type), ['RunFailed']);
+  assert.equal(stream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: second.request.requestId,
+    routeChannel: 'feishu',
+  }).acquired, true);
+  stream.close();
+});
+
+test('idle recovery is fenced by lifecycle activity after the status snapshot', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.recovery-fence',
+    sourceId: 'om_recovery_fence',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_recovery_fence' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  const started = stream.startRuntimeTurn({ runtimeSessionId: 'recovery-fence-session' });
+  const idleSnapshotVersion = started.admission.lifecycleVersion;
+
+  now = 101;
+  const touched = stream.startRuntimeTurn({ runtimeSessionId: 'recovery-fence-session' });
+  assert.equal(touched.replayed, true);
+  assert.ok(touched.admission.lifecycleVersion > idleSnapshotVersion);
+
+  const staleRecovery = stream.recoverRuntimeTurn({
+    admissionId: started.admission.admissionId,
+    expectedLifecycleVersion: idleSnapshotVersion,
+    reason: 'runtime_sustained_idle',
+  });
+  assert.equal(staleRecovery.recovered, false);
+  assert.equal(staleRecovery.reason, 'runtime_turn_lifecycle_changed');
+  assert.equal(stream.getActiveRuntimeTurn().status, 'started');
+  stream.close();
+});
+
+test('a delayed Stop cannot complete the next turn before its prompt starts', () => {
+  const stream = openAssistantResponseStream({ dbPath: ':memory:' });
+  const first = accept(stream, {
+    requestId: 'assistant.feishu.fenced-stop-a',
+    sourceId: 'om_fenced_stop_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_fenced_stop_a' },
+  });
+  const second = accept(stream, {
+    requestId: 'assistant.feishu.fenced-stop-b',
+    sourceId: 'om_fenced_stop_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_fenced_stop_b' },
+  });
+
+  stream.acquireRuntimeTurn({
+    conversationId: first.request.conversationId,
+    requestId: first.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.startRuntimeTurn({ runtimeSessionId: 'shared-runtime-session' });
+  stream.finishRuntimeTurn({ runtimeSessionId: 'shared-runtime-session', reason: 'stop' });
+
+  const next = stream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: second.request.requestId,
+    routeChannel: 'feishu',
+  });
+  const delayedStop = stream.finishRuntimeTurn({
+    runtimeSessionId: 'shared-runtime-session',
+    reason: 'stop',
+  });
+
+  assert.equal(delayedStop.finished, false);
+  assert.equal(delayedStop.reason, 'runtime_turn_not_started');
+  assert.equal(stream.getActiveRuntimeTurn().admissionId, next.admission.admissionId);
+  assert.equal(stream.getActiveRuntimeTurn().status, 'submitted');
+  stream.close();
+});
+
+test('observation time fences delayed lifecycle hooks after the next turn starts', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 500,
+  });
+  const first = accept(stream, {
+    requestId: 'assistant.feishu.observation-fence-a',
+    sourceId: 'om_observation_fence_a',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_observation_fence_a' },
+  });
+  const second = accept(stream, {
+    requestId: 'assistant.feishu.observation-fence-b',
+    sourceId: 'om_observation_fence_b',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_observation_fence_b' },
+  });
+
+  stream.acquireRuntimeTurn({
+    conversationId: first.request.conversationId,
+    requestId: first.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.startRuntimeTurn({
+    runtimeSessionId: 'shared-observation-session',
+    observedAtMs: 1_000,
+  });
+  stream.finishRuntimeTurn({
+    runtimeSessionId: 'shared-observation-session',
+    reason: 'stop',
+    observedAtMs: 1_100,
+  });
+
+  const next = stream.acquireRuntimeTurn({
+    conversationId: second.request.conversationId,
+    requestId: second.request.requestId,
+    routeChannel: 'feishu',
+  });
+  const started = stream.startRuntimeTurn({
+    runtimeSessionId: 'shared-observation-session',
+    observedAtMs: 2_000,
+  });
+  assert.equal(started.started, true);
+
+  const delayedTool = stream.touchRuntimeTurn({
+    runtimeSessionId: 'shared-observation-session',
+    observedAtMs: 1_500,
+  });
+  assert.equal(delayedTool.touched, false);
+  assert.equal(delayedTool.reason, 'runtime_turn_observation_stale');
+  const delayedStop = stream.finishRuntimeTurn({
+    runtimeSessionId: 'shared-observation-session',
+    reason: 'stop',
+    observedAtMs: 1_600,
+  });
+  assert.equal(delayedStop.finished, false);
+  assert.equal(delayedStop.reason, 'runtime_turn_observation_stale');
+
+  const active = stream.getActiveRuntimeTurn();
+  assert.equal(active.admissionId, next.admission.admissionId);
+  assert.equal(active.status, 'started');
+  assert.equal(active.lifecycleVersion, started.admission.lifecycleVersion);
+  assert.equal(active.lifecycleObservedAtMs, 2_000);
+  stream.close();
+});
+
+test('the acquisition observation fence rejects a delayed PreTool before prompt start', () => {
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    observationClock: () => 2_000,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.acquisition-fence',
+    sourceId: 'om_acquisition_fence',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_acquisition_fence' },
+  });
+  const acquired = stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  assert.equal(acquired.admission.lifecycleObservedAtMs, 2_000);
+
+  const delayedPreTool = stream.startRuntimeTurn({
+    runtimeSessionId: 'acquisition-fence-session',
+    observedAtMs: 1_999,
+  });
+  assert.equal(delayedPreTool.started, false);
+  assert.equal(delayedPreTool.reason, 'runtime_turn_observation_stale');
+  assert.equal(stream.getActiveRuntimeTurn().status, 'submitted');
+
+  const prompt = stream.startRuntimeTurn({
+    runtimeSessionId: 'acquisition-fence-session',
+    observedAtMs: 2_001,
+  });
+  assert.equal(prompt.started, true);
+  assert.equal(prompt.admission.status, 'started');
   stream.close();
 });
 

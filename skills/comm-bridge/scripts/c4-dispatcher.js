@@ -41,6 +41,7 @@ import {
   ENTER_VERIFY_MAX_RETRIES,
   ENTER_VERIFY_WAIT_MS,
   REQUIRE_IDLE_MIN_SECONDS,
+  RUNTIME_TURN_RECOVERY_IDLE_SECONDS,
   REQUIRE_IDLE_POST_SEND_HOLD_MS,
   REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS,
   REQUIRE_IDLE_EXECUTION_POLL_MS,
@@ -514,15 +515,19 @@ function hasAckSuffix(content = '') {
   return content.includes('---- ack via:');
 }
 
-export function getDeliveryContent(item) {
+export function getDeliveryContent(item, activeRuntime = ACTIVE_RUNTIME) {
   const rawContent = item.content || '';
   if (item.type === 'conversation') {
-    const replyViaSuffix = item.assistant_request_id
+    const replyViaSuffix = item.assistant_request_id && activeRuntime === 'claude'
       ? buildStreamedReplySuffix(item.assistant_request_id)
       : (
           item.endpoint_id
           && !hasLegacyReplyViaSuffix(rawContent)
-            ? buildReplyViaSuffix(item.channel, item.endpoint_id)
+            ? buildReplyViaSuffix(
+                item.channel,
+                item.endpoint_id,
+                item.assistant_request_id || null,
+              )
             : ''
         );
     return truncateForDelivery(rawContent, replyViaSuffix, item.id);
@@ -649,6 +654,30 @@ export function shouldDeferConversationForRuntime(item, agentState) {
   return item?.type === 'conversation' && agentState?.state === 'busy';
 }
 
+export function shouldRecoverRuntimeTurnAdmission(
+  admission,
+  agentState,
+  minimumIdleSeconds = RUNTIME_TURN_RECOVERY_IDLE_SECONDS,
+  currentSeconds = nowSeconds(),
+) {
+  return Boolean(
+    admission?.status === 'started'
+    && Number.isSafeInteger(admission?.updatedAt)
+    && admission.updatedAt <= currentSeconds - minimumIdleSeconds
+    && agentState?.healthy === true
+    && agentState?.health === 'ok'
+    && agentState?.state === 'idle'
+    && Number(agentState?.idleSeconds) >= minimumIdleSeconds
+  );
+}
+
+export function runtimeTurnAdmissionsEnabled(activeRuntime = ACTIVE_RUNTIME) {
+  // Claude exposes synchronous prompt/pre-tool/Stop lifecycle fences. Codex
+  // has no MessageDisplay-equivalent completion boundary, so it retains the
+  // monitor gate and explicit c4-send response path.
+  return activeRuntime === 'claude';
+}
+
 function blockingAssistantRun(item) {
   if (item.type !== 'conversation') return null;
   const responseStream = openAssistantResponseStream();
@@ -660,7 +689,9 @@ function blockingAssistantRun(item) {
 }
 
 function acquireRuntimeTurnAdmission(item) {
-  if (item.type !== 'conversation') return { acquired: true, admission: null };
+  if (item.type !== 'conversation' || !runtimeTurnAdmissionsEnabled()) {
+    return { acquired: true, admission: null };
+  }
   const responseStream = openAssistantResponseStream();
   try {
     return responseStream.acquireRuntimeTurn({
@@ -673,8 +704,24 @@ function acquireRuntimeTurnAdmission(item) {
   }
 }
 
+function reconcileRuntimeTurnAdmission(item, agentState) {
+  if (item.type !== 'conversation' || !runtimeTurnAdmissionsEnabled()) return null;
+  const responseStream = openAssistantResponseStream();
+  try {
+    const active = responseStream.getActiveRuntimeTurn();
+    if (!shouldRecoverRuntimeTurnAdmission(active, agentState)) return null;
+    return responseStream.recoverRuntimeTurn({
+      admissionId: active.admissionId,
+      expectedLifecycleVersion: active.lifecycleVersion,
+      reason: 'runtime_sustained_idle',
+    });
+  } finally {
+    responseStream.close();
+  }
+}
+
 function releaseRuntimeTurnAdmission(item, reason) {
-  if (item.type !== 'conversation') return null;
+  if (item.type !== 'conversation' || !runtimeTurnAdmissionsEnabled()) return null;
   const responseStream = openAssistantResponseStream();
   try {
     return responseStream.releaseRuntimeTurn({
@@ -789,6 +836,14 @@ async function processNextMessage() {
     releaseItem(item);
     logRuntimeAdmissionBlock(item);
     return { delivered: false, state: agentState.state };
+  }
+
+  const recoveredRuntimeTurn = reconcileRuntimeTurnAdmission(item, agentState);
+  if (recoveredRuntimeTurn?.recovered) {
+    log(
+      `Recovered runtime admission ${recoveredRuntimeTurn.admission.admissionId} `
+        + `after ${agentState.idleSeconds}s sustained idle`,
+    );
   }
 
   const blockingRun = blockingAssistantRun(item);

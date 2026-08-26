@@ -176,6 +176,12 @@ export function desiredClaudeHooks({
     // The turn binding/rejection must be durable before any tool hook runs.
     { async: false, timeout: 5 }
   );
+  const lifecycleBoundaryHook = commandHook(
+    'skills/activity-monitor/scripts/hook-activity.js',
+    // PreToolUse is the legacy start fence and Stop is the terminal fence.
+    // Both must complete before Claude can advance to the next lifecycle phase.
+    { async: false, timeout: 5 }
+  );
   const messageDisplayHook = commandHook(
     'skills/activity-monitor/scripts/hook-activity.js',
     // MessageDisplay batches must reach the durable stream in source order.
@@ -195,7 +201,7 @@ export function desiredClaudeHooks({
     PreToolUse: [
       {
         matcher: '',
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...lifecycleBoundaryHook }],
       },
     ],
     PermissionRequest: [
@@ -227,13 +233,13 @@ export function desiredClaudeHooks({
     ],
     Stop: [
       {
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...lifecycleBoundaryHook }],
       },
     ],
     Notification: [
       {
         matcher: 'idle_prompt',
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...lifecycleBoundaryHook }],
       },
     ],
   };

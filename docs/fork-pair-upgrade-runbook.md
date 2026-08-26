@@ -11,7 +11,7 @@
 - Core fork 是必需的：固定编排器、双向 C4 门禁、关键通信文件门禁和 PM2
   真在线校验都属于 Core 升级基础设施。
 - 当前 Feishu 目标不需要为本流程再改代码；使用已经通过测试的
-  `0.3.7-rc.5` 提交 `b1da95bc91663be6e63d9651c7fede7fb66f6301`。
+  `0.3.7-rc.6` 提交 `d97604d86c15eef7f0851cf6d285fb9e9942dad7`。
 - `upstream` 只用于读取和同步；发布只允许推送到 `origin` 对应的
   `HeXiaobo/*` fork。
 - 只有结构化报告为 `status: "PASS"` 且外部消息往返验收成功，才可宣告升级
@@ -134,7 +134,7 @@ Claude session，而且 B 在 A 的 `Stop` 之前、C 在 B 的 `Stop` 之前就
 旧 hook 会按“唯一 started 请求”猜测绑定，使无 marker 轮次抢走尚未绑定的飞书
 响应卡。只修 marker 不能阻止消息先进入旧轮次，只修 idle 也不能保证卡片绑定正确。
 
-Core `0.7.2-rc.7` 同时执行三层门禁：
+Core `0.7.2-rc.8` 同时执行三层门禁：
 
 1. 每条普通 conversation 在写入 tmux 前取得唯一、持久化的 runtime-turn
    admission；无论来自飞书、HXA 还是 OpenMax，都只在同一 session 的 `Stop` 后
@@ -145,6 +145,22 @@ Core `0.7.2-rc.7` 同时执行三层门禁：
    非末尾 marker 持久化为 fail-closed，后续 tool/display/stop 不得回退猜测；每次
    bound/rejected/closed 决策还会追加到无正文的 per-turn JSONL 审计轨迹，避免再次
    因 last-write-wins 状态文件而无法复盘。
+
+Claude 的 `UserPromptSubmit`、兼容用 `PreToolUse`、`Stop` 和 idle Notification 是
+同步边界；PostTool/MessageDisplay 等非启动事件只能触碰已经 started 的 admission，
+不能把下一条 submitted 消息提前晋级。每次可信 lifecycle 活动都会推进持久化
+generation；sustained-idle 恢复必须同时匹配 generation，并且最后一次活动也已超过
+30 秒。monitor 与 durable admission 事务都会拒绝 observation time 早于当前
+generation 的迟到 idle/Stop/PostTool；因此即使升级前遗留的 async hook 在下一轮
+已经 started 后才恢复，也不能结束新 admission、发布错误工具进度或用旧答案完成
+新请求。新 admission 在取得锁时就写入 observation 下界；旧库中 active 且为空的
+基线会在迁移时保守回填，首个迟到 hook 也不能借空值抢占新一轮。
+
+该 runtime-turn admission 只在 Claude 启用。Codex 当前没有等价的
+MessageDisplay 完成边界，因此不会创建无法可靠关闭的 admission；带 assistant
+request 的 Codex 消息固定回退到 request-scoped `c4-send --request-id` 完成路径，
+并继续使用既有 activity-monitor busy/idle 门禁。manifest 的 `runtimeModes` 明确
+公布这一边界，禁止把 Claude display-hook 模式误报为 Codex 已支持。
 
 控制队列仍保留显式 bypass，不会被普通对话 admission 阻断。只有安装中真的缺失
 `UserPromptSubmit` hook 时，首个后续 lifecycle hook 才保留单候选兼容绑定。
@@ -248,15 +264,15 @@ Core step 12 的阻断，不在这个脚本中顺手恢复。
 
 ```bash
 CORE_SHA='<40-hex-core-sha>'
-FEISHU_SHA='b1da95bc91663be6e63d9651c7fede7fb66f6301'
+FEISHU_SHA='d97604d86c15eef7f0851cf6d285fb9e9942dad7'
 
 curl -fsSL \
   "https://raw.githubusercontent.com/HeXiaobo/zylos-core/${CORE_SHA}/scripts/upgrade-fork-pair.sh" \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.7' \
-      --feishu-version '0.3.7-rc.5' \
+      --core-version '0.7.2-rc.8' \
+      --feishu-version '0.3.7-rc.6' \
       --agent '<agent-id>' \
       --execute
 ```

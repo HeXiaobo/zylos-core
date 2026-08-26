@@ -31,6 +31,7 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed']);
 const MAX_IDENTIFIER_LENGTH = 512;
 const MAX_DELTA_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+const DEFAULT_RUNTIME_TURN_SUBMITTED_STALE_SECONDS = 60;
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -137,6 +138,8 @@ function toRuntimeTurnAdmission(row) {
     startedAt: row.started_at,
     terminalAt: row.terminal_at,
     updatedAt: row.updated_at,
+    lifecycleVersion: row.lifecycle_version,
+    lifecycleObservedAtMs: row.lifecycle_observed_at_ms,
     terminalReason: row.terminal_reason,
   };
 }
@@ -186,12 +189,22 @@ function safeErrorCode(value) {
 export function openAssistantResponseStream({
   dbPath = null,
   clock = nowSeconds,
+  observationClock = Date.now,
   leaseToken = randomUUID,
+  runtimeTurnSubmittedStaleSeconds = DEFAULT_RUNTIME_TURN_SUBMITTED_STALE_SECONDS,
 } = {}) {
+  requireInteger(
+    runtimeTurnSubmittedStaleSeconds,
+    'runtimeTurnSubmittedStaleSeconds',
+    { minimum: 1 },
+  );
+  if (typeof observationClock !== 'function') {
+    throw new TypeError('observationClock must be a function');
+  }
   const opened = openDatabase(dbPath);
   const database = opened.database;
   let ownsDatabase = opened.ownsDatabase;
-  ensureAssistantResponseSchema(database);
+  ensureAssistantResponseSchema(database, { observationClock });
 
   const selectRequest = database.prepare(`
     SELECT request_id, conversation_id, route_channel, route_endpoint, source_id,
@@ -221,7 +234,7 @@ export function openAssistantResponseStream({
   const selectActiveRuntimeTurnAdmission = database.prepare(`
     SELECT id, conversation_id, request_id, route_channel, status,
            runtime_session_id, acquired_at, started_at, terminal_at,
-           updated_at, terminal_reason
+           updated_at, lifecycle_version, lifecycle_observed_at_ms, terminal_reason
     FROM runtime_turn_admissions
     WHERE status IN ('submitted', 'started')
     ORDER BY id ASC
@@ -230,7 +243,7 @@ export function openAssistantResponseStream({
   const selectRuntimeTurnAdmissionById = database.prepare(`
     SELECT id, conversation_id, request_id, route_channel, status,
            runtime_session_id, acquired_at, started_at, terminal_at,
-           updated_at, terminal_reason
+           updated_at, lifecycle_version, lifecycle_observed_at_ms, terminal_reason
     FROM runtime_turn_admissions
     WHERE id = ?
   `);
@@ -870,34 +883,88 @@ export function openAssistantResponseStream({
     const safeConversationId = requireInteger(conversationId, 'conversationId', { minimum: 1 });
     const safeRequestId = requestId === null ? null : requireIdentifier(requestId, 'requestId');
     const safeRouteChannel = requireText(routeChannel, 'routeChannel');
+    const current = clock();
+    const currentObservedAtMs = requireInteger(
+      observationClock(),
+      'observationClock result',
+      { minimum: 0 },
+    );
     const active = selectActiveRuntimeTurnAdmission.get();
     if (active) {
-      return { acquired: false, admission: toRuntimeTurnAdmission(active) };
+      if (
+        active.status !== 'submitted'
+        || active.updated_at > current - runtimeTurnSubmittedStaleSeconds
+      ) {
+        return { acquired: false, admission: toRuntimeTurnAdmission(active) };
+      }
+      database.prepare(`
+        UPDATE runtime_turn_admissions
+        SET status = 'released', terminal_at = ?, updated_at = ?,
+            terminal_reason = 'stale_before_reacquire'
+        WHERE id = ? AND status = 'submitted'
+      `).run(current, current, active.id);
     }
 
-    const current = clock();
     const inserted = database.prepare(`
       INSERT INTO runtime_turn_admissions (
         singleton_key, conversation_id, request_id, route_channel, status,
         runtime_session_id, acquired_at, started_at, terminal_at, updated_at,
-        terminal_reason
-      ) VALUES (1, ?, ?, ?, 'submitted', NULL, ?, NULL, NULL, ?, NULL)
-    `).run(safeConversationId, safeRequestId, safeRouteChannel, current, current);
+        lifecycle_version, lifecycle_observed_at_ms, terminal_reason
+      ) VALUES (1, ?, ?, ?, 'submitted', NULL, ?, NULL, NULL, ?, 0, ?, NULL)
+    `).run(
+      safeConversationId,
+      safeRequestId,
+      safeRouteChannel,
+      current,
+      current,
+      currentObservedAtMs,
+    );
     return {
       acquired: true,
+      recoveredAdmission: active
+        ? toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id))
+        : null,
       admission: toRuntimeTurnAdmission(
         selectRuntimeTurnAdmissionById.get(Number(inserted.lastInsertRowid)),
       ),
     };
   });
 
-  const startRuntimeTurnTransaction = database.transaction(({ runtimeSessionId }) => {
+  const startRuntimeTurnTransaction = database.transaction(({
+    runtimeSessionId,
+    observedAtMs = null,
+  }) => {
     const safeRuntimeSessionId = requireIdentifier(runtimeSessionId, 'runtimeSessionId');
+    const safeObservedAtMs = observedAtMs === null
+      ? null
+      : requireInteger(observedAtMs, 'observedAtMs', { minimum: 0 });
     const active = selectActiveRuntimeTurnAdmission.get();
     if (!active) return { started: false, admission: null, reason: 'no_active_admission' };
+    if (
+      safeObservedAtMs !== null
+      && active.lifecycle_observed_at_ms !== null
+      && safeObservedAtMs < active.lifecycle_observed_at_ms
+    ) {
+      return {
+        started: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_observation_stale',
+      };
+    }
     if (active.status === 'started') {
       if (active.runtime_session_id === safeRuntimeSessionId) {
-        return { started: true, admission: toRuntimeTurnAdmission(active), replayed: true };
+        const current = clock();
+        database.prepare(`
+          UPDATE runtime_turn_admissions
+          SET updated_at = ?, lifecycle_version = lifecycle_version + 1,
+              lifecycle_observed_at_ms = COALESCE(?, lifecycle_observed_at_ms)
+          WHERE id = ? AND status = 'started' AND runtime_session_id = ?
+        `).run(current, safeObservedAtMs, active.id, safeRuntimeSessionId);
+        return {
+          started: true,
+          admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+          replayed: true,
+        };
       }
       return {
         started: false,
@@ -909,9 +976,10 @@ export function openAssistantResponseStream({
     const current = clock();
     database.prepare(`
       UPDATE runtime_turn_admissions
-      SET status = 'started', runtime_session_id = ?, started_at = ?, updated_at = ?
+      SET status = 'started', runtime_session_id = ?, started_at = ?, updated_at = ?,
+          lifecycle_version = lifecycle_version + 1, lifecycle_observed_at_ms = ?
       WHERE id = ? AND status = 'submitted'
-    `).run(safeRuntimeSessionId, current, current, active.id);
+    `).run(safeRuntimeSessionId, current, current, safeObservedAtMs, active.id);
     return {
       started: true,
       admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
@@ -919,14 +987,74 @@ export function openAssistantResponseStream({
     };
   });
 
+  const touchRuntimeTurnTransaction = database.transaction(({
+    runtimeSessionId,
+    observedAtMs = null,
+  }) => {
+    const safeRuntimeSessionId = requireIdentifier(runtimeSessionId, 'runtimeSessionId');
+    const safeObservedAtMs = observedAtMs === null
+      ? null
+      : requireInteger(observedAtMs, 'observedAtMs', { minimum: 0 });
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (!active) return { touched: false, admission: null, reason: 'no_active_admission' };
+    if (active.status !== 'started') {
+      return {
+        touched: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_not_started',
+      };
+    }
+    if (active.runtime_session_id !== safeRuntimeSessionId) {
+      return {
+        touched: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_session_conflict',
+      };
+    }
+    if (
+      safeObservedAtMs !== null
+      && active.lifecycle_observed_at_ms !== null
+      && safeObservedAtMs < active.lifecycle_observed_at_ms
+    ) {
+      return {
+        touched: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_observation_stale',
+      };
+    }
+
+    const current = clock();
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET updated_at = ?, lifecycle_version = lifecycle_version + 1,
+          lifecycle_observed_at_ms = COALESCE(?, lifecycle_observed_at_ms)
+      WHERE id = ? AND status = 'started' AND runtime_session_id = ?
+    `).run(current, safeObservedAtMs, active.id, safeRuntimeSessionId);
+    return {
+      touched: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+    };
+  });
+
   const finishRuntimeTurnTransaction = database.transaction(({
     runtimeSessionId,
     reason = 'stop',
+    observedAtMs = null,
   }) => {
     const safeRuntimeSessionId = requireIdentifier(runtimeSessionId, 'runtimeSessionId');
     const safeReason = requireText(reason, 'reason', 64);
+    const safeObservedAtMs = observedAtMs === null
+      ? null
+      : requireInteger(observedAtMs, 'observedAtMs', { minimum: 0 });
     const active = selectActiveRuntimeTurnAdmission.get();
     if (!active) return { finished: false, admission: null, reason: 'no_active_admission' };
+    if (active.status !== 'started') {
+      return {
+        finished: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_not_started',
+      };
+    }
     if (
       active.runtime_session_id !== null
       && active.runtime_session_id !== safeRuntimeSessionId
@@ -937,14 +1065,26 @@ export function openAssistantResponseStream({
         reason: 'runtime_session_conflict',
       };
     }
+    if (
+      safeObservedAtMs !== null
+      && active.lifecycle_observed_at_ms !== null
+      && safeObservedAtMs < active.lifecycle_observed_at_ms
+    ) {
+      return {
+        finished: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_observation_stale',
+      };
+    }
 
     const current = clock();
     database.prepare(`
       UPDATE runtime_turn_admissions
       SET status = 'completed', runtime_session_id = COALESCE(runtime_session_id, ?),
-          terminal_at = ?, updated_at = ?, terminal_reason = ?
-      WHERE id = ? AND status IN ('submitted', 'started')
-    `).run(safeRuntimeSessionId, current, current, safeReason, active.id);
+          terminal_at = ?, updated_at = ?, lifecycle_version = lifecycle_version + 1,
+          lifecycle_observed_at_ms = COALESCE(?, lifecycle_observed_at_ms), terminal_reason = ?
+      WHERE id = ? AND status = 'started'
+    `).run(safeRuntimeSessionId, current, current, safeObservedAtMs, safeReason, active.id);
     return {
       finished: true,
       admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
@@ -978,6 +1118,68 @@ export function openAssistantResponseStream({
     return {
       released: true,
       admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+    };
+  });
+
+  const recoverRuntimeTurnTransaction = database.transaction(({
+    admissionId,
+    expectedLifecycleVersion,
+    reason = 'runtime_sustained_idle',
+  }) => {
+    const safeAdmissionId = requireInteger(admissionId, 'admissionId', { minimum: 1 });
+    const safeLifecycleVersion = requireInteger(
+      expectedLifecycleVersion,
+      'expectedLifecycleVersion',
+    );
+    const safeReason = requireText(reason, 'reason', 64);
+    const active = selectActiveRuntimeTurnAdmission.get();
+    if (!active || active.id !== safeAdmissionId) {
+      return { recovered: false, admission: toRuntimeTurnAdmission(active) };
+    }
+    if (active.status !== 'started') {
+      return {
+        recovered: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_not_started',
+      };
+    }
+    if (active.lifecycle_version !== safeLifecycleVersion) {
+      return {
+        recovered: false,
+        admission: toRuntimeTurnAdmission(active),
+        reason: 'runtime_turn_lifecycle_changed',
+      };
+    }
+
+    const events = [];
+    if (active.request_id) {
+      const request = selectRequest.get(active.request_id);
+      if (request && !TERMINAL_STATUSES.has(request.status)) {
+        const failed = appendEvent(request, 'RunFailed', {
+          code: 'RUNTIME_TURN_RECOVERED_AFTER_IDLE',
+          retryable: true,
+        });
+        const terminalAt = clock();
+        database.prepare(`
+          UPDATE assistant_requests
+          SET status = 'failed', updated_at = ?, terminal_at = ?
+          WHERE request_id = ? AND status IN ('queued', 'started')
+        `).run(terminalAt, terminalAt, request.request_id);
+        events.push(failed.event);
+      }
+    }
+
+    const current = clock();
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET status = 'released', terminal_at = ?, updated_at = ?, terminal_reason = ?
+      WHERE id = ? AND status = 'started'
+    `).run(current, current, safeReason, active.id);
+    return {
+      recovered: true,
+      admission: toRuntimeTurnAdmission(selectRuntimeTurnAdmissionById.get(active.id)),
+      request: active.request_id ? toRequest(selectRequest.get(active.request_id)) : null,
+      events,
     };
   });
 
@@ -1074,12 +1276,20 @@ export function openAssistantResponseStream({
       return startRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn start'));
     },
 
+    touchRuntimeTurn(input = {}) {
+      return touchRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn activity'));
+    },
+
     finishRuntimeTurn(input = {}) {
       return finishRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn completion'));
     },
 
     releaseRuntimeTurn(input = {}) {
       return releaseRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn release'));
+    },
+
+    recoverRuntimeTurn(input = {}) {
+      return recoverRuntimeTurnTransaction.immediate(requireRecord(input, 'runtime turn recovery'));
     },
 
     getActiveRuntimeTurn() {

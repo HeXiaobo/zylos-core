@@ -37,9 +37,18 @@ const {
   shouldAutoAckHeartbeat,
   findBlockingAssistantRun,
   shouldDeferConversationForRuntime,
+  shouldRecoverRuntimeTurnAdmission,
+  runtimeTurnAdmissionsEnabled,
   readJsonFileWithRetry,
   getDeliveryContent
 } = mod;
+
+describe('runtime turn admission scope', () => {
+  it('enables hook-fenced admissions only for Claude', () => {
+    assert.equal(runtimeTurnAdmissionsEnabled('claude'), true);
+    assert.equal(runtimeTurnAdmissionsEnabled('codex'), false);
+  });
+});
 
 after(() => {
   if (origZylosDir === undefined) {
@@ -446,6 +455,20 @@ describe('getDeliveryContent', () => {
     assert.equal(result.includes('oc_1|type:p2p|msg:om_1'), false);
   });
 
+  it('uses explicit request-scoped c4-send completion on Codex', () => {
+    const result = getDeliveryContent({
+      type: 'conversation',
+      channel: 'feishu',
+      endpoint_id: 'oc_1|type:p2p|msg:om_1',
+      assistant_request_id: 'assistant.feishu.om_1',
+      content: 'hello',
+    }, 'codex');
+
+    assert.match(result, /c4-send\.js/);
+    assert.match(result, /--request-id "assistant\.feishu\.om_1"/);
+    assert.equal(result.includes('displayed assistant text is delivered automatically'), false);
+  });
+
   it('does not add reply routing for conversation items without endpoints', () => {
     assert.equal(getDeliveryContent({
       type: 'conversation',
@@ -634,5 +657,33 @@ describe('assistant turn admission', () => {
       },
     };
     assert.equal(findBlockingAssistantRun({ type: 'control' }, responseStream), null);
+  });
+
+  it('recovers a started admission only after sustained healthy idle', () => {
+    const admission = { status: 'started', admissionId: 7, updatedAt: 100 };
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'idle', health: 'ok', healthy: true, idleSeconds: 30,
+    }, 30, 130), true);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'idle', health: 'ok', healthy: true, idleSeconds: 29,
+    }, 30, 130), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'busy', health: 'ok', healthy: true, idleSeconds: 300,
+    }, 30, 130), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'idle', health: 'recovering', healthy: true, idleSeconds: 300,
+    }, 30, 130), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(
+      { ...admission, updatedAt: 101 },
+      { state: 'idle', health: 'ok', healthy: true, idleSeconds: 300 },
+      30,
+      130,
+    ), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(
+      { status: 'submitted', admissionId: 8, updatedAt: 1 },
+      { state: 'idle', health: 'ok', healthy: true, idleSeconds: 300 },
+      30,
+      130,
+    ), false);
   });
 });

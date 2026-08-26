@@ -178,6 +178,16 @@ describe('desiredClaudeHooks', () => {
     assert.equal(groups[0].hooks[0].async, false);
     assert.equal(groups[0].hooks[0].timeout, 5);
   });
+
+  it('registers lifecycle boundary hooks synchronously', () => {
+    const hooks = desiredClaudeHooks();
+    for (const event of ['PreToolUse', 'Stop', 'Notification']) {
+      assert.equal(hooks[event].length, 1);
+      assert.equal(hooks[event][0].hooks.length, 1);
+      assert.equal(hooks[event][0].hooks[0].async, false);
+      assert.equal(hooks[event][0].hooks[0].timeout, 5);
+    }
+  });
 });
 
 describe('Activity monitor threshold fallback', () => {
