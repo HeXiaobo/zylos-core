@@ -133,34 +133,21 @@ function bindingFromResult(sessionId, result, nowMs) {
 
 function bindPromptTurn(responseStream, record, hookData) {
   const requestId = assistantRequestIdFromPrompt(hookData);
-  if (!requestId && promptContainsAssistantRequestMarker(hookData)) {
+  if (!requestId) {
     return writeTurnBinding(record.session_id, {
       mode: 'rejected',
-      reason: 'non_terminal_marker',
-      nowMs: record.ts,
-    });
-  }
-  if (!requestId && readTurnBinding(record.session_id)?.mode === 'bound') {
-    // A UserPromptSubmit is a new turn boundary. Reusing the prior turn's
-    // active binding would route this turn's output into the wrong request.
-    // Persist the rejection so later hook processes cannot fall back to A.
-    return writeTurnBinding(record.session_id, {
-      mode: 'rejected',
-      reason: 'active_turn_conflict',
+      reason: promptContainsAssistantRequestMarker(hookData)
+        ? 'non_terminal_marker'
+        : 'missing_terminal_marker',
       nowMs: record.ts,
     });
   }
   try {
-    const result = requestId
-      ? responseStream.execute({
-        type: 'BindTurn',
-        requestId,
-        runtimeSessionId: record.session_id,
-      })
-      : responseStream.execute({
-        type: 'BeginNextRun',
-        runtimeSessionId: record.session_id,
-      });
+    const result = responseStream.execute({
+      type: 'BindTurn',
+      requestId,
+      runtimeSessionId: record.session_id,
+    });
     return bindingFromResult(record.session_id, result, record.ts);
   } catch (error) {
     appendError(`assistant_binding_rejected ${error?.code || 'invalid_request'}`);
