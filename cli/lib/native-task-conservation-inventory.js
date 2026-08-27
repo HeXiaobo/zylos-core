@@ -2,6 +2,7 @@
 
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { loadCommitmentCore } from '../commands/task.js';
@@ -113,6 +114,14 @@ async function main() {
   }
 }
 
+export function pathsReferToSameFile(left, right) {
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return path.resolve(left) === path.resolve(right);
+  }
+}
+
 const isMain = process.argv[1]
-  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+  && pathsReferToSameFile(process.argv[1], fileURLToPath(import.meta.url));
 if (isMain) await main();

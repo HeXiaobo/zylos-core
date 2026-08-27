@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { collectNativeTaskConservationInventory } from '../native-task-conservation-inventory.js';
+import {
+  collectNativeTaskConservationInventory,
+  pathsReferToSameFile,
+} from '../native-task-conservation-inventory.js';
 
 function task(index) {
   return {
@@ -12,6 +18,19 @@ function task(index) {
 }
 
 describe('Core native-task conservation inventory', () => {
+  it('recognizes its entrypoint through a filesystem path alias', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'native-task-inventory-alias-'));
+    try {
+      const real = path.join(root, 'real.js');
+      const alias = path.join(root, 'alias.js');
+      fs.writeFileSync(real, '#!/usr/bin/env node\n');
+      fs.symlinkSync(real, alias);
+      assert.equal(pathsReferToSameFile(alias, real), true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('paginates beyond the ordinary CLI limit and reads links through the public Interface', async () => {
     const allTasks = Array.from({ length: 201 }, (_, index) => task(index));
     const queries = [];
