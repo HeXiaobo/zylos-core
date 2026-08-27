@@ -30,12 +30,35 @@ to `~/zylos/commitments/commitments.db` when `ZYLOS_DIR` is unset.
   `created: false`.
 - Reusing the key with different normalized content throws an error whose
   `code` is `IDEMPOTENCY_CONFLICT`; callers must not retry it unchanged.
-- `adoptLegacyTask({ idempotencyKey, externalId, task, mode? })` adopts one
-  already-created native Task GUID without calling Feishu. It creates a ready
+- `adoptLegacyTask({ idempotencyKey, externalId, taskId?, task, mode? })` adopts one
+  already-created native Task GUID without calling Feishu. When a remote marker
+  must be written before the Core row, callers provide a stable `taskId`; when
+  omitted, Core generates one at commit time. It creates a ready
   Core Task, its `TaskCreated` Event/Outbox row, exactly one
   `backend=feishu-task-v2` ExternalLink, and an adoption receipt in one SQLite
   transaction. `mode: "plan"` is read-only; the default `commit` mode persists
   the result (`dryRun: true` and `plan: true` are equivalent plan aliases).
+  Plan mode reports a caller-supplied `taskId` and checks that it is unused and
+  that the native GUID is not already linked; it never reserves either value.
+  For a batch of pre-marked native Tasks, the adjacent
+  `scripts/legacy-task-adoption.js` one-shot accepts a JSON manifest with
+  explicit `taskId` values. Plan snapshots the configured Core database through
+  a readonly SQLite connection and analyzes a temporary `VACUUM INTO` copy;
+  when the source is absent, it falls back to an isolated memory-only plan.
+  Only `--commit` opens the live Core database. It never loads Feishu or
+  performs remote calls:
+
+  ```sh
+  node "$ZYLOS_DIR/.claude/skills/commitment-core/scripts/legacy-task-adoption.js" \
+    --manifest /absolute/path/legacy-task-adoption.json
+  node "$ZYLOS_DIR/.claude/skills/commitment-core/scripts/legacy-task-adoption.js" \
+    --manifest /absolute/path/legacy-task-adoption.json --commit
+  ```
+
+  The manifest schema is `zylos.legacy-task-adoption/v1` with non-empty,
+  unique `idempotencyKey`, `externalId`, and `taskId` per entry. Unknown
+  manifest or task fields are rejected before Core is opened; commit entries
+  are processed independently and summarized as JSON.
   Replaying the same normalized request returns the original
   result, while changed content returns `IDEMPOTENCY_CONFLICT`. A link identity
   already owned by another Task returns `EXTERNAL_LINK_CONFLICT` and rolls the

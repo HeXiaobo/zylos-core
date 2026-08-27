@@ -140,6 +140,74 @@ test('adoptLegacyTask plan is read-only and the later commit consumes the plan o
   }
 });
 
+test('adoptLegacyTask accepts a caller-owned task id for remote marker coordination', () => {
+  const harness = createHarness({
+    taskIds: ['generated-task-must-not-be-used'],
+    eventIds: ['event-explicit-task-id'],
+    linkIds: ['external-link-explicit-task-id'],
+  });
+
+  try {
+    const request = adoptionRequest({ taskId: 'task-marker-coordination-1' });
+    const plan = harness.core.adoptLegacyTask({ ...request, mode: 'plan' });
+    assert.equal(plan.task.id, 'task-marker-coordination-1');
+    assert.equal(harness.core.query({ limit: 10 }).length, 0);
+
+    const result = harness.core.adoptLegacyTask(request);
+    assert.equal(result.task.id, 'task-marker-coordination-1');
+    assert.equal(harness.core.query({ taskId: 'generated-task-must-not-be-used' }), null);
+    assert.deepEqual(
+      harness.core.adoptLegacyTask(request),
+      result,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('adoptLegacyTask plan detects task and GUID conflicts without writing', () => {
+  const harness = createHarness({
+    taskIds: ['task-existing', 'task-unused'],
+    eventIds: ['event-existing'],
+    linkIds: ['external-link-existing'],
+  });
+
+  try {
+    harness.core.ingest({
+      idempotencyKey: 'source-existing',
+      source: { channel: 'test', externalId: 'source-existing', senderId: 'owner-1' },
+      task: { title: 'Existing', ownerId: 'owner-1', acceptorId: 'owner-1' },
+    });
+    harness.core.externalLinks.link({
+      taskId: 'task-existing',
+      actorId: 'owner-1',
+      backend: 'feishu-task-v2',
+      externalId: 'task-guid-existing',
+      idempotencyKey: 'existing-link',
+    });
+
+    assert.throws(
+      () => harness.core.adoptLegacyTask({
+        ...adoptionRequest({ taskId: 'task-existing' }),
+        mode: 'plan',
+      }),
+      error => error?.code === 'TASK_ID_CONFLICT',
+    );
+    assert.throws(
+      () => harness.core.adoptLegacyTask({
+      ...adoptionRequest({ taskId: 'task-new' }),
+        externalId: 'task-guid-existing',
+        mode: 'plan',
+      }),
+      error => error?.code === 'EXTERNAL_LINK_CONFLICT',
+    );
+    assert.equal(harness.core.query({ limit: 10 }).length, 1);
+    assert.equal(harness.core.externalLinks.query({ backend: 'feishu-task-v2' }).length, 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('adoptLegacyTask replay is idempotent and changed content conflicts', () => {
   const harness = createHarness();
 

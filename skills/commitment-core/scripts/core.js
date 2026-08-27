@@ -155,7 +155,7 @@ function normalizeLegacyTaskAdoption(rawRequest) {
   }
   rejectUnknownFields(
     rawRequest,
-    new Set(['idempotencyKey', 'externalId', 'task', 'mode', 'dryRun', 'plan']),
+    new Set(['idempotencyKey', 'externalId', 'taskId', 'task', 'mode', 'dryRun', 'plan']),
     'legacy task adoption request',
   );
   const mode = rawRequest.mode ?? (
@@ -178,6 +178,9 @@ function normalizeLegacyTaskAdoption(rawRequest) {
   return {
     idempotencyKey: requireText(rawRequest.idempotencyKey, 'idempotencyKey'),
     externalId: requireText(rawRequest.externalId, 'externalId').trim(),
+    taskId: rawRequest.taskId === undefined || rawRequest.taskId === null
+      ? null
+      : requireText(rawRequest.taskId, 'taskId').trim(),
     task: normalizeTask(rawRequest.task),
     mode,
   };
@@ -979,6 +982,7 @@ export function openCommitmentCore({
     const requestFingerprint = fingerprintEnvelope({
       idempotencyKey: request.idempotencyKey,
       externalId: request.externalId,
+      taskId: request.taskId,
       task: request.task,
     });
     const receipt = selectLegacyTaskAdoptionReceipt.get(request.idempotencyKey);
@@ -990,11 +994,24 @@ export function openCommitmentCore({
     }
 
     if (request.mode === 'plan') {
+      if (request.taskId !== null && selectTask.get(request.taskId)) {
+        throw domainError('TASK_ID_CONFLICT', `task id already exists: ${request.taskId}`);
+      }
+      const existingLink = externalLinkModule.publicInterface.query({
+        backend: LEGACY_TASK_ADOPTION_BACKEND,
+        externalId: request.externalId,
+      });
+      if (existingLink) {
+        throw domainError(
+          'EXTERNAL_LINK_CONFLICT',
+          `${LEGACY_TASK_ADOPTION_BACKEND}:${request.externalId} is already linked`,
+        );
+      }
       return {
         planned: true,
         created: false,
         task: {
-          id: null,
+          id: request.taskId,
           ...request.task,
           state: 'ready',
           version: 1,
@@ -1008,7 +1025,7 @@ export function openCommitmentCore({
       };
     }
 
-    const taskId = requireText(idGenerator(), 'generated task id');
+    const taskId = request.taskId ?? requireText(idGenerator(), 'generated task id');
     const timestamp = requireText(clock(), 'clock result');
     const { task } = createReadyTask({
       taskId,
