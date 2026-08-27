@@ -440,7 +440,6 @@ function validateCurrentTarget(zylosDir, agent) {
 const READ_ONLY_PROFILE_PROBE = String.raw`
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 const [skillDir, configPath, orgLabel] = process.argv.slice(1);
@@ -449,9 +448,7 @@ const orgConfig = config.orgs?.[orgLabel];
 if (!orgConfig) throw new Error('configured HXA org is missing');
 const envModule = await import(pathToFileURL(path.join(skillDir, 'src', 'env.js')));
 await envModule.setupFetchProxy();
-const require = createRequire(path.join(skillDir, 'package.json'));
-const sdkEntry = require.resolve('@coco-xyz/hxa-connect-sdk');
-const { HxaConnectClient } = await import(pathToFileURL(sdkEntry));
+const { HxaConnectClient } = await import('@coco-xyz/hxa-connect-sdk');
 const client = new HxaConnectClient({
   url: orgConfig.hub_url || config.default_hub_url,
   token: orgConfig.agent_token,
@@ -469,7 +466,11 @@ function probeRemoteProfile(skillDir, configPath, orgLabel, childEnvAdditions = 
     skillDir,
     configPath,
     orgLabel,
-  ], { timeout: 30_000, env: safeChildEnv(childEnvAdditions) }), 'read-only HXA Hub profile probe failed', 'IDENTITY_UNVERIFIED');
+  ], {
+    timeout: 30_000,
+    cwd: skillDir,
+    env: safeChildEnv(childEnvAdditions),
+  }), 'read-only HXA Hub profile probe failed', 'IDENTITY_UNVERIFIED');
   const prefix = '__ZYLOS_READ_ONLY_PROFILE__';
   const line = result.stdout.split(/\r?\n/).find((candidate) => candidate.startsWith(prefix));
   if (!line) throw new HoldError('read-only HXA Hub profile probe returned no profile', 'IDENTITY_UNVERIFIED');
