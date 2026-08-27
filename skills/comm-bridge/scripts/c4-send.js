@@ -33,6 +33,7 @@ import { insertConversation, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
+import { enforceOutboundPolicy } from './c4-outbound-policy.js';
 
 function printUsage() {
   console.log('Usage (message body via stdin/heredoc or --body-file; arg-mode exits 2):');
@@ -74,6 +75,9 @@ function parseArgs(args) {
       requestId = args[index + 1];
       index += 1;
       continue;
+    }
+    if (arg === '--allow-banned' || arg.startsWith('--allow-banned=')) {
+      return { error: '--allow-banned is deliberately unsupported; outbound policy cannot be bypassed' };
     }
     if (arg.startsWith('--')) return { error: `Unknown option: ${arg}` };
     positional.push(arg);
@@ -198,6 +202,19 @@ async function main() {
     if (cleanArgs.length === 1) printUsage();
     console.error('Error: Message is required');
     process.exit(1);
+  }
+
+  if (channel !== 'void') {
+    try {
+      const policyDecision = enforceOutboundPolicy({ channel, endpoint, message });
+      if (!policyDecision.allowed) {
+        console.error(`[C4] Outbound policy rejected message (rule refs: ${policyDecision.ruleRefs.join(', ')})`);
+        process.exit(3);
+      }
+    } catch (err) {
+      console.error(`[C4] Outbound policy rejected message: ${err.message}`);
+      process.exit(3);
+    }
   }
 
   const assistantRequestId = parsed.requestId;
