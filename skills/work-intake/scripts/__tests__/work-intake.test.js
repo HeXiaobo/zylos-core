@@ -12,7 +12,7 @@ const YUERAN_OPTIONS = Object.freeze({
 function inbound(text, overrides = {}) {
   return {
     source: {
-      channel: 'feishu',
+      channel: overrides.channel ?? 'feishu',
       messageId: overrides.messageId ?? 'om_regression',
       conversationId: 'oc_regression',
       conversationType: overrides.conversationType ?? 'direct',
@@ -182,6 +182,94 @@ test('does not mistake ordinary response instructions for a human assignment', (
     classify(inbound('【上线验收·流式复测】玥然，请先显示处理状态，再只回复：流式复测通过。'), YUERAN_OPTIONS).decision,
     'chat_only',
   );
+});
+
+test('keeps release canary response instructions out of high-risk task intake', () => {
+  for (const [channel, canaryText] of [
+    ['feishu', 'ZYL-P0-FEISHU-f09908ea-6c4b-4073-87e0-4add88c141f0：这是 yueran 发布前通信 canary，请只回复“ACK FEISHU-f09908ea-6c4b-4073-87e0-4add88c141f0”。'],
+    ['hxa-connect', 'ZYL-P0-HXA-c50a9f94-93a4-49f3-bf68-1dda66a87f04：这是 yueran 发布前通信 canary，请只回复“ACK HXA-c50a9f94-93a4-49f3-bf68-1dda66a87f04”。'],
+  ]) {
+    const decision = classify(inbound(canaryText, { channel }), YUERAN_OPTIONS);
+    assert.equal(decision.decision, 'chat_only', canaryText);
+    assert.equal(decision.reasonCode, 'RESPONSE_ONLY_INSTRUCTION', canaryText);
+    assert.equal(decision.taskDraft, null, canaryText);
+  }
+
+  for (const riskyText of [
+    '任务：发布公告，只回复“已完成”',
+    '请只回复客户并发布公告',
+    '请删除所有数据，只回复“完成”',
+    '请付款给供应商，只回复“已完成”',
+    '请授权小王访问项目；只回复“确认”',
+    'ZYL-P0-FEISHU-f09908ea-6c4b-4073-87e0-4add88c141f0：这是 yueran 发布前通信 canary，请只回复“ACK HXA-f09908ea-6c4b-4073-87e0-4add88c141f0”。',
+    'ZYL-P0-FEISHU-f09908ea-6c4b-4073-87e0-4add88c141f0：这是 yueran 发布前通信 canary，请只回复“ACK FEISHU-c50a9f94-93a4-49f3-bf68-1dda66a87f04”。',
+  ]) {
+    assert.equal(
+      classify(inbound(riskyText), YUERAN_OPTIONS).reasonCode,
+      'HIGH_RISK_EXTERNAL_ACTION',
+      riskyText,
+    );
+  }
+
+  assert.equal(
+    classify(inbound(
+      'ZYL-P0-FEISHU-f09908ea-6c4b-4073-87e0-4add88c141f0：这是 yueran 发布前通信 canary，请只回复“ACK FEISHU-f09908ea-6c4b-4073-87e0-4add88c141f0”。',
+      { channel: 'telegram' },
+    ), YUERAN_OPTIONS).reasonCode,
+    'HIGH_RISK_EXTERNAL_ACTION',
+  );
+  assert.equal(
+    classify(inbound(
+      'ZYL-P0-HXA-c50a9f94-93a4-49f3-bf68-1dda66a87f04：这是 yueran 发布前通信 canary，请只回复“ACK HXA-c50a9f94-93a4-49f3-bf68-1dda66a87f04”。',
+      { channel: 'hxa' },
+    ), YUERAN_OPTIONS).reasonCode,
+    'HIGH_RISK_EXTERNAL_ACTION',
+  );
+});
+
+test('does not parse UUID fragments as task deadlines', () => {
+  const decision = classify(inbound(
+    '任务：发布 canary f09908ea-6c4b-4073-87e0-4add88c141f0',
+  ));
+
+  assert.equal(decision.decision, 'confirm');
+  assert.equal(decision.reasonCode, 'HIGH_RISK_EXTERNAL_ACTION');
+  assert.equal(decision.taskDraft.dueText, null);
+
+  for (const [text, dueText] of [
+    ['8月28日前完成复盘', '8月28日前'],
+    ['8-28前完成复盘', '8-28前'],
+    ['8/28前完成复盘', '8/28前'],
+    ['2026-09-01前完成复盘', '2026-09-01前'],
+    ['8月1日-8月2日完成复盘', '8月1日'],
+    ['2026-08-01-2026-08-02完成复盘', '2026-08-01'],
+    ['2026/08/01-2026/08/02完成复盘', '2026/08/01'],
+    ['2026-08-01日下午3点前完成复盘', '2026-08-01日下午3点前'],
+    ['8/1日下午3点前完成复盘', '8/1日下午3点前'],
+    ['2026年8-1日下午3点前完成复盘', '2026年8-1日下午3点前'],
+    ['2026-08-01日13:00前完成复盘', '2026-08-01日13:00前'],
+    ['8/1日3点前完成复盘', '8/1日3点前'],
+    ['2026年8-1日13:00前完成复盘', '2026年8-1日13:00前'],
+  ]) {
+    assert.equal(
+      classify(inbound(text)).taskDraft.dueText,
+      dueText,
+      text,
+    );
+  }
+
+  for (const invalidDate of [
+    '13月1日前完成复盘',
+    '1月32日前完成复盘',
+    '2026-13-01前完成复盘',
+    '2026-01-32前完成复盘',
+    '2026/13/01前完成复盘',
+    '2026/01/32前完成复盘',
+  ]) {
+    const invalidDecision = classify(inbound(invalidDate));
+    assert.equal(invalidDecision.decision, 'chat_only', invalidDate);
+    assert.equal(invalidDecision.taskDraft, null, invalidDate);
+  }
 });
 
 test('applies a configured default assignee only when no person was assigned', () => {
