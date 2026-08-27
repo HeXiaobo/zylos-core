@@ -3,7 +3,7 @@
  *
  * Runs the deployed c4-send and c4-receive executables against local temporary
  * state, so an upgrade can prove outbound body contracts, inbound durable
- * persistence, and the deployment's exact legacy argv policy without sending
+ * persistence, and the deployment's exact argv rejection policy without sending
  * anything to a real external channel.
  */
 
@@ -31,6 +31,8 @@ export const COMMUNICATION_CRITICAL_ASSETS = Object.freeze([
 const STRICT_ARG_REJECTIONS = new Set([
   '[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.',
   '[c4-send] arg-mode disabled by strict stdin-only policy: pass the message via stdin/heredoc.',
+  '[c4-send] arg-mode disabled by stdin-only policy: pass the message via stdin/heredoc or --body-file.',
+  '[c4-send] arg-mode disabled by strict stdin-only policy: pass the message via stdin/heredoc or --body-file.',
 ]);
 
 function readSelectedEnv(zylosDir, names, fsApi) {
@@ -153,7 +155,7 @@ export function verifyCommunicationAssets({ skillsDir, fsApi = fs } = {}) {
 }
 
 function isStrictArgPolicyRejection(result) {
-  if (!Number.isInteger(result.status) || result.status === 0) return false;
+  if (result.status !== 2) return false;
   const firstLine = String(result.stderr || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -162,9 +164,8 @@ function isStrictArgPolicyRejection(result) {
 }
 
 /**
- * Verify the active c4-send reply policy. Compatibility mode must preserve
- * argv delivery. Explicit strict mode must preserve stdin and body-file
- * delivery while returning the known policy rejection for argv bodies.
+ * Verify the active c4-send reply policy. Stdin and body-file preserve the
+ * message body, while argv bodies must return the known policy rejection.
  * Returns structured, content-free diagnostics suitable for upgrade output.
  */
 export function verifyCommunicationContinuity({
@@ -187,9 +188,6 @@ export function verifyCommunicationContinuity({
   const policyEnv = readPolicyFlags(zylosDir, fsApi);
   const selectedWorkIntakeEnv = workIntakeEnv
     ?? readSelectedEnv(zylosDir, WORK_INTAKE_ENV_KEYS, fsApi);
-  const strictPolicy = policyEnv.C4_STRICT_STDIN_ONLY === '1'
-    && policyEnv.C4_LEGACY_ARG_MODE !== '1';
-
   try {
     fsApi.mkdirSync(channelDir, { recursive: true });
     fsApi.mkdirSync(path.join(canaryRoot, '.claude', 'skills', 'feishu'), { recursive: true });
@@ -208,17 +206,17 @@ export function verifyCommunicationContinuity({
         input: 'stdin canary with "quotes" and $vars',
         expected: 'delivery',
       },
-      ...(strictPolicy ? [{
+      {
         name: 'body_file_reply',
         args: [channel, endpoint, `--body-file=${bodyFilePath}`],
         body: bodyFileCanary,
         expected: 'delivery',
-      }] : []),
+      },
       {
         name: 'legacy_argv_reply',
         args: [channel, endpoint, 'legacy canary with "quotes" and $vars'],
-        expected: strictPolicy ? 'strict_rejection' : 'delivery',
-        mode: strictPolicy ? 'strict_rejection' : 'compatibility',
+        expected: 'strict_rejection',
+        mode: 'strict_rejection',
       },
     ];
 

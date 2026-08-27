@@ -23,12 +23,13 @@ function verify(options = {}) {
 }
 
 describe('communication continuity canary', () => {
-  it('proves stdin and exact legacy reply calls preserve the message body', () => {
+  it('proves safe body transports succeed and argv replies are policy-rejected', () => {
     const result = verify({ c4SendPath: C4_SEND_PATH });
 
     assert.equal(result.compatible, true, JSON.stringify(result));
     assert.deepEqual(result.checks.map(({ name, status }) => ({ name, status })), [
       { name: 'stdin_reply', status: 'passed' },
+      { name: 'body_file_reply', status: 'passed' },
       { name: 'legacy_argv_reply', status: 'passed' },
       { name: 'inbound_receive', status: 'passed' },
       { name: 'inbound_persistence', status: 'passed' },
@@ -47,7 +48,7 @@ describe('communication continuity canary', () => {
     assert.match(result.error, /not found/);
   });
 
-  it('uses only safe body transports and proves argv is policy-rejected when strict policy is explicit', () => {
+  it('uses only safe body transports and rejects argv even when strict policy is explicit', () => {
     const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-continuity-policy-'));
     try {
       fs.writeFileSync(path.join(zylosDir, '.env'), 'C4_STRICT_STDIN_ONLY=1\n');
@@ -184,16 +185,19 @@ describe('communication continuity canary', () => {
     }
   });
 
-  it('fails when the deployed executable breaks the legacy recovery contract', () => {
+  it('fails when the deployed executable breaks the argv rejection contract', () => {
     let call = 0;
     const result = verify({
       c4SendPath: C4_SEND_PATH,
       spawnSyncFn: (_command, args, options) => {
         call += 1;
-        if (call === 1) {
+        if (call <= 2) {
+          const bodyFileArg = args.find((arg) => arg.startsWith('--body-file='));
+          const body = options.input
+            ?? fs.readFileSync(bodyFileArg.slice('--body-file='.length), 'utf8');
           fs.writeFileSync(
             options.env.C4_CANARY_OUTPUT,
-            JSON.stringify([args[2], options.input]),
+            JSON.stringify([args[2], body]),
           );
           return { status: 0, stdout: '', stderr: '' };
         }
@@ -203,11 +207,11 @@ describe('communication continuity canary', () => {
 
     assert.equal(result.compatible, false);
     assert.equal(result.checks[0].status, 'passed');
-    assert.equal(result.checks[1].status, 'failed');
+    assert.equal(result.checks[2].status, 'failed');
     assert.match(result.error, /legacy_argv_reply/);
   });
 
-  it('honors the break-glass override when strict policy is present', () => {
+  it('does not let the break-glass override bypass argv rejection', () => {
     const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-continuity-policy-'));
     try {
       fs.writeFileSync(
@@ -221,6 +225,11 @@ describe('communication continuity canary', () => {
       });
 
       assert.equal(result.compatible, true, JSON.stringify(result));
+      assert.deepEqual(result.checks.slice(0, 3).map(({ name, status, mode }) => ({ name, status, mode })), [
+        { name: 'stdin_reply', status: 'passed', mode: undefined },
+        { name: 'body_file_reply', status: 'passed', mode: undefined },
+        { name: 'legacy_argv_reply', status: 'passed', mode: 'strict_rejection' },
+      ]);
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
