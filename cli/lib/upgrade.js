@@ -31,6 +31,181 @@ import {
   validateUpgradeSource,
 } from './upgrade-metadata.js';
 
+// Component upgrades must never turn a service/package command into an
+// ambient shell string.  Resolve the default tools to absolute executable
+// paths once, then run every invocation with argv + shell:false.  Callers that
+// need a test or platform-specific runner can inject the same seams through
+// runUpgrade({ tools: { pm2, npm, spawnSync } }).
+function isExecutable(filePath, { trusted = false } = {}) {
+  if (!filePath || !path.isAbsolute(filePath)) return false;
+  try {
+    const resolved = fs.realpathSync.native(filePath);
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile() || (stat.mode & 0o111) === 0) return false;
+    if (trusted) return true;
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    const parent = fs.statSync(path.dirname(resolved));
+    if ((stat.mode & 0o022) !== 0 || (parent.mode & 0o022) !== 0) return false;
+    if (currentUid !== null && ![0, currentUid].includes(stat.uid)) return false;
+    if (currentUid !== null && ![0, currentUid].includes(parent.uid)) return false;
+    if (currentUid !== null) {
+      let ancestor = path.dirname(path.dirname(resolved));
+      while (true) {
+        const ancestorStat = fs.statSync(ancestor);
+        if ((ancestorStat.mode & 0o022) !== 0) return false;
+        if (![0, currentUid].includes(ancestorStat.uid)) return false;
+        const next = path.dirname(ancestor);
+        if (next === ancestor) break;
+        ancestor = next;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveExecutable(name) {
+  const pathEntries = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const entry of pathEntries) {
+    const candidate = path.join(entry, name);
+    if (isExecutable(candidate)) return fs.realpathSync.native(candidate);
+  }
+  return null;
+}
+
+function resolveUpgradeTools(injected = {}) {
+  const supplied = injected || {};
+  const tools = {
+    pm2: supplied.pm2 === undefined ? resolveExecutable('pm2') : supplied.pm2,
+    npm: supplied.npm === undefined ? resolveExecutable('npm') : supplied.npm,
+    spawnSync: supplied.spawnSync || spawnSync,
+    trusted: supplied.trusted === true,
+  };
+  for (const name of ['pm2', 'npm']) {
+    if (tools[name] !== null && !isExecutable(tools[name], { trusted: tools.trusted })) {
+      throw new Error(`${name} tool must be an executable absolute path`);
+    }
+  }
+  if (typeof tools.spawnSync !== 'function') throw new Error('spawnSync tool must be callable');
+  return tools;
+}
+
+function runTool(tools, name, argv, options = {}) {
+  const command = tools?.[name];
+  if (!isExecutable(command, { trusted: tools?.trusted === true })) {
+    return {
+      command,
+      argv,
+      status: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      error: `${name} executable is unavailable or untrusted`,
+    };
+  }
+  let result;
+  try {
+    result = tools.spawnSync(command, argv, {
+      cwd: options.cwd,
+      env: options.env,
+      encoding: 'utf8',
+      timeout: options.timeout ?? 300_000,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: options.maxBuffer ?? (8 * 1024 * 1024),
+    });
+  } catch (error) {
+    return {
+      command,
+      argv,
+      status: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      error: error.message,
+    };
+  }
+  return {
+    command,
+    argv,
+    status: result.status,
+    signal: result.signal,
+    stdout: String(result.stdout || ''),
+    stderr: String(result.stderr || ''),
+    error: result.error?.message || null,
+  };
+}
+
+function toolFailure(result) {
+  return result.error
+    || result.stderr.trim().split(/\r?\n/).find(Boolean)
+    || result.stdout.trim().split(/\r?\n/).find(Boolean)
+    || `exit ${result.status}`;
+}
+
+function requireToolSuccess(result, label) {
+  if (result.status === 0 && !result.error) return result;
+  throw new Error(`${label}: ${toolFailure(result)}`);
+}
+
+function parsePm2Processes(result) {
+  requireToolSuccess(result, 'pm2 jlist');
+  let processes;
+  try {
+    processes = JSON.parse(result.stdout || '[]');
+  } catch (err) {
+    throw new Error(`pm2 jlist returned invalid JSON: ${err.message}`);
+  }
+  if (!Array.isArray(processes)) throw new Error('pm2 jlist returned a non-array');
+  return processes;
+}
+
+function inspectPm2WithTools(tools, serviceName) {
+  const result = runTool(tools, 'pm2', ['jlist']);
+  const processes = parsePm2Processes(result);
+  return processes.find(process => process.name === serviceName) || null;
+}
+
+function startManagedProcessWithTools(ctx, serviceName, ecosystemPath) {
+  const tools = ctx.tools;
+  const start = () => {
+    if (fs.existsSync(ecosystemPath)) {
+      requireToolSuccess(
+        runTool(tools, 'pm2', ['start', ecosystemPath, '--only', serviceName, '--update-env']),
+        `pm2 start ${serviceName}`,
+      );
+    } else {
+      requireToolSuccess(
+        runTool(tools, 'pm2', ['restart', serviceName]),
+        `pm2 restart ${serviceName}`,
+      );
+    }
+    const process = inspectPm2WithTools(tools, serviceName);
+    if (process?.pm2_env?.status !== 'online') {
+      throw new Error(`pm2 process ${serviceName} is not online`);
+    }
+  };
+
+  try {
+    start();
+  } catch (firstError) {
+    if (!fs.existsSync(ecosystemPath)) throw firstError;
+    try {
+      runTool(tools, 'pm2', ['delete', serviceName]);
+    } catch {
+      // Preserve the original failure if cleanup cannot be attempted.
+    }
+    try {
+      start();
+    } catch (secondError) {
+      throw new Error(`${firstError.message}; recovery: ${secondError.message}`);
+    }
+  }
+
+  requireToolSuccess(runTool(tools, 'pm2', ['save']), 'pm2 save');
+}
+
 // ---------------------------------------------------------------------------
 // Version helpers
 // ---------------------------------------------------------------------------
@@ -372,7 +547,16 @@ export function cleanupTemp(tempDir) {
 // Internal: create upgrade context
 // ---------------------------------------------------------------------------
 
-function createContext(component, { tempDir, newVersion, mode, jsonOutput, source, registryEntry } = {}) {
+function createContext(component, {
+  tempDir,
+  newVersion,
+  mode,
+  jsonOutput,
+  source,
+  registryEntry,
+  postUpgradeCheck,
+  tools,
+} = {}) {
   const skillDir = path.join(SKILLS_DIR, component);
   const dataDir = path.join(COMPONENTS_DIR, component);
 
@@ -386,9 +570,14 @@ function createContext(component, { tempDir, newVersion, mode, jsonOutput, sourc
     jsonOutput: Boolean(jsonOutput),
     source: source || null,
     registryEntry: registryEntry || null,
+    tools: resolveUpgradeTools(tools),
+    postUpgradeCheck: postUpgradeCheck || null,
+    postUpgradeCheckResult: null,
     sourceMarker: null,
     targetRegistryEntry: null,
     metadataRecoveryPending: false,
+    baselineCommitted: false,
+    metadataCommitted: false,
     metadataTransaction: null,
     // State tracking
     backupDir: null,
@@ -399,12 +588,18 @@ function createContext(component, { tempDir, newVersion, mode, jsonOutput, sourc
     envFileExisted: false,
     backupComplete: false,
     serviceStopped: false,
+    serviceTransitionAttempted: false,
     serviceExists: true,
     serviceWasRunning: false,
     mutationStarted: false,
     caddyChanged: false,
     mergeConflicts: [],
     mergedFiles: [],
+    mergeOverwritten: [],
+    mergeKept: [],
+    mergeAdded: [],
+    mergeDeleted: [],
+    mergePreserved: [],
     // Results
     steps: [],
     from: null,
@@ -455,10 +650,21 @@ function step3_stopService(ctx) {
   const parsed = parseSkillMd(ctx.skillDir);
   const serviceName = parsed?.frontmatter?.lifecycle?.service?.name || `zylos-${ctx.component}`;
 
+  const pm2Available = ctx.tools
+    ? Boolean(ctx.tools.pm2 && isExecutable(ctx.tools.pm2, { trusted: ctx.tools.trusted === true }))
+    : true;
+  if (!pm2Available) {
+    return { step: 3, name: 'stop_service', status: 'skipped', message: 'pm2 not available', duration: Date.now() - startTime };
+  }
+
   try {
-    const output = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
-    const processes = JSON.parse(output);
-    const service = processes.find(p => p.name === serviceName);
+    const service = ctx.tools
+      ? inspectPm2WithTools(ctx.tools, serviceName)
+      : (() => {
+        const output = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
+        const processes = JSON.parse(output);
+        return processes.find(p => p.name === serviceName);
+      })();
 
     if (!service) {
       ctx.serviceExists = false;
@@ -472,12 +678,23 @@ function step3_stopService(ctx) {
       return { step: 3, name: 'stop_service', status: 'skipped', message: 'not running', duration: Date.now() - startTime };
     }
 
-    execSync(`pm2 stop ${serviceName} 2>/dev/null`, { stdio: 'pipe' });
+    ctx.serviceTransitionAttempted = true;
+    if (ctx.tools) {
+      requireToolSuccess(runTool(ctx.tools, 'pm2', ['stop', serviceName]), `pm2 stop ${serviceName}`);
+    } else {
+      execSync(`pm2 stop ${serviceName} 2>/dev/null`, { stdio: 'pipe' });
+    }
     ctx.serviceStopped = true;
 
     return { step: 3, name: 'stop_service', status: 'done', message: serviceName, duration: Date.now() - startTime };
-  } catch {
-    return { step: 3, name: 'stop_service', status: 'skipped', message: 'pm2 not available', duration: Date.now() - startTime };
+  } catch (err) {
+    return {
+      step: 3,
+      name: 'stop_service',
+      status: 'failed',
+      error: `PM2 service transition failed: ${err.message}`,
+      duration: Date.now() - startTime,
+    };
   }
 }
 
@@ -550,6 +767,11 @@ function step4_smartMerge(ctx) {
     // Store merge info on context for final result
     ctx.mergeConflicts = mergeResult.conflicts;
     ctx.mergedFiles = mergeResult.merged;
+    ctx.mergeOverwritten = mergeResult.overwritten;
+    ctx.mergeKept = mergeResult.kept;
+    ctx.mergeAdded = mergeResult.added;
+    ctx.mergeDeleted = mergeResult.deleted;
+    ctx.mergePreserved = mergeResult.preserved;
 
     const msg = formatMergeResult(mergeResult);
 
@@ -577,11 +799,18 @@ function step5_npmInstall(ctx) {
   }
 
   try {
-    execSync('npm install --omit=dev --ignore-scripts', {
-      cwd: ctx.skillDir,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    if (ctx.tools) {
+      requireToolSuccess(
+        runTool(ctx.tools, 'npm', ['install', '--omit=dev', '--ignore-scripts'], { cwd: ctx.skillDir }),
+        'npm install',
+      );
+    } else {
+      execSync('npm install --omit=dev --ignore-scripts', {
+        cwd: ctx.skillDir,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    }
     return { step: 5, name: 'npm_install', status: 'done', duration: Date.now() - startTime };
   } catch (err) {
     return { step: 5, name: 'npm_install', status: 'failed', error: err.stderr?.trim() || err.message, duration: Date.now() - startTime };
@@ -611,6 +840,18 @@ function step10_commitBaseline(ctx) {
   let metadataTransaction = null;
   let baselineCommitted = false;
   try {
+    // The source marker and component registry are intentionally committed
+    // last. Run the caller's runtime postcheck immediately before that commit
+    // so a failed PM2/source-version readback still uses the normal component
+    // rollback path and never leaves a successful-looking transaction with
+    // unverified runtime state.
+    if (ctx.postUpgradeCheck) {
+      const postcheck = ctx.postUpgradeCheck(ctx);
+      if (!postcheck || postcheck.status !== 'PASS') {
+        throw new Error('post-upgrade runtime check did not return PASS');
+      }
+      ctx.postUpgradeCheckResult = postcheck;
+    }
     let manifest = ctx.nextManifest;
     if (ctx.source) {
       const updatedVersion = getLocalVersion(ctx.skillDir);
@@ -634,10 +875,12 @@ function step10_commitBaseline(ctx) {
     }
     saveMergeBaseline(ctx.skillDir, ctx.tempDir, manifest);
     baselineCommitted = true;
+    ctx.baselineCommitted = true;
     if (metadataTransaction) {
       const finalized = finalizeUpgradeMetadataTransaction(metadataTransaction);
       ctx.sourceMarker = finalized.marker;
       ctx.targetRegistryEntry = finalized.targetRegistryEntry;
+      ctx.metadataCommitted = true;
     }
     return {
       step: 10,
@@ -795,7 +1038,11 @@ export function step8_startService(ctx, deps = {}) {
   const ecosystemPath = path.join(ctx.skillDir, 'ecosystem.config.cjs');
 
   try {
-    restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
+    if (ctx.tools) {
+      startManagedProcessWithTools(ctx, serviceName, ecosystemPath);
+    } else {
+      restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
+    }
     return { step: 9, name: 'start_service', status: 'done', message: serviceName, duration: Date.now() - startTime };
   } catch {
     // If the process disappeared from PM2 between step1 and step8, retry via
@@ -804,8 +1051,13 @@ export function step8_startService(ctx, deps = {}) {
       if (!exists(ecosystemPath)) {
         throw new Error(`ecosystem config not found: ${ecosystemPath}`);
       }
-      try { exec(`pm2 delete "${serviceName}" 2>/dev/null`, { stdio: 'pipe' }); } catch {}
-      restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
+      if (ctx.tools) {
+        try { runTool(ctx.tools, 'pm2', ['delete', serviceName]); } catch {}
+        startManagedProcessWithTools(ctx, serviceName, ecosystemPath);
+      } else {
+        try { exec(`pm2 delete "${serviceName}" 2>/dev/null`, { stdio: 'pipe' }); } catch {}
+        restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
+      }
       return { step: 9, name: 'start_service', status: 'done', message: `${serviceName} (restarted from ecosystem)`, duration: Date.now() - startTime };
     } catch {
       return { step: 9, name: 'start_service', status: 'failed', error: `Failed to restart ${serviceName}`, duration: Date.now() - startTime };
@@ -840,10 +1092,17 @@ export function rollback(ctx, deps = {}) {
     const packageJson = path.join(ctx.skillDir, 'package.json');
     if (fs.existsSync(packageJson)) {
       try {
-        execSync('npm install --omit=dev --ignore-scripts', {
-          cwd: ctx.skillDir,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
+        if (ctx.tools) {
+          requireToolSuccess(
+            runTool(ctx.tools, 'npm', ['install', '--omit=dev', '--ignore-scripts'], { cwd: ctx.skillDir }),
+            'npm install (rollback)',
+          );
+        } else {
+          execSync('npm install --omit=dev --ignore-scripts', {
+            cwd: ctx.skillDir,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
+        }
         results.push({ action: 'restore_dependencies', success: true });
       } catch (err) {
         results.push({ action: 'restore_dependencies', success: false, error: err.message });
@@ -855,15 +1114,25 @@ export function rollback(ctx, deps = {}) {
   // that data back in the same transaction as the code rollback. For a
   // component that had no data directory before the attempt, remove only the
   // directory created during the failed upgrade.
-  results.push(...rollbackComponentData(ctx));
+  try {
+    results.push(...rollbackComponentData(ctx));
+  } catch (err) {
+    results.push({ action: 'restore_component_data', success: false, error: err.message });
+  }
 
   if (ctx.caddyChanged) {
     const applyRoutes = deps.applyCaddyRoutes ?? applyCaddyRoutes;
     const removeRoutes = deps.removeCaddyRoutes ?? removeCaddyRoutes;
     // Read the route contract from the immutable backup rather than trusting
     // the live directory after a possibly-partial file restore.
-    const parsed = parseSkillMd(ctx.backupDir || ctx.skillDir);
-    const oldRoutes = parsed?.frontmatter?.http_routes;
+    let oldRoutes = null;
+    try {
+      const parsed = parseSkillMd(ctx.backupDir || ctx.skillDir);
+      oldRoutes = parsed?.frontmatter?.http_routes;
+      results.push({ action: 'read_caddy_route_contract', success: true });
+    } catch (err) {
+      results.push({ action: 'read_caddy_route_contract', success: false, error: err.message });
+    }
     try {
       const result = Array.isArray(oldRoutes) && oldRoutes.length > 0
         ? applyRoutes(ctx.component, oldRoutes)
@@ -881,14 +1150,26 @@ export function rollback(ctx, deps = {}) {
   // Restart service if it was running
   if (ctx.serviceWasRunning) {
     const restartManaged = deps.restartManagedProcess ?? restartManagedProcess;
-    const parsed = parseSkillMd(ctx.skillDir);
-    const serviceName = parsed?.frontmatter?.lifecycle?.service?.name || `zylos-${ctx.component}`;
-    const ecosystemPath = path.join(ctx.skillDir, 'ecosystem.config.cjs');
+    let serviceName = `zylos-${ctx.component}`;
+    let ecosystemPath = path.join(ctx.skillDir, 'ecosystem.config.cjs');
+    try {
+      const parsed = parseSkillMd(ctx.skillDir);
+      serviceName = parsed?.frontmatter?.lifecycle?.service?.name || serviceName;
+      results.push({ action: 'read_service_contract', success: true });
+    } catch (err) {
+      // Keep attempting the documented default service name even when the
+      // restored SKILL metadata cannot be read.
+      results.push({ action: 'read_service_contract', success: false, error: err.message });
+    }
     try {
       // save: true persists the PM2 dump so the rolled-back service survives a
       // reboot. Without it, a recreated process (pm2 delete + start) lives only
       // in memory and is lost on the next `pm2 resurrect`.
-      restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
+      if (ctx.tools) {
+        startManagedProcessWithTools(ctx, serviceName, ecosystemPath);
+      } else {
+        restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
+      }
       results.push({ action: 'restart_service', success: true });
     } catch (err) {
       results.push({ action: 'restart_service', success: false, error: err.message });
@@ -971,12 +1252,31 @@ function cleanupDataBackup(ctx) {
  * Lock must be acquired by caller (component.js).
  *
  * @param {string} component
- * @param {{ tempDir: string, newVersion: string, source?: object, registryEntry?: object }} opts
+ * @param {{ tempDir: string, newVersion: string, source?: object, registryEntry?: object, postUpgradeCheck?: (context: object) => object }} opts
  * @returns {object} Upgrade result
  */
-export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, onStep, source, registryEntry } = {}) {
+export function runUpgrade(component, {
+  tempDir,
+  newVersion,
+  mode,
+  jsonOutput,
+  onStep,
+  source,
+  registryEntry,
+  postUpgradeCheck,
+  tools,
+} = {}) {
   recoverUpgradeMetadataTransactions({ component });
-  const ctx = createContext(component, { tempDir, newVersion, mode, jsonOutput, source, registryEntry });
+  const ctx = createContext(component, {
+    tempDir,
+    newVersion,
+    mode,
+    jsonOutput,
+    source,
+    registryEntry,
+    postUpgradeCheck,
+    tools,
+  });
 
   if (!fs.existsSync(ctx.skillDir)) {
     return {
@@ -1027,10 +1327,30 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
   let failedStep = null;
 
   for (const stepFn of steps) {
-    const result = stepFn(ctx);
+    let result;
+    try {
+      result = stepFn(ctx);
+      if (!result || typeof result !== 'object') {
+        throw new Error('upgrade step returned no result');
+      }
+    } catch (err) {
+      result = {
+        step: ctx.steps.length,
+        name: stepFn.name || 'upgrade_step',
+        status: 'failed',
+        error: `Upgrade step threw: ${err.message}`,
+      };
+    }
     result.total = total;
     ctx.steps.push(result);
-    if (onStep) onStep(result);
+    if (onStep) {
+      try {
+        onStep(result);
+      } catch (err) {
+        result.status = 'failed';
+        result.error = `Upgrade progress callback threw: ${err.message}`;
+      }
+    }
 
     if (result.status === 'failed') {
       failedStep = result;
@@ -1041,9 +1361,45 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
 
   // If failed, rollback
   if (failedStep) {
-    const rollbackNeeded = ctx.serviceStopped || ctx.mutationStarted;
-    const dataRollback = !rollbackNeeded ? rollbackComponentData(ctx) : [];
-    const rollbackResults = rollbackNeeded ? rollback(ctx) : dataRollback;
+    // Once the authoritative baseline has been committed, business-file
+    // rollback can no longer restore the old metadata atomically.  Surface a
+    // terminal hold instead of claiming that a rollback succeeded.
+    if (ctx.baselineCommitted || ctx.metadataRecoveryPending) {
+      return {
+        action: 'upgrade',
+        component,
+        success: false,
+        committedHold: true,
+        from: ctx.from,
+        to: null,
+        failedStep: failedStep.step,
+        error: failedStep.error,
+        steps: ctx.steps,
+        rollback: {
+          performed: false,
+          status: 'COMMITTED_HOLD',
+          steps: [],
+          error: 'baseline was committed; manual metadata/runtime recovery required',
+        },
+        postUpgradeCheck: ctx.postUpgradeCheckResult,
+        mergeConflicts: ctx.mergeConflicts.length > 0 ? ctx.mergeConflicts : null,
+        mergedFiles: ctx.mergedFiles.length > 0 ? ctx.mergedFiles : null,
+        mergeOverwritten: ctx.mergeOverwritten.length > 0 ? ctx.mergeOverwritten : null,
+        mergeKept: ctx.mergeKept.length > 0 ? ctx.mergeKept : null,
+        mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
+        mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
+        mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
+      };
+    }
+    const rollbackNeeded = ctx.serviceStopped || ctx.serviceTransitionAttempted || ctx.mutationStarted;
+    let dataRollback = [];
+    let rollbackResults;
+    try {
+      dataRollback = !rollbackNeeded ? rollbackComponentData(ctx) : [];
+      rollbackResults = rollbackNeeded ? rollback(ctx) : dataRollback;
+    } catch (err) {
+      rollbackResults = [{ action: 'rollback_exception', success: false, error: err.message }];
+    }
     if (ctx.metadataTransaction) {
       const rollbackComplete = rollbackResults.length > 0
         && rollbackResults.every(result => result.success === true);
@@ -1077,15 +1433,27 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
       error: failedStep.error,
       steps: ctx.steps,
       rollback: { performed: rollbackPerformed, steps: rollbackResults },
+      postUpgradeCheck: ctx.postUpgradeCheckResult,
+      mergeConflicts: ctx.mergeConflicts.length > 0 ? ctx.mergeConflicts : null,
+      mergedFiles: ctx.mergedFiles.length > 0 ? ctx.mergedFiles : null,
+      mergeOverwritten: ctx.mergeOverwritten.length > 0 ? ctx.mergeOverwritten : null,
+      mergeKept: ctx.mergeKept.length > 0 ? ctx.mergeKept : null,
+      mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
+      mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
+      mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
     };
   }
 
-  // Success — read the new version and SKILL.md metadata
-  cleanupDataBackup(ctx);
-  const updatedVersion = getLocalVersion(ctx.skillDir);
-  if (updatedVersion.success) {
-    ctx.to = updatedVersion.version;
-  }
+  // Success — read the new version and SKILL.md metadata. These reads happen
+  // after the authoritative baseline commit, so an unexpected filesystem or
+  // parser error must remain a terminal committed hold rather than escaping to
+  // a caller that might incorrectly attempt an ordinary pre-commit rollback.
+  try {
+    cleanupDataBackup(ctx);
+    const updatedVersion = getLocalVersion(ctx.skillDir);
+    if (updatedVersion.success) {
+      ctx.to = updatedVersion.version;
+    }
 
   // Include SKILL.md metadata for Claude (hooks, config, service info)
   const skillMeta = parseSkillMd(ctx.skillDir);
@@ -1100,24 +1468,61 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
     ? { ...caddyStep.caddy, status: caddyStep.status }
     : (caddyStep ? { action: caddyStep.message, status: caddyStep.status } : null);
 
-  return {
-    action: 'upgrade',
-    component,
-    success: true,
-    from: ctx.from,
-    to: ctx.to,
-    steps: ctx.steps,
-    backupDir: ctx.backupDir,
-    source: ctx.sourceMarker,
-    targetRegistryEntry: ctx.targetRegistryEntry,
-    metadataRecoveryPending: ctx.metadataRecoveryPending,
-    skill: {
-      hooks: Object.keys(hooks).length > 0 ? hooks : null,
-      config: Object.keys(config).length > 0 ? config : null,
-      service: lifecycle.service || null,
-      caddy: caddyResult,
-    },
-    mergeConflicts: ctx.mergeConflicts.length > 0 ? ctx.mergeConflicts : null,
-    mergedFiles: ctx.mergedFiles.length > 0 ? ctx.mergedFiles : null,
-  };
+    return {
+      action: 'upgrade',
+      component,
+      success: true,
+      from: ctx.from,
+      to: ctx.to,
+      steps: ctx.steps,
+      backupDir: ctx.backupDir,
+      source: ctx.sourceMarker,
+      targetRegistryEntry: ctx.targetRegistryEntry,
+      metadataRecoveryPending: ctx.metadataRecoveryPending,
+      postUpgradeCheck: ctx.postUpgradeCheckResult,
+      skill: {
+        hooks: Object.keys(hooks).length > 0 ? hooks : null,
+        config: Object.keys(config).length > 0 ? config : null,
+        service: lifecycle.service || null,
+        caddy: caddyResult,
+      },
+      mergeConflicts: ctx.mergeConflicts.length > 0 ? ctx.mergeConflicts : null,
+      mergedFiles: ctx.mergedFiles.length > 0 ? ctx.mergedFiles : null,
+      mergeOverwritten: ctx.mergeOverwritten.length > 0 ? ctx.mergeOverwritten : null,
+      mergeKept: ctx.mergeKept.length > 0 ? ctx.mergeKept : null,
+      mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
+      mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
+      mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
+    };
+  } catch (err) {
+    return {
+      action: 'upgrade',
+      component,
+      success: false,
+      committedHold: true,
+      from: ctx.from,
+      to: null,
+      failedStep: 10,
+      error: `Post-commit verification failed: ${err.message}`,
+      steps: ctx.steps,
+      backupDir: ctx.backupDir,
+      source: ctx.sourceMarker,
+      targetRegistryEntry: ctx.targetRegistryEntry,
+      metadataRecoveryPending: ctx.metadataRecoveryPending,
+      postUpgradeCheck: ctx.postUpgradeCheckResult,
+      rollback: {
+        performed: false,
+        status: 'COMMITTED_HOLD',
+        steps: [],
+        error: 'post-commit verification failed; manual metadata/runtime recovery required',
+      },
+      mergeConflicts: ctx.mergeConflicts.length > 0 ? ctx.mergeConflicts : null,
+      mergedFiles: ctx.mergedFiles.length > 0 ? ctx.mergedFiles : null,
+      mergeOverwritten: ctx.mergeOverwritten.length > 0 ? ctx.mergeOverwritten : null,
+      mergeKept: ctx.mergeKept.length > 0 ? ctx.mergeKept : null,
+      mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
+      mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
+      mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
+    };
+  }
 }
