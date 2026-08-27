@@ -4,7 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { verifyCommunicationContinuity } from '../communication-continuity.js';
+import {
+  COMMUNICATION_CRITICAL_ASSETS,
+  verifyCommunicationAssets,
+  verifyCommunicationContinuity,
+} from '../communication-continuity.js';
 
 const C4_SEND_PATH = path.resolve('skills/comm-bridge/scripts/c4-send.js');
 const C4_RECEIVE_PATH = path.resolve('skills/comm-bridge/scripts/c4-receive.js');
@@ -23,6 +27,26 @@ function verify(options = {}) {
 }
 
 describe('communication continuity canary', () => {
+  it('fails closed when the deployed outbound policy module is missing', () => {
+    const skillsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-communication-assets-'));
+    try {
+      for (const relativePath of COMMUNICATION_CRITICAL_ASSETS) {
+        if (relativePath.endsWith('/c4-outbound-policy.js')) continue;
+        const filePath = path.join(skillsDir, relativePath);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, '#!/usr/bin/env node\n');
+      }
+
+      const result = verifyCommunicationAssets({ skillsDir });
+
+      assert.equal(COMMUNICATION_CRITICAL_ASSETS.includes('comm-bridge/scripts/c4-outbound-policy.js'), true);
+      assert.equal(result.compatible, false);
+      assert.deepEqual(result.missing, ['comm-bridge/scripts/c4-outbound-policy.js']);
+    } finally {
+      fs.rmSync(skillsDir, { recursive: true, force: true });
+    }
+  });
+
   it('proves safe body transports succeed and argv replies are policy-rejected', () => {
     const result = verify({ c4SendPath: C4_SEND_PATH });
 

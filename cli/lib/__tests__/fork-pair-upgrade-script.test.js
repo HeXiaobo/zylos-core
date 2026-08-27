@@ -62,6 +62,7 @@ function writeCoreFixture(root) {
   }));
   for (const relativePath of [
     'skills/comm-bridge/scripts/c4-send.js',
+    'skills/comm-bridge/scripts/c4-outbound-policy.js',
     'skills/comm-bridge/scripts/c4-receive.js',
     'skills/comm-bridge/scripts/c4-dispatcher.js',
     'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
@@ -284,6 +285,21 @@ describe('fork-pair upgrade target contract', () => {
 
       assert.equal(result.ok, false);
       assert.match(result.error, /c4-receive\.js/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails source validation when an immutable Core archive lacks the outbound policy module', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
+    try {
+      writeCoreFixture(root);
+      fs.rmSync(path.join(root, 'skills/comm-bridge/scripts/c4-outbound-policy.js'));
+
+      const result = validateCoreSource(root, '0.7.2-rc.5');
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, /c4-outbound-policy\.js/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
