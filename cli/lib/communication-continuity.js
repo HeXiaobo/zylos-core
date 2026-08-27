@@ -11,8 +11,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 const POLICY_FLAGS = ['C4_STRICT_STDIN_ONLY', 'C4_LEGACY_ARG_MODE'];
+const WORK_INTAKE_ENV_KEYS = Object.freeze([
+  'ZYLOS_AGENT_ID',
+  'ZYLOS_AGENT_PROFILE',
+  'ZYLOS_AGENT_LABEL',
+  'ZYLOS_AGENT_ALIASES',
+  'C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID',
+]);
 export const COMMUNICATION_CRITICAL_ASSETS = Object.freeze([
   'comm-bridge/scripts/c4-send.js',
   'comm-bridge/scripts/c4-receive.js',
@@ -25,7 +33,7 @@ const STRICT_ARG_REJECTIONS = new Set([
   '[c4-send] arg-mode disabled by strict stdin-only policy: pass the message via stdin/heredoc.',
 ]);
 
-function readPolicyFlags(zylosDir, fsApi) {
+function readSelectedEnv(zylosDir, names, fsApi) {
   const values = {};
   let fileValues = {};
 
@@ -42,11 +50,30 @@ function readPolicyFlags(zylosDir, fsApi) {
     // An absent policy file means the compatibility default applies.
   }
 
-  for (const name of POLICY_FLAGS) {
+  for (const name of names) {
     if (process.env[name] !== undefined) values[name] = process.env[name];
     else if (fileValues[name] !== undefined) values[name] = fileValues[name];
   }
   return values;
+}
+
+function readPolicyFlags(zylosDir, fsApi) {
+  return readSelectedEnv(zylosDir, POLICY_FLAGS, fsApi);
+}
+
+function expectedWorkIntakeAssignee(env) {
+  const explicit = String(env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID || '').trim();
+  if (explicit) return explicit;
+  const agentId = String(env.ZYLOS_AGENT_ID || '').trim();
+  if (agentId) return agentId;
+  const profile = String(env.ZYLOS_AGENT_PROFILE || '').trim();
+  return profile ? `agent:${profile}` : null;
+}
+
+function childEnvWithSelection(baseEnv, selectedEnv) {
+  const result = { ...baseEnv };
+  for (const name of WORK_INTAKE_ENV_KEYS) delete result[name];
+  return { ...result, ...selectedEnv };
 }
 
 function failureDetail(result) {
@@ -148,6 +175,7 @@ export function verifyCommunicationContinuity({
   fsApi = fs,
   spawnSyncFn = spawnSync,
   spawnInboundSyncFn = spawnSync,
+  workIntakeEnv = null,
 } = {}) {
   const checks = [];
   const canaryRoot = fsApi.mkdtempSync(path.join(os.tmpdir(), 'zylos-c4-continuity-'));
@@ -157,11 +185,14 @@ export function verifyCommunicationContinuity({
   const endpoint = 'local-loopback';
   const channelDir = path.join(canaryRoot, '.claude', 'skills', channel, 'scripts');
   const policyEnv = readPolicyFlags(zylosDir, fsApi);
+  const selectedWorkIntakeEnv = workIntakeEnv
+    ?? readSelectedEnv(zylosDir, WORK_INTAKE_ENV_KEYS, fsApi);
   const strictPolicy = policyEnv.C4_STRICT_STDIN_ONLY === '1'
     && policyEnv.C4_LEGACY_ARG_MODE !== '1';
 
   try {
     fsApi.mkdirSync(channelDir, { recursive: true });
+    fsApi.mkdirSync(path.join(canaryRoot, '.claude', 'skills', 'feishu'), { recursive: true });
     fsApi.writeFileSync(path.join(channelDir, 'send.js'), [
       "const fs = require('node:fs');",
       "fs.writeFileSync(process.env.C4_CANARY_OUTPUT, JSON.stringify(process.argv.slice(2)));",
@@ -286,6 +317,85 @@ export function verifyCommunicationContinuity({
           name: 'inbound_persistence',
           status: persistencePassed ? 'passed' : 'failed',
           ...(persistencePassed ? {} : { error: failureDetail(observeResult) }),
+        });
+      }
+
+      const expectedAssigneeId = expectedWorkIntakeAssignee(selectedWorkIntakeEnv);
+      if (!expectedAssigneeId) {
+        checks.push({
+          name: 'work_intake_default_assignee',
+          status: 'failed',
+          error: 'managed deployment requires ZYLOS_AGENT_ID or ZYLOS_AGENT_PROFILE',
+        });
+      } else {
+        const messageId = 'om_work_intake_continuity';
+        const idempotencyKey = `feishu:${messageId}:work-intake:r1`;
+        const envelope = {
+          source: {
+            channel: 'feishu',
+            messageId,
+            conversationId: 'oc_work_intake_continuity',
+            conversationType: 'direct',
+            threadId: null,
+          },
+          sender: { id: 'ou_continuity_human', kind: 'human' },
+          text: '明天 18:00 前完成升级后通信检查',
+          intentRevision: 1,
+          receivedAt: new Date().toISOString(),
+          timeZone: 'Asia/Shanghai',
+          people: [],
+        };
+        const intakeResult = spawnInboundSyncFn(process.execPath, [
+          c4ReceivePath,
+          '--channel', 'feishu',
+          '--endpoint', `${envelope.source.conversationId}|type:p2p|msg:${messageId}`,
+          '--json',
+          '--work-intake-envelope-json', JSON.stringify(envelope),
+          '--content', `[Feishu DM] Continuity canary said: ${envelope.text}`,
+        ], {
+          encoding: 'utf8',
+          timeout: 10000,
+          env: childEnvWithSelection({
+            ...process.env,
+            ZYLOS_DIR: canaryRoot,
+          }, selectedWorkIntakeEnv),
+        });
+        const intakeReceipt = parseLastJsonValue(intakeResult.stdout);
+        let intakeRow = null;
+        let observerResult = null;
+        if (intakeResult.status === 0 && intakeReceipt?.workIntake?.decision === 'create_task') {
+          const observerExpression = [
+            `const { openCommitmentIntakeQueue } = await import(${JSON.stringify(pathToFileURL(c4DbPath).href)});`,
+            `const queue = openCommitmentIntakeQueue({ dbPath: ${JSON.stringify(path.join(canaryRoot, 'comm-bridge', 'c4.db'))} });`,
+            'try {',
+            `process.stdout.write(JSON.stringify(queue.get({ idempotencyKey: ${JSON.stringify(idempotencyKey)} })));`,
+            '} finally { queue.close(); }',
+          ].join('');
+          observerResult = spawnInboundSyncFn(process.execPath, [
+            '--input-type=module', '--eval', observerExpression,
+          ], {
+            encoding: 'utf8',
+            timeout: 10000,
+            env: childEnvWithSelection(process.env, selectedWorkIntakeEnv),
+          });
+          intakeRow = parseLastJsonValue(observerResult.stdout);
+        }
+        const actualAssigneeId = intakeRow?.envelope?.task?.assigneeId ?? null;
+        const intakePassed = intakeResult.status === 0
+          && intakeReceipt?.workIntake?.decision === 'create_task'
+          && observerResult?.status === 0
+          && actualAssigneeId === expectedAssigneeId;
+        const intakeError = intakeResult.status !== 0
+          ? failureDetail(intakeResult)
+          : intakeReceipt?.workIntake?.decision !== 'create_task'
+            ? 'canary message did not create a task'
+            : observerResult?.status !== 0
+              ? failureDetail(observerResult || {})
+              : `expected default assignee ${expectedAssigneeId}, found ${actualAssigneeId ?? 'missing'}`;
+        checks.push({
+          name: 'work_intake_default_assignee',
+          status: intakePassed ? 'passed' : 'failed',
+          ...(intakePassed ? {} : { error: intakeError }),
         });
       }
     }

@@ -199,11 +199,11 @@ test('maps a configured non-Yueran Agent alias to its logical deployment identit
   });
 });
 
-test('the configured deployment assignee is persisted for an otherwise unassigned task', () => {
+test('the configured Agent identity is persisted for an otherwise unassigned task', () => {
   withZylosDir((zylosDir) => {
     const envelope = inbound('明天 18:00 前完成客户复盘', 'om_default_assignee');
     const response = receive(zylosDir, envelope, {
-      env: { C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: 'agent:yueran' },
+      env: { ZYLOS_AGENT_ID: 'agent:yueran' },
     });
 
     assert.equal(response.workIntake.decision, 'create_task');

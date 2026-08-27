@@ -317,6 +317,20 @@ projection event。
 、component upgrade、`zylos service restart` 和 baseline-only rollback 路径。所有
 入口只能在全部目标回读 online 后保存 PM2 dump；禁止靠延长 30 秒超时掩盖此类 no-op。
 
+### 2.19 WorkIntake 默认负责人必须进入固定通信门禁
+
+私聊中的明确任务即使没有再次点名 Agent，也已经投递给该受管 Agent。Core
+`0.7.2-rc.13` 因此在没有显式人员分派时使用 `ZYLOS_AGENT_ID`（或由
+`ZYLOS_AGENT_PROFILE` 推导的逻辑身份）作为默认负责人；只有显式配置
+`C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID` 才改投其他负责人。缺少负责人会使 Core 任务
+成功创建、但 Feishu task-v2 投影永久失败，是不可接受的“局部成功”。
+
+固定 pair upgrader 的 hermetic communication postcheck 必须包含
+`work_intake_default_assignee`：在隔离目录提交一条无显式负责人的 direct-message
+任务，要求分类结果为 `create_task`，随后从 durable C4 intake queue 回读 envelope，
+并证明 `task.assigneeId` 精确等于部署默认负责人。缺少 Agent identity、没有创建任务、
+队列不可读或负责人不一致时，整笔升级必须 `HOLD`，不得等真实业务积压后再发现。
+
 SS 业务技能恢复采用冻结观察集而非“全量缺失”口径：当前观察集为 7 个名字，其中
 5 个已通过 verify/dry-run/execute 并回读为 `ALREADY_EXACT`，2 个因源不完整保持
 `HOLD`。观察集之外的 xiaohongshu、meeting-notes-processor、zsxq-skill 需单独
@@ -480,7 +494,7 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.12' \
+      --core-version '0.7.2-rc.13' \
       --feishu-version '0.3.7-rc.7' \
       --agent '<agent-id>' \
       --execute

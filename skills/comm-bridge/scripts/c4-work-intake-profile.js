@@ -57,8 +57,14 @@ export function workIntakeProfileFromEnv(env = process.env) {
     throw new TypeError('Agent aliases require ZYLOS_AGENT_ID or ZYLOS_AGENT_PROFILE');
   }
 
+  const configuredDefaultAssigneeId = optionalText(
+    env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID,
+  );
+
   return Object.freeze({
-    defaultAssigneeId: optionalText(env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID),
+    // A message delivered to one managed Agent is work for that Agent unless
+    // the deployment explicitly routes WorkIntake to another assignee.
+    defaultAssigneeId: configuredDefaultAssigneeId ?? agentId,
     agentId,
     agentAliases: Object.freeze(agentAliases),
   });

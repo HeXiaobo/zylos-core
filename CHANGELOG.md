@@ -5,6 +5,19 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.13] - 2026-08-27
+
+### Fixed
+- WorkIntake delivered directly to a managed Agent now defaults otherwise
+  unassigned tasks to that Agent's logical identity. An explicit
+  `C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID` still takes precedence, so deployments
+  can intentionally route intake elsewhere without changing classification.
+- The fixed communication-continuity postcheck now submits an isolated direct
+  WorkIntake task and reads its durable queue envelope back from SQLite. A
+  missing deployment identity, a non-task decision, or a missing/wrong
+  `assigneeId` fails the upgrade closed instead of allowing projection
+  dead-letters to appear after an apparently successful upgrade.
+
 ## [0.7.2-rc.12] - 2026-08-27
 
 ### Fixed

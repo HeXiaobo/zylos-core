@@ -19,9 +19,31 @@ test('resolves one shared Agent identity and natural-language aliases', () => {
 
 test('derives the logical identity from Agent Profile for managed runtimes', () => {
   assert.deepEqual(workIntakeProfileFromEnv({ ZYLOS_AGENT_PROFILE: 'mylos' }), {
-    defaultAssigneeId: null,
+    defaultAssigneeId: 'agent:mylos',
     agentId: 'agent:mylos',
     agentAliases: ['mylos'],
+  });
+});
+
+test('defaults direct WorkIntake to the configured Agent identity', () => {
+  assert.deepEqual(workIntakeProfileFromEnv({
+    ZYLOS_AGENT_ID: 'agent:yueran',
+    ZYLOS_AGENT_LABEL: '玥然',
+  }), {
+    defaultAssigneeId: 'agent:yueran',
+    agentId: 'agent:yueran',
+    agentAliases: ['玥然'],
+  });
+});
+
+test('preserves an explicit WorkIntake default assignee override', () => {
+  assert.deepEqual(workIntakeProfileFromEnv({
+    ZYLOS_AGENT_ID: 'agent:yueran',
+    C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: 'agent:triage',
+  }), {
+    defaultAssigneeId: 'agent:triage',
+    agentId: 'agent:yueran',
+    agentAliases: [],
   });
 });
 

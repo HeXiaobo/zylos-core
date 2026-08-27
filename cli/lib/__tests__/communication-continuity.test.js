@@ -11,10 +11,20 @@ const C4_RECEIVE_PATH = path.resolve('skills/comm-bridge/scripts/c4-receive.js')
 const STRICT_C4_SEND_FIXTURE = path.resolve(
   'cli/lib/__tests__/fixtures/strict-c4-send.js',
 );
+const WORK_INTAKE_ENV = Object.freeze({
+  ZYLOS_AGENT_ID: 'agent:continuity-canary',
+});
+
+function verify(options = {}) {
+  return verifyCommunicationContinuity({
+    workIntakeEnv: WORK_INTAKE_ENV,
+    ...options,
+  });
+}
 
 describe('communication continuity canary', () => {
   it('proves stdin and exact legacy reply calls preserve the message body', () => {
-    const result = verifyCommunicationContinuity({ c4SendPath: C4_SEND_PATH });
+    const result = verify({ c4SendPath: C4_SEND_PATH });
 
     assert.equal(result.compatible, true, JSON.stringify(result));
     assert.deepEqual(result.checks.map(({ name, status }) => ({ name, status })), [
@@ -22,11 +32,12 @@ describe('communication continuity canary', () => {
       { name: 'legacy_argv_reply', status: 'passed' },
       { name: 'inbound_receive', status: 'passed' },
       { name: 'inbound_persistence', status: 'passed' },
+      { name: 'work_intake_default_assignee', status: 'passed' },
     ]);
   });
 
   it('fails closed when the deployed receive entrypoint is missing', () => {
-    const result = verifyCommunicationContinuity({
+    const result = verify({
       c4SendPath: C4_SEND_PATH,
       c4ReceivePath: `${C4_RECEIVE_PATH}.missing`,
     });
@@ -41,7 +52,7 @@ describe('communication continuity canary', () => {
     try {
       fs.writeFileSync(path.join(zylosDir, '.env'), 'C4_STRICT_STDIN_ONLY=1\n');
 
-      const result = verifyCommunicationContinuity({
+      const result = verify({
         c4SendPath: C4_SEND_PATH,
         zylosDir,
         spawnSyncFn: (_command, args, options) => {
@@ -72,6 +83,7 @@ describe('communication continuity canary', () => {
         { name: 'legacy_argv_reply', status: 'passed', mode: 'strict_rejection' },
         { name: 'inbound_receive', status: 'passed', mode: undefined },
         { name: 'inbound_persistence', status: 'passed', mode: undefined },
+        { name: 'work_intake_default_assignee', status: 'passed', mode: undefined },
       ]);
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
@@ -83,7 +95,7 @@ describe('communication continuity canary', () => {
     try {
       fs.writeFileSync(path.join(zylosDir, '.env'), 'C4_STRICT_STDIN_ONLY=1\n');
 
-      const result = verifyCommunicationContinuity({
+      const result = verify({
         c4SendPath: STRICT_C4_SEND_FIXTURE,
         c4ReceivePath: C4_RECEIVE_PATH,
         c4DbPath: path.resolve('skills/comm-bridge/scripts/c4-db.js'),
@@ -97,6 +109,7 @@ describe('communication continuity canary', () => {
         { name: 'legacy_argv_reply', status: 'passed', mode: 'strict_rejection' },
         { name: 'inbound_receive', status: 'passed', mode: undefined },
         { name: 'inbound_persistence', status: 'passed', mode: undefined },
+        { name: 'work_intake_default_assignee', status: 'passed', mode: undefined },
       ]);
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
@@ -108,7 +121,7 @@ describe('communication continuity canary', () => {
     let call = 0;
     try {
       fs.writeFileSync(path.join(zylosDir, '.env'), 'C4_STRICT_STDIN_ONLY=1\n');
-      const result = verifyCommunicationContinuity({
+      const result = verify({
         c4SendPath: C4_SEND_PATH,
         zylosDir,
         spawnSyncFn: (_command, args, options) => {
@@ -141,7 +154,7 @@ describe('communication continuity canary', () => {
     let call = 0;
     try {
       fs.writeFileSync(path.join(zylosDir, '.env'), 'C4_STRICT_STDIN_ONLY=1\n');
-      const result = verifyCommunicationContinuity({
+      const result = verify({
         c4SendPath: C4_SEND_PATH,
         zylosDir,
         spawnSyncFn: (_command, args, options) => {
@@ -173,7 +186,7 @@ describe('communication continuity canary', () => {
 
   it('fails when the deployed executable breaks the legacy recovery contract', () => {
     let call = 0;
-    const result = verifyCommunicationContinuity({
+    const result = verify({
       c4SendPath: C4_SEND_PATH,
       spawnSyncFn: (_command, args, options) => {
         call += 1;
@@ -202,7 +215,7 @@ describe('communication continuity canary', () => {
         'C4_STRICT_STDIN_ONLY=1\nC4_LEGACY_ARG_MODE=1\n',
       );
 
-      const result = verifyCommunicationContinuity({
+      const result = verify({
         c4SendPath: C4_SEND_PATH,
         zylosDir,
       });
@@ -211,5 +224,16 @@ describe('communication continuity canary', () => {
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
+  });
+
+  it('fails closed when a managed deployment has no WorkIntake Agent identity', () => {
+    const result = verifyCommunicationContinuity({
+      c4SendPath: C4_SEND_PATH,
+      workIntakeEnv: {},
+    });
+
+    assert.equal(result.compatible, false);
+    assert.match(result.error, /work_intake_default_assignee/);
+    assert.match(result.error, /ZYLOS_AGENT_ID or ZYLOS_AGENT_PROFILE/);
   });
 });
