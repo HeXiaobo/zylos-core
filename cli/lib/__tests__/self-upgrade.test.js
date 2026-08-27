@@ -1138,6 +1138,23 @@ describe('self-upgrade backup and rollback', () => {
     ]);
   });
 
+  it('restores component daemons from their preserved PM2 definition during rollback', () => {
+    const calls = [];
+
+    rollbackSelf({
+      servicesWereRunning: ['zylos-feishu-task-projection', 'activity-monitor'],
+    }, {
+      coreEcosystemServiceNames: ['activity-monitor'],
+      restartExistingProcess: (name) => calls.push(`component:${name}`),
+      restartManagedProcess: (name) => calls.push(`core:${name}`),
+    });
+
+    assert.deepStrictEqual(calls, [
+      'component:zylos-feishu-task-projection',
+      'core:activity-monitor',
+    ]);
+  });
+
   it('falls back to plain restart when the backup has no ecosystem file', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-rollback-fallback-'));
     const zylosDir = path.join(tmpDir, 'zylos');

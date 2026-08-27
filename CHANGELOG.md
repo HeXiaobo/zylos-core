@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.2-rc.15] - 2026-08-27
 
 ### Fixed
+- Core self-upgrade and rollback now restart component-owned daemons from their
+  existing PM2 definitions instead of forcing their names through the Core
+  ecosystem. Additional Feishu projection and comment workers therefore remain
+  online across a Core upgrade while Core-owned services still receive the new
+  ecosystem configuration.
 - Standalone acknowledgements such as `已授权`, `确认添加`, and `收到` now stay
   on the ordinary chat path. They can authorize an existing interaction but
   can no longer be interpreted as a fresh high-risk task merely because the
@@ -130,7 +135,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state is always retained for recovery. Runtime provenance is excluded from
   business-file change detection and no longer appears as a local modification
   on the next upgrade.
-
 ## [0.7.2-rc.8] - 2026-08-27
 
 ### Added
