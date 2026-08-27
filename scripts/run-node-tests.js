@@ -58,7 +58,7 @@ let result;
 try {
   result = spawnSync(
     process.execPath,
-    ['--experimental-test-module-mocks', '--test', ...testFiles],
+    ['--experimental-test-module-mocks', '--test-concurrency=1', '--test', ...testFiles],
     {
       stdio: 'inherit',
       env: {

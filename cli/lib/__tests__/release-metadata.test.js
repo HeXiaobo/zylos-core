@@ -29,6 +29,7 @@ describe('fork release metadata', () => {
 
   it('runs destructive rollback tests in an isolated ZYLOS_DIR', () => {
     const runner = fs.readFileSync(path.join(ROOT, 'scripts', 'run-node-tests.js'), 'utf8');
+    assert.match(runner, /['"]--test-concurrency=1['"]/);
     assert.match(runner, /mkdtempSync\(path\.join\(os\.tmpdir\(\), 'zylos-node-tests-home-'\)\)/);
     assert.match(runner, /HOME:\s*isolatedHomeDir/);
     assert.match(runner, /ZYLOS_DIR:\s*isolatedZylosDir/);
