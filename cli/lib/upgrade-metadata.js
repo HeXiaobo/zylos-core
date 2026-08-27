@@ -5,6 +5,7 @@ import { atomicWriteJson, removeDurably } from './atomic-json.js';
 import { updateComponentsRegistry } from './components-registry.js';
 import { CONFIG_DIR, SKILLS_DIR } from './config.js';
 import { captureProcessIdentity, inspectProcessIdentity } from './process-identity.js';
+import { isValidGitHubRepository } from './component-repo-override.js';
 
 const JOURNAL_DIR = path.join(CONFIG_DIR, 'upgrade-metadata-transactions');
 const SOURCE_MARKER = '.zylos-source.json';
@@ -30,7 +31,7 @@ function assertTimestamp(value, label) {
 export function validateUpgradeSource(source) {
   assertPlainObject(source, 'upgrade source');
   if (source.type !== 'github-release') throw new Error('upgrade source type must be github-release');
-  if (typeof source.repo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(source.repo)) {
+  if (!isValidGitHubRepository(source.repo)) {
     throw new Error('upgrade source repo must be owner/name');
   }
   if (typeof source.ref !== 'string' || source.ref.length === 0) {
