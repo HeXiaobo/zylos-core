@@ -30,6 +30,16 @@ to `~/zylos/commitments/commitments.db` when `ZYLOS_DIR` is unset.
   `created: false`.
 - Reusing the key with different normalized content throws an error whose
   `code` is `IDEMPOTENCY_CONFLICT`; callers must not retry it unchanged.
+- `adoptLegacyTask({ idempotencyKey, externalId, task, mode? })` adopts one
+  already-created native Task GUID without calling Feishu. It creates a ready
+  Core Task, its `TaskCreated` Event/Outbox row, exactly one
+  `backend=feishu-task-v2` ExternalLink, and an adoption receipt in one SQLite
+  transaction. `mode: "plan"` is read-only; the default `commit` mode persists
+  the result (`dryRun: true` and `plan: true` are equivalent plan aliases).
+  Replaying the same normalized request returns the original
+  result, while changed content returns `IDEMPOTENCY_CONFLICT`. A link identity
+  already owned by another Task returns `EXTERNAL_LINK_CONFLICT` and rolls the
+  whole adoption back.
 - `query({ taskId })` returns the task view or `null`.
 - `query({ taskId, includeEvents: true })` returns `{ task, events }`, with
   events ordered by Task version.

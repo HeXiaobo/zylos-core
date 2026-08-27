@@ -67,6 +67,11 @@ function optionalNonNegativeInteger(value, field) {
   return value;
 }
 
+function rejectUnknownFields(value, allowedFields, field) {
+  const unknown = Object.keys(value).find((key) => !allowedFields.has(key));
+  if (unknown) throw new TypeError(`unsupported ${field} field: ${unknown}`);
+}
+
 function toTaskView(row) {
   if (!row) return null;
   return {
@@ -98,16 +103,10 @@ function toEventView(row) {
   };
 }
 
-function normalizeEnvelope(envelope) {
-  if (!envelope || typeof envelope !== 'object') {
-    throw new TypeError('envelope must be an object');
+function normalizeTask(task) {
+  if (!task || typeof task !== 'object' || Array.isArray(task)) {
+    throw new TypeError('task must be an object');
   }
-
-  const source = envelope.source;
-  const task = envelope.task;
-  if (!source || typeof source !== 'object') throw new TypeError('source must be an object');
-  if (!task || typeof task !== 'object') throw new TypeError('task must be an object');
-
   const ownerId = requireText(task.ownerId, 'task.ownerId');
   const dueAt = optionalTimestamp(task.dueAt, 'task.dueAt');
   const reminderMinutesBeforeDue = optionalNonNegativeInteger(
@@ -118,21 +117,69 @@ function normalizeEnvelope(envelope) {
     throw new TypeError('task.reminderMinutesBeforeDue requires task.dueAt');
   }
   return {
+    title: requireText(task.title, 'task.title'),
+    description: optionalText(task.description, 'task.description'),
+    ownerId,
+    acceptorId: optionalText(task.acceptorId, 'task.acceptorId') ?? ownerId,
+    assigneeId: optionalText(task.assigneeId, 'task.assigneeId'),
+    dueAt,
+    reminderMinutesBeforeDue,
+  };
+}
+
+function normalizeEnvelope(envelope) {
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    throw new TypeError('envelope must be an object');
+  }
+
+  const source = envelope.source;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    throw new TypeError('source must be an object');
+  }
+  return {
     idempotencyKey: requireText(envelope.idempotencyKey, 'idempotencyKey'),
     source: {
       channel: requireText(source.channel, 'source.channel'),
       externalId: requireText(source.externalId, 'source.externalId'),
       senderId: optionalText(source.senderId, 'source.senderId'),
     },
-    task: {
-      title: requireText(task.title, 'task.title'),
-      description: optionalText(task.description, 'task.description'),
-      ownerId,
-      acceptorId: optionalText(task.acceptorId, 'task.acceptorId') ?? ownerId,
-      assigneeId: optionalText(task.assigneeId, 'task.assigneeId'),
-      dueAt,
-      reminderMinutesBeforeDue,
-    },
+    task: normalizeTask(envelope.task),
+  };
+}
+
+const LEGACY_TASK_ADOPTION_BACKEND = 'feishu-task-v2';
+
+function normalizeLegacyTaskAdoption(rawRequest) {
+  if (!rawRequest || typeof rawRequest !== 'object' || Array.isArray(rawRequest)) {
+    throw new TypeError('legacy task adoption request must be an object');
+  }
+  rejectUnknownFields(
+    rawRequest,
+    new Set(['idempotencyKey', 'externalId', 'task', 'mode', 'dryRun', 'plan']),
+    'legacy task adoption request',
+  );
+  const mode = rawRequest.mode ?? (
+    rawRequest.dryRun === true || rawRequest.plan === true ? 'plan' : 'commit'
+  );
+  if (mode !== 'commit' && mode !== 'plan') {
+    throw new TypeError('legacy task adoption mode must be commit or plan');
+  }
+  for (const field of ['dryRun', 'plan']) {
+    if (rawRequest[field] !== undefined && typeof rawRequest[field] !== 'boolean') {
+      throw new TypeError(`legacy task adoption ${field} must be a boolean`);
+    }
+    if (rawRequest[field] === true && mode === 'commit') {
+      throw new TypeError(`legacy task adoption ${field} requires mode=plan`);
+    }
+    if (rawRequest[field] === false && mode === 'plan') {
+      throw new TypeError(`legacy task adoption ${field}=false conflicts with mode=plan`);
+    }
+  }
+  return {
+    idempotencyKey: requireText(rawRequest.idempotencyKey, 'idempotencyKey'),
+    externalId: requireText(rawRequest.externalId, 'externalId').trim(),
+    task: normalizeTask(rawRequest.task),
+    mode,
   };
 }
 
@@ -543,16 +590,33 @@ function initializeSchema(database) {
       created_at TEXT NOT NULL,
       FOREIGN KEY (task_id) REFERENCES commitment_tasks(id) ON DELETE RESTRICT
     );
+
+  `);
+}
+
+function initializeLegacyTaskAdoptionSchema(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS commitment_legacy_task_adoption_receipts (
+      idempotency_key TEXT PRIMARY KEY,
+      request_fingerprint TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      external_link_id TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (task_id) REFERENCES commitment_tasks(id) ON DELETE RESTRICT,
+      FOREIGN KEY (external_link_id) REFERENCES commitment_external_links(id) ON DELETE RESTRICT
+    );
   `);
 }
 
 /**
  * Open the durable Commitment Core Module.
  *
- * Callers interact only through ingest/command/query and the nested runs,
- * evidence, externalLinks, conversation, subscriptions, audience,
- * notifications, and outbox Interfaces. SQLite transactions, schema migration,
- * deduplication, events, leases, and persistence remain inside the Module.
+ * Callers interact only through ingest/adoptLegacyTask/command/query and the
+ * nested runs, evidence, externalLinks, conversation, subscriptions, audience,
+ * notifications, and outbox Interfaces. SQLite transactions, schema
+ * migration, deduplication, events, leases, and persistence remain inside the
+ * Module.
  */
 export function openCommitmentCore({
   dbPath = defaultDbPath(),
@@ -580,6 +644,7 @@ export function openCommitmentCore({
   initializeTaskRunSchema(database);
   initializeEvidenceSchema(database);
   initializeExternalLinkSchema(database);
+  initializeLegacyTaskAdoptionSchema(database);
   initializeTaskConversationSchema(database);
   initializeTaskSubscriptionSchema(database);
   initializeTaskNotificationSchema(database);
@@ -608,6 +673,11 @@ export function openCommitmentCore({
   const selectCommand = database.prepare(`
     SELECT request_fingerprint, result_json
     FROM commitment_commands
+    WHERE idempotency_key = ?
+  `);
+  const selectLegacyTaskAdoptionReceipt = database.prepare(`
+    SELECT request_fingerprint, result_json
+    FROM commitment_legacy_task_adoption_receipts
     WHERE idempotency_key = ?
   `);
   const insertTask = database.prepare(`
@@ -644,6 +714,59 @@ export function openCommitmentCore({
       idempotency_key, request_fingerprint, task_id, result_json, created_at
     ) VALUES (?, ?, ?, ?, ?)
   `);
+  const insertLegacyTaskAdoptionReceipt = database.prepare(`
+    INSERT INTO commitment_legacy_task_adoption_receipts (
+      idempotency_key, request_fingerprint, task_id, external_link_id,
+      result_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
+  function insertReadyTask({ taskId, task, timestamp }) {
+    insertTask.run(
+      taskId,
+      task.title,
+      task.description,
+      task.ownerId,
+      task.acceptorId,
+      task.assigneeId,
+      task.dueAt,
+      task.reminderMinutesBeforeDue,
+      timestamp,
+      timestamp,
+    );
+    return toTaskView(selectTask.get(taskId));
+  }
+
+  function appendTaskCreatedEvent({ task, actorId, timestamp }) {
+    const event = {
+      id: requireText(eventIdGenerator(), 'generated event id'),
+      type: 'TaskCreated',
+      taskId: task.id,
+      actorId: requireText(actorId, 'TaskCreated actorId'),
+      fromState: null,
+      toState: task.state,
+      version: task.version,
+      occurredAt: timestamp,
+    };
+    insertEvent.run(
+      event.id,
+      event.type,
+      event.taskId,
+      event.actorId,
+      event.fromState,
+      event.toState,
+      event.version,
+      event.occurredAt,
+    );
+    projectionOutboxModule.append(event);
+    return event;
+  }
+
+  function createReadyTask({ taskId, task, actorId, timestamp }) {
+    const createdTask = insertReadyTask({ taskId, task, timestamp });
+    const event = appendTaskCreatedEvent({ task: createdTask, actorId, timestamp });
+    return { task: createdTask, event };
+  }
 
   function transitionTask({ task, toState, eventType, actorId, timestamp }) {
     const updated = updateTaskState.run(toState, timestamp, task.id, task.version);
@@ -732,18 +855,7 @@ export function openCommitmentCore({
 
     const taskId = requireText(idGenerator(), 'generated task id');
     const timestamp = requireText(clock(), 'clock result');
-    insertTask.run(
-      taskId,
-      envelope.task.title,
-      envelope.task.description,
-      envelope.task.ownerId,
-      envelope.task.acceptorId,
-      envelope.task.assigneeId,
-      envelope.task.dueAt,
-      envelope.task.reminderMinutesBeforeDue,
-      timestamp,
-      timestamp,
-    );
+    const task = insertReadyTask({ taskId, task: envelope.task, timestamp });
     insertSource.run(
       envelope.idempotencyKey,
       envelope.source.channel,
@@ -753,28 +865,11 @@ export function openCommitmentCore({
       taskId,
       timestamp,
     );
-    const task = toTaskView(selectTask.get(taskId));
-    const event = {
-      id: requireText(eventIdGenerator(), 'generated event id'),
-      type: 'TaskCreated',
-      taskId: task.id,
-      actorId: envelope.source.senderId ?? task.ownerId,
-      fromState: null,
-      toState: task.state,
-      version: task.version,
-      occurredAt: timestamp,
-    };
-    insertEvent.run(
-      event.id,
-      event.type,
-      event.taskId,
-      event.actorId,
-      event.fromState,
-      event.toState,
-      event.version,
-      event.occurredAt,
-    );
-    projectionOutboxModule.append(event);
+    appendTaskCreatedEvent({
+      task,
+      actorId: envelope.source.senderId ?? envelope.task.ownerId,
+      timestamp,
+    });
 
     return { created: true, task };
   });
@@ -879,6 +974,66 @@ export function openCommitmentCore({
     externalLinkIdGenerator,
     taskStore,
   });
+  const legacyTaskAdoptionTransaction = database.transaction((rawRequest) => {
+    const request = normalizeLegacyTaskAdoption(rawRequest);
+    const requestFingerprint = fingerprintEnvelope({
+      idempotencyKey: request.idempotencyKey,
+      externalId: request.externalId,
+      task: request.task,
+    });
+    const receipt = selectLegacyTaskAdoptionReceipt.get(request.idempotencyKey);
+    if (receipt) {
+      if (receipt.request_fingerprint !== requestFingerprint) {
+        throw idempotencyConflict(request.idempotencyKey);
+      }
+      return JSON.parse(receipt.result_json);
+    }
+
+    if (request.mode === 'plan') {
+      return {
+        planned: true,
+        created: false,
+        task: {
+          id: null,
+          ...request.task,
+          state: 'ready',
+          version: 1,
+          createdAt: null,
+          updatedAt: null,
+        },
+        link: {
+          backend: LEGACY_TASK_ADOPTION_BACKEND,
+          externalId: request.externalId,
+        },
+      };
+    }
+
+    const taskId = requireText(idGenerator(), 'generated task id');
+    const timestamp = requireText(clock(), 'clock result');
+    const { task } = createReadyTask({
+      taskId,
+      task: request.task,
+      actorId: request.task.ownerId,
+      timestamp,
+    });
+    const linked = externalLinkModule.linkWithinTransaction({
+      taskId: task.id,
+      actorId: task.ownerId,
+      backend: LEGACY_TASK_ADOPTION_BACKEND,
+      externalId: request.externalId,
+      idempotencyKey: `legacy-task-adoption:link:${request.idempotencyKey}`,
+    });
+    const result = { created: true, task, link: linked.link };
+    insertLegacyTaskAdoptionReceipt.run(
+      request.idempotencyKey,
+      requestFingerprint,
+      task.id,
+      linked.link.id,
+      JSON.stringify(result),
+      timestamp,
+    );
+    return result;
+  });
   const conversationModule = createTaskConversationModule({
     database,
     clock,
@@ -902,12 +1057,15 @@ export function openCommitmentCore({
     ingest(envelope) {
       return ingestTransaction.immediate(envelope);
     },
+    adoptLegacyTask(request) {
+      return legacyTaskAdoptionTransaction.immediate(request);
+    },
     command(command, expectedVersion) {
       return commandTransaction.immediate(command, expectedVersion);
     },
     runs: runModule.publicInterface,
     evidence: evidenceModule,
-    externalLinks: externalLinkModule,
+    externalLinks: externalLinkModule.publicInterface,
     conversation: conversationModule,
     subscriptions: subscriptionModule,
     audience: audienceModule,
