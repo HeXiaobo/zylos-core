@@ -319,6 +319,169 @@ test('check-only downloads the exact ref from the explicit repository', () => {
   }
 });
 
+test('exact-ref check fails closed when the pinned archive cannot be downloaded', () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-component-repo-check-fail-'));
+  const zylosDir = path.join(fixtureRoot, 'zylos-home');
+  const fakeBin = path.join(fixtureRoot, 'bin');
+  const urlLog = path.join(fixtureRoot, 'urls.log');
+  const component = 'hxa-connect';
+  const overrideRepo = 'HeXiaobo/zylos-hxa-connect';
+  const skillDir = path.join(zylosDir, '.claude', 'skills', component);
+
+  try {
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: hxa-connect\nversion: 1.7.4\n---\n',
+    );
+    fs.mkdirSync(path.join(zylosDir, '.zylos'), { recursive: true });
+    fs.writeFileSync(
+      path.join(zylosDir, '.zylos', 'components.json'),
+      JSON.stringify({ [component]: { version: '1.7.4', repo: 'coco-xyz/zylos-hxa-connect' } }),
+    );
+
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(fakeBin, 'curl'), `#!/bin/sh
+printf '%s\n' "$@" >> "${urlLog}"
+echo 'curl: pinned archive unavailable' >&2
+exit 22
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(fakeBin, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+
+    const child = spawnSync(process.execPath, [
+      CLI,
+      'upgrade',
+      component,
+      '--repo',
+      overrideRepo,
+      '--branch',
+      SHA,
+      '--check',
+      '--json',
+    ], {
+      cwd: fixtureRoot,
+      env: {
+        ...process.env,
+        ZYLOS_DIR: zylosDir,
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+        GITHUB_TOKEN: '',
+        GH_TOKEN: '',
+        ZYLOS_GH_RETRY_DELAY_MS: '',
+      },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+
+    assert.notEqual(child.status, 0, `stdout:\n${child.stdout}\nstderr:\n${child.stderr}`);
+    const output = JSON.parse(child.stdout);
+    assert.equal(output.success, false);
+    assert.equal(output.hasUpdate, false);
+    assert.equal(output.error, 'exact_ref_download_failed');
+    assert.match(output.message, /Failed to download/);
+    assert.equal(output.branch, SHA);
+    assert.doesNotMatch(output.reply, /Run "zylos upgrade/);
+    assert.match(
+      fs.readFileSync(urlLog, 'utf8'),
+      new RegExp(`https://github\\.com/${overrideRepo}/archive/${SHA}\\.tar\\.gz`),
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('exact-ref check and execute fail closed when the target version is unreadable', () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-component-repo-version-fail-'));
+  const zylosDir = path.join(fixtureRoot, 'zylos-home');
+  const fakeBin = path.join(fixtureRoot, 'bin');
+  const archiveRoot = path.join(fixtureRoot, 'component-fixture');
+  const tarball = path.join(fixtureRoot, 'component.tar.gz');
+  const urlLog = path.join(fixtureRoot, 'urls.log');
+  const component = 'hxa-connect';
+  const overrideRepo = 'HeXiaobo/zylos-hxa-connect';
+  const skillDir = path.join(zylosDir, '.claude', 'skills', component);
+
+  try {
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: hxa-connect\nversion: 1.7.4\n---\n',
+    );
+    fs.mkdirSync(path.join(zylosDir, '.zylos'), { recursive: true });
+    fs.writeFileSync(
+      path.join(zylosDir, '.zylos', 'components.json'),
+      JSON.stringify({ [component]: { version: '1.7.4', repo: 'coco-xyz/zylos-hxa-connect' } }),
+    );
+
+    fs.mkdirSync(archiveRoot, { recursive: true });
+    fs.writeFileSync(path.join(archiveRoot, 'README.md'), 'no component version here\n');
+    execFileSync('tar', ['czf', tarball, '-C', fixtureRoot, path.basename(archiveRoot)]);
+
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(fakeBin, 'curl'), [
+      '#!/bin/sh',
+      'printf "%s\\n" "$@" >> "$ZYLOS_TEST_URL_LOG"',
+      'while [ "$#" -gt 0 ]; do',
+      '  if [ "$1" = "-o" ]; then cp "$ZYLOS_TEST_TARBALL" "$2"; exit 0; fi',
+      '  shift',
+      'done',
+      'exit 1',
+    ].join('\n'), { mode: 0o755 });
+
+    const runCli = (extraArgs) => spawnSync(process.execPath, [
+      CLI,
+      'upgrade',
+      component,
+      '--repo',
+      overrideRepo,
+      '--branch',
+      SHA,
+      ...extraArgs,
+      '--json',
+    ], {
+      cwd: fixtureRoot,
+      env: {
+        ...process.env,
+        ZYLOS_DIR: zylosDir,
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+        ZYLOS_TEST_URL_LOG: urlLog,
+        ZYLOS_TEST_TARBALL: tarball,
+        GITHUB_TOKEN: '',
+        GH_TOKEN: '',
+      },
+      encoding: 'utf8',
+      timeout: 30000,
+    });
+
+    for (const [mode, extraArgs] of [['check', ['--check']], ['execute', ['--yes', '--skip-eval']]]) {
+      const child = runCli(extraArgs);
+      assert.notEqual(child.status, 0, `${mode} unexpectedly succeeded:\n${child.stdout}\n${child.stderr}`);
+      const output = JSON.parse(child.stdout);
+      assert.equal(output.action, mode === 'check' ? 'check' : 'upgrade');
+      assert.equal(output.success, false);
+      assert.equal(output.error, 'exact_ref_version_unreadable');
+      assert.match(output.message, /Cannot read target component version/);
+      assert.equal(output.branch, SHA);
+      assert.doesNotMatch(output.reply, /Run "zylos upgrade/);
+    }
+
+    const urls = fs.readFileSync(urlLog, 'utf8')
+      .trim()
+      .split('\n')
+      .filter((value) => value.startsWith('https://'));
+    assert.deepEqual(urls, [
+      `https://github.com/${overrideRepo}/archive/${SHA}.tar.gz`,
+      `https://github.com/${overrideRepo}/archive/${SHA}.tar.gz`,
+    ]);
+    assert.equal(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8'), '---\nname: hxa-connect\nversion: 1.7.4\n---\n');
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(zylosDir, '.zylos', 'components.json'), 'utf8')),
+      { [component]: { version: '1.7.4', repo: 'coco-xyz/zylos-hxa-connect' } },
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test('execute commits override provenance consistently in marker and registry', () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-component-repo-execute-'));
   const zylosDir = path.join(fixtureRoot, 'zylos-home');

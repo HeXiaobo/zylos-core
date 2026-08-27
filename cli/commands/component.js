@@ -453,6 +453,34 @@ export async function upgradeComponent(args) {
   if (!ok) process.exit(1);
 }
 
+function printCheckFailure(component, result, jsonOutput) {
+  if (jsonOutput) {
+    const errOutput = { action: 'check', component, ...result };
+    errOutput.reply = formatC4Reply('error', result);
+    console.log(JSON.stringify(errOutput, null, 2));
+  } else {
+    console.error(`Error: ${result.message || result.error}`);
+  }
+  process.exit(1);
+}
+
+function printUpgradeFailure(component, { jsonOutput, errorCode, message, branch = null }) {
+  if (jsonOutput) {
+    const errOutput = {
+      action: 'upgrade',
+      component,
+      success: false,
+      error: errorCode,
+      message,
+      ...(branch ? { branch } : {}),
+    };
+    errOutput.reply = formatC4Reply('error', { message });
+    console.log(JSON.stringify(errOutput, null, 2));
+  } else {
+    console.error(`Error: ${message}`);
+  }
+}
+
 /**
  * Handle --check flag: check for updates only (no lock needed).
  * Also fetches changelog, detects local changes, and runs Claude eval for a complete preview.
@@ -464,18 +492,10 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false, re
     repoOverride: repoOverride?.repo,
     exactRef: repoOverride?.branch,
   });
+  const exactRef = Boolean(repoOverride?.branch);
 
   if (!result.success) {
-    if (!branch) {
-      if (jsonOutput) {
-        const errOutput = { action: 'check', component, ...result };
-        errOutput.reply = formatC4Reply('error', result);
-        console.log(JSON.stringify(errOutput, null, 2));
-      } else {
-        console.error(`Error: ${result.message}`);
-      }
-      process.exit(1);
-    }
+    if (!branch || exactRef) printCheckFailure(component, result, jsonOutput);
     // When --branch is specified, version check failure is non-fatal
   }
 
@@ -503,6 +523,16 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false, re
         // When using --branch, read version from the downloaded package.json
         if (branch) {
           const downloadedVersion = readDownloadedComponentVersion(tempDir);
+          if (exactRef && !downloadedVersion) {
+            result.success = false;
+            result.hasUpdate = false;
+            result.error = 'exact_ref_version_unreadable';
+            result.message = `Cannot read target component version from downloaded ${repo}@${branch}`;
+            result.repo = repo;
+            result.branch = branch;
+            cleanupTemp(tempDir);
+            printCheckFailure(component, result, jsonOutput);
+          }
           if (downloadedVersion) {
             result.latest = downloadedVersion;
             result.hasUpdate = result.current !== result.latest;
@@ -515,6 +545,14 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false, re
         // Read changelog from downloaded package (more reliable than remote fetch)
         const fullChangelog = readChangelog(tempDir);
         changelog = filterChangelog(fullChangelog, result.current);
+      } else if (exactRef) {
+        result.success = false;
+        result.hasUpdate = false;
+        result.error = 'exact_ref_download_failed';
+        result.message = dlResult.error || `Failed to download ${repo}@${branch}`;
+        result.repo = repo;
+        result.branch = branch;
+        printCheckFailure(component, result, jsonOutput);
       } else if (!branch) {
         // Fallback: fetch changelog from remote (only for non-branch)
         try {
@@ -637,9 +675,10 @@ async function handleUpgradeFlow(component, {
       repoOverride: repoOverride?.repo,
       exactRef: repoOverride?.branch,
     });
+    const exactRef = Boolean(repoOverride?.branch);
 
     if (!check.success) {
-      if (!branch) {
+      if (!branch || exactRef) {
         if (jsonOutput) {
           const errOutput = { action: 'check', component, ...check };
           errOutput.reply = formatC4Reply('error', check);
@@ -689,6 +728,15 @@ async function handleUpgradeFlow(component, {
       dlResult = { success: false, error: err.message };
     }
     if (!dlResult.success) {
+      if (exactRef) {
+        printUpgradeFailure(component, {
+          jsonOutput,
+          errorCode: 'exact_ref_download_failed',
+          message: dlResult.error || `Failed to download ${repo}@${branch}`,
+          branch,
+        });
+        return false;
+      }
       if (jsonOutput) {
         const errOutput = { action: 'upgrade', component, success: false, error: dlResult.error };
         errOutput.reply = formatC4Reply('error', { message: dlResult.error });
@@ -706,6 +754,15 @@ async function handleUpgradeFlow(component, {
     // own package/SKILL version rather than a moving or null tag value.
     if (branch) {
       const downloadedVersion = readDownloadedComponentVersion(tempDir);
+      if (exactRef && !downloadedVersion) {
+        printUpgradeFailure(component, {
+          jsonOutput,
+          errorCode: 'exact_ref_version_unreadable',
+          message: `Cannot read target component version from downloaded ${repo}@${branch}`,
+          branch,
+        });
+        return false;
+      }
       if (downloadedVersion) check.latest = downloadedVersion;
     }
 
