@@ -1,0 +1,8 @@
+# Governance and release controls require the repository owner review.
+/AGENTS.md @HeXiaobo
+/package.json @HeXiaobo
+/package-lock.json @HeXiaobo
+/scripts/agent-governance-check.js @HeXiaobo
+/.github/CODEOWNERS @HeXiaobo
+/.github/pull_request_template.md @HeXiaobo
+/.github/workflows/agent-governance.yml @HeXiaobo
