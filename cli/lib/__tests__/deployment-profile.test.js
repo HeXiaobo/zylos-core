@@ -124,6 +124,11 @@ describe('Agent and Deployment Profile selection', () => {
     assert.match(profile.content, /3AI Memory Governance Profile/);
     assert.match(profile.content, /Commitment gate/);
     assert.match(profile.content, /Anti-Recurrence Gates/);
+    assert.match(profile.content, /<!-- 5b:canon:start -->/);
+    assert.match(profile.content, /<!-- 5d:canon:end -->/);
+    assert.match(profile.content, /7b\. \*\*Banned-character gate/);
+    assert.match(profile.content, /7c\. \*\*Resident-tier customer-money scan/);
+    assert.match(profile.content, /Report measured byte sizes taken from/);
   });
 
   it('mechanically resolves selected governance into a verifiable Memory Sync directive', () => {
@@ -279,5 +284,8 @@ describe('Agent and Deployment Profile selection', () => {
     assert.doesNotMatch(defaultSkill, /3ai-shared/i);
     assert.doesNotMatch(defaultSkill, /Mylos/);
     assert.doesNotMatch(defaultSkill, /veda/);
+    assert.match(defaultSkill, /task-attention\.md/);
+    assert.doesNotMatch(defaultSkill, /NO\.1080 UNION/);
+    assert.doesNotMatch(defaultSkill, /<!-- 5b:canon:start -->/);
   });
 });
