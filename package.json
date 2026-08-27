@@ -12,7 +12,13 @@
     "pretest": "node scripts/install-skill-deps.js",
     "test": "npm run test:jest && npm run test:node",
     "test:jest": "node --experimental-vm-modules node_modules/.bin/jest",
-    "test:node": "node scripts/run-node-tests.js"
+    "test:node": "node scripts/run-node-tests.js",
+    "test:governance": "npm run test:jest -- --runInBand test/agent-governance.test.js",
+    "governance:check": "node scripts/agent-governance-check.js --mode=check",
+    "governance:release": "node scripts/agent-governance-check.js --mode=release",
+    "governance:deploy": "node scripts/agent-governance-check.js --mode=deploy",
+    "release:gate": "node scripts/agent-governance-check.js --mode=release",
+    "deploy:gate": "node scripts/agent-governance-check.js --mode=deploy"
   },
   "repository": {
     "type": "git",
