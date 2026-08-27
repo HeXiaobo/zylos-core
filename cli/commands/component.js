@@ -250,6 +250,7 @@ export async function upgradeComponent(args) {
   const upgradeAll = args.includes('--all');
   const skipEval = args.includes('--skip-eval');
   const beta = args.includes('--beta');
+  const dryRun = args.includes('--dry-run');
   const hasTempDirFlag = args.includes('--temp-dir');
 
   if (hasTempDirFlag) {
@@ -329,6 +330,25 @@ export async function upgradeComponent(args) {
     return true;
   });
 
+  // The generic component command has a mutating implementation and does not
+  // own the release-bound preflight contract. Never silently ignore a
+  // --dry-run request and fall through to prompts, locks, hooks, or writes.
+  // Use a parameterized release wrapper for this operation.
+  if (dryRun) {
+    const message = 'generic component --dry-run is unsupported; use scripts/upgrade-hxa-connect.js with an immutable release binding';
+    const output = {
+      action: 'upgrade',
+      component: target || null,
+      success: false,
+      error: 'dry_run_unsupported',
+      message,
+    };
+    if (jsonOutput) console.log(JSON.stringify(output, null, 2));
+    else console.error(`Error: ${message}`);
+    process.exitCode = 1;
+    return;
+  }
+
   let repoOverride = null;
   if (hasRepoOverride) {
     try {
@@ -367,6 +387,7 @@ export async function upgradeComponent(args) {
     console.error('       zylos upgrade --self');
     console.log('\nOptions:');
     console.log('  --check        Check for updates only (downloads to temp for comparison)');
+    console.log('  --dry-run      Unsupported here; use the release-bound upgrade wrapper');
     console.log('  --json         Output in JSON format');
     console.log('  --yes, -y      Skip confirmation');
     console.log('  --skip-eval    Skip upgrade analysis of local changes');
