@@ -331,6 +331,17 @@ projection event。
 并证明 `task.assigneeId` 精确等于部署默认负责人。缺少 Agent identity、没有创建任务、
 队列不可读或负责人不一致时，整笔升级必须 `HOLD`，不得等真实业务积压后再发现。
 
+### 2.20 临时 bootstrap 必须证明主程序实际执行
+
+macOS 的 `/var` 与 `/private/var` 指向同一文件系统位置。Core `0.7.2-rc.14` 之前的
+pair、HXA recovery 与 SS blocker Node 入口用未解析路径字符串判断主模块；从
+`mktemp` 下载后可能因此静默跳过 `run*()`，以 0 退出却不生成报告。固定入口现按
+`dev + ino` 文件身份判断同一文件，并有 path-alias 回归测试。
+
+调用方不得把 shell exit 0 单独当成成功。每次 bootstrap 后必须发现本次新建的
+`summary.json`，其 `startedAt` 位于本次执行窗口、目标 SHA/version 与冻结值相同，且
+`status/result` 达到该模式要求；没有新报告一律 `HOLD_BOOTSTRAP_NO_REPORT`。
+
 SS 业务技能恢复采用冻结观察集而非“全量缺失”口径：当前观察集为 7 个名字，其中
 5 个已通过 verify/dry-run/execute 并回读为 `ALREADY_EXACT`，2 个因源不完整保持
 `HOLD`。观察集之外的 xiaohongshu、meeting-notes-processor、zsxq-skill 需单独
@@ -494,7 +505,7 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.13' \
+      --core-version '0.7.2-rc.14' \
       --feishu-version '0.3.7-rc.7' \
       --agent '<agent-id>' \
       --execute

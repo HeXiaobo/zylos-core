@@ -28,6 +28,17 @@ export const SS_BLOCKER_TARGETS = Object.freeze([
   }),
 ]);
 
+export function pathsReferToSameFile(leftPath, rightPath, fsApi = fs) {
+  if (!leftPath || !rightPath) return false;
+  try {
+    const left = fsApi.statSync(leftPath);
+    const right = fsApi.statSync(rightPath);
+    return left.dev === right.dev && left.ino === right.ino;
+  } catch {
+    return false;
+  }
+}
+
 class HoldError extends Error {
   constructor(message, code = 'RECOVERY_HOLD') {
     super(message);
@@ -451,6 +462,5 @@ export function runBlockerRecovery(argv = process.argv.slice(2)) {
   }
 }
 
-const isMain = process.argv[1]
-  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = pathsReferToSameFile(process.argv[1], fileURLToPath(import.meta.url));
 if (isMain) process.exitCode = runBlockerRecovery();

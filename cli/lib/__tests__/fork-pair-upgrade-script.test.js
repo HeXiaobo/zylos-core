@@ -9,6 +9,7 @@ import {
   executeCoreBackupRetention,
   planCoreBackupRetention,
   planPm2PreflightRepairs,
+  pathsReferToSameFile as upgradePathsReferToSameFile,
   validateCoreSource,
   validateFeishuSource,
   validatePm2Snapshot,
@@ -16,6 +17,7 @@ import {
 } from '../../../scripts/upgrade-fork-pair.js';
 import {
   buildHxaProbeCommands,
+  pathsReferToSameFile as hxaPathsReferToSameFile,
   validateHxaPm2Process,
   validateHxaRegistryEntry,
   validateHxaSource,
@@ -23,6 +25,7 @@ import {
 } from '../../../scripts/restore-hxa-connect.js';
 import {
   SS_BLOCKER_TARGETS,
+  pathsReferToSameFile as blockerPathsReferToSameFile,
   validatePinnedBlockerRecoveryTarget,
   validateRequiredComponentPm2,
   validateRequiredComponentRegistry,
@@ -110,6 +113,25 @@ function writeFeishuFixture(root) {
 }
 
 describe('fork-pair upgrade target contract', () => {
+  it('recognizes a bootstrap entrypoint reached through a filesystem path alias', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-main-module-alias-'));
+    try {
+      const realDir = path.join(root, 'real');
+      const aliasDir = path.join(root, 'alias');
+      fs.mkdirSync(realDir);
+      fs.writeFileSync(path.join(realDir, 'entry.js'), '#!/usr/bin/env node\n');
+      fs.symlinkSync(realDir, aliasDir);
+      const realPath = path.join(realDir, 'entry.js');
+      const aliasPath = path.join(aliasDir, 'entry.js');
+
+      assert.equal(upgradePathsReferToSameFile(aliasPath, realPath), true);
+      assert.equal(hxaPathsReferToSameFile(aliasPath, realPath), true);
+      assert.equal(blockerPathsReferToSameFile(aliasPath, realPath), true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   function writeCoreBackup(root, name, version, mtimeMs) {
     const backupDir = path.join(root, name);
     fs.mkdirSync(path.join(backupDir, 'core-package'), { recursive: true });

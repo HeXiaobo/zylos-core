@@ -25,6 +25,17 @@ const CORE_BACKUP_QUARANTINE_PREFIX = '.zylos-core-retention-quarantine-';
 const CORE_BACKUP_RETENTION_LOCK = 'core-backup-retention.lock';
 const CORE_BACKUP_OWNER_MARKER = '.zylos-core-backup-owner.json';
 
+export function pathsReferToSameFile(leftPath, rightPath, fsApi = fs) {
+  if (!leftPath || !rightPath) return false;
+  try {
+    const left = fsApi.statSync(leftPath);
+    const right = fsApi.statSync(rightPath);
+    return left.dev === right.dev && left.ino === right.ino;
+  } catch {
+    return false;
+  }
+}
+
 const FEISHU_REQUIRED_CORE_PROTOCOLS = Object.freeze({
   'c4.reply': 2,
   'c4.reply.argv-compat': 1,
@@ -1545,6 +1556,5 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
   }
 }
 
-const isMain = process.argv[1]
-  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = pathsReferToSameFile(process.argv[1], fileURLToPath(import.meta.url));
 if (isMain) process.exitCode = runForkPairUpgrade();

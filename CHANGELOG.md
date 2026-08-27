@@ -5,6 +5,16 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.14] - 2026-08-27
+
+### Fixed
+- Immutable fork-pair, HXA recovery, and SS blocker bootstraps now identify
+  their downloaded Node entrypoints by filesystem identity. macOS aliases
+  `/var` as `/private/var`; comparing unresolved path strings previously made
+  a valid temporary entrypoint look like an imported module, causing a silent
+  zero-exit no-op with no report. The fixed scripts execute normally through
+  either path and retain their structured fail-closed reports.
+
 ## [0.7.2-rc.13] - 2026-08-27
 
 ### Fixed
