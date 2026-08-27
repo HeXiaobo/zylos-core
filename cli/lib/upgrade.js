@@ -577,7 +577,7 @@ function step5_npmInstall(ctx) {
   }
 
   try {
-    execSync('npm install --omit=dev', {
+    execSync('npm install --omit=dev --ignore-scripts', {
       cwd: ctx.skillDir,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -840,7 +840,7 @@ export function rollback(ctx, deps = {}) {
     const packageJson = path.join(ctx.skillDir, 'package.json');
     if (fs.existsSync(packageJson)) {
       try {
-        execSync('npm install --omit=dev', {
+        execSync('npm install --omit=dev --ignore-scripts', {
           cwd: ctx.skillDir,
           stdio: ['pipe', 'pipe', 'pipe'],
         });
