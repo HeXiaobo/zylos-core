@@ -174,7 +174,7 @@ export function createExternalLinkModule({
     ) VALUES (?, ?, ?, ?, ?, ?)
   `);
 
-  const linkTransaction = database.transaction((rawRequest) => {
+  function linkWithinTransaction(rawRequest) {
     const request = normalizeLink(rawRequest);
     const requestFingerprint = fingerprint(request);
     const receipt = selectReceipt.get(request.idempotencyKey);
@@ -249,9 +249,11 @@ export function createExternalLinkModule({
       timestamp,
     );
     return result;
-  });
+  }
 
-  return Object.freeze({
+  const linkTransaction = database.transaction(linkWithinTransaction);
+
+  const publicInterface = Object.freeze({
     link(request) {
       return linkTransaction.immediate(request);
     },
@@ -282,4 +284,8 @@ export function createExternalLinkModule({
       `).all(normalized.backend, normalized.limit).map(toLinkView);
     },
   });
+
+  // Core-only seam: adoption composes the same normalization, authorization,
+  // uniqueness, and receipt logic without opening a nested SQLite transaction.
+  return Object.freeze({ publicInterface, linkWithinTransaction });
 }
