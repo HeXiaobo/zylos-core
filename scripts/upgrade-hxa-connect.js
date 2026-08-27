@@ -308,6 +308,57 @@ function atomicWriteJson(filePath, value) {
   }
 }
 
+function persistTerminalSummary(summaryPath, summary) {
+  if (!summaryPath) return { summary, persisted: false, path: null, attempted: false };
+  try {
+    atomicWriteJson(summaryPath, summary);
+    return { summary, persisted: true, path: summaryPath, attempted: true };
+  } catch {
+    // Fall through to an adjacent terminal record. The caller must still
+    // report a non-zero result even when this fallback is successful.
+  }
+
+  const fallbackPath = path.join(path.dirname(summaryPath), `terminal-summary-${summary.executionId}.json`);
+  const fallbackSummary = {
+    ...summary,
+    code: 'SUMMARY_WRITE_FAILED',
+    checks: {
+      ...summary.checks,
+      terminalSummary: {
+        status: 'FALLBACK',
+        primary: 'FAILED',
+        path: path.basename(fallbackPath),
+      },
+    },
+  };
+  if (fallbackPath) {
+    try {
+      atomicWriteJson(fallbackPath, fallbackSummary);
+      return { summary: fallbackSummary, persisted: true, path: fallbackPath, attempted: true };
+    } catch {
+      // No filesystem evidence could be persisted. Return the safe terminal
+      // object for stdout/stderr rather than leaving a RUNNING-looking state.
+    }
+  }
+  return {
+    summary: {
+      ...fallbackSummary,
+      checks: {
+        ...fallbackSummary.checks,
+        terminalSummary: {
+          ...fallbackSummary.checks.terminalSummary,
+          status: 'FAILED',
+          primary: 'FAILED',
+          path: null,
+        },
+      },
+    },
+    persisted: false,
+    path: null,
+    attempted: true,
+  };
+}
+
 function parseArgs(argv) {
   const values = new Map([
     ['--repo', 'repo'],
@@ -972,9 +1023,27 @@ function collectExactSourceTree(root, label) {
   return files;
 }
 
-function verifyExactSourceTree(installedDir, stagedDir) {
+function sourceTreeDigest(files) {
+  const digest = crypto.createHash('sha256');
+  for (const [relative, metadata] of [...files.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    digest.update(`${relative}\0${metadata.bytes}\0${metadata.sha256}\n`);
+  }
+  return digest.digest('hex');
+}
+
+function freezeExactSourceTree(root, label) {
+  const files = collectExactSourceTree(root, label);
+  return Object.freeze({
+    files,
+    sha256: sourceTreeDigest(files),
+  });
+}
+
+function verifyExactSourceTree(installedDir, frozenCandidate) {
   const installed = collectExactSourceTree(installedDir, 'installed HXA source');
-  const staged = collectExactSourceTree(stagedDir, 'staged HXA source');
+  const staged = frozenCandidate?.files instanceof Map
+    ? frozenCandidate.files
+    : collectExactSourceTree(frozenCandidate, 'staged HXA source');
   const missing = [];
   const extra = [];
   const mismatched = [];
@@ -1002,6 +1071,7 @@ function verifyExactSourceTree(installedDir, stagedDir) {
     status: 'PASS',
     mode: 'overwrite',
     comparedFiles: staged.size,
+    candidateSha256: frozenCandidate?.sha256 || sourceTreeDigest(staged),
     missing: [],
     extra: [],
     mismatched: [],
@@ -1371,6 +1441,16 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
       extractedBytes: staged.extractedBytes,
       marker: fs.existsSync(path.join(staged.sourceDir, '.zylos-source.json')) ? 'MATCHED' : 'ABSENT',
     };
+    // Freeze the validated candidate before any lifecycle hook runs. A
+    // pre-upgrade hook executes with the candidate as its cwd and must not be
+    // able to redefine the bytes later used as provenance evidence.
+    const frozenCandidate = freezeExactSourceTree(staged.sourceDir, 'validated HXA source snapshot');
+    summary.checks.sourceSnapshot = {
+      status: 'PASS',
+      comparedFiles: frozenCandidate.files.size,
+      sha256: frozenCandidate.sha256,
+      excludedNames: [...EXACT_SOURCE_EXCLUDED_NAMES].sort(),
+    };
     summary.checks.package = {
       status: 'PASS',
       name: summary.checks.source.packageName,
@@ -1482,7 +1562,7 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
           }
           const exactSource = verifyExactSourceTree(
             transactionContext.skillDir,
-            transactionContext.tempDir,
+            frozenCandidate,
           );
           const runtime = verifyPostUpgradeRuntime(
             zylosDir,
@@ -1703,8 +1783,10 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
     summary.code = error.code || 'PREFLIGHT_FAILED';
     summary.error = error.message;
     summary.finishedAt = new Date().toISOString();
-    if (summaryPath) {
-      try { atomicWriteJson(summaryPath, summary); } catch {}
+    const terminalSummary = persistTerminalSummary(summaryPath, summary);
+    summary = terminalSummary.summary;
+    if (terminalSummary.attempted && !terminalSummary.persisted) {
+      process.stderr.write('HXA terminal summary persistence failed; terminal state is available only in this response\n');
     }
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
     return 1;

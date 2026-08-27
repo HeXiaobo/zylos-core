@@ -507,7 +507,13 @@ lifecycle:
 ---
 `, 'utf8');
     fs.mkdirSync(path.join(archiveRoot, 'hooks'), { recursive: true });
-    fs.writeFileSync(path.join(archiveRoot, 'hooks', 'pre-upgrade.js'), 'process.exit(0);\n', 'utf8');
+    fs.writeFileSync(path.join(archiveRoot, 'hooks', 'pre-upgrade.js'), [
+      "import fs from 'node:fs';",
+      "import path from 'node:path';",
+      "if (process.env.ZYLOS_TEST_MUTATE_CANDIDATE) fs.writeFileSync(path.join(process.cwd(), 'src', 'bot.js'), 'tampered-by-hook\\n');",
+      'process.exit(0);',
+      '',
+    ].join('\n'), 'utf8');
     fs.writeFileSync(path.join(archiveRoot, 'hooks', 'post-upgrade.js'), 'process.exit(0);\n', 'utf8');
     execFileSync('tar', ['czf', tarball, '-C', fixtureRoot, path.basename(archiveRoot)]);
 
@@ -517,6 +523,7 @@ lifecycle:
       "import fs from 'node:fs';",
       `fs.appendFileSync(${JSON.stringify(calls)}, 'pm2 ' + process.argv.slice(2).join(' ') + '\\n');`,
       "if (process.argv[2] === 'jlist') {",
+      "  if (process.env.ZYLOS_TEST_BREAK_SUMMARY && !fs.existsSync(process.env.ZYLOS_TEST_BREAK_MARKER)) { fs.writeFileSync(process.env.ZYLOS_TEST_BREAK_MARKER, '1'); fs.rmSync(process.env.ZYLOS_TEST_SUMMARY_PATH, { force: true }); fs.mkdirSync(process.env.ZYLOS_TEST_SUMMARY_PATH); }",
       `  process.stdout.write(${JSON.stringify(`${JSON.stringify([{ name: 'zylos-hxa-connect', pid: 1, pm2_env: { status: 'online', pm_exec_path: path.join(skillDir, 'src', 'bot.js'), restart_time: 0, unstable_restarts: 0 } }])}\n`)});`,
       '}',
     ].join('\n'), { mode: 0o755 });
@@ -596,6 +603,88 @@ lifecycle:
     assert.match(callLog, /pm2 (?:start .*--only zylos-hxa-connect|restart zylos-hxa-connect)/);
     assert.match(callLog, /pm2 save/);
     assert.match(callLog, /npm install/);
+
+    const terminalReportRoot = path.join(zylosDir, '.zylos', 'upgrade-reports', 'ZYL-TEST-TERMINAL-SUMMARY');
+    const terminalSummaryPath = path.join(terminalReportRoot, 'summary.json');
+    const terminalBreakMarker = path.join(fixtureRoot, 'terminal-summary-broken');
+    const terminalSummaryChild = runWithInjectedRuntime([
+      '--dry-run',
+      '--repo', 'HeXiaobo/zylos-hxa-connect',
+      '--sha', SHA,
+      '--version', '1.7.5',
+      '--agent', 'ss',
+      '--profile-id', 'profile-ss',
+      '--hostname', HOSTNAME,
+      '--release-id', 'ZYL-TEST-TERMINAL-SUMMARY',
+      '--report-root', terminalReportRoot,
+    ], {
+      cwd: fixtureRoot,
+      env: {
+        ...process.env,
+        ZYLOS_DIR: zylosDir,
+        PATH: childEnvAdditions.PATH,
+        ZYLOS_TEST_CALLS: calls,
+        ZYLOS_TEST_TARBALL: tarball,
+        ZYLOS_TEST_BREAK_SUMMARY: '1',
+        ZYLOS_TEST_BREAK_MARKER: terminalBreakMarker,
+        ZYLOS_TEST_SUMMARY_PATH: terminalSummaryPath,
+      },
+      tools,
+      childEnvAdditions: {
+        ...childEnvAdditions,
+        ZYLOS_TEST_BREAK_SUMMARY: '1',
+        ZYLOS_TEST_BREAK_MARKER: terminalBreakMarker,
+        ZYLOS_TEST_SUMMARY_PATH: terminalSummaryPath,
+      },
+    });
+    assert.notEqual(terminalSummaryChild.status, 0, `stdout:\n${terminalSummaryChild.stdout}\nstderr:\n${terminalSummaryChild.stderr}`);
+    const terminalSummaryOutput = JSON.parse(terminalSummaryChild.stdout);
+    assert.equal(terminalSummaryOutput.status, 'HOLD');
+    assert.equal(terminalSummaryOutput.result, 'HOLD');
+    assert.equal(terminalSummaryOutput.code, 'SUMMARY_WRITE_FAILED');
+    assert.equal(terminalSummaryOutput.checks.terminalSummary.status, 'FALLBACK');
+    const terminalFallbackPath = path.join(
+      terminalReportRoot,
+      `terminal-summary-${terminalSummaryOutput.executionId}.json`,
+    );
+    assert.equal(fs.existsSync(terminalFallbackPath), true);
+    const terminalFallback = JSON.parse(fs.readFileSync(terminalFallbackPath, 'utf8'));
+    assert.equal(terminalFallback.status, 'HOLD');
+    assert.notEqual(terminalFallback.checks.transaction?.status, 'RUNNING');
+
+    const candidateMutationReportRoot = path.join(zylosDir, '.zylos', 'upgrade-reports', 'ZYL-TEST-CANDIDATE-MUTATION');
+    const candidateMutation = runWithInjectedRuntime([
+      '--execute',
+      '--repo', 'HeXiaobo/zylos-hxa-connect',
+      '--sha', SHA,
+      '--version', '1.7.5',
+      '--agent', 'ss',
+      '--profile-id', 'profile-ss',
+      '--hostname', HOSTNAME,
+      '--release-id', 'ZYL-TEST-CANDIDATE-MUTATION',
+      '--report-root', candidateMutationReportRoot,
+    ], {
+      cwd: fixtureRoot,
+      env: {
+        ...process.env,
+        ZYLOS_DIR: zylosDir,
+        PATH: childEnvAdditions.PATH,
+        ZYLOS_TEST_CALLS: calls,
+        ZYLOS_TEST_TARBALL: tarball,
+        ZYLOS_TEST_MUTATE_CANDIDATE: '1',
+      },
+      tools,
+      childEnvAdditions,
+    });
+    assert.notEqual(candidateMutation.status, 0);
+    const candidateMutationOutput = JSON.parse(candidateMutation.stdout);
+    assert.equal(candidateMutationOutput.status, 'HOLD');
+    assert.equal(candidateMutationOutput.code, 'UPGRADE_FAILED');
+    assert.equal(candidateMutationOutput.checks.sourceSnapshot.status, 'PASS');
+    assert.equal(candidateMutationOutput.checks.transaction.result.failedStep, 10);
+    assert.match(candidateMutationOutput.checks.transaction.result.error, /exact candidate/i);
+    assert.equal(candidateMutationOutput.checks.rollback.status, 'PASS');
+    assert.equal(fs.readFileSync(path.join(skillDir, 'src', 'bot.js'), 'utf8'), 'new\n');
 
     const raceReportRoot = path.join(zylosDir, '.zylos', 'upgrade-reports', 'ZYL-TEST-IDENTITY-RACE');
     const race = runWithInjectedRuntime([
