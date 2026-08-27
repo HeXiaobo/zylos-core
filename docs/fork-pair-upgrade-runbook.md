@@ -347,6 +347,21 @@ SS 业务技能恢复采用冻结观察集而非“全量缺失”口径：当�
 `HOLD`。观察集之外的 xiaohongshu、meeting-notes-processor、zsxq-skill 需单独
 取证，任何同侪或 HXA 转述都不能替代 Owner 在飞书 user identity 的直接授权。
 
+### 2.21 活跃 Core 任务与原生任务必须守恒
+
+升级与验收期间只允许 Core projection 创建新的原生任务；并行审计线程必须只读，
+不得再调用 legacy `feishu-task-mirror create`。短确认语（如“已授权”“确认添加”）
+属于既有交互的授权/回执，不是新的工作项；Core `0.7.2-rc.15` 会在 high-risk 词判定前
+将这类完整短句固定路由到普通聊天。
+
+pair upgrader 在修改前和完整 postcheck 后都执行同一条守恒门禁：所有活跃 Core 任务
+必须有负责人；当前 Agent 的 `ready`/`in_progress` 任务必须恰好对应一张未完成卡，
+`review` 必须恰好对应一张已完成卡；description、extra marker 与持久
+`feishu-task-v2` link 三者必须一致。当前 app 的未完成卡不得缺 link，也不得指向终态
+或其他负责人的 Core 任务。门禁使用 Core 与飞书各自的双次稳定全量分页快照；任一侧
+缺失、重复、变化、晚到或孤立都返回 `NATIVE_TASK_CONSERVATION_FAILED`。已完成/已取消
+历史和旧 dead-letter 只保留审计，不进入当前工作分母，也不盲目 redrive。
+
 ## 3. 发布前准备
 
 发布负责人在本机完成以下检查，并记录两端的完整 SHA：
@@ -505,8 +520,8 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.14' \
-      --feishu-version '0.3.7-rc.7' \
+      --core-version '0.7.2-rc.15' \
+      --feishu-version '0.3.7-rc.8' \
       --agent '<agent-id>' \
       --execute
 ```
@@ -518,6 +533,8 @@ curl -fsSL \
   `HeXiaobo/zylos-feishu`；
 - `c4-receive.js` 仍存在、可用磁盘不少于 5 GiB；
 - 现有关键 PM2 进程在线且执行文件真实存在。
+- 活跃 Core / 当前 Agent 原生任务满足一对一守恒，且不存在无负责人的活跃 Core
+  任务或无 Core link 的当前 app 未完成卡。
 - 所有声称 online 的 PM2 进程都有真实 executable；组件代码缺失会在事务前
   `HOLD`，不会等 Core step 12 再回滚。
 - 若检测到旧回滚留下的、路径和目标均完全匹配的 response supervisor 幽灵条目，

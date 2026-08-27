@@ -81,6 +81,10 @@ const REGRESSION_CASES = [
   ['看看这个客户怎么处理？', 'chat_only'],
   ['你好玥然', 'chat_only'],
   ['谢谢，已经解决了', 'chat_only'],
+  ['已授权', 'chat_only'],
+  ['确认添加', 'chat_only'],
+  ['同意继续', 'chat_only'],
+  ['收到', 'chat_only'],
   ['我刚刚完成了客户回访', 'chat_only'],
   ['这是本周的销售数据', 'chat_only'],
 ];
@@ -101,6 +105,24 @@ test('information questions stay chat-only even when they mention high-risk acti
   ]) {
     assert.equal(classify(inbound(text)).decision, 'chat_only', text);
   }
+});
+
+test('standalone acknowledgements never become new high-risk tasks', () => {
+  for (const text of ['已授权', '确认', '确认添加', '同意继续', '好的', 'OK']) {
+    const decision = classify(inbound(text), {
+      defaultAssigneeId: 'agent:yueran',
+    });
+    assert.equal(decision.decision, 'chat_only', text);
+    assert.equal(decision.reasonCode, 'ACKNOWLEDGEMENT_ONLY', text);
+    assert.equal(decision.taskDraft, null, text);
+  }
+
+  assert.equal(
+    classify(inbound('任务：授权小王访问项目'), {
+      defaultAssigneeId: 'agent:yueran',
+    }).decision,
+    'confirm',
+  );
 });
 
 test('recognizes an explicit task behind a chat label and polite wrapper', () => {

@@ -6,12 +6,14 @@ import { describe, it } from 'node:test';
 
 import {
   buildUpgradeCommands,
+  buildNativeTaskConservationCommand,
   executeCoreBackupRetention,
   planCoreBackupRetention,
   planPm2PreflightRepairs,
   pathsReferToSameFile as upgradePathsReferToSameFile,
   validateCoreSource,
   validateFeishuSource,
+  validateNativeTaskDeploymentIdentity,
   validatePm2Snapshot,
   validatePinnedTarget,
 } from '../../../scripts/upgrade-fork-pair.js';
@@ -54,6 +56,7 @@ function writeCoreFixture(root) {
       'commitment-core': 1,
       'projection-outbox': 1,
       'external-task-adapter': 1,
+      'native-task-conservation-inventory': 1,
       'task-reminder': 1,
     },
   }));
@@ -65,6 +68,7 @@ function writeCoreFixture(root) {
     'skills/activity-monitor/scripts/assistant-turn-binding.js',
     'scripts/upgrade-fork-pair.js',
     'scripts/upgrade-fork-pair.sh',
+    'cli/lib/native-task-conservation-inventory.js',
   ]) {
     const filePath = path.join(root, relativePath);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -81,6 +85,9 @@ function writeFeishuFixture(root) {
     schemaVersion: 1,
     product: 'zylos-feishu',
     release: '0.3.7-rc.5',
+    provides: {
+      'feishu.native-task-conservation-gate': 1,
+    },
     requires: {
       'zylos-core': {
         protocols: {
@@ -92,6 +99,7 @@ function writeFeishuFixture(root) {
           'commitment-core': 1,
           'projection-outbox': 1,
           'external-task-adapter': 1,
+          'native-task-conservation-inventory': 1,
           'task-reminder': 1,
         },
       },
@@ -103,6 +111,9 @@ function writeFeishuFixture(root) {
     'hooks/post-upgrade.js',
     'scripts/native-task-closure-gate.js',
     'scripts/native-task-completion-gate.js',
+    'scripts/native-task-conservation-gate.js',
+    'src/lib/native-task-conservation-gate.js',
+    'src/lib/native-task-conservation-remote.js',
     'src/lib/task-comment-worker.js',
     'src/lib/task-v2-projection.js',
   ]) {
@@ -230,6 +241,39 @@ describe('fork-pair upgrade target contract', () => {
     assert.match(missingAgent.error, /agent identity/);
   });
 
+  it('binds the requested Agent, WorkIntake assignee, and Feishu App mapping', () => {
+    assert.deepEqual(validateNativeTaskDeploymentIdentity({
+      requestedAgent: 'yueran',
+      agentId: 'agent:yueran',
+      defaultAssigneeId: 'agent:yueran',
+      appId: 'cli_yueran',
+      agentAppIds: '{"agent:yueran":"cli_yueran"}',
+    }), {
+      ok: true,
+      identity: { agentId: 'agent:yueran', appId: 'cli_yueran' },
+    });
+
+    assert.equal(validateNativeTaskDeploymentIdentity({
+      requestedAgent: 'ss',
+      agentId: 'agent:yueran',
+      appId: 'cli_yueran',
+      agentAppIds: { 'agent:yueran': 'cli_yueran' },
+    }).ok, false);
+    assert.equal(validateNativeTaskDeploymentIdentity({
+      requestedAgent: 'yueran',
+      agentId: 'agent:yueran',
+      defaultAssigneeId: 'agent:ss',
+      appId: 'cli_yueran',
+      agentAppIds: { 'agent:yueran': 'cli_yueran' },
+    }).ok, false);
+    assert.equal(validateNativeTaskDeploymentIdentity({
+      requestedAgent: 'yueran',
+      agentId: 'agent:yueran',
+      appId: 'cli_yueran',
+      agentAppIds: { 'agent:yueran': 'cli_other' },
+    }).ok, false);
+  });
+
   it('fails source validation when an immutable Core archive lacks c4-receive', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
     try {
@@ -328,6 +372,24 @@ describe('fork-pair upgrade target contract', () => {
       args: [
         '/opt/zylos/cli/zylos.js', 'upgrade', 'feishu', '--branch', FEISHU_SHA,
         '--yes', '--skip-eval', '--json',
+      ],
+    });
+  });
+
+  it('builds the Feishu conservation gate around the public Core inventory', () => {
+    const command = buildNativeTaskConservationCommand({
+      nodePath: '/usr/bin/node',
+      coreDir: '/opt/zylos',
+      feishuDir: '/opt/zylos-feishu',
+    });
+
+    assert.deepEqual(command, {
+      command: '/usr/bin/node',
+      args: [
+        '/opt/zylos-feishu/scripts/native-task-conservation-gate.js',
+        '--core-inventory-command', '/usr/bin/node',
+        '--core-inventory-arg', '/opt/zylos/cli/lib/native-task-conservation-inventory.js',
+        '--timeout-ms', '90000',
       ],
     });
   });

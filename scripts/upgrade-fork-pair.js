@@ -45,12 +45,17 @@ const FEISHU_REQUIRED_CORE_PROTOCOLS = Object.freeze({
   'commitment-core': 1,
   'projection-outbox': 1,
   'external-task-adapter': 1,
+  'native-task-conservation-inventory': 1,
   'task-reminder': 1,
 });
 
 const CORE_TARGET_PROTOCOLS = Object.freeze({
   ...FEISHU_REQUIRED_CORE_PROTOCOLS,
   'c4.reply.body-file': 1,
+});
+
+const FEISHU_TARGET_PROTOCOLS = Object.freeze({
+  'feishu.native-task-conservation-gate': 1,
 });
 
 const CORE_ASSETS = Object.freeze([
@@ -61,6 +66,7 @@ const CORE_ASSETS = Object.freeze([
   'skills/activity-monitor/scripts/assistant-turn-binding.js',
   'scripts/upgrade-fork-pair.js',
   'scripts/upgrade-fork-pair.sh',
+  'cli/lib/native-task-conservation-inventory.js',
 ]);
 
 const FEISHU_ASSETS = Object.freeze([
@@ -69,6 +75,9 @@ const FEISHU_ASSETS = Object.freeze([
   'hooks/post-upgrade.js',
   'scripts/native-task-closure-gate.js',
   'scripts/native-task-completion-gate.js',
+  'scripts/native-task-conservation-gate.js',
+  'src/lib/native-task-conservation-gate.js',
+  'src/lib/native-task-conservation-remote.js',
   'src/lib/task-comment-worker.js',
   'src/lib/task-v2-projection.js',
 ]);
@@ -127,6 +136,61 @@ export function validatePinnedTarget({ coreSha, feishuSha, coreVersion, feishuVe
   return { ok: true };
 }
 
+function canonicalAgentId(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return null;
+  return text.startsWith('agent:') ? text : `agent:${text}`;
+}
+
+export function validateNativeTaskDeploymentIdentity({
+  requestedAgent,
+  agentId,
+  defaultAssigneeId,
+  appId,
+  agentAppIds,
+} = {}) {
+  const expectedAgentId = canonicalAgentId(requestedAgent);
+  const deploymentAgentId = canonicalAgentId(agentId);
+  const normalizedDefault = defaultAssigneeId
+    ? canonicalAgentId(defaultAssigneeId)
+    : deploymentAgentId;
+  const normalizedAppId = String(appId || '').trim();
+  if (!expectedAgentId || !deploymentAgentId || expectedAgentId !== deploymentAgentId) {
+    return {
+      ok: false,
+      error: `requested Agent ${expectedAgentId || '(missing)'} does not match ZYLOS_AGENT_ID ${deploymentAgentId || '(missing)'}`,
+    };
+  }
+  if (normalizedDefault !== deploymentAgentId) {
+    return {
+      ok: false,
+      error: `C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID ${normalizedDefault || '(missing)'} does not match ZYLOS_AGENT_ID ${deploymentAgentId}`,
+    };
+  }
+  if (!normalizedAppId) {
+    return { ok: false, error: 'FEISHU_APP_ID is required' };
+  }
+  let mappings;
+  try {
+    mappings = typeof agentAppIds === 'string' ? JSON.parse(agentAppIds) : agentAppIds;
+  } catch (error) {
+    return { ok: false, error: `FEISHU_TASK_V2_AGENT_APP_IDS is invalid JSON: ${error.message}` };
+  }
+  if (!mappings || typeof mappings !== 'object' || Array.isArray(mappings)) {
+    return { ok: false, error: 'FEISHU_TASK_V2_AGENT_APP_IDS must be an object' };
+  }
+  if (String(mappings[deploymentAgentId] || '').trim() !== normalizedAppId) {
+    return {
+      ok: false,
+      error: `FEISHU_TASK_V2_AGENT_APP_IDS must map ${deploymentAgentId} to FEISHU_APP_ID`,
+    };
+  }
+  return {
+    ok: true,
+    identity: Object.freeze({ agentId: deploymentAgentId, appId: normalizedAppId }),
+  };
+}
+
 export function validateCoreSource(root, expectedVersion, fsApi = fs) {
   try {
     const pkg = readJson(path.join(root, 'package.json'), fsApi);
@@ -175,6 +239,7 @@ export function validateFeishuSource(root, expectedVersion, fsApi = fs) {
       capabilities.requires?.['zylos-core']?.protocols,
       FEISHU_REQUIRED_CORE_PROTOCOLS,
     ));
+    errors.push(...validateProtocols(capabilities.provides, FEISHU_TARGET_PROTOCOLS));
     const missing = validateAssets(root, FEISHU_ASSETS, fsApi);
     if (missing.length > 0) errors.push(`missing critical Feishu assets: ${missing.join(', ')}`);
     return errors.length === 0 ? { ok: true, package: pkg, capabilities } : {
@@ -209,6 +274,23 @@ export function buildUpgradeCommands({
         '--yes', '--skip-eval', '--json',
       ],
     },
+  };
+}
+
+export function buildNativeTaskConservationCommand({
+  nodePath,
+  coreDir,
+  feishuDir,
+  timeoutMs = 90_000,
+}) {
+  return {
+    command: nodePath,
+    args: [
+      path.join(feishuDir, 'scripts', 'native-task-conservation-gate.js'),
+      '--core-inventory-command', nodePath,
+      '--core-inventory-arg', path.join(coreDir, 'cli', 'lib', 'native-task-conservation-inventory.js'),
+      '--timeout-ms', String(timeoutMs),
+    ],
   };
 }
 
@@ -1285,6 +1367,85 @@ function runCommunicationCanary(installedCoreDir, zylosDir) {
   return payload;
 }
 
+function runNativeTaskConservationGate({
+  coreDir,
+  feishuDir,
+  zylosDir,
+  requestedAgent,
+  reportPath,
+}) {
+  const envPath = path.join(zylosDir, '.env');
+  const configured = {
+    requestedAgent,
+    agentId: persistedEnvValue(envPath, 'ZYLOS_AGENT_ID'),
+    defaultAssigneeId: persistedEnvValue(envPath, 'C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID'),
+    appId: persistedEnvValue(envPath, 'FEISHU_APP_ID'),
+    agentAppIds: persistedEnvValue(envPath, 'FEISHU_TASK_V2_AGENT_APP_IDS'),
+  };
+  const identity = validateNativeTaskDeploymentIdentity(configured);
+  if (!identity.ok) {
+    throw new HoldError(
+      `native task deployment identity is invalid: ${identity.error}`,
+      'NATIVE_TASK_CONSERVATION_FAILED',
+    );
+  }
+  const command = buildNativeTaskConservationCommand({
+    nodePath: process.execPath,
+    coreDir,
+    feishuDir,
+  });
+  const gateEnv = {
+    ...process.env,
+    ZYLOS_DIR: zylosDir,
+    ZYLOS_AGENT_ID: identity.identity.agentId,
+    FEISHU_APP_ID: identity.identity.appId,
+    FEISHU_TASK_V2_AGENT_APP_IDS: configured.agentAppIds,
+    ...(configured.defaultAssigneeId
+      ? { C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: configured.defaultAssigneeId }
+      : {}),
+  };
+  const gateRun = run(command.command, command.args, {
+    env: gateEnv,
+    cwd: feishuDir,
+    timeout: 120_000,
+  });
+  const report = parseJsonOutput(gateRun.status === 2 ? gateRun.stderr : gateRun.stdout) ?? {
+    schema: 'zylos.native-task-conservation-gate/error-v1',
+    passed: false,
+    failureCodes: ['INVALID_GATE_OUTPUT'],
+    error: {
+      message: gateRun.error
+        || gateRun.stderr.trim()
+        || gateRun.stdout.trim()
+        || `gate exited ${gateRun.status}`,
+    },
+  };
+  atomicWriteJson(reportPath, report);
+  if (gateRun.status !== 0 || gateRun.error) {
+    throw new HoldError(
+      `native task conservation failed: ${(report.failureCodes || ['GATE_RUNTIME_ERROR']).join(', ')}`,
+      'NATIVE_TASK_CONSERVATION_FAILED',
+    );
+  }
+  if (
+    report.schema !== 'zylos.native-task-conservation-gate/v1'
+    || report.passed !== true
+    || report.deployment?.agentId !== identity.identity.agentId
+    || report.deployment?.appId !== identity.identity.appId
+    || report.inventory?.core?.schema !== 'zylos.native-task-core-inventory/v1'
+    || report.inventory?.core?.snapshot?.stable !== true
+    || report.inventory?.core?.identity?.agentId !== identity.identity.agentId
+    || report.inventory?.remote?.identity?.kind !== 'app'
+    || report.inventory?.remote?.identity?.appId !== identity.identity.appId
+  ) {
+    throw new HoldError(
+      'native task conservation returned an invalid or mismatched PASS report',
+      'NATIVE_TASK_CONSERVATION_FAILED',
+    );
+  }
+  return report;
+}
+
 function makeReportDir(zylosDir, explicitRoot) {
   const root = explicitRoot
     ? path.resolve(explicitRoot)
@@ -1344,6 +1505,17 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
     stageImmutableArchive(FEISHU_REPO, args.feishuSha, stagedFeishuDir);
     const feishuSource = validateFeishuSource(stagedFeishuDir, args.feishuVersion);
     if (!feishuSource.ok) throw new HoldError(feishuSource.error, 'INVALID_FEISHU_SOURCE');
+    const liveFeishuDir = path.join(zylosDir, '.claude', 'skills', 'feishu');
+    const liveFeishuNodeModules = path.join(liveFeishuDir, 'node_modules');
+    try {
+      if (!fs.statSync(liveFeishuNodeModules).isDirectory()) throw new Error('not a directory');
+      fs.symlinkSync(liveFeishuNodeModules, path.join(stagedFeishuDir, 'node_modules'), 'dir');
+    } catch (error) {
+      throw new HoldError(
+        `target Feishu preflight cannot reuse live runtime dependencies: ${error.message}`,
+        'INVALID_FEISHU_SOURCE',
+      );
+    }
 
     const envPath = path.join(zylosDir, '.env');
     const persistedCoreRepo = persistedEnvValue(envPath, 'ZYLOS_SELF_UPGRADE_REPO');
@@ -1415,6 +1587,14 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
       };
     }
 
+    const nativeTaskConservation = runNativeTaskConservationGate({
+      coreDir: stagedCoreDir,
+      feishuDir: stagedFeishuDir,
+      zylosDir,
+      requestedAgent: args.agent,
+      reportPath: path.join(reportDir, 'native-task-conservation-preflight.json'),
+    });
+
     summary.preflight = {
       status: 'PASS',
       diskAvailableKb,
@@ -1429,6 +1609,7 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
         c4Database: hashFile(path.join(zylosDir, 'comm-bridge', 'c4.db')),
       },
       pm2: beforePm2,
+      nativeTaskConservation,
     };
     atomicWriteJson(summaryPath, summary);
 
@@ -1494,7 +1675,6 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
     summary.feishuUpgraded = true;
     atomicWriteJson(summaryPath, summary);
 
-    const liveFeishuDir = path.join(zylosDir, '.claude', 'skills', 'feishu');
     const liveFeishu = validateFeishuSource(liveFeishuDir, args.feishuVersion);
     if (!liveFeishu.ok) throw new HoldError(liveFeishu.error, 'POSTCHECK_FAILED');
 
@@ -1504,12 +1684,20 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
       throw new HoldError(afterPm2Errors.join('; '), 'POSTCHECK_FAILED');
     }
     const communication = runCommunicationCanary(installedCoreDir, zylosDir);
+    const nativeTaskConservationPostcheck = runNativeTaskConservationGate({
+      coreDir: installedCoreDir,
+      feishuDir: liveFeishuDir,
+      zylosDir,
+      requestedAgent: args.agent,
+      reportPath: path.join(reportDir, 'native-task-conservation.json'),
+    });
 
     summary.postcheck = {
       status: 'PASS',
       coreVersion: installedCore.package.version,
       feishuVersion: liveFeishu.package.version,
       communication,
+      nativeTaskConservation: nativeTaskConservationPostcheck,
       hashes: {
         env: hashFile(envPath),
         components: hashFile(componentsPath),
@@ -1544,9 +1732,11 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
     summary.status = 'HOLD';
     summary.code = error.code || 'UNEXPECTED_ERROR';
     summary.error = error.message;
-    summary.result = summary.coreUpgraded && !summary.feishuUpgraded
-      ? 'CORE_UPGRADED_FEISHU_ROLLED_BACK_OR_UNCHANGED'
-      : 'NO_VERIFIED_PAIR_UPGRADE';
+    summary.result = summary.coreUpgraded && summary.feishuUpgraded
+      ? 'UPGRADED_UNVERIFIED'
+      : summary.coreUpgraded
+        ? 'CORE_UPGRADED_FEISHU_ROLLED_BACK_OR_UNCHANGED'
+        : 'NO_VERIFIED_PAIR_UPGRADE';
     summary.finishedAt = new Date().toISOString();
     atomicWriteJson(summaryPath, summary);
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);

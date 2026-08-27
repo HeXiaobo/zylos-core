@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "product": "zylos-core",
-  "release": "0.7.2-rc.14",
+  "release": "0.7.2-rc.15",
   "protocols": {
     "c4.reply": 2,
     "c4.reply.argv-compat": 1,
@@ -11,6 +11,7 @@
     "work-intake": 1,
     "commitment-core": 1,
     "external-task-adapter": 1,
+    "native-task-conservation-inventory": 1,
     "projection-outbox": 1,
     "task-reminder": 1
   },

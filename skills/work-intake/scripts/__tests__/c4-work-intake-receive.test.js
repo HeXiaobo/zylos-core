@@ -481,6 +481,33 @@ test('ordinary questions stay on the normal C4 chat path without task pollution'
   });
 });
 
+test('standalone authorization acknowledgements stay on chat without task pollution', () => {
+  withZylosDir((zylosDir) => {
+    const response = receive(
+      zylosDir,
+      inbound('已授权', 'om_authorization_ack'),
+      { env: { ZYLOS_AGENT_ID: 'agent:yueran' } },
+    );
+    assert.equal(response.action, 'queued');
+    assert.equal(response.workIntake.decision, 'chat_only');
+    assert.equal(response.workIntake.reasonCode, 'ACKNOWLEDGEMENT_ONLY');
+
+    const database = new Database(path.join(zylosDir, 'comm-bridge', 'c4.db'));
+    try {
+      assert.equal(
+        database.prepare('SELECT COUNT(*) AS count FROM commitment_intake_queue').get().count,
+        0,
+      );
+      assert.equal(
+        database.prepare('SELECT COUNT(*) AS count FROM conversations').get().count,
+        1,
+      );
+    } finally {
+      database.close();
+    }
+  });
+});
+
 test('a deferred response stream is opened only when WorkIntake resolves to ordinary chat', () => {
   withZylosDir((zylosDir) => {
     const assistantRequest = {

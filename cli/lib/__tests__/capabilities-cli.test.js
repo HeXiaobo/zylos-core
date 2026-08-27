@@ -30,6 +30,7 @@ describe('zylos capabilities', () => {
       'work-intake': 1,
       'commitment-core': 1,
       'external-task-adapter': 1,
+      'native-task-conservation-inventory': 1,
       'projection-outbox': 1,
       'task-reminder': 1,
     });

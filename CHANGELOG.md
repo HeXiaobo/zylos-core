@@ -5,6 +5,19 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.15] - 2026-08-27
+
+### Fixed
+- Standalone acknowledgements such as `已授权`, `确认添加`, and `收到` now stay
+  on the ordinary chat path. They can authorize an existing interaction but
+  can no longer be interpreted as a fresh high-risk task merely because the
+  acknowledgement contains a word such as `授权`.
+- The fixed pair upgrader now enforces Core/native-task conservation both
+  before mutation and after upgrade using full, stable snapshots and
+  persistent `feishu-task-v2` links. `ready`/`in_progress` Agent work maps to
+  exactly one open card, `review` maps to exactly one completed card, and open
+  app cards may not be orphaned. Terminal audit history remains excluded.
+
 ## [0.7.2-rc.14] - 2026-08-27
 
 ### Fixed

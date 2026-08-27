@@ -12,6 +12,7 @@ const DUE_TEXT = /(?:今天|明天|后天|本周[一二三四五六日天]?|下�
 const REMINDER_TEXT = /提前\s*(\d+)\s*(分钟|小时|天)(?:\s*(?:提醒|通知))?/u;
 const QUESTION = /(?:[?？]\s*$|^(?:什么|为什么|怎么|如何|是否|能否|可以|有没有|哪里|谁|几点|多少|请问|我想(?:知道|了解)|想问(?:一下)?|能告诉我|可否告诉我))/u;
 const ONE_SHOT_REQUEST = /(?:告诉我|解释一下|查一下|查询一下|搜一下|翻译一下|总结这段|看看这张|分析一下|回答一下|推荐一下|计算一下|改写一下|润色一下|生成一段|现在几点|天气怎么样)/u;
+const ACKNOWLEDGEMENT_ONLY = /^(?:已?(?:确认|授权|同意|批准)|确认(?:添加|执行|继续|处理|发送|发布|安装|升级)?|同意(?:添加|执行|继续|处理|发送|发布|安装|升级)?|可以|行|好(?:的)?|收到|知道了|明白(?:了)?|继续|执行|开始|搞定|没问题|ok(?:ay)?|yes|confirm|approved?)[。！!，,\s]*$/iu;
 const AMBIGUOUS_REQUEST = /(?:看看(?:这个|这件事|这个事|一下)?|跟一下(?:这个|这件事|这个事)?|处理一下(?:这个|这件事|这个事)?|弄一下|关注一下|推进一下|安排一下|记一下|搞一下|留意一下|盯一下)/u;
 const HUMAN_ASSIGNMENT = /(?:交给|让|安排)\s*@?([\p{L}\p{N}_-]{1,20}?)\s*(?:来|负责|处理|完成|跟进|整理|推进)/u;
 const POLITE_HUMAN_ASSIGNMENT = /(?:请|麻烦)\s*@?([\p{L}\p{N}_-]{1,20}?)(?=在|今天|明天|后天|本周|下周|周|来|负责)/u;
@@ -233,6 +234,14 @@ export function classify(input, options) {
     return result(envelope, 'chat_only', QUESTION.test(directiveText)
       ? 'QUESTION_OR_INFORMATION_REQUEST'
       : 'ONE_SHOT_REQUEST');
+  }
+
+  // Acknowledgements authorize or confirm an already established interaction;
+  // they are never a new unit of work on their own. This must run before the
+  // high-risk verb gate because short replies such as “已授权” contain a risky
+  // action word without expressing a fresh task.
+  if (!explicitTask && ACKNOWLEDGEMENT_ONLY.test(directiveText)) {
+    return result(envelope, 'chat_only', 'ACKNOWLEDGEMENT_ONLY');
   }
 
   if (HIGH_RISK_ACTION.test(directiveText)) {
