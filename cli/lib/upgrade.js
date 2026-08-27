@@ -60,7 +60,9 @@ function getLocalVersion(skillDir) {
 /**
  * Get the repo for a component from components.json or registry.
  */
-export function getRepo(component) {
+export function getRepo(component, repoOverride = null) {
+  if (repoOverride) return repoOverride;
+
   const components = loadComponents();
   if (components[component]?.source?.type?.startsWith('local-')) return null;
   if (components[component]?.repo) return components[component].repo;
@@ -133,9 +135,15 @@ function getLatestVersion(component, repo, { beta = false } = {}) {
  * @param {string} component
  * @param {object} [opts]
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) versions
+ * @param {string|null} [opts.repoOverride=null] - Explicit GitHub owner/name
+ * @param {string|null} [opts.exactRef=null] - Immutable commit ref; skips moving tags
  * @returns {object} { success, hasUpdate, current, latest, repo }
  */
-export function checkForUpdates(component, { beta = false } = {}) {
+export function checkForUpdates(component, {
+  beta = false,
+  repoOverride = null,
+  exactRef = null,
+} = {}) {
   const skillDir = path.join(SKILLS_DIR, component);
 
   if (!fs.existsSync(skillDir)) {
@@ -158,7 +166,29 @@ export function checkForUpdates(component, { beta = false } = {}) {
     };
   }
 
-  const repo = getRepo(component);
+  const repo = getRepo(component, repoOverride);
+
+  // An explicit commit source is already immutable. Do not consult the
+  // installed repository's latest tag (or any moving tag in the override
+  // repository) before downloading the requested commit.
+  if (exactRef) {
+    if (!repo) {
+      return {
+        success: false,
+        error: 'remote_version_failed',
+        message: 'Cannot determine repository for the requested commit',
+      };
+    }
+    return {
+      success: true,
+      hasUpdate: true,
+      current: localVersion.version,
+      latest: null,
+      repo,
+      ref: exactRef,
+    };
+  }
+
   const latest = getLatestVersion(component, repo, { beta });
   if (!latest.success) {
     return {

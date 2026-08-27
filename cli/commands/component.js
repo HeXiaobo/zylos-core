@@ -23,6 +23,7 @@ import { acquireLock, releaseLock } from '../lib/lock.js';
 import { fetchRawFile } from '../lib/github.js';
 import { promptYesNo } from '../lib/prompts.js';
 import { evaluateUpgrade } from '../lib/claude-eval.js';
+import { validateComponentRepoOverride } from '../lib/component-repo-override.js';
 
 /**
  * Print a single upgrade step result in real time.
@@ -263,11 +264,40 @@ export async function upgradeComponent(args) {
     process.exit(1);
   }
 
-  // Parse --branch <name> flag
-  const branchIndex = args.indexOf('--branch');
-  const branch = branchIndex !== -1 ? args[branchIndex + 1] : null;
+  // Parse --branch <name> (or --branch=<name>) flag.
+  const branchFlagIndices = args
+    .map((arg, index) => ({ arg, index }))
+    .filter(({ arg }) => arg === '--branch' || arg.startsWith('--branch='));
+  if (branchFlagIndices.length > 1) {
+    console.error('Error: --branch may only be provided once.');
+    process.exit(1);
+  }
+  const branchIndex = branchFlagIndices[0]?.index ?? -1;
+  const branchFlag = branchFlagIndices[0]?.arg ?? null;
+  const branch = branchFlag === '--branch'
+    ? args[branchIndex + 1]
+    : branchFlag?.slice('--branch='.length) || null;
   if (branchIndex !== -1 && (!branch || branch.startsWith('-'))) {
     console.error('Error: --branch requires a branch name.');
+    process.exit(1);
+  }
+
+  // Parse --repo <owner/name> (or --repo=<owner/name>) for immutable
+  // component upgrades. Validation happens after target discovery so the
+  // self/all modes can be rejected before any update or download work.
+  const repoFlagIndex = args.findIndex((arg) => arg === '--repo' || arg.startsWith('--repo='));
+  const repoFlagCount = args.filter((arg) => arg === '--repo' || arg.startsWith('--repo=')).length;
+  if (repoFlagCount > 1) {
+    console.error('Error: --repo may only be provided once.');
+    process.exit(1);
+  }
+  const hasRepoOverride = repoFlagIndex !== -1;
+  const repoFlag = hasRepoOverride ? args[repoFlagIndex] : null;
+  const repoOverrideValue = repoFlag === '--repo'
+    ? args[repoFlagIndex + 1]
+    : repoFlag?.slice('--repo='.length);
+  if (hasRepoOverride && (!repoOverrideValue || repoOverrideValue.startsWith('-'))) {
+    console.error('Error: --repo requires a GitHub owner/name repository.');
     process.exit(1);
   }
 
@@ -290,7 +320,7 @@ export async function upgradeComponent(args) {
   }
 
   // Get target component (filter out flags and flag values)
-  const flagsWithValues = new Set(['--branch', '--mode']);
+  const flagsWithValues = new Set(['--branch', '--mode', '--repo']);
   const target = args.find((a, i) => {
     if (a.startsWith('-')) return false;
     if (a === 'confirm') return false;
@@ -298,6 +328,22 @@ export async function upgradeComponent(args) {
     if (i > 0 && flagsWithValues.has(args[i - 1])) return false;
     return true;
   });
+
+  let repoOverride = null;
+  if (hasRepoOverride) {
+    try {
+      repoOverride = validateComponentRepoOverride({
+        repo: repoOverrideValue,
+        branch,
+        target,
+        upgradeSelf,
+        upgradeAll,
+      });
+    } catch (err) {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    }
+  }
 
   // Handle --self: upgrade zylos-core itself
   if (upgradeSelf) {
@@ -326,12 +372,14 @@ export async function upgradeComponent(args) {
     console.log('  --skip-eval    Skip upgrade analysis of local changes');
     console.log('  --beta         Include prerelease (beta) versions');
     console.log('  --branch <b>   Upgrade from a specific branch (e.g. feat/xxx)');
+    console.log('  --repo <owner/name>  Use a GitHub repo with --branch <40-hex-commit-sha>');
     console.log('  --mode <m>     Merge mode: "merge" (default, smart three-way) or "overwrite"');
     console.log('\nExamples:');
     console.log('  zylos upgrade telegram --check --json');
     console.log('  zylos upgrade --self --check --beta');
     console.log('  zylos upgrade telegram --yes');
     console.log('  zylos upgrade telegram --mode overwrite');
+    console.log('  zylos upgrade telegram --repo owner/repo --branch <40-hex-commit-sha> --yes');
     process.exit(1);
   }
 
@@ -389,12 +437,48 @@ export async function upgradeComponent(args) {
 
   // Mode 1: Check only (--check) — no lock, downloads to temp for file comparison
   if (checkOnly) {
-    return handleCheckOnly(target, { jsonOutput, branch, beta });
+    return handleCheckOnly(target, { jsonOutput, branch, beta, repoOverride });
   }
 
   // Mode 2 & 3: Full upgrade flow (lock-first)
-  const ok = await handleUpgradeFlow(target, { jsonOutput, skipConfirm: skipConfirm || explicitConfirm, skipEval, branch, beta, mode });
+  const ok = await handleUpgradeFlow(target, {
+    jsonOutput,
+    skipConfirm: skipConfirm || explicitConfirm,
+    skipEval,
+    branch,
+    beta,
+    mode,
+    repoOverride,
+  });
   if (!ok) process.exit(1);
+}
+
+function printCheckFailure(component, result, jsonOutput) {
+  if (jsonOutput) {
+    const errOutput = { action: 'check', component, ...result };
+    errOutput.reply = formatC4Reply('error', result);
+    console.log(JSON.stringify(errOutput, null, 2));
+  } else {
+    console.error(`Error: ${result.message || result.error}`);
+  }
+  process.exit(1);
+}
+
+function printUpgradeFailure(component, { jsonOutput, errorCode, message, branch = null }) {
+  if (jsonOutput) {
+    const errOutput = {
+      action: 'upgrade',
+      component,
+      success: false,
+      error: errorCode,
+      message,
+      ...(branch ? { branch } : {}),
+    };
+    errOutput.reply = formatC4Reply('error', { message });
+    console.log(JSON.stringify(errOutput, null, 2));
+  } else {
+    console.error(`Error: ${message}`);
+  }
 }
 
 /**
@@ -402,20 +486,16 @@ export async function upgradeComponent(args) {
  * Also fetches changelog, detects local changes, and runs Claude eval for a complete preview.
  * When --branch is specified, downloads from branch and reads version from its package.json.
  */
-async function handleCheckOnly(component, { jsonOutput, branch, beta = false }) {
-  const result = checkForUpdates(component, { beta });
+async function handleCheckOnly(component, { jsonOutput, branch, beta = false, repoOverride = null }) {
+  const result = checkForUpdates(component, {
+    beta,
+    repoOverride: repoOverride?.repo,
+    exactRef: repoOverride?.branch,
+  });
+  const exactRef = Boolean(repoOverride?.branch);
 
   if (!result.success) {
-    if (!branch) {
-      if (jsonOutput) {
-        const errOutput = { action: 'check', component, ...result };
-        errOutput.reply = formatC4Reply('error', result);
-        console.log(JSON.stringify(errOutput, null, 2));
-      } else {
-        console.error(`Error: ${result.message}`);
-      }
-      process.exit(1);
-    }
+    if (!branch || exactRef) printCheckFailure(component, result, jsonOutput);
     // When --branch is specified, version check failure is non-fatal
   }
 
@@ -429,7 +509,7 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false }) 
   const shouldDownload = branch || (result.hasUpdate && result.repo);
 
   if (shouldDownload) {
-    const repo = result.repo || (branch ? getRepo(component) : null);
+    const repo = result.repo || (branch ? (repoOverride?.repo || getRepo(component)) : null);
     if (repo) {
       let dlResult;
       try {
@@ -442,21 +522,37 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false }) 
 
         // When using --branch, read version from the downloaded package.json
         if (branch) {
-          try {
-            const branchPkg = JSON.parse(fs.readFileSync(path.join(tempDir, 'package.json'), 'utf8'));
-            result.latest = branchPkg.version || result.latest;
+          const downloadedVersion = readDownloadedComponentVersion(tempDir);
+          if (exactRef && !downloadedVersion) {
+            result.success = false;
+            result.hasUpdate = false;
+            result.error = 'exact_ref_version_unreadable';
+            result.message = `Cannot read target component version from downloaded ${repo}@${branch}`;
+            result.repo = repo;
+            result.branch = branch;
+            cleanupTemp(tempDir);
+            printCheckFailure(component, result, jsonOutput);
+          }
+          if (downloadedVersion) {
+            result.latest = downloadedVersion;
             result.hasUpdate = result.current !== result.latest;
             result.success = true;
             result.repo = repo;
             result.branch = branch;
-          } catch {
-            // If package.json read fails, keep existing result
           }
         }
 
         // Read changelog from downloaded package (more reliable than remote fetch)
         const fullChangelog = readChangelog(tempDir);
         changelog = filterChangelog(fullChangelog, result.current);
+      } else if (exactRef) {
+        result.success = false;
+        result.hasUpdate = false;
+        result.error = 'exact_ref_download_failed';
+        result.message = dlResult.error || `Failed to download ${repo}@${branch}`;
+        result.repo = repo;
+        result.branch = branch;
+        printCheckFailure(component, result, jsonOutput);
       } else if (!branch) {
         // Fallback: fetch changelog from remote (only for non-branch)
         try {
@@ -547,7 +643,15 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false }) 
  * Returns true on success, false on failure.
  * Does NOT call process.exit() — caller decides exit behavior.
  */
-async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval, branch, beta = false, mode = 'merge' }) {
+async function handleUpgradeFlow(component, {
+  jsonOutput,
+  skipConfirm,
+  skipEval,
+  branch,
+  beta = false,
+  mode = 'merge',
+  repoOverride = null,
+}) {
   const skillDir = path.join(SKILLS_DIR, component);
   let tempDir = null;
 
@@ -566,10 +670,15 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
 
   try {
     // 2. Check for updates (skip version comparison when --branch is specified)
-    const check = checkForUpdates(component, { beta });
+    const check = checkForUpdates(component, {
+      beta,
+      repoOverride: repoOverride?.repo,
+      exactRef: repoOverride?.branch,
+    });
+    const exactRef = Boolean(repoOverride?.branch);
 
     if (!check.success) {
-      if (!branch) {
+      if (!branch || exactRef) {
         if (jsonOutput) {
           const errOutput = { action: 'check', component, ...check };
           errOutput.reply = formatC4Reply('error', check);
@@ -594,7 +703,7 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
     }
 
     // 3. Download new version to temp (always fresh in confirm/--yes flow)
-    const repo = check.repo || (branch ? getRepo(component) : null);
+    const repo = check.repo || (branch ? (repoOverride?.repo || getRepo(component)) : null);
     if (!repo) {
       if (jsonOutput) {
         const errOutput = { action: 'upgrade', component, success: false, error: 'No repo configured' };
@@ -619,6 +728,15 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
       dlResult = { success: false, error: err.message };
     }
     if (!dlResult.success) {
+      if (exactRef) {
+        printUpgradeFailure(component, {
+          jsonOutput,
+          errorCode: 'exact_ref_download_failed',
+          message: dlResult.error || `Failed to download ${repo}@${branch}`,
+          branch,
+        });
+        return false;
+      }
       if (jsonOutput) {
         const errOutput = { action: 'upgrade', component, success: false, error: dlResult.error };
         errOutput.reply = formatC4Reply('error', { message: dlResult.error });
@@ -629,6 +747,24 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
       return false;
     }
     tempDir = dlResult.tempDir;
+
+    // A commit override has no tag to provide a version. Resolve the version
+    // from the downloaded artifact before presenting the plan and creating
+    // the metadata transaction, so the transaction records the artifact's
+    // own package/SKILL version rather than a moving or null tag value.
+    if (branch) {
+      const downloadedVersion = readDownloadedComponentVersion(tempDir);
+      if (exactRef && !downloadedVersion) {
+        printUpgradeFailure(component, {
+          jsonOutput,
+          errorCode: 'exact_ref_version_unreadable',
+          message: `Cannot read target component version from downloaded ${repo}@${branch}`,
+          branch,
+        });
+        return false;
+      }
+      if (downloadedVersion) check.latest = downloadedVersion;
+    }
 
     // 4. Show info: version diff, changelog, local changes + Claude eval
     const changes = detectChanges(skillDir);
@@ -804,6 +940,25 @@ function cleanOldBackups(skillDir) {
   } catch {
     // Non-critical, ignore
   }
+}
+
+/**
+ * Resolve a downloaded component's version without consulting a remote tag.
+ * Package metadata is preferred, with SKILL.md as the compatibility fallback
+ * used by versionless components.
+ */
+function readDownloadedComponentVersion(dir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    if (pkg.version !== undefined && String(pkg.version).trim()) return String(pkg.version).trim();
+  } catch {
+    // Components are allowed to publish only SKILL.md metadata.
+  }
+  const parsed = parseSkillMd(dir);
+  const version = parsed?.frontmatter?.version;
+  return version === undefined || version === null || String(version).trim() === ''
+    ? null
+    : String(version).trim();
 }
 
 /**
