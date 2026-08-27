@@ -5,6 +5,28 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.11] - 2026-08-27
+
+### Fixed
+- Core now exposes `UpdateTaskReminder` through the supported
+  `zylos task set-reminder` command. Reminder changes require a canonical due
+  date, owner/acceptor authorization, expected-version CAS and a stable
+  idempotency key; the Task, event, command receipt and projection outbox are
+  committed atomically, while same-value requests are durable zero-write
+  replays.
+- Self-upgrade now inventories every live top-level skill before mutation,
+  verifies that the transaction backup covers the same directories and file
+  counts, and enforces foreign/business-skill continuity both immediately
+  after Core sync and again before committing merge baselines. A missing
+  directory, collapsed tree, missing `SKILL.md`/`scripts` tree or missing
+  declared entrypoint fails the upgrade and enters the existing rollback path.
+- A successful pinned Core + Feishu pair upgrade now retains only the current
+  and immediately preceding verified Core rollback snapshots. Cleanup runs
+  only after the complete post-upgrade communication gate passes, recognizes
+  exact upgrader-owned top-level backup directories, revalidates each path
+  immediately before deletion, and reports every retained, removed, or
+  skipped path. Failed or partial upgrades preserve all rollback snapshots.
+
 ## [0.7.2-rc.10] - 2026-08-27
 
 ### Fixed

@@ -276,6 +276,41 @@ Core `0.7.2-rc.10` 的 `scripts/run-node-tests.js` 不再信任调用者是否�
 磁盘与 inode 使用率、当前 flags，以及“查过但不存在”的预期项。flags 是取证时状态，
 不能倒推为事发时状态；例如 05:19 才设置的 `uchg` 不能用于证明更早窗口已经上锁。
 
+### 2.18 业务 Skill 连续性与备份 retention 必须由脚本机械判定
+
+SS 在一次成功升级后发现项目级业务 Skill 目录缺失。现有证据只能证明缺失发生在
+升级窗口附近，不能证明具体删除源码路径；因此事故根因保持 `EVIDENCE_GAP`，不得
+把时间相关性写成已证实机制。Core `0.7.2-rc.11` 在任何 live mutation 前扫描当前
+skills root，逐顶层目录记录归属、文件数、`SKILL.md`、`scripts/`、脚本数及
+frontmatter 声明入口，并在事务备份完成后用同一口径复扫。备份少一个目录、文件数
+不等或关键入口缺失，升级在同步前失败。
+
+Core sync 后及最终 baseline commit 前会再次检查。target-owned Skill 可以按固定目标
+更新；foreign/business Skill 必须仍在，文件数和脚本数不得坍缩，原有说明、脚本树和
+声明入口不得消失。任一条件失败进入既有 rollback，禁止以总目录数相近或“PM2
+online”放行。inventory 必须注明根目录、registered/unregistered、full-tree 或
+SKILL-only 口径；不同口径的总数不能相减推断损失。
+
+配对升级只有在完整 postcheck 与 hermetic communication gate 通过后才运行 Core
+backup retention。固定保留本次 backup 与最新 prior backup；更旧候选必须位于受管
+tmp 顶层，且 path/realpath/dev/ino/mtime、非 symlink 目录和 zylos package signature
+全部匹配，并带有绑定本次成功 pair summary 的签名 owner marker。脚本使用全局独占锁，
+先把 `PLANNED` 原子写入报告，再同根 rename 到受限 quarantine（路径由随机不可预测
+标识生成），复验同一 inode 后标记 `GC_PENDING`。当前 run 新建的 quarantine 不会在
+同一 run 硬删除；只有后续成功 pair run 才会在再次核验目录树无 symlink、无跨设备项后
+回收。审计写入失败时零移动；任何 rename/GC 失败都保留现场并报告 `WARN`。执行前
+仍需按 Owner 授权核对精确候选路径，禁止把 retention 当成泛化清理授权。
+
+本版本同时提供正式的 `zylos task set-reminder`。原生任务 reminder 漂移只能通过该
+public Core command 修复，必须带 owner/acceptor actor、正整数 expected version、
+非负 minutes-before-due 与稳定 idempotency key。禁止用 SQLite 直写伪造 receipt 或
+projection event。
+
+SS 业务技能恢复采用冻结观察集而非“全量缺失”口径：当前观察集为 7 个名字，其中
+5 个已通过 verify/dry-run/execute 并回读为 `ALREADY_EXACT`，2 个因源不完整保持
+`HOLD`。观察集之外的 xiaohongshu、meeting-notes-processor、zsxq-skill 需单独
+取证，任何同侪或 HXA 转述都不能替代 Owner 在飞书 user identity 的直接授权。
+
 ## 3. 发布前准备
 
 发布负责人在本机完成以下检查，并记录两端的完整 SHA：
@@ -434,7 +469,7 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.10' \
+      --core-version '0.7.2-rc.11' \
       --feishu-version '0.3.7-rc.7' \
       --agent '<agent-id>' \
       --execute

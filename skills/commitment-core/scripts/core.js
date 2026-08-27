@@ -215,6 +215,13 @@ const COMMAND_DEFINITIONS = Object.freeze({
       return actorId === task.ownerId || actorId === task.acceptorId;
     },
   },
+  UpdateTaskReminder: {
+    fromStates: ['ready', 'in_progress', 'review'],
+    eventType: 'TaskReminderUpdated',
+    authorize(task, actorId) {
+      return actorId === task.ownerId || actorId === task.acceptorId;
+    },
+  },
 });
 
 const TASK_STATES = new Set(['ready', 'in_progress', 'review', 'done', 'cancelled']);
@@ -229,12 +236,23 @@ function normalizeCommand(command) {
   if (!COMMAND_DEFINITIONS[type]) {
     throw domainError('INVALID_COMMAND', `unsupported command type: ${type}`);
   }
-  return {
+  const normalized = {
     type,
     taskId: requireText(command.taskId, 'command.taskId'),
     actorId: requireText(command.actorId, 'command.actorId'),
     idempotencyKey: requireText(command.idempotencyKey, 'command.idempotencyKey'),
   };
+  if (type === 'UpdateTaskReminder') {
+    const reminderMinutesBeforeDue = optionalNonNegativeInteger(
+      command.reminderMinutesBeforeDue,
+      'command.reminderMinutesBeforeDue',
+    );
+    if (reminderMinutesBeforeDue === null) {
+      throw new TypeError('command.reminderMinutesBeforeDue must be a non-negative safe integer');
+    }
+    normalized.reminderMinutesBeforeDue = reminderMinutesBeforeDue;
+  }
+  return normalized;
 }
 
 function normalizeExpectedVersion(expectedVersion) {
@@ -610,6 +628,11 @@ export function openCommitmentCore({
     SET state = ?, version = version + 1, updated_at = ?
     WHERE id = ? AND version = ?
   `);
+  const updateTaskReminder = database.prepare(`
+    UPDATE commitment_tasks
+    SET reminder_minutes_before_due = ?, version = version + 1, updated_at = ?
+    WHERE id = ? AND version = ?
+  `);
   const insertEvent = database.prepare(`
     INSERT INTO commitment_events (
       id, event_type, task_id, actor_id, from_state, to_state,
@@ -638,6 +661,44 @@ export function openCommitmentCore({
       actorId,
       fromState: task.state,
       toState: updatedTask.state,
+      version: updatedTask.version,
+      occurredAt: timestamp,
+    };
+    insertEvent.run(
+      event.id,
+      event.type,
+      event.taskId,
+      event.actorId,
+      event.fromState,
+      event.toState,
+      event.version,
+      event.occurredAt,
+    );
+    projectionOutboxModule.append(event);
+    return { task: updatedTask, event };
+  }
+
+  function updateReminder({ task, reminderMinutesBeforeDue, actorId, timestamp }) {
+    const updated = updateTaskReminder.run(
+      reminderMinutesBeforeDue,
+      timestamp,
+      task.id,
+      task.version,
+    );
+    if (updated.changes !== 1) {
+      throw domainError(
+        'VERSION_CONFLICT',
+        `task changed while updating reminder: ${task.id}`,
+      );
+    }
+    const updatedTask = toTaskView(selectTask.get(task.id));
+    const event = {
+      id: requireText(eventIdGenerator(), 'generated event id'),
+      type: 'TaskReminderUpdated',
+      taskId: task.id,
+      actorId,
+      fromState: task.state,
+      toState: task.state,
       version: updatedTask.version,
       occurredAt: timestamp,
     };
@@ -751,20 +812,38 @@ export function openCommitmentCore({
     if (!definition.authorize(task, command.actorId)) {
       throw domainError('FORBIDDEN', `${command.actorId} cannot apply ${command.type}`);
     }
+    if (command.type === 'UpdateTaskReminder' && task.dueAt === null) {
+      throw domainError(
+        'REMINDER_REQUIRES_DUE_AT',
+        `task reminder requires a canonical dueAt: ${task.id}`,
+      );
+    }
 
     const timestamp = requireText(clock(), 'clock result');
-    const result = runModule.coordinateTaskCommand({
-      type: command.type,
-      task,
-      timestamp,
-      transition: () => transitionTask({
+    let result;
+    if (command.type === 'UpdateTaskReminder') {
+      result = task.reminderMinutesBeforeDue === command.reminderMinutesBeforeDue
+        ? { task, event: null }
+        : updateReminder({
+          task,
+          reminderMinutesBeforeDue: command.reminderMinutesBeforeDue,
+          actorId: command.actorId,
+          timestamp,
+        });
+    } else {
+      result = runModule.coordinateTaskCommand({
+        type: command.type,
         task,
-        toState: definition.toState,
-        eventType: definition.eventType,
-        actorId: command.actorId,
         timestamp,
-      }),
-    });
+        transition: () => transitionTask({
+          task,
+          toState: definition.toState,
+          eventType: definition.eventType,
+          actorId: command.actorId,
+          timestamp,
+        }),
+      });
+    }
     insertCommand.run(
       command.idempotencyKey,
       fingerprint,

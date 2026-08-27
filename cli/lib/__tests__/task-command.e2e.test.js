@@ -156,6 +156,83 @@ test('zylos task completes create through acceptance and filters the resulting t
   }
 });
 
+test('zylos task set-reminder updates a due Task through the public Core command', () => {
+  const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-reminder-cli-'));
+
+  try {
+    installTaskCore(zylosDir);
+    const task = json(runTask(zylosDir, [
+      'create',
+      '--title', 'CLI 设置提醒',
+      '--owner', 'owner-1',
+      '--acceptor', 'acceptor-1',
+      '--due-at', '2026-08-28T18:00:00+08:00',
+      '--json',
+    ])).task;
+
+    const updatedResult = runTask(zylosDir, [
+      'set-reminder', task.id,
+      '--actor', 'acceptor-1',
+      '--expected-version', '1',
+      '--reminder-minutes-before-due', '60',
+      '--idempotency-key', 'cli:reminder:task-1',
+      '--json',
+    ]);
+    assert.equal(updatedResult.status, 0, updatedResult.stderr);
+    const updated = json(updatedResult);
+    assert.equal(updated.task.reminderMinutesBeforeDue, 60);
+    assert.equal(updated.task.version, 2);
+    assert.equal(updated.event.type, 'TaskReminderUpdated');
+
+    const shown = json(runTask(zylosDir, ['show', task.id, '--events', '--json']));
+    assert.equal(shown.task.reminderMinutesBeforeDue, 60);
+    assert.deepEqual(
+      shown.events.map((event) => event.type),
+      ['TaskCreated', 'TaskReminderUpdated'],
+    );
+  } finally {
+    rmSync(zylosDir, { recursive: true, force: true });
+  }
+});
+
+test('zylos task set-reminder exposes help and rejects invalid reminder arguments', () => {
+  const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-reminder-cli-errors-'));
+
+  try {
+    const help = runTask(zylosDir, ['set-reminder', '--help']);
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /set-reminder <taskId>/);
+    assert.match(help.stdout, /--reminder-minutes-before-due <n>/);
+
+    installTaskCore(zylosDir);
+    const task = json(runTask(zylosDir, [
+      'create', '--title', 'CLI 提醒参数', '--owner', 'owner-1',
+      '--due-at', '2026-08-28T18:00:00+08:00', '--json',
+    ])).task;
+    for (const args of [
+      [
+        'set-reminder', task.id,
+        '--actor', 'owner-1',
+        '--expected-version', '1',
+        '--reminder-minutes-before-due', '-1',
+        '--json',
+      ],
+      [
+        'set-reminder', task.id,
+        '--actor', 'owner-1',
+        '--expected-version', '1',
+        '--json',
+      ],
+    ]) {
+      const invalid = runTask(zylosDir, args);
+      assert.equal(invalid.status, 2, invalid.stderr);
+      assert.equal(json(invalid).error.code, 'INVALID_ARGUMENT');
+    }
+  } finally {
+    rmSync(zylosDir, { recursive: true, force: true });
+  }
+});
+
 test('zylos task exposes the Task Run lease lifecycle without treating completion as acceptance', () => {
   const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-run-cli-'));
 

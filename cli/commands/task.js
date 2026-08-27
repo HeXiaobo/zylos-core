@@ -105,6 +105,7 @@ const WRITE_COMMANDS = Object.freeze({
   cancel: 'CancelTask',
   reopen: 'ReopenTask',
 });
+const REMINDER_COMMAND = 'set-reminder';
 const RUN_COMMANDS = new Set(['claim', 'heartbeat', 'complete-run', 'release-run', 'runs']);
 
 function argumentError(message) {
@@ -219,6 +220,7 @@ Subcommands:
   rework <taskId>        review → ready
   cancel <taskId>        ready/in_progress/review → cancelled
   reopen <taskId>        done → ready
+  set-reminder <taskId>  Update minutes-before-due reminder
   claim <taskId>         Claim a Task Run lease and start ready work
   heartbeat <taskId>     Renew an active Task Run lease
   complete-run <taskId>  End a Run and submit the Task for review
@@ -248,6 +250,14 @@ List/show options:
 State command options:
   --actor <id>           Required actor identity
   --expected-version <n> Required positive Task version
+  --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
+  --json                 JSON output
+
+Reminder command options:
+  --actor <id>           Required owner or acceptor identity
+  --expected-version <n> Required positive Task version
+  --reminder-minutes-before-due <n>
+                         Required non-negative reminder offset
   --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
   --json                 JSON output
 
@@ -380,6 +390,31 @@ function applyStateCommand(core, subcommand, args, makeIdempotencyKey) {
   else printTask(result.task);
 }
 
+function setTaskReminder(core, args, makeIdempotencyKey) {
+  const { options, positionals } = parseArgs(args, {
+    valueFlags: [
+      'actor', 'expected-version', 'reminder-minutes-before-due', 'idempotency-key',
+    ],
+    booleanFlags: ['json'],
+    positionalCount: 1,
+  });
+  const result = core.command({
+    type: 'UpdateTaskReminder',
+    taskId: requireValue(positionals[0], 'taskId'),
+    actorId: requireValue(options.actor, '--actor'),
+    reminderMinutesBeforeDue: parseNonNegativeInteger(
+      options['reminder-minutes-before-due'],
+      '--reminder-minutes-before-due',
+    ),
+    idempotencyKey: options['idempotency-key']
+      ? requireValue(options['idempotency-key'], '--idempotency-key')
+      : makeIdempotencyKey(REMINDER_COMMAND),
+  }, parsePositiveInteger(options['expected-version'], '--expected-version'));
+
+  if (options.json) printJson(result);
+  else printTask(result.task);
+}
+
 function claimRun(core, args, makeIdempotencyKey) {
   const { options, positionals } = parseArgs(args, {
     valueFlags: ['actor', 'worker', 'lease-ms', 'expected-version', 'idempotency-key'],
@@ -493,12 +528,19 @@ export async function taskCommand(args, {
     showTaskHelp();
     return;
   }
+  if (subcommand === REMINDER_COMMAND
+      && args.length === 2
+      && ['--help', '-h'].includes(args[1])) {
+    showTaskHelp();
+    return;
+  }
 
   const jsonMode = args.includes('--json');
   let core;
   try {
     if (!['create', 'list', 'show'].includes(subcommand)
       && !WRITE_COMMANDS[subcommand]
+      && subcommand !== REMINDER_COMMAND
       && !RUN_COMMANDS.has(subcommand)) {
       throw argumentError(`unknown task subcommand: ${subcommand}`);
     }
@@ -509,6 +551,9 @@ export async function taskCommand(args, {
     else if (subcommand === 'show') showTask(core, args.slice(1));
     else if (WRITE_COMMANDS[subcommand]) {
       applyStateCommand(core, subcommand, args.slice(1), makeIdempotencyKey);
+    }
+    else if (subcommand === REMINDER_COMMAND) {
+      setTaskReminder(core, args.slice(1), makeIdempotencyKey);
     }
     else if (subcommand === 'claim') claimRun(core, args.slice(1), makeIdempotencyKey);
     else if (subcommand === 'heartbeat') heartbeatRun(core, args.slice(1), makeIdempotencyKey);

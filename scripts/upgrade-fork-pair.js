@@ -19,6 +19,11 @@ const FEISHU_REPO = 'HeXiaobo/zylos-feishu';
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const MIN_AVAILABLE_KB = 5 * 1024 * 1024;
+const CORE_BACKUP_PREFIX = 'zylos-core-backup-';
+const CORE_BACKUP_RETAIN = 2;
+const CORE_BACKUP_QUARANTINE_PREFIX = '.zylos-core-retention-quarantine-';
+const CORE_BACKUP_RETENTION_LOCK = 'core-backup-retention.lock';
+const CORE_BACKUP_OWNER_MARKER = '.zylos-core-backup-owner.json';
 
 const FEISHU_REQUIRED_CORE_PROTOCOLS = Object.freeze({
   'c4.reply': 2,
@@ -280,10 +285,43 @@ function parseJsonOutput(output) {
   return null;
 }
 
-function atomicWriteJson(filePath, value) {
-  const tempPath = `${filePath}.tmp-${process.pid}`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  fs.renameSync(tempPath, filePath);
+function atomicWriteJson(filePath, value, fsApi = fs) {
+  const tempPath = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(12).toString('hex')}`;
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  try {
+    let fileHandle = null;
+    try {
+      fileHandle = fsApi.openSync(tempPath, 'wx', 0o600);
+      fsApi.writeFileSync(fileHandle, content, 'utf8');
+      fsApi.fsyncSync(fileHandle);
+    } finally {
+      if (fileHandle !== null) fsApi.closeSync(fileHandle);
+    }
+    fsApi.renameSync(tempPath, filePath);
+    const directoryHandle = fsApi.openSync(path.dirname(filePath), 'r');
+    try {
+      fsApi.fsyncSync(directoryHandle);
+    } finally {
+      fsApi.closeSync(directoryHandle);
+    }
+  } catch (error) {
+    try { fsApi.rmSync(tempPath, { force: true }); } catch {}
+    throw error;
+  }
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function signedDocument(payload) {
+  return { ...payload, signature: sha256(JSON.stringify(payload)) };
+}
+
+function hasValidSignature(document) {
+  if (!document || typeof document !== 'object' || typeof document.signature !== 'string') return false;
+  const { signature, ...payload } = document;
+  return signature === sha256(JSON.stringify(payload));
 }
 
 function hashFile(filePath) {
@@ -418,6 +456,760 @@ function availableDiskKb(targetPath) {
   const available = Number(fields?.[3]);
   if (!Number.isFinite(available)) throw new HoldError('could not parse available disk space');
   return available;
+}
+
+function coreBackupRoots({ homeDir = os.homedir(), tmpDir = os.tmpdir() } = {}) {
+  return [...new Set([
+    path.resolve(tmpDir),
+    path.resolve(homeDir, 'tmp'),
+  ])];
+}
+
+function inspectCoreBackupDir(candidatePath, { fsApi = fs, roots, expectedName } = {}) {
+  const resolvedCandidate = path.resolve(candidatePath);
+  const allowedRoots = roots ?? coreBackupRoots();
+  const root = allowedRoots.find((candidateRoot) => path.dirname(resolvedCandidate) === candidateRoot);
+  const candidateName = path.basename(resolvedCandidate);
+  if (
+    !root
+    || (expectedName ? candidateName !== expectedName : !candidateName.startsWith(CORE_BACKUP_PREFIX))
+  ) return null;
+  try {
+    const rootStat = fsApi.lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return null;
+    const stat = fsApi.lstatSync(resolvedCandidate);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+    const realRoot = fsApi.realpathSync(root);
+    const realCandidate = fsApi.realpathSync(resolvedCandidate);
+    if (fsApi.realpathSync(path.dirname(resolvedCandidate)) !== realRoot) return null;
+    if (path.dirname(realCandidate) !== realRoot) return null;
+    const corePackagePath = path.join(resolvedCandidate, 'core-package');
+    const packagePath = path.join(resolvedCandidate, 'core-package', 'package.json');
+    const skillsPath = path.join(resolvedCandidate, 'skills');
+    const corePackageStat = fsApi.lstatSync(corePackagePath);
+    const packageStat = fsApi.lstatSync(packagePath);
+    const skillsStat = fsApi.lstatSync(skillsPath);
+    if (!corePackageStat.isDirectory() || corePackageStat.isSymbolicLink()) return null;
+    if (!packageStat.isFile() || packageStat.isSymbolicLink()) return null;
+    if (!skillsStat.isDirectory() || skillsStat.isSymbolicLink()) return null;
+    if (fsApi.realpathSync(corePackagePath) !== path.join(realCandidate, 'core-package')) return null;
+    if (fsApi.realpathSync(packagePath) !== path.join(realCandidate, 'core-package', 'package.json')) return null;
+    if (fsApi.realpathSync(skillsPath) !== path.join(realCandidate, 'skills')) return null;
+    const pkg = readJson(packagePath, fsApi);
+    if (pkg.name !== 'zylos' || !VERSION.test(pkg.version ?? '')) return null;
+    return {
+      path: resolvedCandidate,
+      realPath: realCandidate,
+      rootPath: root,
+      rootRealPath: realRoot,
+      name: candidateName,
+      dev: stat.dev,
+      ino: stat.ino,
+      mtimeMs: stat.mtimeMs,
+      version: pkg.version ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function pairSummaryProof(summary, summaryPath) {
+  const resolvedSummaryPath = path.resolve(summaryPath);
+  if (
+    summary?.schema !== 'zylos.fork-pair-upgrade/v1'
+    || summary.status !== 'PASS'
+    || summary.result !== 'UPGRADE_COMPLETE'
+    || summary.coreUpgraded !== true
+    || summary.feishuUpgraded !== true
+    || summary.postcheck?.status !== 'PASS'
+    || !FULL_SHA.test(summary.target?.core?.sha ?? '')
+    || !VERSION.test(summary.target?.core?.version ?? '')
+    || path.resolve(summary.reportDir ?? '') !== path.dirname(resolvedSummaryPath)
+    || typeof summary.startedAt !== 'string'
+    || typeof summary.finishedAt !== 'string'
+  ) return null;
+  return {
+    kind: 'pair-summary',
+    summaryPath: resolvedSummaryPath,
+    reportDir: path.resolve(summary.reportDir),
+    startedAt: summary.startedAt,
+    finishedAt: summary.finishedAt,
+    coreSha: summary.target.core.sha,
+    coreVersion: summary.target.core.version,
+    backupDir: path.resolve(summary.coreResult?.backupDir ?? ''),
+  };
+}
+
+function verifyPairSummaryProof(proof, fsApi = fs) {
+  try {
+    const summaryStat = fsApi.lstatSync(proof.summaryPath);
+    if (
+      !summaryStat.isFile()
+      || summaryStat.isSymbolicLink()
+      || (typeof process.geteuid === 'function' && summaryStat.uid !== process.geteuid())
+      || (summaryStat.mode & 0o022) !== 0
+      || fsApi.realpathSync(proof.summaryPath) !== path.join(
+        fsApi.realpathSync(path.dirname(proof.summaryPath)),
+        path.basename(proof.summaryPath),
+      )
+    ) return false;
+    const summary = readJson(proof.summaryPath, fsApi);
+    const actual = pairSummaryProof(summary, proof.summaryPath);
+    return actual && JSON.stringify(actual) === JSON.stringify(proof);
+  } catch {
+    return false;
+  }
+}
+
+function ownerMarkerPayload(backup, proof, fsApi = fs) {
+  const stat = fsApi.lstatSync(backup.path);
+  const packagePath = path.join(backup.path, 'core-package', 'package.json');
+  return {
+    schema: 'zylos.core-backup-owner/v1',
+    backup: {
+      path: backup.path,
+      realPath: backup.realPath,
+      dev: stat.dev,
+      ino: stat.ino,
+      uid: stat.uid,
+      gid: stat.gid,
+      mode: stat.mode & 0o777,
+      packageVersion: backup.version,
+      packageSha256: sha256(fsApi.readFileSync(packagePath)),
+    },
+    proof,
+  };
+}
+
+function claimCurrentBackupOwnership(currentBackupDir, summary, summaryPath, {
+  fsApi = fs,
+  roots,
+} = {}) {
+  const backup = inspectCoreBackupDir(currentBackupDir, { fsApi, roots });
+  const proof = pairSummaryProof(summary, summaryPath);
+  if (!backup || !proof || proof.backupDir !== backup.path || !verifyPairSummaryProof(proof, fsApi)) {
+    return null;
+  }
+  const markerPath = path.join(backup.path, CORE_BACKUP_OWNER_MARKER);
+  atomicWriteJson(markerPath, signedDocument(ownerMarkerPayload(backup, proof, fsApi)), fsApi);
+  return inspectOwnedCoreBackup(backup.path, { fsApi, roots });
+}
+
+function inspectOwnedCoreBackup(candidatePath, { fsApi = fs, roots } = {}) {
+  const backup = inspectCoreBackupDir(candidatePath, { fsApi, roots });
+  if (!backup) return null;
+  try {
+    const markerPath = path.join(backup.path, CORE_BACKUP_OWNER_MARKER);
+    const backupStat = fsApi.lstatSync(backup.path);
+    const markerStat = fsApi.lstatSync(markerPath);
+    if (
+      !markerStat.isFile()
+      || markerStat.isSymbolicLink()
+      || (markerStat.mode & 0o777) !== 0o600
+      || markerStat.uid !== backupStat.uid
+      || markerStat.gid !== backupStat.gid
+      || (typeof process.geteuid === 'function' && backupStat.uid !== process.geteuid())
+      || (typeof process.getegid === 'function' && backupStat.gid !== process.getegid())
+      || (backupStat.mode & 0o022) !== 0
+      || fsApi.realpathSync(markerPath) !== path.join(backup.realPath, CORE_BACKUP_OWNER_MARKER)
+    ) return null;
+    const marker = readJson(markerPath, fsApi);
+    if (!hasValidSignature(marker) || marker.schema !== 'zylos.core-backup-owner/v1') return null;
+    const expected = ownerMarkerPayload(backup, marker.proof, fsApi);
+    if (JSON.stringify(expected) !== JSON.stringify((({ signature, ...payload }) => payload)(marker))) {
+      return null;
+    }
+    if (!verifyPairSummaryProof(marker.proof, fsApi)) return null;
+    return { ...backup, ownership: marker };
+  } catch {
+    return null;
+  }
+}
+
+function pathExistsByLstat(targetPath, fsApi = fs) {
+  try {
+    fsApi.lstatSync(targetPath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+export function planCoreBackupRetention({
+  currentBackupDir,
+  retain = CORE_BACKUP_RETAIN,
+  fsApi = fs,
+  homeDir = os.homedir(),
+  tmpDir = os.tmpdir(),
+} = {}) {
+  if (!Number.isSafeInteger(retain) || retain < CORE_BACKUP_RETAIN || retain > 10) {
+    throw new TypeError('Core backup retention must be between 2 and 10');
+  }
+  const roots = coreBackupRoots({ homeDir, tmpDir });
+  const current = currentBackupDir
+    ? inspectOwnedCoreBackup(currentBackupDir, { fsApi, roots })
+    : null;
+  if (!current) {
+    return {
+      status: 'SKIPPED',
+      reason: 'current successful Core backup is missing or not owned by the upgrader',
+      retained: [],
+      candidates: [],
+    };
+  }
+
+  const byPath = new Map([[current.path, current]]);
+  for (const root of roots) {
+    let entries = [];
+    try {
+      entries = fsApi.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.name.startsWith(CORE_BACKUP_PREFIX)) continue;
+      const inspected = inspectOwnedCoreBackup(path.join(root, entry.name), { fsApi, roots });
+      if (inspected) byPath.set(inspected.path, inspected);
+    }
+  }
+
+  const ordered = [...byPath.values()].sort((left, right) => (
+    right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name)
+  ));
+  const retained = [current];
+  for (const candidate of ordered) {
+    if (retained.length >= retain) break;
+    if (candidate.path !== current.path) retained.push(candidate);
+  }
+  const retainedPaths = new Set(retained.map(({ path: backupPath }) => backupPath));
+  return {
+    status: 'PLANNED',
+    retained,
+    candidates: ordered
+      .filter(candidate => !retainedPaths.has(candidate.path))
+      .map(candidate => ({ ...candidate })),
+  };
+}
+
+function retentionLockPath(homeDir) {
+  return path.join(path.resolve(homeDir), '.zylos', 'locks', CORE_BACKUP_RETENTION_LOCK);
+}
+
+function acquireCoreBackupRetentionLock(homeDir, fsApi = fs) {
+  const lockPath = retentionLockPath(homeDir);
+  const lockRoot = path.dirname(lockPath);
+  fsApi.mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
+  try {
+    fsApi.mkdirSync(lockPath, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code === 'EEXIST') return null;
+    throw error;
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  const ownerPath = path.join(lockPath, 'owner.json');
+  try {
+    atomicWriteJson(ownerPath, {
+      schema: 'zylos.core-backup-retention-lock/v1',
+      token,
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+    }, fsApi);
+    return { path: lockPath, ownerPath, token };
+  } catch (error) {
+    try { fsApi.rmSync(lockPath, { recursive: true, force: true }); } catch {}
+    throw error;
+  }
+}
+
+function releaseCoreBackupRetentionLock(lock, fsApi = fs) {
+  if (!lock) return;
+  const owner = readJson(lock.ownerPath, fsApi);
+  if (owner.token !== lock.token || owner.pid !== process.pid) {
+    throw new Error('Core backup retention lock ownership changed before release');
+  }
+  fsApi.rmSync(lock.ownerPath, { force: false });
+  fsApi.rmdirSync(lock.path);
+  const parentHandle = fsApi.openSync(path.dirname(lock.path), 'r');
+  try {
+    fsApi.fsyncSync(parentHandle);
+  } finally {
+    fsApi.closeSync(parentHandle);
+  }
+}
+
+function randomQuarantineName() {
+  return `${CORE_BACKUP_QUARANTINE_PREFIX}${crypto.randomBytes(24).toString('hex')}`;
+}
+
+function fsyncDirectory(directoryPath, fsApi = fs) {
+  const handle = fsApi.openSync(directoryPath, 'r');
+  try {
+    fsApi.fsyncSync(handle);
+  } finally {
+    fsApi.closeSync(handle);
+  }
+}
+
+function prepareQuarantineGenerations(plan, createdBy) {
+  const byRoot = new Map();
+  for (const candidate of plan.candidates) {
+    let generation = byRoot.get(candidate.rootPath);
+    if (!generation) {
+      const generationPath = path.join(candidate.rootPath, randomQuarantineName());
+      generation = {
+        schema: 'zylos.core-backup-quarantine/v1',
+        generationId: crypto.randomBytes(24).toString('hex'),
+        rootPath: candidate.rootPath,
+        rootRealPath: candidate.rootRealPath,
+        path: generationPath,
+        objectsPath: path.join(generationPath, 'objects'),
+        markerPath: path.join(generationPath, 'retention.json'),
+        status: 'PLANNED',
+        moveIntent: null,
+        moved: [],
+        items: [],
+        createdBy,
+        identity: null,
+      };
+      byRoot.set(candidate.rootPath, generation);
+    }
+    const quarantinePath = path.join(
+      generation.objectsPath,
+      crypto.randomBytes(24).toString('hex'),
+    );
+    const item = { ...candidate, quarantinePath };
+    generation.items.push(item);
+  }
+  return [...byRoot.values()];
+}
+
+function quarantineMarker(generation) {
+  return signedDocument({
+    schema: generation.schema,
+    generationId: generation.generationId,
+    rootPath: generation.rootPath,
+    rootRealPath: generation.rootRealPath,
+    path: generation.path,
+    objectsPath: generation.objectsPath,
+    status: generation.status,
+    moveIntent: generation.moveIntent,
+    moved: generation.moved,
+    items: generation.items,
+    createdBy: generation.createdBy,
+    identity: generation.identity,
+  });
+}
+
+function createPrivateQuarantine(generation, fsApi = fs) {
+  const rootStat = fsApi.lstatSync(generation.rootPath);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error(`quarantine root is not a direct directory: ${generation.rootPath}`);
+  }
+  if (fsApi.realpathSync(generation.rootPath) !== generation.rootRealPath) {
+    throw new Error(`quarantine root identity changed: ${generation.rootPath}`);
+  }
+  fsApi.mkdirSync(generation.path, { mode: 0o700 });
+  fsApi.chmodSync(generation.path, 0o700);
+  fsApi.mkdirSync(generation.objectsPath, { mode: 0o700 });
+  fsApi.chmodSync(generation.objectsPath, 0o700);
+  const generationStat = fsApi.lstatSync(generation.path);
+  const objectsStat = fsApi.lstatSync(generation.objectsPath);
+  generation.identity = {
+    dev: generationStat.dev,
+    ino: generationStat.ino,
+    uid: generationStat.uid,
+    gid: generationStat.gid,
+    mode: generationStat.mode & 0o777,
+    objectsDev: objectsStat.dev,
+    objectsIno: objectsStat.ino,
+    objectsMode: objectsStat.mode & 0o777,
+  };
+  atomicWriteJson(generation.markerPath, quarantineMarker(generation), fsApi);
+  fsyncDirectory(generation.rootPath, fsApi);
+}
+
+function inspectQuarantinedBackup(candidatePath, generation, fsApi = fs) {
+  try {
+    const generationRealPath = fsApi.realpathSync(generation.path);
+    const objectsRealPath = fsApi.realpathSync(generation.objectsPath);
+    if (path.dirname(objectsRealPath) !== generationRealPath) return null;
+    const stat = fsApi.lstatSync(candidatePath);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+    const realCandidate = fsApi.realpathSync(candidatePath);
+    if (path.dirname(realCandidate) !== objectsRealPath) return null;
+    const corePackagePath = path.join(candidatePath, 'core-package');
+    const packagePath = path.join(corePackagePath, 'package.json');
+    const skillsPath = path.join(candidatePath, 'skills');
+    for (const [entryPath, kind] of [
+      [corePackagePath, 'directory'],
+      [packagePath, 'file'],
+      [skillsPath, 'directory'],
+    ]) {
+      const entryStat = fsApi.lstatSync(entryPath);
+      if (entryStat.isSymbolicLink()) return null;
+      if (kind === 'directory' && !entryStat.isDirectory()) return null;
+      if (kind === 'file' && !entryStat.isFile()) return null;
+      if (fsApi.realpathSync(entryPath) !== path.join(realCandidate, path.relative(candidatePath, entryPath))) {
+        return null;
+      }
+    }
+    const pkg = readJson(packagePath, fsApi);
+    if (pkg.name !== 'zylos' || !VERSION.test(pkg.version ?? '')) return null;
+    return { path: candidatePath, realPath: realCandidate, dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+function publicGeneration(generation) {
+  return {
+    generationId: generation.generationId,
+    rootPath: generation.rootPath,
+    path: generation.path,
+    markerPath: generation.markerPath,
+    status: generation.status,
+    moveIntent: generation.moveIntent,
+    moved: generation.moved,
+    items: generation.items,
+    createdBy: generation.createdBy,
+    identity: generation.identity,
+  };
+}
+
+function inspectQuarantineGeneration(generationPath, { fsApi = fs, rootPath, rootRealPath } = {}) {
+  try {
+    const resolvedPath = path.resolve(generationPath);
+    if (
+      path.dirname(resolvedPath) !== rootPath
+      || !path.basename(resolvedPath).startsWith(CORE_BACKUP_QUARANTINE_PREFIX)
+    ) return null;
+    const stat = fsApi.lstatSync(resolvedPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700) return null;
+    const realPath = fsApi.realpathSync(resolvedPath);
+    if (path.dirname(realPath) !== rootRealPath) return null;
+    const objectsPath = path.join(resolvedPath, 'objects');
+    const objectsStat = fsApi.lstatSync(objectsPath);
+    if (
+      !objectsStat.isDirectory()
+      || objectsStat.isSymbolicLink()
+      || objectsStat.dev !== stat.dev
+      || (objectsStat.mode & 0o777) !== 0o700
+      || fsApi.realpathSync(objectsPath) !== path.join(realPath, 'objects')
+    ) return null;
+    const markerPath = path.join(resolvedPath, 'retention.json');
+    const markerStat = fsApi.lstatSync(markerPath);
+    if (
+      !markerStat.isFile()
+      || markerStat.isSymbolicLink()
+      || markerStat.uid !== stat.uid
+      || markerStat.gid !== stat.gid
+      || (markerStat.mode & 0o777) !== 0o600
+      || fsApi.realpathSync(markerPath) !== path.join(realPath, 'retention.json')
+    ) return null;
+    const marker = readJson(markerPath, fsApi);
+    if (
+      !hasValidSignature(marker)
+      || marker.schema !== 'zylos.core-backup-quarantine/v1'
+      || marker.rootPath !== rootPath
+      || marker.rootRealPath !== rootRealPath
+      || marker.path !== resolvedPath
+      || marker.objectsPath !== objectsPath
+      || marker.status !== 'GC_PENDING'
+      || marker.moveIntent !== null
+      || !verifyPairSummaryProof(marker.createdBy, fsApi)
+      || marker.identity?.dev !== stat.dev
+      || marker.identity?.ino !== stat.ino
+      || marker.identity?.uid !== stat.uid
+      || marker.identity?.gid !== stat.gid
+      || marker.identity?.mode !== (stat.mode & 0o777)
+      || marker.identity?.objectsDev !== objectsStat.dev
+      || marker.identity?.objectsIno !== objectsStat.ino
+      || marker.identity?.objectsMode !== (objectsStat.mode & 0o777)
+    ) return null;
+    for (const moved of marker.moved ?? []) {
+      const inspected = inspectQuarantinedBackup(moved.quarantinePath, {
+        path: resolvedPath,
+        objectsPath,
+      }, fsApi);
+      if (!inspected || inspected.dev !== moved.dev || inspected.ino !== moved.ino) return null;
+    }
+    return { path: resolvedPath, realPath, stat, marker, markerPath };
+  } catch {
+    return null;
+  }
+}
+
+function assertSafeRecursiveTree(targetPath, expectedDev, fsApi = fs) {
+  const pending = [targetPath];
+  while (pending.length > 0) {
+    const entryPath = pending.pop();
+    const entryStat = fsApi.lstatSync(entryPath);
+    if (entryStat.isSymbolicLink()) throw new Error(`refusing symlink in retired quarantine: ${entryPath}`);
+    if (entryStat.dev !== expectedDev) throw new Error(`refusing cross-device mount in retired quarantine: ${entryPath}`);
+    if (!entryStat.isDirectory()) continue;
+    for (const name of fsApi.readdirSync(entryPath)) pending.push(path.join(entryPath, name));
+  }
+}
+
+function gcPriorQuarantines({ roots, currentProof, fsApi = fs, persistProgress = () => {} }) {
+  const removed = [];
+  const residual = [];
+  const current = [];
+  for (const rootPath of roots) {
+    let rootStat;
+    let rootRealPath;
+    let entries;
+    try {
+      rootStat = fsApi.lstatSync(rootPath);
+      rootRealPath = fsApi.realpathSync(rootPath);
+      entries = fsApi.readdirSync(rootPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) continue;
+    for (const entry of entries) {
+      if (!entry.name.startsWith(CORE_BACKUP_QUARANTINE_PREFIX)) continue;
+      const generationPath = path.join(rootPath, entry.name);
+      const generation = inspectQuarantineGeneration(generationPath, { fsApi, rootPath, rootRealPath });
+      if (!generation) {
+        residual.push({ path: generationPath, reason: 'unverified quarantine generation; fail closed' });
+        continue;
+      }
+      const creator = generation.marker.createdBy;
+      if (creator.summaryPath === currentProof.summaryPath) {
+        current.push(generation);
+        continue;
+      }
+      if (Date.parse(currentProof.startedAt) <= Date.parse(creator.finishedAt)) {
+        residual.push({ path: generationPath, reason: 'no later successful pair upgrade proves GC eligibility' });
+        continue;
+      }
+      try {
+        persistProgress({
+          status: 'GC_PLANNED',
+          generation: generation.path,
+          identity: { dev: generation.stat.dev, ino: generation.stat.ino },
+        });
+        assertSafeRecursiveTree(generation.path, generation.stat.dev, fsApi);
+        const rechecked = inspectQuarantineGeneration(generation.path, { fsApi, rootPath, rootRealPath });
+        if (!rechecked || rechecked.stat.dev !== generation.stat.dev || rechecked.stat.ino !== generation.stat.ino) {
+          throw new Error('quarantine generation identity changed before GC');
+        }
+        fsApi.rmSync(generation.path, { recursive: true, force: false });
+        const rootHandle = fsApi.openSync(rootPath, 'r');
+        try { fsApi.fsyncSync(rootHandle); } finally { fsApi.closeSync(rootHandle); }
+        removed.push(...generation.marker.moved.map(item => ({ ...item, generationPath: generation.path })));
+      } catch (error) {
+        residual.push({ path: generation.path, reason: error.message });
+      }
+    }
+  }
+  return { removed, residual, current };
+}
+
+function applyCoreBackupRetention(plan, {
+  fsApi = fs,
+  persistProgress = () => {},
+  currentProof,
+  roots = [],
+} = {}) {
+  if (plan?.status !== 'PLANNED') {
+    return { ...plan, removed: [], quarantined: [], skipped: [], generations: [] };
+  }
+  const retainedPaths = new Set(plan.retained.map(({ path: backupPath }) => backupPath));
+  const candidateRoots = [...new Set(plan.retained.concat(plan.candidates).map(({ path: backupPath }) => (
+    path.dirname(backupPath)
+  )))];
+  const gc = gcPriorQuarantines({ roots, currentProof, fsApi, persistProgress });
+  if (gc.residual.length > 0 || gc.current.length > 0) {
+    return {
+      status: gc.residual.length > 0 ? 'WARN' : 'GC_PENDING',
+      retained: plan.retained,
+      candidates: plan.candidates,
+      removed: gc.removed,
+      quarantined: [],
+      skipped: gc.residual,
+      generations: gc.current.map(item => item.marker),
+    };
+  }
+  const generations = prepareQuarantineGenerations(plan, currentProof);
+  const quarantined = [];
+  const skipped = [];
+  for (const generation of generations) {
+    try {
+      createPrivateQuarantine(generation, fsApi);
+      persistProgress({
+        status: 'PLANNED',
+        retained: plan.retained,
+        candidates: plan.candidates,
+        removed: gc.removed,
+        quarantined,
+        skipped,
+        generations: generations.map(publicGeneration),
+      });
+    } catch (error) {
+      skipped.push(...generation.items.map(candidate => ({ ...candidate, reason: error.message })));
+      continue;
+    }
+
+    for (const candidate of generation.items) {
+      const inspected = inspectOwnedCoreBackup(candidate.path, { fsApi, roots: candidateRoots });
+      if (
+        !inspected
+        || retainedPaths.has(inspected.path)
+        || inspected.realPath !== candidate.realPath
+        || inspected.rootRealPath !== candidate.rootRealPath
+        || inspected.name !== candidate.name
+        || inspected.dev !== candidate.dev
+        || inspected.ino !== candidate.ino
+        || inspected.mtimeMs !== candidate.mtimeMs
+      ) {
+        skipped.push({ ...candidate, reason: 'backup changed after retention planning' });
+        continue;
+      }
+      try {
+        generation.moveIntent = {
+          sourcePath: candidate.path,
+          quarantinePath: candidate.quarantinePath,
+          dev: candidate.dev,
+          ino: candidate.ino,
+        };
+        atomicWriteJson(generation.markerPath, quarantineMarker(generation), fsApi);
+        persistProgress({
+          status: 'PLANNED',
+          retained: plan.retained,
+          candidates: plan.candidates,
+          removed: gc.removed,
+          quarantined,
+          skipped,
+          generations: generations.map(publicGeneration),
+        });
+        if (pathExistsByLstat(candidate.quarantinePath, fsApi)) {
+          throw new Error('random quarantine destination already exists');
+        }
+        fsApi.renameSync(inspected.path, candidate.quarantinePath);
+        fsyncDirectory(candidate.rootPath, fsApi);
+        fsyncDirectory(generation.objectsPath, fsApi);
+        const moved = inspectQuarantinedBackup(candidate.quarantinePath, generation, fsApi);
+        if (
+          !moved
+          || moved.dev !== candidate.dev
+          || moved.ino !== candidate.ino
+          || moved.mtimeMs !== candidate.mtimeMs
+        ) {
+          throw new Error('quarantined backup identity changed after rename');
+        }
+        const movedRecord = { ...candidate, quarantinedAt: new Date().toISOString() };
+        quarantined.push(movedRecord);
+        generation.moved.push(movedRecord);
+        generation.moveIntent = null;
+        generation.status = 'GC_PENDING';
+        atomicWriteJson(generation.markerPath, quarantineMarker(generation), fsApi);
+        persistProgress({
+          status: 'GC_PENDING',
+          retained: plan.retained,
+          candidates: plan.candidates,
+          removed: gc.removed,
+          quarantined,
+          skipped,
+          generations: generations.map(publicGeneration),
+        });
+      } catch (error) {
+        skipped.push({ ...candidate, reason: error.message });
+      }
+    }
+  }
+  return {
+    status: skipped.length > 0 ? 'WARN' : quarantined.length > 0 ? 'GC_PENDING' : 'PASS',
+    retained: plan.retained,
+    candidates: plan.candidates,
+    removed: gc.removed,
+    quarantined,
+    skipped,
+    generations: generations.map(publicGeneration),
+  };
+}
+
+export function executeCoreBackupRetention({
+  currentBackupDir,
+  retain = CORE_BACKUP_RETAIN,
+  fsApi = fs,
+  homeDir = os.homedir(),
+  tmpDir = os.tmpdir(),
+  summary,
+  summaryPath,
+} = {}) {
+  if (!summary || typeof summary !== 'object' || !summaryPath) {
+    throw new TypeError('Core backup retention requires a summary audit destination');
+  }
+  const lock = acquireCoreBackupRetentionLock(homeDir, fsApi);
+  if (!lock) {
+    const result = {
+      status: 'WARN',
+      reason: 'Core backup retention is locked by another run',
+      retained: [],
+      candidates: [],
+      removed: [],
+      quarantined: [],
+      skipped: [],
+      generations: [],
+    };
+    summary.backupRetention = result;
+    atomicWriteJson(summaryPath, summary, fsApi);
+    return result;
+  }
+  try {
+    atomicWriteJson(summaryPath, summary, fsApi);
+    const roots = coreBackupRoots({ homeDir, tmpDir });
+    const currentProof = pairSummaryProof(summary, summaryPath);
+    if (!claimCurrentBackupOwnership(currentBackupDir, summary, summaryPath, { fsApi, roots })) {
+      const result = {
+        status: 'SKIPPED',
+        reason: 'current Core backup is not bound to this successful pair summary',
+        retained: [],
+        candidates: [],
+        removed: [],
+        quarantined: [],
+        skipped: [],
+        generations: [],
+      };
+      summary.backupRetention = result;
+      atomicWriteJson(summaryPath, summary, fsApi);
+      return result;
+    }
+    const plan = planCoreBackupRetention({
+      currentBackupDir,
+      retain,
+      fsApi,
+      homeDir,
+      tmpDir,
+    });
+    summary.backupRetention = {
+      ...plan,
+      removed: [],
+      quarantined: [],
+      skipped: [],
+      generations: [],
+    };
+    atomicWriteJson(summaryPath, summary, fsApi);
+    const result = applyCoreBackupRetention(plan, {
+      fsApi,
+      currentProof,
+      roots,
+      persistProgress: (progress) => {
+        summary.backupRetention = progress.status === 'GC_PLANNED'
+          ? { ...summary.backupRetention, gcIntent: progress }
+          : progress;
+        atomicWriteJson(summaryPath, summary, fsApi);
+      },
+    });
+    summary.backupRetention = result;
+    atomicWriteJson(summaryPath, summary, fsApi);
+    return result;
+  } finally {
+    releaseCoreBackupRetentionLock(lock, fsApi);
+  }
 }
 
 function stageImmutableArchive(repo, sha, destination) {
@@ -718,6 +1510,22 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
     summary.status = 'PASS';
     summary.result = 'UPGRADE_COMPLETE';
     summary.finishedAt = new Date().toISOString();
+    atomicWriteJson(summaryPath, summary);
+    try {
+      executeCoreBackupRetention({
+        currentBackupDir: summary.coreResult.backupDir,
+        summary,
+        summaryPath,
+      });
+    } catch (error) {
+      summary.backupRetention = {
+        status: 'WARN',
+        retained: [],
+        removed: [],
+        skipped: [],
+        error: error.message,
+      };
+    }
     atomicWriteJson(summaryPath, summary);
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
     return 0;

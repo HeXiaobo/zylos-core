@@ -14,6 +14,7 @@ const {
   step1_backupCoreSkills,
   step5_syncCoreSkills,
   step13_verifyCommunicationContinuity,
+  step14_commitSkillBaselines,
   step7_syncInstructions,
   rollbackSelf,
   resolveSelfUpgradeFinalizerTimeoutMs,
@@ -56,6 +57,14 @@ function writeTargetCommunicationAssets(root, assets = TARGET_COMMUNICATION_ASSE
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, '#!/usr/bin/env node\n');
   }
+}
+
+function emptyExactSkillsInventory(root = '/tmp/live-skills') {
+  return {
+    schemaVersion: 2,
+    root,
+    skills: [],
+  };
 }
 
 describe('self-upgrade repository routing', () => {
@@ -143,6 +152,7 @@ describe('self-upgrade finalizer handoff', () => {
   });
 
   it('serializes the state needed by the newly installed finalizer', () => {
+    const preUpgradeSkillsInventory = emptyExactSkillsInventory();
     assert.deepEqual(createFinalizeState({
       tempDir: '/tmp/new-core',
       backupDir: '/tmp/backup',
@@ -153,6 +163,7 @@ describe('self-upgrade finalizer handoff', () => {
       to: '0.4.13',
       newVersion: '0.4.13',
       mode: 'merge',
+      preUpgradeSkillsInventory,
     }), {
       schemaVersion: 1,
       tempDir: '/tmp/new-core',
@@ -164,6 +175,7 @@ describe('self-upgrade finalizer handoff', () => {
       to: '0.4.13',
       newVersion: '0.4.13',
       mode: 'merge',
+      preUpgradeSkillsInventory,
     });
   });
 
@@ -179,6 +191,7 @@ describe('self-upgrade finalizer handoff', () => {
       from: '0.4.12',
       to: '0.4.13',
       mode: 'merge',
+      preUpgradeSkillsInventory: emptyExactSkillsInventory(),
     }, {
       steps: [
         (ctx) => {
@@ -208,6 +221,37 @@ describe('self-upgrade finalizer handoff', () => {
     }]);
   });
 
+  it('fails closed before post-install mutation for a legacy finalizer state without an exact skills manifest', () => {
+    let postInstallStarted = false;
+    let rollbackStarted = false;
+
+    const result = runSelfUpgradeFinalize({
+      schemaVersion: 1,
+      tempDir: '/tmp/new-core',
+      backupDir: '/tmp/backup',
+      globalCoreDir: '/opt/node/lib/node_modules/zylos',
+      servicesWereRunning: ['activity-monitor'],
+      from: '0.7.2-rc.10',
+      to: '0.7.2-rc.11',
+      mode: 'merge',
+    }, {
+      steps: [() => {
+        postInstallStarted = true;
+        return { step: 5, name: 'sync_core_skills', status: 'done' };
+      }],
+      rollbackSelf: () => {
+        rollbackStarted = true;
+        return [];
+      },
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.failedStep, 5);
+    assert.match(result.error, /pre-mutation skills inventory/i);
+    assert.equal(postInstallStarted, false);
+    assert.equal(rollbackStarted, true);
+  });
+
   it('rolls back when a post-install step fails', () => {
     const rollbackCalls = [];
     const result = runSelfUpgradeFinalize({
@@ -217,6 +261,7 @@ describe('self-upgrade finalizer handoff', () => {
       servicesWereRunning: ['activity-monitor'],
       from: '0.4.12',
       to: '0.4.13',
+      preUpgradeSkillsInventory: emptyExactSkillsInventory(),
     }, {
       steps: [
         () => ({ step: 5, name: 'sync_core_skills', status: 'failed', error: 'sync failed' }),
@@ -469,6 +514,361 @@ describe('step10_ensureCodexConfig', () => {
 });
 
 describe('self-upgrade backup and rollback', () => {
+  it('fails before live mutation when the transaction backup omits an existing top-level skill', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-incomplete-skills-backup-'));
+    const skillsDir = path.join(tmpDir, 'live-skills');
+    const targetDir = path.join(tmpDir, 'target');
+    const backupDir = path.join(tmpDir, 'backup');
+    let mutationStarted = false;
+    let capturedContext = null;
+
+    fs.mkdirSync(path.join(skillsDir, 'core-skill'), { recursive: true });
+    fs.mkdirSync(path.join(skillsDir, 'foreign-skill', 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(skillsDir, 'foreign-skill', 'node_modules', 'fixture'), { recursive: true });
+    fs.mkdirSync(path.join(skillsDir, 'foreign-skill', '.backup', 'old'), { recursive: true });
+    fs.mkdirSync(path.join(targetDir, 'skills', 'core-skill'), { recursive: true });
+    fs.writeFileSync(path.join(skillsDir, 'core-skill', 'SKILL.md'), '# Core\n');
+    fs.writeFileSync(path.join(skillsDir, 'foreign-skill', 'SKILL.md'), [
+      '---',
+      'name: foreign-skill',
+      'lifecycle:',
+      '  service:',
+      '    entry: scripts/server.js',
+      '---',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(skillsDir, 'foreign-skill', 'scripts', 'server.js'), 'old server\n');
+    fs.writeFileSync(path.join(skillsDir, 'foreign-skill', 'node_modules', 'fixture', 'index.js'), 'ignored\n');
+    fs.writeFileSync(path.join(skillsDir, 'foreign-skill', '.backup', 'old', 'server.js'), 'ignored\n');
+
+    const result = runSelfUpgrade({ tempDir: targetDir, newVersion: '0.7.2-rc.11' }, {
+      getCurrentVersion: () => ({ success: true, version: '0.7.2-rc.10' }),
+      preInstallSteps: [
+        (ctx) => {
+          capturedContext = ctx;
+          return step1_backupCoreSkills(ctx, {
+            zylosDir: path.join(tmpDir, 'zylos'),
+            skillsDir,
+            backupDir,
+            copyTree: (src, dest, options) => {
+              if (src !== skillsDir) {
+                fs.cpSync(src, dest, { recursive: true });
+                return;
+              }
+              fs.mkdirSync(path.join(dest, 'core-skill'), { recursive: true });
+              fs.copyFileSync(
+                path.join(src, 'core-skill', 'SKILL.md'),
+                path.join(dest, 'core-skill', 'SKILL.md'),
+              );
+              assert.deepEqual(options, { excludes: ['node_modules'] });
+          },
+          installedCoreSkillsDir: path.join(targetDir, 'skills'),
+        });
+        },
+        () => {
+          mutationStarted = true;
+          return { step: 4, name: 'npm_install_global', status: 'done' };
+        },
+      ],
+      runInstalledFinalizer: () => ({ success: true, steps: [] }),
+      rollbackSelf: () => [],
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.failedStep, 1);
+    assert.match(result.error, /backup.*foreign-skill/i);
+    assert.equal(mutationStarted, false);
+    assert.deepEqual(
+      capturedContext.preUpgradeSkillsInventory.skills.map(({ name }) => name),
+      ['core-skill', 'foreign-skill'],
+    );
+    assert.equal(
+      capturedContext.preUpgradeSkillsInventory.skills.find(({ name }) => name === 'foreign-skill')
+        .declaredScripts[0].path,
+      'scripts/server.js',
+    );
+    assert.equal(
+      capturedContext.preUpgradeSkillsInventory.skills.find(({ name }) => name === 'foreign-skill')
+        .fileCount,
+      2,
+    );
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('fails before live mutation when a same-shape skills backup has corrupted bytes', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-corrupt-skills-backup-'));
+    const skillsDir = path.join(tmpDir, 'live-skills');
+    const targetDir = path.join(tmpDir, 'target');
+    const backupDir = path.join(tmpDir, 'backup');
+    const skillDir = path.join(skillsDir, 'foreign-skill');
+
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.mkdirSync(path.join(targetDir, 'skills', 'core-skill'), { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '# Foreign\n');
+    fs.writeFileSync(path.join(skillDir, 'local-config.json'), '{"keep":true}\n');
+
+    const result = step1_backupCoreSkills({ tempDir: targetDir }, {
+      zylosDir: path.join(tmpDir, 'zylos'),
+      skillsDir,
+      backupDir,
+      copyTree: (src, dest) => {
+        fs.cpSync(src, dest, { recursive: true });
+        fs.writeFileSync(path.join(dest, 'foreign-skill', 'local-config.json'), '{"keep":FAIL}\n');
+      },
+    });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /backup.*foreign-skill.*local-config\.json.*sha256/i);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('fails and rolls back when Core sync deletes a foreign skill directory', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-foreign-skill-delete-'));
+    const liveRoot = path.join(tmpDir, 'live');
+    const skillsDir = path.join(liveRoot, 'skills');
+    const targetDir = path.join(tmpDir, 'target');
+    const backupDir = path.join(tmpDir, 'backup');
+    const foreignSkillDir = path.join(skillsDir, 'foreign-skill');
+
+    writeTargetCommunicationAssets(liveRoot);
+    writeTargetCommunicationAssets(targetDir);
+    fs.mkdirSync(path.join(foreignSkillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(foreignSkillDir, 'SKILL.md'), [
+      '---',
+      'name: foreign-skill',
+      'lifecycle:',
+      '  service:',
+      '    entry: scripts/server.js',
+      '---',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(foreignSkillDir, 'scripts', 'server.js'), 'foreign server\n');
+    fs.writeFileSync(path.join(foreignSkillDir, 'local-config.json'), '{"keep":true}\n');
+
+    const backupContext = {
+      tempDir: targetDir,
+      newVersion: '0.7.2-rc.11',
+      mode: 'merge',
+      servicesWereRunning: [],
+      cronServicesWereRunning: [],
+      from: '0.7.2-rc.10',
+      to: '0.7.2-rc.11',
+    };
+    const backup = step1_backupCoreSkills(backupContext, {
+      zylosDir: liveRoot,
+      skillsDir,
+      backupDir,
+      installedCoreSkillsDir: path.join(targetDir, 'skills'),
+    });
+    assert.equal(backup.status, 'done');
+    assert.equal(
+      backupContext.preUpgradeSkillsInventory.skills
+        .find(({ name }) => name === 'foreign-skill').ownedByTarget,
+      false,
+    );
+
+    const result = runSelfUpgradeFinalize(createFinalizeState(backupContext), {
+      steps: [
+        (ctx) => step5_syncCoreSkills(ctx, {
+          zylosDir: liveRoot,
+          skillsDir,
+          syncCoreSkills: () => {
+            fs.rmSync(foreignSkillDir, { recursive: true, force: true });
+            return {
+              synced: [], added: [], merged: [], deleted: [], preserved: [],
+              conflicts: [], errors: [], pendingBaselines: [],
+            };
+          },
+        }),
+      ],
+      rollbackSelf: (ctx) => rollbackSelf(ctx, {
+        zylosDir: liveRoot,
+        skillsDir,
+      }),
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.failedStep, 5);
+    assert.match(result.error, /foreign-skill.*top-level directory missing/i);
+    assert.equal(result.rollback.performed, true);
+    assert.equal(fs.readFileSync(path.join(foreignSkillDir, 'scripts', 'server.js'), 'utf8'), 'foreign server\n');
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('fails and rolls back when a foreign declared script is replaced without reducing file counts', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-foreign-script-delete-'));
+    const liveRoot = path.join(tmpDir, 'live');
+    const skillsDir = path.join(liveRoot, 'skills');
+    const targetDir = path.join(tmpDir, 'target');
+    const backupDir = path.join(tmpDir, 'backup');
+    const foreignSkillDir = path.join(skillsDir, 'foreign-skill');
+    const declaredScript = path.join(foreignSkillDir, 'scripts', 'server.js');
+    const replacementScript = path.join(foreignSkillDir, 'scripts', 'replacement.js');
+
+    writeTargetCommunicationAssets(liveRoot);
+    writeTargetCommunicationAssets(targetDir);
+    fs.mkdirSync(path.dirname(declaredScript), { recursive: true });
+    fs.writeFileSync(path.join(foreignSkillDir, 'SKILL.md'), [
+      '---',
+      'name: foreign-skill',
+      'lifecycle:',
+      '  service:',
+      '    entry: scripts/server.js',
+      '---',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(declaredScript, 'foreign server\n');
+
+    const backupContext = {
+      tempDir: targetDir,
+      newVersion: '0.7.2-rc.11',
+      mode: 'merge',
+      servicesWereRunning: [],
+      cronServicesWereRunning: [],
+      from: '0.7.2-rc.10',
+      to: '0.7.2-rc.11',
+    };
+    assert.equal(step1_backupCoreSkills(backupContext, {
+      zylosDir: liveRoot,
+      skillsDir,
+      backupDir,
+      installedCoreSkillsDir: path.join(targetDir, 'skills'),
+    }).status, 'done');
+
+    const result = runSelfUpgradeFinalize(createFinalizeState(backupContext), {
+      steps: [
+        (ctx) => step5_syncCoreSkills(ctx, {
+          zylosDir: liveRoot,
+          skillsDir,
+          syncCoreSkills: () => {
+            fs.rmSync(declaredScript);
+            fs.writeFileSync(replacementScript, 'replacement\n');
+            return {
+              synced: [], added: [], merged: [], deleted: [], preserved: [],
+              conflicts: [], errors: [], pendingBaselines: [],
+            };
+          },
+        }),
+      ],
+      rollbackSelf: (ctx) => rollbackSelf(ctx, {
+        zylosDir: liveRoot,
+        skillsDir,
+      }),
+    });
+
+    assert.equal(result.success, false);
+    assert.match(result.error, /foreign-skill.*declared script missing.*scripts\/server\.js/i);
+    assert.equal(fs.readFileSync(declaredScript, 'utf8'), 'foreign server\n');
+    assert.equal(fs.existsSync(replacementScript), false);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('rejects a foreign skill file-count collapse even when the directory and critical paths remain', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-foreign-file-collapse-'));
+    const skillsDir = path.join(tmpDir, 'live-skills');
+    const targetDir = path.join(tmpDir, 'target');
+    const backupDir = path.join(tmpDir, 'backup');
+    const foreignSkillDir = path.join(skillsDir, 'foreign-skill');
+
+    fs.mkdirSync(path.join(foreignSkillDir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(targetDir, 'skills', 'core-skill'), { recursive: true });
+    fs.writeFileSync(path.join(foreignSkillDir, 'SKILL.md'), '# Foreign\n');
+    fs.writeFileSync(path.join(foreignSkillDir, 'scripts', 'server.js'), 'server\n');
+    fs.writeFileSync(path.join(foreignSkillDir, 'local-config.json'), '{"keep":true}\n');
+
+    const ctx = { tempDir: targetDir, mode: 'merge' };
+    assert.equal(step1_backupCoreSkills(ctx, {
+      zylosDir: path.join(tmpDir, 'zylos'),
+      skillsDir,
+      backupDir,
+    }).status, 'done');
+
+    fs.rmSync(path.join(foreignSkillDir, 'local-config.json'));
+    const result = step14_commitSkillBaselines(ctx, { skillsDir });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /foreign-skill.*file count collapsed from 3 to 2/i);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('rejects a one-for-one replacement of an undeclared foreign skill file', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-foreign-file-replacement-'));
+    const skillsDir = path.join(tmpDir, 'live-skills');
+    const targetDir = path.join(tmpDir, 'target');
+    const foreignSkillDir = path.join(skillsDir, 'foreign-skill');
+
+    fs.mkdirSync(path.join(foreignSkillDir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(targetDir, 'skills', 'core-skill'), { recursive: true });
+    fs.writeFileSync(path.join(foreignSkillDir, 'SKILL.md'), '# Foreign\n');
+    fs.writeFileSync(path.join(foreignSkillDir, 'scripts', 'server.js'), 'server\n');
+    fs.writeFileSync(path.join(foreignSkillDir, 'local-config.json'), '{"keep":true}\n');
+
+    const ctx = { tempDir: targetDir, mode: 'merge' };
+    assert.equal(step1_backupCoreSkills(ctx, {
+      zylosDir: path.join(tmpDir, 'zylos'),
+      skillsDir,
+      backupDir: path.join(tmpDir, 'backup'),
+    }).status, 'done');
+
+    fs.rmSync(path.join(foreignSkillDir, 'local-config.json'));
+    fs.writeFileSync(path.join(foreignSkillDir, 'replacement.json'), '{"junk":true}\n');
+    const result = step14_commitSkillBaselines(ctx, { skillsDir });
+
+    assert.equal(result.status, 'failed');
+    assert.match(result.error, /foreign-skill.*entry missing.*local-config\.json/i);
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('allows target-owned skill changes while preserving an unchanged foreign skill', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-owned-skill-change-'));
+    const liveRoot = path.join(tmpDir, 'live');
+    const skillsDir = path.join(liveRoot, 'skills');
+    const targetDir = path.join(tmpDir, 'target');
+    const coreSkillDir = path.join(skillsDir, 'core-skill');
+    const foreignSkillDir = path.join(skillsDir, 'foreign-skill');
+
+    writeTargetCommunicationAssets(liveRoot);
+    writeTargetCommunicationAssets(targetDir);
+    fs.mkdirSync(coreSkillDir, { recursive: true });
+    fs.mkdirSync(path.join(targetDir, 'skills', 'core-skill'), { recursive: true });
+    fs.mkdirSync(path.join(foreignSkillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(coreSkillDir, 'SKILL.md'), '# Core\n');
+    fs.writeFileSync(path.join(coreSkillDir, 'retired.js'), 'retired\n');
+    fs.writeFileSync(path.join(foreignSkillDir, 'SKILL.md'), '# Foreign\n');
+    fs.writeFileSync(path.join(foreignSkillDir, 'scripts', 'server.js'), 'foreign server\n');
+
+    const ctx = { tempDir: targetDir, mode: 'merge' };
+    assert.equal(step1_backupCoreSkills(ctx, {
+      zylosDir: liveRoot,
+      skillsDir,
+      backupDir: path.join(tmpDir, 'backup'),
+      installedCoreSkillsDir: path.join(targetDir, 'skills'),
+    }).status, 'done');
+
+    const result = step5_syncCoreSkills(ctx, {
+      zylosDir: liveRoot,
+      skillsDir,
+      syncCoreSkills: () => {
+        fs.rmSync(path.join(coreSkillDir, 'retired.js'));
+        return {
+          synced: ['core-skill'], added: [], merged: [], deleted: ['core-skill/retired.js'], preserved: [],
+          conflicts: [], errors: [], pendingBaselines: [],
+        };
+      },
+    });
+
+    assert.equal(result.status, 'done');
+    assert.equal(fs.readFileSync(path.join(foreignSkillDir, 'scripts', 'server.js'), 'utf8'), 'foreign server\n');
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   it('fails closed instead of backing up the bootstrap source when the global package cannot be resolved', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-package-missing-'));
     const coreDir = path.join(tmpDir, 'target-bootstrap-source');
@@ -1476,6 +1876,7 @@ describe('step7 manifest deploy (real step7_syncInstructions)', () => {
       tempDir: path.join(tmpDir, 'pkg'),
       from: '0.4.12',
       to: '0.4.13',
+      preUpgradeSkillsInventory: emptyExactSkillsInventory(),
     }, { steps: [wrappedStep7] });
 
     assert.equal(result.success, true);

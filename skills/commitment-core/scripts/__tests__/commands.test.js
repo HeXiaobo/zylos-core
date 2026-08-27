@@ -11,10 +11,11 @@ import { openCommitmentCore } from '../core.js';
 
 function createHarness({ taskId = 'task-001', eventIds = ['event-001'] } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-commitment-command-'));
+  const dbPath = path.join(directory, 'commitments.db');
   let eventIndex = 0;
   let creationEventPending = true;
   const core = openCommitmentCore({
-    dbPath: path.join(directory, 'commitments.db'),
+    dbPath,
     clock: () => '2026-08-25T10:00:00.000Z',
     idGenerator: () => taskId,
     eventIdGenerator: () => {
@@ -28,6 +29,7 @@ function createHarness({ taskId = 'task-001', eventIds = ['event-001'] } = {}) {
 
   return {
     core,
+    dbPath,
     cleanup() {
       core.close();
       rmSync(directory, { recursive: true, force: true });
@@ -103,6 +105,380 @@ test('StartTask moves ready to in_progress and records one domain event', () => 
     assert.equal(history.events[0].type, 'TaskCreated');
     assert.deepEqual(history.events[1], result.event);
   } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder changes the canonical reminder and projects one Task event', () => {
+  const harness = createHarness({ eventIds: ['event-reminder'] });
+
+  try {
+    harness.core.outbox.register({
+      projection: 'test-reminder',
+      bootstrapPolicy: 'from_beginning',
+      actorId: 'test-operator',
+      idempotencyKey: 'register:test-reminder',
+    });
+    ingestReadyTask(harness.core, {
+      dueAt: '2026-08-28T18:00:00+08:00',
+    });
+
+    const result = harness.core.command({
+      type: 'UpdateTaskReminder',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      reminderMinutesBeforeDue: 60,
+      idempotencyKey: 'command:reminder:task-001',
+    }, 1);
+
+    assert.equal(result.task.reminderMinutesBeforeDue, 60);
+    assert.equal(result.task.version, 2);
+    assert.deepEqual(result.event, {
+      id: 'event-reminder',
+      type: 'TaskReminderUpdated',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      fromState: 'ready',
+      toState: 'ready',
+      version: 2,
+      occurredAt: '2026-08-25T10:00:00.000Z',
+    });
+    assert.deepEqual(
+      harness.core.query({ taskId: 'task-001', includeEvents: true })
+        .events.map((event) => event.type),
+      ['TaskCreated', 'TaskReminderUpdated'],
+    );
+    assert.deepEqual(
+      harness.core.outbox.query({ projection: 'test-reminder', limit: 10 })
+        .map((delivery) => delivery.event.type),
+      ['TaskCreated', 'TaskReminderUpdated'],
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder records a deterministic receipt without mutation when the value matches', () => {
+  const harness = createHarness({ eventIds: ['event-reminder-change'] });
+
+  try {
+    harness.core.outbox.register({
+      projection: 'test-reminder-noop',
+      bootstrapPolicy: 'from_beginning',
+      actorId: 'test-operator',
+      idempotencyKey: 'register:test-reminder-noop',
+    });
+    const original = ingestReadyTask(harness.core, {
+      dueAt: '2026-08-28T18:00:00+08:00',
+      reminderMinutesBeforeDue: 60,
+    });
+    const command = {
+      type: 'UpdateTaskReminder',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      reminderMinutesBeforeDue: 60,
+      idempotencyKey: 'command:reminder:no-op',
+    };
+
+    const noOp = harness.core.command(command, 1);
+    assert.deepEqual(noOp, { task: original, event: null });
+    assert.deepEqual(
+      harness.core.query({ taskId: 'task-001', includeEvents: true })
+        .events.map((event) => event.type),
+      ['TaskCreated'],
+    );
+    assert.deepEqual(
+      harness.core.outbox.query({ projection: 'test-reminder-noop', limit: 10 })
+        .map((delivery) => delivery.event.type),
+      ['TaskCreated'],
+    );
+
+    harness.core.command({
+      ...command,
+      reminderMinutesBeforeDue: 30,
+      idempotencyKey: 'command:reminder:change-after-no-op',
+    }, 1);
+    assert.deepEqual(harness.core.command(command, 1), noOp);
+    assert.throws(
+      () => harness.core.command({ ...command, reminderMinutesBeforeDue: 15 }, 1),
+      (error) => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder requires the Task to have a canonical deadline', () => {
+  const harness = createHarness();
+
+  try {
+    ingestReadyTask(harness.core);
+
+    assert.throws(
+      () => harness.core.command({
+        type: 'UpdateTaskReminder',
+        taskId: 'task-001',
+        actorId: 'owner-1',
+        reminderMinutesBeforeDue: 60,
+        idempotencyKey: 'command:reminder:without-due-at',
+      }, 1),
+      (error) => error?.code === 'REMINDER_REQUIRES_DUE_AT',
+    );
+    const unchanged = harness.core.query({ taskId: 'task-001', includeEvents: true });
+    assert.equal(unchanged.task.version, 1);
+    assert.deepEqual(unchanged.events.map((event) => event.type), ['TaskCreated']);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder accepts zero and rejects values outside non-negative safe integers', () => {
+  const harness = createHarness({ eventIds: ['event-reminder-zero'] });
+
+  try {
+    ingestReadyTask(harness.core, { dueAt: '2026-08-28T18:00:00+08:00' });
+    const zero = harness.core.command({
+      type: 'UpdateTaskReminder',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      reminderMinutesBeforeDue: 0,
+      idempotencyKey: 'command:reminder:zero',
+    }, 1);
+    assert.equal(zero.task.reminderMinutesBeforeDue, 0);
+
+    for (const [index, reminderMinutesBeforeDue] of [
+      -1,
+      1.5,
+      '60',
+      Number.MAX_SAFE_INTEGER + 1,
+      null,
+    ].entries()) {
+      assert.throws(
+        () => harness.core.command({
+          type: 'UpdateTaskReminder',
+          taskId: 'task-001',
+          actorId: 'owner-1',
+          reminderMinutesBeforeDue,
+          idempotencyKey: `command:reminder:invalid:${index}`,
+        }, 2),
+        (error) => error instanceof TypeError,
+      );
+    }
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder allows the acceptor and rejects actors outside owner or acceptor', () => {
+  const harness = createHarness({ eventIds: ['event-reminder-acceptor'] });
+
+  try {
+    ingestReadyTask(harness.core, { dueAt: '2026-08-28T18:00:00+08:00' });
+    const updated = harness.core.command({
+      type: 'UpdateTaskReminder',
+      taskId: 'task-001',
+      actorId: 'acceptor-1',
+      reminderMinutesBeforeDue: 60,
+      idempotencyKey: 'command:reminder:acceptor',
+    }, 1);
+    assert.equal(updated.event.actorId, 'acceptor-1');
+
+    assert.throws(
+      () => harness.core.command({
+        type: 'UpdateTaskReminder',
+        taskId: 'task-001',
+        actorId: 'assignee-1',
+        reminderMinutesBeforeDue: 30,
+        idempotencyKey: 'command:reminder:forbidden',
+      }, 2),
+      (error) => error?.code === 'FORBIDDEN',
+    );
+    assert.equal(harness.core.query({ taskId: 'task-001' }).version, 2);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder is available only while a Task can still be acted on', () => {
+  const cases = [
+    {
+      state: 'done',
+      version: 4,
+      eventIds: ['event-start', 'event-submit', 'event-accept'],
+      prepare: moveToReview,
+      finish(core) {
+        core.command({
+          type: 'AcceptTask',
+          taskId: 'task-001',
+          actorId: 'acceptor-1',
+          idempotencyKey: 'command:accept:reminder-state',
+        }, 3);
+      },
+    },
+    {
+      state: 'cancelled',
+      version: 2,
+      eventIds: ['event-cancel'],
+      prepare() {},
+      finish(core) {
+        core.command({
+          type: 'CancelTask',
+          taskId: 'task-001',
+          actorId: 'owner-1',
+          idempotencyKey: 'command:cancel:reminder-state',
+        }, 1);
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const harness = createHarness({ eventIds: testCase.eventIds });
+    try {
+      ingestReadyTask(harness.core, { dueAt: '2026-08-28T18:00:00+08:00' });
+      testCase.prepare(harness.core);
+      testCase.finish(harness.core);
+      assert.throws(
+        () => harness.core.command({
+          type: 'UpdateTaskReminder',
+          taskId: 'task-001',
+          actorId: 'owner-1',
+          reminderMinutesBeforeDue: 60,
+          idempotencyKey: `command:reminder:${testCase.state}`,
+        }, testCase.version),
+        (error) => error?.code === 'INVALID_TRANSITION',
+        testCase.state,
+      );
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test('UpdateTaskReminder preserves in_progress and review state', () => {
+  const harness = createHarness({
+    eventIds: [
+      'event-start-reminder-states',
+      'event-reminder-in-progress',
+      'event-submit-reminder-states',
+      'event-reminder-review',
+    ],
+  });
+
+  try {
+    ingestReadyTask(harness.core, { dueAt: '2026-08-28T18:00:00+08:00' });
+    harness.core.command({
+      type: 'StartTask',
+      taskId: 'task-001',
+      actorId: 'assignee-1',
+      idempotencyKey: 'command:start:reminder-states',
+    }, 1);
+    const inProgress = harness.core.command({
+      type: 'UpdateTaskReminder',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      reminderMinutesBeforeDue: 60,
+      idempotencyKey: 'command:reminder:in-progress',
+    }, 2);
+    assert.equal(inProgress.task.state, 'in_progress');
+    assert.equal(inProgress.event.fromState, 'in_progress');
+    assert.equal(inProgress.event.toState, 'in_progress');
+
+    harness.core.command({
+      type: 'SubmitForReview',
+      taskId: 'task-001',
+      actorId: 'assignee-1',
+      idempotencyKey: 'command:submit:reminder-states',
+    }, 3);
+    const review = harness.core.command({
+      type: 'UpdateTaskReminder',
+      taskId: 'task-001',
+      actorId: 'acceptor-1',
+      reminderMinutesBeforeDue: 30,
+      idempotencyKey: 'command:reminder:review',
+    }, 4);
+    assert.equal(review.task.state, 'review');
+    assert.equal(review.event.fromState, 'review');
+    assert.equal(review.event.toState, 'review');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder applies expectedVersion CAS before a same-value no-op', () => {
+  const harness = createHarness();
+
+  try {
+    ingestReadyTask(harness.core, {
+      dueAt: '2026-08-28T18:00:00+08:00',
+      reminderMinutesBeforeDue: 60,
+    });
+    assert.throws(
+      () => harness.core.command({
+        type: 'UpdateTaskReminder',
+        taskId: 'task-001',
+        actorId: 'owner-1',
+        reminderMinutesBeforeDue: 60,
+        idempotencyKey: 'command:reminder:stale-no-op',
+      }, 2),
+      (error) => error?.code === 'VERSION_CONFLICT',
+    );
+    const unchanged = harness.core.query({ taskId: 'task-001', includeEvents: true });
+    assert.equal(unchanged.task.version, 1);
+    assert.deepEqual(unchanged.events.map((event) => event.type), ['TaskCreated']);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('UpdateTaskReminder rolls Task, Event, receipt, and Outbox back together', () => {
+  const harness = createHarness({
+    eventIds: ['event-reminder-failed', 'event-reminder-retry'],
+  });
+  const raw = new Database(harness.dbPath);
+
+  try {
+    harness.core.outbox.register({
+      projection: 'test-reminder-atomicity',
+      bootstrapPolicy: 'from_beginning',
+      actorId: 'test-operator',
+      idempotencyKey: 'register:test-reminder-atomicity',
+    });
+    ingestReadyTask(harness.core, { dueAt: '2026-08-28T18:00:00+08:00' });
+    raw.exec(`
+      CREATE TRIGGER reject_reminder_projection_record
+      BEFORE INSERT ON commitment_projection_outbox
+      BEGIN
+        SELECT RAISE(ABORT, 'reminder projection outbox rejected');
+      END;
+    `);
+    const command = {
+      type: 'UpdateTaskReminder',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      reminderMinutesBeforeDue: 60,
+      idempotencyKey: 'command:reminder:atomicity',
+    };
+
+    assert.throws(
+      () => harness.core.command(command, 1),
+      /reminder projection outbox rejected/,
+    );
+    const afterFailure = harness.core.query({ taskId: 'task-001', includeEvents: true });
+    assert.equal(afterFailure.task.reminderMinutesBeforeDue, null);
+    assert.equal(afterFailure.task.version, 1);
+    assert.deepEqual(afterFailure.events.map((event) => event.type), ['TaskCreated']);
+    assert.deepEqual(
+      harness.core.outbox.query({ projection: 'test-reminder-atomicity', limit: 10 })
+        .map((delivery) => delivery.event.type),
+      ['TaskCreated'],
+    );
+
+    raw.exec('DROP TRIGGER reject_reminder_projection_record');
+    const retry = harness.core.command(command, 1);
+    assert.equal(retry.event.id, 'event-reminder-retry');
+    assert.equal(retry.task.reminderMinutesBeforeDue, 60);
+  } finally {
+    raw.close();
     harness.cleanup();
   }
 });

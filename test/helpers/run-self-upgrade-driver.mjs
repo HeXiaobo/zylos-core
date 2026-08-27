@@ -57,6 +57,10 @@ try {
       skillsDir: path.join(zylosDir, '.claude', 'skills'),
       backupDir: transactionBackupDir,
       corePackageDir: globalCoreDir,
+      // The fixture package is the installed Core target for the synthetic
+      // merge.  Supplying its skill root gives the continuity gate explicit
+      // ownership provenance instead of relying on a same-name heuristic.
+      installedCoreSkillsDir: path.join(tempDir, 'skills'),
     },
     step3: {
       getSkillsServices: () => [{ name: 'fixture-service', status: 'online' }],

@@ -43,6 +43,12 @@ import {
   verifyCommunicationContinuity,
 } from './communication-continuity.js';
 import { readEnvFile } from './env.js';
+import {
+  assertExactSkillsInventory,
+  captureExactSkillsInventory,
+  verifyExactSkillsBackup,
+  verifyPostSyncSkillsContinuity,
+} from './skills-continuity.js';
 
 // Services that must be present for upgraded Core behavior to function. During
 // an upgrade we start one only when the machine was already running Zylos and
@@ -548,6 +554,7 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     servicesStartedByUpgrade: [],
     mergeConflicts: [],
     mergedFiles: [],
+    preUpgradeSkillsInventory: null,
     // Results
     steps: [],
     from: null,
@@ -643,14 +650,38 @@ export function step1_backupCoreSkills(ctx, deps = {}) {
       if (!corePackageDir || !fsApi.existsSync(corePackageDir)) {
         throw new Error('Installed global Core package not found');
       }
+    }
+
+    const targetSkillsCandidate = ctx.tempDir ? path.join(ctx.tempDir, 'skills') : null;
+    const targetSkillsDir = targetSkillsCandidate && fsApi.existsSync(targetSkillsCandidate)
+      ? targetSkillsCandidate
+      : null;
+    const installedCoreSkillsCandidate = deps.installedCoreSkillsDir
+      ?? (corePackageDir ? path.join(corePackageDir, 'skills') : null);
+    const installedCoreSkillsDir = installedCoreSkillsCandidate
+      && fsApi.existsSync(installedCoreSkillsCandidate)
+      ? installedCoreSkillsCandidate
+      : null;
+    ctx.preUpgradeSkillsInventory = captureExactSkillsInventory({
+      skillsDir,
+      incomingSkillsDir: targetSkillsDir,
+      installedCoreSkillsDir,
+      classifyOwnership: true,
+      fsApi,
+    });
+
+    if (mustBackupCorePackage) {
       copyTreeFn(corePackageDir, path.join(backupDir, 'core-package'));
       ctx.globalCoreDir = corePackageDir;
     }
 
     // Backup the skills directory (include .zylos manifests — needed for correct rollback)
-    if (fsApi.existsSync(skillsDir)) {
-      copyTreeFn(skillsDir, path.join(backupDir, 'skills'), { excludes: ['node_modules'] });
-    }
+    copyTreeFn(skillsDir, path.join(backupDir, 'skills'), { excludes: ['node_modules'] });
+    const backupInventory = captureExactSkillsInventory({
+      skillsDir: path.join(backupDir, 'skills'),
+      fsApi,
+    });
+    verifyExactSkillsBackup(ctx.preUpgradeSkillsInventory, backupInventory);
 
     const ecosystemSrc = deps.ecosystemPath ?? path.join(zylosDir, 'pm2', 'ecosystem.config.cjs');
     if (fsApi.existsSync(ecosystemSrc)) {
@@ -831,6 +862,11 @@ export function step5_syncCoreSkills(ctx, deps = {}) {
 
     if (syncResult.errors.length > 0) {
       return { step: 5, name: 'sync_core_skills', status: 'failed', error: syncResult.errors.join('; '), duration: Date.now() - startTime };
+    }
+
+    if (ctx.preUpgradeSkillsInventory) {
+      const installedInventory = captureExactSkillsInventory({ skillsDir, fsApi });
+      verifyPostSyncSkillsContinuity(ctx.preUpgradeSkillsInventory, installedInventory);
     }
 
     const assets = verifyCommunicationAssets({ skillsDir, fsApi });
@@ -1668,9 +1704,16 @@ export function step13_verifyCommunicationContinuity(_ctx, deps = {}) {
 }
 
 /** Commit every Core Skill baseline after the complete self-upgrade succeeds. */
-function step14_commitSkillBaselines(ctx) {
+export function step14_commitSkillBaselines(ctx, deps = {}) {
   const startTime = Date.now();
   try {
+    const fsApi = deps.fs ?? fs;
+    const skillsDir = deps.skillsDir ?? SKILLS_DIR;
+    if (ctx.preUpgradeSkillsInventory) {
+      const installedInventory = captureExactSkillsInventory({ skillsDir, fsApi });
+      verifyPostSyncSkillsContinuity(ctx.preUpgradeSkillsInventory, installedInventory);
+    }
+
     for (const baseline of ctx.pendingBaselines || []) {
       saveMergeBaseline(baseline.destDir, baseline.srcDir, baseline.manifest);
     }
@@ -1881,6 +1924,9 @@ export function createFinalizeState(ctx) {
     to: ctx.to,
     newVersion: ctx.newVersion,
     mode: ctx.mode,
+    ...(ctx.preUpgradeSkillsInventory
+      ? { preUpgradeSkillsInventory: ctx.preUpgradeSkillsInventory }
+      : {}),
   };
 }
 
@@ -1952,6 +1998,24 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
     : [];
   ctx.from = state.from || null;
   ctx.to = state.to || state.newVersion || null;
+  ctx.preUpgradeSkillsInventory = state.preUpgradeSkillsInventory || null;
+
+  try {
+    assertExactSkillsInventory(ctx.preUpgradeSkillsInventory);
+  } catch (err) {
+    const failedStep = {
+      step: 5,
+      name: 'verify_pre_mutation_skills_inventory',
+      status: 'failed',
+      error: err.message,
+      total: deps.total || 15,
+      duration: 0,
+    };
+    ctx.error = failedStep.error;
+    ctx.steps.push(failedStep);
+    const rollbackFn = deps.rollbackSelf ?? rollbackSelf;
+    return buildSelfUpgradeResult(ctx, failedStep, rollbackFn(ctx), true);
+  }
 
   const steps = deps.steps || POST_INSTALL_STEPS;
   const total = deps.total || 15;
