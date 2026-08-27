@@ -249,6 +249,48 @@ describe('buildCleanEnv', () => {
     assert.equal(env.https_proxy, 'http://proxy:8443');
   });
 
+  it('auto-inherits Core deployment selectors needed by Claude and Codex runtimes', () => {
+    const processEnv = {
+      ...baseProcessEnv,
+      ZYLOS_DIR: '/srv/zylos-agent-26',
+      ZYLOS_AGENT_ID: 'agent:coco-agent-26',
+      ZYLOS_AGENT_PROFILE: 'coco-agent-26',
+      ZYLOS_AGENT_LABEL: '员工 26',
+      ZYLOS_AGENT_ALIASES: '["员工26"]',
+      ZYLOS_DEPLOYMENT_PROFILE: '3ai',
+      C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: 'agent:coco-agent-26',
+    };
+    const { env } = buildCleanEnv({ processEnv, dotenvVars: {}, platform: 'linux' });
+
+    assert.equal(env.ZYLOS_DIR, '/srv/zylos-agent-26');
+    assert.equal(env.ZYLOS_AGENT_ID, 'agent:coco-agent-26');
+    assert.equal(env.ZYLOS_AGENT_PROFILE, 'coco-agent-26');
+    assert.equal(env.ZYLOS_AGENT_LABEL, '员工 26');
+    assert.equal(env.ZYLOS_AGENT_ALIASES, '["员工26"]');
+    assert.equal(env.ZYLOS_DEPLOYMENT_PROFILE, '3ai');
+    assert.equal(env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID, 'agent:coco-agent-26');
+  });
+
+  it('loads Core deployment selectors from .env when the supervisor has none', () => {
+    const dotenvVars = {
+      ZYLOS_AGENT_ID: 'agent:yueran',
+      ZYLOS_AGENT_PROFILE: 'yueran',
+      ZYLOS_AGENT_LABEL: '玥然',
+      ZYLOS_AGENT_ALIASES: '["悦然"]',
+      ZYLOS_DEPLOYMENT_PROFILE: '3ai',
+      C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: 'agent:yueran',
+    };
+    const { env } = buildCleanEnv({
+      processEnv: baseProcessEnv,
+      dotenvVars,
+      platform: 'linux',
+    });
+
+    for (const [name, value] of Object.entries(dotenvVars)) {
+      assert.equal(env[name], value, name);
+    }
+  });
+
   it('includes TMPDIR on macOS when present', () => {
     const processEnv = { ...baseProcessEnv, TMPDIR: '/var/folders/xx/tmp' };
     const { env: envDarwin } = buildCleanEnv({ processEnv, dotenvVars: {}, platform: 'darwin' });

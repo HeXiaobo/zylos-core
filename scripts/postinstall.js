@@ -2,14 +2,12 @@
  * Postinstall script - runs after `npm install -g zylos`
  *
  * Two responsibilities:
- * 1. Sync Core Skills (skipped during self-upgrade — step 5 handles it)
+ * 1. Sync Core Skills
  * 2. Sync settings.json hooks/statusLine and refresh Codex config backfills
- *    (ALWAYS runs when zylos is initialized)
  *
- * Settings sync runs even when ZYLOS_SKIP_POSTINSTALL is set because this is
- * the only reliable hook where the NEWLY INSTALLED code executes during
- * self-upgrade. The old version's in-memory upgrader may not know about new
- * config fields or backfills, so this postinstall catches them.
+ * Local target/bootstrap dependency installs are always zero-write. Global
+ * installs may sync initialized state; self-upgrade additionally suppresses
+ * this lifecycle with npm --ignore-scripts and ZYLOS_SKIP_POSTINSTALL.
  */
 
 import fs from 'node:fs';
@@ -109,6 +107,8 @@ function syncSettings() {
 function main() {
   // CI: skip everything
   if (process.env.CI) return;
+  if (process.env.ZYLOS_SKIP_POSTINSTALL) return;
+  if (String(process.env.npm_config_global).toLowerCase() !== 'true') return;
 
   // Zylos must be initialized — .claude/ directory exists after `zylos init`
   const claudeDir = path.join(ZYLOS_DIR, '.claude');
@@ -117,18 +117,7 @@ function main() {
     return;
   }
 
-  const isSelfUpgrade = !!process.env.ZYLOS_SKIP_POSTINSTALL;
-
-  if (!isSelfUpgrade) {
-    // Fresh install or manual `npm install -g` — sync skills
-    // During self-upgrade, step 5 handles skill sync with smart merge
-    syncSkills();
-  }
-
-  // Settings sync ALWAYS runs when zylos is initialized.
-  // During self-upgrade this is defense-in-depth: the old version's step 8
-  // may lack knowledge of new config fields. This postinstall is the only
-  // code path where the newly installed version's logic executes.
+  syncSkills();
   syncSettings();
 }
 

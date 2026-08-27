@@ -1,0 +1,5 @@
+{
+  "name": "task-attention",
+  "order": 10,
+  "emitter": "skills/zylos-memory/scripts/task-attention-context.js"
+}

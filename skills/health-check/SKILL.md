@@ -28,6 +28,14 @@ pm2 jlist
 Parse the JSON output. Every service should have `status: "online"`.
 Record which services are stopped or errored.
 
+**Crash-loop detection (use the right signal):** a service can read `online` while silently crash-looping. Judge crash-loops by:
+- `pm2_env.unstable_restarts > 0`, **or**
+- current uptime very short (seconds/minutes) **and** restart count rising across consecutive checks.
+
+Do **NOT** alert on `pm2_env.restart_time` alone — it is the *cumulative lifetime* restart count (e.g. 3152), not a signal of an active crash-loop. A large `restart_time` with `unstable_restarts: 0` and a long uptime is a healthy, stable service. (Learned 2026-07-03: a peer bot false-alarmed a stable `zylos-vnc` by reading cumulative `restart_time` as active crashing.)
+
+Also note: wrapper services launched via `bash -c` (e.g. `zylos-vnc`) report the thin parent shell's RSS (a few MB) — low RSS is expected there, not a crash signal; the real work runs in child processes.
+
 ### 2. Check Disk Space
 
 ```bash

@@ -20,6 +20,8 @@
 # The base clean environment already includes:
 #   PATH, HOME, USER, LOGNAME, LANG, LC_ALL, TERM, SHELL,
 #   GH_PROMPT_DISABLED=1, proxy vars (auto-detected), IS_SANDBOX (auto),
+#   ZYLOS_DIR, ZYLOS_AGENT_ID/PROFILE/LABEL/ALIASES,
+#   ZYLOS_DEPLOYMENT_PROFILE, C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID (when set),
 #   TMPDIR (macOS only), Homebrew paths (macOS only).
 
 # ── Timezone ──────────────────────────────────────────────────────────────────

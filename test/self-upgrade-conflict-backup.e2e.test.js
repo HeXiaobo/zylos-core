@@ -54,6 +54,20 @@ beforeEach(() => {
   packageDir = path.join(tmpRoot, 'new-package');
   fs.mkdirSync(skillsDir, { recursive: true });
   fs.mkdirSync(packageDir, { recursive: true });
+  fs.writeFileSync(path.join(packageDir, 'capabilities.json'), JSON.stringify({
+    schemaVersion: 1,
+    product: 'zylos-core',
+    protocols: { 'c4.reply.argv-compat': 1, 'c4.reply.body-file': 1 },
+  }));
+  for (const relativePath of [
+    'skills/comm-bridge/scripts/c4-send.js',
+    'skills/comm-bridge/scripts/c4-receive.js',
+    'skills/comm-bridge/scripts/c4-dispatcher.js',
+    'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',
+    'skills/activity-monitor/scripts/assistant-turn-binding.js',
+  ]) {
+    writeFile(packageDir, relativePath, '#!/usr/bin/env node\n');
+  }
 });
 
 afterEach(() => {
@@ -64,7 +78,7 @@ describe('self-upgrade durable conflict backups (#717)', () => {
   test('old launcher prints every nested conflict path and success cleanup preserves durable backups', () => {
     prepareThreeWayConflictFixture();
 
-    const { result, launcherOutput, npmCommands, stoppedServices, transactionBackupDir } = runScenario('success');
+    const { result, launcherOutput, npmCommands, stoppedServices, transactionBackupDir, globalCoreVersion } = runScenario('success');
 
     expect(result.success).toBe(true);
     expect(result.mergeConflicts).toHaveLength(2);
@@ -72,6 +86,8 @@ describe('self-upgrade durable conflict backups (#717)', () => {
     expect(npmCommands).toHaveLength(2);
     expect(npmCommands[0]).toMatch(/^npm pack/);
     expect(npmCommands[1]).toMatch(/^npm install -g/);
+    expect(npmCommands[1]).toContain('--ignore-scripts');
+    expect(globalCoreVersion).toBe('0.5.4-test');
     expect(fs.existsSync(transactionBackupDir)).toBe(false);
 
     for (const conflict of result.mergeConflicts) {
@@ -98,15 +114,26 @@ describe('self-upgrade durable conflict backups (#717)', () => {
     }
   });
 
-  test('later finalizer failure performs no rollback and retains both backup lifecycles', () => {
+  test('later finalizer failure rolls back deployed skills and retains recovery backups', () => {
     prepareThreeWayConflictFixture();
 
-    const { result, transactionBackupDir } = runScenario('later-failure');
+    const { result, restartedServices, transactionBackupDir, globalCoreVersion } = runScenario('later-failure');
 
     expect(result.success).toBe(false);
     expect(result.failedStep).toBe(6);
-    expect(result.rollback).toEqual({ performed: false, steps: [] });
+    expect(result.rollback).toEqual({
+      performed: true,
+      steps: [
+        { action: 'restore_global_core_package', success: true },
+        { action: 'restore_core_skills', success: true },
+        { action: 'restart_fixture-service', success: true },
+        { action: 'save_pm2_rollback_state', success: true },
+      ],
+    });
+    expect(globalCoreVersion).toBe('0.5.3');
+    expect(restartedServices).toEqual(['fixture-service']);
     expect(fs.existsSync(transactionBackupDir)).toBe(true);
+    expect(readFile(path.join(skillsDir, 'demo-skill', 'SKILL.md'))).toContain('value=local');
 
     const durableRoot = path.join(zylosDir, '.backup');
     const durableFiles = fs.readdirSync(durableRoot, { recursive: true })

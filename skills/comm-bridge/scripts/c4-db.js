@@ -10,6 +10,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { DATA_DIR, DB_PATH, CONTROL_MAX_RETRIES } from './c4-config.js';
 import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
+import { serializeTaskEnvelope } from './c4-task-envelope.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,6 +42,8 @@ export function getDb() {
     ensureConversationsSchema(db);
     ensureControlQueueSchema(db);
     ensureStatusNoticeCooldownSchema(db);
+    ensureCommitmentIntakeSchema(db);
+    ensureAssistantResponseSchema(db);
     ensureVoidChannelMigration(db);
   }
   return db;
@@ -135,6 +138,542 @@ function ensureStatusNoticeCooldownSchema(database) {
     CREATE INDEX IF NOT EXISTS idx_status_notice_cooldowns_expires_at
       ON status_notice_cooldowns(expires_at);
   `);
+}
+
+function ensureCommitmentIntakeSchema(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS commitment_intake_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_id INTEGER NOT NULL UNIQUE,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+      retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      retry_generation INTEGER NOT NULL DEFAULT 0 CHECK (retry_generation >= 0),
+      available_at INTEGER NOT NULL,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_commitment_intake_queue_ready
+      ON commitment_intake_queue(status, available_at, id);
+    CREATE INDEX IF NOT EXISTS idx_commitment_intake_queue_stale
+      ON commitment_intake_queue(status, updated_at);
+  `);
+
+  const columnNames = getColumnNames(database, 'commitment_intake_queue');
+  if (!columnNames.has('retry_generation')) {
+    database.exec(`
+      ALTER TABLE commitment_intake_queue
+      ADD COLUMN retry_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (retry_generation >= 0)
+    `);
+  }
+}
+
+export function ensureAssistantResponseSchema(database, { observationClock = Date.now } = {}) {
+  if (typeof observationClock !== 'function') {
+    throw new TypeError('observationClock must be a function');
+  }
+  const migrationObservedAtMs = observationClock();
+  if (!Number.isSafeInteger(migrationObservedAtMs) || migrationObservedAtMs < 0) {
+    throw new TypeError('observationClock result must be a non-negative safe integer');
+  }
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS assistant_requests (
+      request_id TEXT PRIMARY KEY,
+      conversation_id INTEGER UNIQUE,
+      route_channel TEXT NOT NULL,
+      route_endpoint TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      status TEXT NOT NULL
+        CHECK (status IN ('queued', 'started', 'completed', 'failed')),
+      runtime_session_id TEXT,
+      next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
+      output_text TEXT NOT NULL DEFAULT '',
+      accepted_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_at INTEGER,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_requests_status_time
+      ON assistant_requests(status, accepted_at, request_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_requests_runtime
+      ON assistant_requests(runtime_session_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_assistant_requests_route
+      ON assistant_requests(route_channel, route_endpoint, status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS assistant_response_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL,
+      sequence INTEGER NOT NULL CHECK (sequence >= 1),
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      idempotency_key TEXT,
+      delivery_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+      retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
+      available_at INTEGER NOT NULL,
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      delivered_at INTEGER,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+      UNIQUE (request_id, sequence),
+      UNIQUE (request_id, idempotency_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_response_events_delivery
+      ON assistant_response_events(delivery_status, available_at, id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_response_events_request
+      ON assistant_response_events(request_id, sequence);
+
+    CREATE TABLE IF NOT EXISTS runtime_turn_admissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      singleton_key INTEGER NOT NULL DEFAULT 1 CHECK (singleton_key = 1),
+      conversation_id INTEGER NOT NULL,
+      request_id TEXT,
+      route_channel TEXT NOT NULL,
+      status TEXT NOT NULL
+        CHECK (status IN ('submitted', 'started', 'completed', 'released')),
+      runtime_session_id TEXT,
+      acquired_at INTEGER NOT NULL,
+      started_at INTEGER,
+      terminal_at INTEGER,
+      updated_at INTEGER NOT NULL,
+      lifecycle_version INTEGER NOT NULL DEFAULT 0 CHECK (lifecycle_version >= 0),
+      lifecycle_observed_at_ms INTEGER
+        CHECK (lifecycle_observed_at_ms IS NULL OR lifecycle_observed_at_ms >= 0),
+      recovery_activity_observed_at_ms INTEGER
+        CHECK (recovery_activity_observed_at_ms IS NULL OR recovery_activity_observed_at_ms >= 0),
+      recovery_activity_id TEXT,
+      binding_mode TEXT NOT NULL DEFAULT 'pending'
+        CHECK (binding_mode IN ('pending', 'bound', 'rejected', 'closed')),
+      binding_reason TEXT,
+      binding_projection_pending INTEGER NOT NULL DEFAULT 0
+        CHECK (binding_projection_pending IN (0, 1)),
+      binding_projection_observed_at_ms INTEGER
+        CHECK (
+          binding_projection_observed_at_ms IS NULL
+          OR binding_projection_observed_at_ms >= 0
+        ),
+      binding_projected_at INTEGER,
+      terminal_reason TEXT,
+      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_turn_admissions_one_active
+      ON runtime_turn_admissions(singleton_key)
+      WHERE status IN ('submitted', 'started');
+    CREATE INDEX IF NOT EXISTS idx_runtime_turn_admissions_conversation
+      ON runtime_turn_admissions(conversation_id, id);
+    CREATE INDEX IF NOT EXISTS idx_runtime_turn_admissions_session
+      ON runtime_turn_admissions(runtime_session_id, status, id);
+
+    CREATE TABLE IF NOT EXISTS assistant_final_output_candidates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL,
+      admission_id INTEGER NOT NULL,
+      runtime_session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      activity_id TEXT NOT NULL,
+      output_hash TEXT NOT NULL CHECK (length(output_hash) = 64),
+      observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+      status TEXT NOT NULL
+        CHECK (status IN ('active', 'consumed', 'invalidated')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_reason TEXT,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+      FOREIGN KEY (admission_id) REFERENCES runtime_turn_admissions(id) ON DELETE RESTRICT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_final_output_one_active
+      ON assistant_final_output_candidates(request_id)
+      WHERE status = 'active';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_final_output_exact_event
+      ON assistant_final_output_candidates(request_id, admission_id, message_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_final_output_request
+      ON assistant_final_output_candidates(request_id, id);
+  `);
+
+  const eventColumns = getColumnNames(database, 'assistant_response_events');
+  if (!eventColumns.has('redrive_count')) {
+    database.exec(`
+      ALTER TABLE assistant_response_events
+      ADD COLUMN redrive_count INTEGER NOT NULL DEFAULT 0
+        CHECK (redrive_count >= 0)
+    `);
+  }
+
+  const finalOutputColumns = getColumnNames(database, 'assistant_final_output_candidates');
+  if (!finalOutputColumns.has('observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE assistant_final_output_candidates
+      ADD COLUMN observed_at_ms INTEGER CHECK (observed_at_ms IS NULL OR observed_at_ms >= 0)
+    `);
+    database.prepare(`
+      UPDATE assistant_final_output_candidates
+      SET observed_at_ms = ?
+      WHERE observed_at_ms IS NULL
+    `).run(observationClock());
+  }
+  if (!finalOutputColumns.has('activity_id')) {
+    database.exec('ALTER TABLE assistant_final_output_candidates ADD COLUMN activity_id TEXT');
+    database.prepare(`
+      UPDATE assistant_final_output_candidates
+      SET activity_id = 'legacy-candidate:' || id
+      WHERE activity_id IS NULL
+    `).run();
+  }
+
+  const runtimeTurnColumns = getColumnNames(database, 'runtime_turn_admissions');
+  if (!runtimeTurnColumns.has('lifecycle_version')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 0
+        CHECK (lifecycle_version >= 0)
+    `);
+  }
+  if (!runtimeTurnColumns.has('lifecycle_observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN lifecycle_observed_at_ms INTEGER
+        CHECK (lifecycle_observed_at_ms IS NULL OR lifecycle_observed_at_ms >= 0)
+    `);
+  }
+  if (!runtimeTurnColumns.has('recovery_activity_observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN recovery_activity_observed_at_ms INTEGER
+        CHECK (recovery_activity_observed_at_ms IS NULL OR recovery_activity_observed_at_ms >= 0)
+    `);
+  }
+  if (!runtimeTurnColumns.has('recovery_activity_id')) {
+    database.exec('ALTER TABLE runtime_turn_admissions ADD COLUMN recovery_activity_id TEXT');
+  }
+  if (!runtimeTurnColumns.has('binding_mode')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN binding_mode TEXT NOT NULL DEFAULT 'pending'
+        CHECK (binding_mode IN ('pending', 'bound', 'rejected', 'closed'))
+    `);
+  }
+  if (!runtimeTurnColumns.has('binding_reason')) {
+    database.exec('ALTER TABLE runtime_turn_admissions ADD COLUMN binding_reason TEXT');
+  }
+  if (!runtimeTurnColumns.has('binding_projection_pending')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN binding_projection_pending INTEGER NOT NULL DEFAULT 0
+        CHECK (binding_projection_pending IN (0, 1))
+    `);
+  }
+  if (!runtimeTurnColumns.has('binding_projection_observed_at_ms')) {
+    database.exec(`
+      ALTER TABLE runtime_turn_admissions
+      ADD COLUMN binding_projection_observed_at_ms INTEGER
+        CHECK (
+          binding_projection_observed_at_ms IS NULL
+          OR binding_projection_observed_at_ms >= 0
+        )
+    `);
+  }
+  if (!runtimeTurnColumns.has('binding_projected_at')) {
+    database.exec('ALTER TABLE runtime_turn_admissions ADD COLUMN binding_projected_at INTEGER');
+  }
+  // A NULL observation baseline would let the first delayed hook after an
+  // upgrade define the new generation. Conservatively fence every active
+  // legacy admission at migration time; a hook process observed before this
+  // point must not mutate it.
+  database.prepare(`
+    UPDATE runtime_turn_admissions
+    SET lifecycle_observed_at_ms = ?
+    WHERE status IN ('submitted', 'started') AND lifecycle_observed_at_ms IS NULL
+  `).run(migrationObservedAtMs);
+}
+
+function toCommitmentIntakeView(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    idempotencyKey: row.idempotency_key,
+    envelope: JSON.parse(row.payload_json),
+    status: row.status,
+    retryCount: row.retry_count,
+    retryGeneration: row.retry_generation,
+    availableAt: row.available_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/**
+ * Open the durable C4 → Commitment Core intake Module.
+ *
+ * The Interface owns the conversation/intake transaction and exposes queue
+ * state without leaking SQL or payload serialization to callers.
+ */
+export function openCommitmentIntakeQueue({
+  dbPath = null,
+  clock = nowSeconds,
+  beforeQueueInsert = null,
+} = {}) {
+  let ownsDatabase = false;
+  let database;
+  if (dbPath) {
+    if (dbPath !== ':memory:') {
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    }
+    const isNew = dbPath === ':memory:' || !fs.existsSync(dbPath);
+    database = new Database(dbPath);
+    ownsDatabase = true;
+    database.pragma('busy_timeout = 5000');
+    database.pragma('foreign_keys = ON');
+    if (dbPath !== ':memory:') database.pragma('journal_mode = WAL');
+    if (isNew) database.exec(fs.readFileSync(INIT_SQL_PATH, 'utf8'));
+    ensureConversationsSchema(database);
+    ensureControlQueueSchema(database);
+    ensureStatusNoticeCooldownSchema(database);
+    ensureCommitmentIntakeSchema(database);
+    ensureVoidChannelMigration(database);
+  } else {
+    database = getDb();
+  }
+  const selectByIdempotencyKey = database.prepare(`
+    SELECT id, conversation_id, idempotency_key, payload_json, status,
+           retry_count, retry_generation, available_at, last_error, created_at, updated_at
+    FROM commitment_intake_queue
+    WHERE idempotency_key = ?
+  `);
+  const selectIntakeById = database.prepare(`
+    SELECT id, conversation_id, idempotency_key, payload_json, status,
+           retry_count, retry_generation, available_at, last_error, created_at, updated_at
+    FROM commitment_intake_queue
+    WHERE id = ?
+  `);
+  const selectConversationById = database.prepare(`
+    SELECT id, direction, channel, endpoint_id, content, status,
+           delivery_action, priority, require_idle, retry_count
+    FROM conversations
+    WHERE id = ?
+  `);
+
+  const recordInboundTransaction = database.transaction(({ conversation, envelope }) => {
+    const current = clock();
+    const payloadJson = serializeTaskEnvelope(envelope);
+    const existingIntake = selectByIdempotencyKey.get(envelope.idempotencyKey);
+    if (existingIntake) {
+      if (existingIntake.payload_json !== payloadJson) {
+        const error = new Error(`intake idempotency key belongs to different payload: ${envelope.idempotencyKey}`);
+        error.code = 'IDEMPOTENCY_CONFLICT';
+        throw error;
+      }
+      return {
+        created: false,
+        conversation: selectConversationById.get(existingIntake.conversation_id),
+        intake: toCommitmentIntakeView(existingIntake),
+        intakeId: existingIntake.id,
+      };
+    }
+    const finalStatus = conversation.status || 'pending';
+    const requireIdle = conversation.requireIdle ? 1 : 0;
+    const conversationResult = database.prepare(`
+      INSERT INTO conversations (
+        direction, channel, endpoint_id, content, status, delivery_action,
+        priority, require_idle
+      ) VALUES ('in', ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      conversation.channel,
+      conversation.endpointId ?? null,
+      conversation.content,
+      finalStatus,
+      conversation.deliveryAction ?? null,
+      conversation.priority ?? 3,
+      requireIdle,
+    );
+    const conversationId = Number(conversationResult.lastInsertRowid);
+
+    if (beforeQueueInsert) beforeQueueInsert({ conversationId, envelope });
+
+    const intakeResult = database.prepare(`
+      INSERT INTO commitment_intake_queue (
+        conversation_id, idempotency_key, payload_json, status, retry_count, retry_generation,
+        available_at, last_error, created_at, updated_at
+      ) VALUES (?, ?, ?, 'pending', 0, 0, ?, NULL, ?, ?)
+    `).run(
+      conversationId,
+      envelope.idempotencyKey,
+      payloadJson,
+      current,
+      current,
+      current,
+    );
+    const intake = selectByIdempotencyKey.get(envelope.idempotencyKey);
+
+    return {
+      created: true,
+      conversation: {
+        id: conversationId,
+        direction: 'in',
+        channel: conversation.channel,
+        endpoint_id: conversation.endpointId ?? null,
+        content: conversation.content,
+        status: finalStatus,
+        delivery_action: conversation.deliveryAction ?? null,
+        priority: conversation.priority ?? 3,
+        require_idle: requireIdle,
+        retry_count: 0,
+      },
+      intake: toCommitmentIntakeView(intake),
+      intakeId: Number(intakeResult.lastInsertRowid),
+    };
+  });
+  const claimNextTransaction = database.transaction(({ staleAfterSeconds }) => {
+    const current = clock();
+    const staleBefore = current - staleAfterSeconds;
+    database.prepare(`
+      UPDATE commitment_intake_queue
+      SET status = 'pending', available_at = ?, updated_at = ?,
+          last_error = COALESCE(last_error, 'STALE_PROCESSING_RECOVERED')
+      WHERE status = 'processing' AND updated_at <= ?
+    `).run(current, current, staleBefore);
+
+    const candidate = database.prepare(`
+      SELECT id
+      FROM commitment_intake_queue
+      WHERE status = 'pending' AND available_at <= ?
+      ORDER BY available_at ASC, id ASC
+      LIMIT 1
+    `).get(current);
+    if (!candidate) return null;
+
+    const claimed = database.prepare(`
+      UPDATE commitment_intake_queue
+      SET status = 'processing', updated_at = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(current, candidate.id);
+    if (claimed.changes !== 1) return null;
+    return toCommitmentIntakeView(selectIntakeById.get(candidate.id));
+  });
+  const retryFailedTransaction = database.transaction(({ idempotencyKey }) => {
+    if (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') {
+      throw new TypeError('idempotencyKey must be a non-empty string');
+    }
+    const existing = selectByIdempotencyKey.get(idempotencyKey.trim());
+    if (!existing) {
+      const error = new Error(`commitment intake not found: ${idempotencyKey.trim()}`);
+      error.code = 'TASK_INTAKE_NOT_FOUND';
+      throw error;
+    }
+    if (existing.status !== 'failed') {
+      const error = new Error(`commitment intake is ${existing.status}, not failed`);
+      error.code = 'TASK_INTAKE_NOT_FAILED';
+      throw error;
+    }
+    const current = clock();
+    const updated = database.prepare(`
+      UPDATE commitment_intake_queue
+      SET status = 'pending', retry_count = 0,
+          retry_generation = retry_generation + 1,
+          available_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND status = 'failed'
+    `).run(current, current, existing.id);
+    if (updated.changes !== 1) {
+      const error = new Error(`commitment intake changed while retrying: ${existing.id}`);
+      error.code = 'TASK_INTAKE_RETRY_CONFLICT';
+      throw error;
+    }
+    database.prepare(`
+      UPDATE conversations
+      SET delivery_action = NULL
+      WHERE id = ? AND delivery_action = 'task-intake-failed'
+    `).run(existing.conversation_id);
+    return toCommitmentIntakeView(selectIntakeById.get(existing.id));
+  });
+
+  return Object.freeze({
+    recordInbound(input) {
+      return recordInboundTransaction.immediate(input);
+    },
+    get({ idempotencyKey } = {}) {
+      return toCommitmentIntakeView(selectByIdempotencyKey.get(idempotencyKey));
+    },
+    claimNext({ staleAfterSeconds = 60 } = {}) {
+      return claimNextTransaction.immediate({ staleAfterSeconds });
+    },
+    retryFailed(request) {
+      return retryFailedTransaction.immediate(request || {});
+    },
+    markCompleted(intakeId) {
+      const current = clock();
+      const updated = database.prepare(`
+        UPDATE commitment_intake_queue
+        SET status = 'completed', last_error = NULL, updated_at = ?
+        WHERE id = ? AND status = 'processing'
+      `).run(current, intakeId);
+      if (updated.changes !== 1) {
+        throw new Error(`cannot complete commitment intake ${intakeId}`);
+      }
+      return toCommitmentIntakeView(selectIntakeById.get(intakeId));
+    },
+    retryOrFail(intakeId, lastError, { maxRetries = 3, delaySeconds = 5 } = {}) {
+      const transition = database.transaction(() => {
+        const currentRow = selectIntakeById.get(intakeId);
+        if (!currentRow || currentRow.status !== 'processing') return null;
+
+        const current = clock();
+        const nextRetryCount = currentRow.retry_count + 1;
+        const nextStatus = nextRetryCount >= maxRetries ? 'failed' : 'pending';
+        const availableAt = nextStatus === 'pending' ? current + delaySeconds : current;
+        database.prepare(`
+          UPDATE commitment_intake_queue
+          SET status = ?, retry_count = ?, available_at = ?,
+              last_error = ?, updated_at = ?
+          WHERE id = ? AND status = 'processing'
+        `).run(
+          nextStatus,
+          nextRetryCount,
+          availableAt,
+          String(lastError),
+          current,
+          intakeId,
+        );
+        if (nextStatus === 'failed') {
+          database.prepare(`
+            UPDATE conversations
+            SET delivery_action = 'task-intake-failed'
+            WHERE id = ?
+          `).run(currentRow.conversation_id);
+        }
+        return toCommitmentIntakeView(selectIntakeById.get(intakeId));
+      }).immediate();
+      return transition;
+    },
+    updateConversation({ conversationId, content, status, deliveryAction = null }) {
+      database.prepare(`
+        UPDATE conversations
+        SET content = ?, status = ?, delivery_action = ?
+        WHERE id = ? AND direction = 'in'
+      `).run(content, status, deliveryAction, conversationId);
+      return selectConversationById.get(conversationId) || null;
+    },
+    close() {
+      if (ownsDatabase) {
+        database.close();
+        ownsDatabase = false;
+      }
+    },
+  });
 }
 
 /**
@@ -247,10 +786,13 @@ export function getStatusNoticeCooldowns() {
 export function getNextPending() {
   const db = getDb();
   return db.prepare(`
-    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count
-    FROM conversations
-    WHERE direction = 'in' AND status = 'pending'
-    ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
+    SELECT c.id, c.direction, c.channel, c.endpoint_id, c.content, c.timestamp,
+           c.priority, c.require_idle, c.retry_count,
+           ar.request_id AS assistant_request_id
+    FROM conversations c
+    LEFT JOIN assistant_requests ar ON ar.conversation_id = c.id
+    WHERE c.direction = 'in' AND c.status = 'pending'
+    ORDER BY COALESCE(c.priority, 3) ASC, c.timestamp ASC
     LIMIT 1
   `).get() || null;
 }

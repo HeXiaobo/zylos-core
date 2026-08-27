@@ -18,7 +18,7 @@ import { ZYLOS_DIR, CONFIG_DIR, SKILLS_DIR, COMPONENTS_FILE } from '../lib/confi
 import { readEnvFile } from '../lib/env.js';
 import { loadComponents } from '../lib/components.js';
 import { fetchLatestTagAsync, compareSemverDesc } from '../lib/github.js';
-import { getCurrentVersion } from '../lib/self-upgrade.js';
+import { CORE_REPO, getCurrentVersion } from '../lib/self-upgrade.js';
 import { commandExists } from '../lib/shell-utils.js';
 import { parseSkillMd } from '../lib/skill.js';
 import { bold, dim, green, red, yellow, heading } from '../lib/colors.js';
@@ -811,7 +811,7 @@ export async function doctorCommand(args) {
       const targets = [];
 
       if (coreVersion.success) {
-        targets.push({ name: 'zylos-core', repo: 'zylos-ai/zylos-core', current: coreVersion.version });
+        targets.push({ name: 'zylos-core', repo: CORE_REPO, current: coreVersion.version });
       }
 
       for (const [name, info] of Object.entries(components)) {

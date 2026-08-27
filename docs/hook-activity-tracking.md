@@ -1,5 +1,21 @@
 # Proposal: Hook-Based Activity Tracking for zylos-core
 
+> Current addendum (2026-08-25): `MessageDisplay` is also registered for
+> response-stream requests. Unlike watchdog hooks, it runs synchronously so
+> displayed answer batches stay ordered, writes only to the durable assistant
+> response ledger, and does not enter `tool-events.jsonl`. `Stop` records the
+> final displayed assistant message as canonical output. Neither hook receives
+> or publishes Claude thinking blocks. Explicit `[PUBLIC_REASONING]` lines are
+> routed to `PublicReasoningDelta` and removed from the canonical answer. A
+> mode-0600 transient buffer flushes concurrent hook processes by
+> `message_id + batch_index`, so process scheduling cannot reverse visible
+> reasoning or answer segments.
+>
+> Codex does not use this Claude hook. Activity Monitor tails the active Codex
+> rollout with a persisted byte offset and maps only public reasoning summaries,
+> commentary, final answers, and task completion onto the same response-stream
+> Interface. Raw/encrypted reasoning fields are deliberately not read.
+
 **Status:** Reviewed and approved
 **Branch:** feat/heartbeat-v2
 **Target version:** v0.1.8

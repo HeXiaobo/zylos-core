@@ -41,6 +41,7 @@ import {
   ENTER_VERIFY_MAX_RETRIES,
   ENTER_VERIFY_WAIT_MS,
   REQUIRE_IDLE_MIN_SECONDS,
+  RUNTIME_TURN_RECOVERY_IDLE_SECONDS,
   REQUIRE_IDLE_POST_SEND_HOLD_MS,
   REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS,
   REQUIRE_IDLE_EXECUTION_POLL_MS,
@@ -57,12 +58,22 @@ import {
   findPromptY as sharedFindPromptY,
   isUsageOverlayCapture as sharedIsUsageOverlayCapture
 } from './tmux-input-state.js';
-import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
+import {
+  buildReplyViaSuffix,
+  buildStreamedReplySuffix,
+  hasLegacyReplyViaSuffix,
+  truncateForDelivery,
+} from './c4-utils.js';
+import { openAssistantResponseStream } from './assistant-response-stream.js';
+import { writeAssistantTurnBinding } from '../../activity-monitor/scripts/assistant-turn-binding.js';
 
 let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
+let lastAssistantAdmissionBlock = null;
+let lastRuntimeAdmissionBlock = null;
+let lastRuntimeTurnAdmissionBlock = null;
 
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const NOTIFY_DELIVERED_TIMEOUT_MS = 5000;
@@ -505,13 +516,21 @@ function hasAckSuffix(content = '') {
   return content.includes('---- ack via:');
 }
 
-export function getDeliveryContent(item) {
+export function getDeliveryContent(item, activeRuntime = ACTIVE_RUNTIME) {
   const rawContent = item.content || '';
   if (item.type === 'conversation') {
-    const replyViaSuffix = (
-      item.endpoint_id &&
-      !hasLegacyReplyViaSuffix(rawContent)
-    ) ? buildReplyViaSuffix(item.channel, item.endpoint_id) : '';
+    const replyViaSuffix = item.assistant_request_id && activeRuntime === 'claude'
+      ? buildStreamedReplySuffix(item.assistant_request_id)
+      : (
+          item.endpoint_id
+          && !hasLegacyReplyViaSuffix(rawContent)
+            ? buildReplyViaSuffix(
+                item.channel,
+                item.endpoint_id,
+                item.assistant_request_id || null,
+              )
+            : ''
+        );
     return truncateForDelivery(rawContent, replyViaSuffix, item.id);
   }
 
@@ -529,6 +548,20 @@ async function handleConversationDeliveryFailure(msg) {
 
     if (nextCount >= MAX_RETRIES) {
       markFailed(msg.id);
+      if (msg.assistant_request_id) {
+        try {
+          const responseStream = openAssistantResponseStream();
+          responseStream.execute({
+            type: 'FailRun',
+            requestId: msg.assistant_request_id,
+            code: 'RUNTIME_DISPATCH_FAILED',
+            retryable: true,
+          });
+          responseStream.close();
+        } catch (err) {
+          log(`Warning: failed to record assistant dispatch failure (${err.message})`);
+        }
+      }
       log(`FAILED: conversation id=${msg.id} channel=${msg.channel} marked as failed after ${nextCount} retries`);
       logDeliveryFailure('conversation', msg.id, 'MAX_RETRIES', { channel: msg.channel, retries: nextCount });
       return;
@@ -608,6 +641,183 @@ function claimNextItem() {
   return null;
 }
 
+export function findBlockingAssistantRun(item, responseStream) {
+  if (item?.type !== 'conversation') return null;
+  if (!responseStream || typeof responseStream.findStartedRequest !== 'function') {
+    throw new TypeError('responseStream.findStartedRequest is required');
+  }
+  return responseStream.findStartedRequest({
+    excludingRequestId: item.assistant_request_id || null,
+  });
+}
+
+export function shouldDeferConversationForRuntime(item, agentState) {
+  return item?.type === 'conversation' && agentState?.state === 'busy';
+}
+
+export function shouldRecoverRuntimeTurnAdmission(
+  admission,
+  agentState,
+  minimumIdleSeconds = RUNTIME_TURN_RECOVERY_IDLE_SECONDS,
+  currentSeconds = nowSeconds(),
+) {
+  return Boolean(
+    admission?.status === 'started'
+    && Number.isSafeInteger(admission?.updatedAt)
+    && admission.updatedAt <= currentSeconds - minimumIdleSeconds
+    && agentState?.healthy === true
+    && agentState?.health === 'ok'
+    && agentState?.state === 'idle'
+    && Number(agentState?.idleSeconds) >= minimumIdleSeconds
+  );
+}
+
+export function runtimeTurnAdmissionsEnabled(activeRuntime = ACTIVE_RUNTIME) {
+  // Claude exposes synchronous prompt/pre-tool/Stop lifecycle fences. Codex
+  // has no MessageDisplay-equivalent completion boundary, so it retains the
+  // monitor gate and explicit c4-send response path.
+  return activeRuntime === 'claude';
+}
+
+export function projectPendingAssistantTurnBindings(
+  responseStream,
+  { writeBinding = writeAssistantTurnBinding } = {},
+) {
+  const projections = responseStream.queryPendingRuntimeTurnBindingProjections();
+  const projected = [];
+  for (const admission of projections) {
+    const state = writeBinding(admission.runtimeSessionId, {
+      mode: 'closed',
+      requestId: admission.requestId,
+      reason: admission.bindingReason || admission.terminalReason || 'runtime_turn_terminal',
+      nowMs: admission.bindingProjectionObservedAtMs,
+    });
+    const acknowledgement = responseStream.ackRuntimeTurnBindingProjection({
+      admissionId: admission.admissionId,
+    });
+    if (!acknowledgement.acknowledged) {
+      throw new Error(`binding projection ${admission.admissionId} was not acknowledged`);
+    }
+    projected.push({ admission, state });
+  }
+  return { projected: projected.length, projections: projected };
+}
+
+function blockingAssistantRun(item) {
+  if (item.type !== 'conversation') return null;
+  const responseStream = openAssistantResponseStream();
+  try {
+    return findBlockingAssistantRun(item, responseStream);
+  } finally {
+    responseStream.close();
+  }
+}
+
+function acquireRuntimeTurnAdmission(item) {
+  if (item.type !== 'conversation' || !runtimeTurnAdmissionsEnabled()) {
+    return { acquired: true, admission: null };
+  }
+  const responseStream = openAssistantResponseStream();
+  try {
+    return responseStream.acquireRuntimeTurn({
+      conversationId: item.id,
+      requestId: item.assistant_request_id || null,
+      routeChannel: item.channel,
+    });
+  } finally {
+    responseStream.close();
+  }
+}
+
+function reconcileRuntimeTurnAdmission(item, agentState) {
+  if (item.type !== 'conversation' || !runtimeTurnAdmissionsEnabled()) return null;
+  const responseStream = openAssistantResponseStream();
+  try {
+    const active = responseStream.getActiveRuntimeTurn();
+    if (!shouldRecoverRuntimeTurnAdmission(active, agentState)) return null;
+    return responseStream.recoverRuntimeTurn({
+      admissionId: active.admissionId,
+      expectedLifecycleVersion: active.lifecycleVersion,
+      reason: 'runtime_sustained_idle',
+    });
+  } finally {
+    responseStream.close();
+  }
+}
+
+function flushPendingRuntimeTurnBindingProjections() {
+  const responseStream = openAssistantResponseStream();
+  try {
+    return projectPendingAssistantTurnBindings(responseStream);
+  } finally {
+    responseStream.close();
+  }
+}
+
+function releaseRuntimeTurnAdmission(item, reason) {
+  if (item.type !== 'conversation' || !runtimeTurnAdmissionsEnabled()) return null;
+  const responseStream = openAssistantResponseStream();
+  try {
+    return responseStream.releaseRuntimeTurn({
+      conversationId: item.id,
+      reason,
+    });
+  } finally {
+    responseStream.close();
+  }
+}
+
+function logAssistantAdmissionBlock(item, blockingRun) {
+  const nowMs = Date.now();
+  if (
+    lastAssistantAdmissionBlock?.conversationId === item.id
+    && lastAssistantAdmissionBlock?.requestId === blockingRun.requestId
+    && nowMs - lastAssistantAdmissionBlock.loggedAt < 60_000
+  ) {
+    return;
+  }
+  lastAssistantAdmissionBlock = {
+    conversationId: item.id,
+    requestId: blockingRun.requestId,
+    loggedAt: nowMs,
+  };
+  log(
+    `Deferring conversation id=${item.id}: assistant request ${blockingRun.requestId} is still started`,
+  );
+}
+
+function logRuntimeAdmissionBlock(item) {
+  const nowMs = Date.now();
+  if (
+    lastRuntimeAdmissionBlock?.conversationId === item.id
+    && nowMs - lastRuntimeAdmissionBlock.loggedAt < 60_000
+  ) {
+    return;
+  }
+  lastRuntimeAdmissionBlock = { conversationId: item.id, loggedAt: nowMs };
+  log(`Deferring conversation id=${item.id}: runtime turn is still busy`);
+}
+
+function logRuntimeTurnAdmissionBlock(item, admission) {
+  const nowMs = Date.now();
+  if (
+    lastRuntimeTurnAdmissionBlock?.conversationId === item.id
+    && lastRuntimeTurnAdmissionBlock?.admissionId === admission.admissionId
+    && nowMs - lastRuntimeTurnAdmissionBlock.loggedAt < 60_000
+  ) {
+    return;
+  }
+  lastRuntimeTurnAdmissionBlock = {
+    conversationId: item.id,
+    admissionId: admission.admissionId,
+    loggedAt: nowMs,
+  };
+  log(
+    `Deferring conversation id=${item.id}: runtime admission ${admission.admissionId} `
+      + `for conversation ${admission.conversationId} is still ${admission.status}`,
+  );
+}
+
 function maybeCleanupControlQueue() {
   const nowMs = Date.now();
   if (lastControlCleanupMs !== 0 && (nowMs - lastControlCleanupMs) < CONTROL_CLEANUP_INTERVAL_MS) {
@@ -656,8 +866,44 @@ async function processNextMessage() {
     return { delivered: false, state: agentState.state };
   }
 
+  if (shouldDeferConversationForRuntime(item, agentState)) {
+    releaseItem(item);
+    logRuntimeAdmissionBlock(item);
+    return { delivered: false, state: agentState.state };
+  }
+
+  const recoveredRuntimeTurn = reconcileRuntimeTurnAdmission(item, agentState);
+  if (recoveredRuntimeTurn?.recovered) {
+    log(
+      `Recovered runtime admission ${recoveredRuntimeTurn.admission.admissionId} `
+        + `after ${agentState.idleSeconds}s sustained idle`,
+    );
+  }
+
+  try {
+    flushPendingRuntimeTurnBindingProjections();
+  } catch (error) {
+    releaseItem(item);
+    log(`Deferring conversation id=${item.id}: binding projection failed (${error.message})`);
+    return { delivered: false, state: agentState.state };
+  }
+
+  const blockingRun = blockingAssistantRun(item);
+  if (blockingRun) {
+    releaseItem(item);
+    logAssistantAdmissionBlock(item, blockingRun);
+    return { delivered: false, state: agentState.state };
+  }
+
   if (item.require_idle === 1 && (agentState.state !== 'idle' || agentState.idleSeconds < REQUIRE_IDLE_MIN_SECONDS)) {
     releaseItem(item);
+    return { delivered: false, state: agentState.state };
+  }
+
+  const runtimeTurnAdmission = acquireRuntimeTurnAdmission(item);
+  if (!runtimeTurnAdmission.acquired) {
+    releaseItem(item);
+    logRuntimeTurnAdmissionBlock(item, runtimeTurnAdmission.admission);
     return { delivered: false, state: agentState.state };
   }
 
@@ -713,6 +959,21 @@ async function processNextMessage() {
   if (result === 'submitted') {
     if (item.type === 'conversation') {
       markDelivered(item.id);
+      if (item.assistant_request_id) {
+        try {
+          const responseStream = openAssistantResponseStream();
+          responseStream.execute({
+            type: 'StartRun',
+            requestId: item.assistant_request_id,
+          });
+          responseStream.close();
+        } catch (err) {
+          // The conversation is already verified as submitted.  Preserve that
+          // delivery and let CompleteRun's compatibility path synthesize a
+          // missing RunStarted event if the lifecycle write is unavailable.
+          log(`Warning: failed to record assistant run start (${err.message})`);
+        }
+      }
       log(`Conversation id=${item.id} delivered`);
       notifyMessageDelivered({ conversationId: item.id, channel: item.channel }).catch((err) => {
         log(`Warning: failed to notify AM of message delivery: ${err.message}`);
@@ -733,6 +994,13 @@ async function processNextMessage() {
   }
 
   const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
+  if (result === 'paste_error' && item.type === 'conversation') {
+    try {
+      releaseRuntimeTurnAdmission(item, 'tmux_paste_failed');
+    } catch (err) {
+      log(`Warning: failed to release runtime admission (${err.message})`);
+    }
+  }
   log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
   logDeliveryFailure(item.type, item.id, reason);
   if (item.type === 'control') {

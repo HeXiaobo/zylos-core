@@ -10,6 +10,11 @@ import crypto from 'node:crypto';
 const MANIFEST_DIR = '.zylos';
 const MANIFEST_FILE = 'manifest.json';
 const ORIGINALS_DIR = 'originals';
+const SOURCE_MARKER_FILE = '.zylos-source.json';
+
+function isRuntimeProvenance(name) {
+  return name === SOURCE_MARKER_FILE || name.startsWith(`${SOURCE_MARKER_FILE}.tmp-`);
+}
 
 /**
  * Validate that a resolved path stays within the expected base directory.
@@ -42,12 +47,12 @@ export function hashFile(filePath) {
  * @param {string[]} [exclude] - Directory/file names to skip
  * @returns {string[]} Array of relative file paths
  */
-function collectFiles(dir, baseDir, exclude = ['.git', '.zylos', 'node_modules', '.backup']) {
+function collectFiles(dir, baseDir, exclude = ['.git', '.zylos', '.zylos-source.json', 'node_modules', '.backup']) {
   const files = [];
   const entries = fs.readdirSync(dir, { withFileTypes: true });
 
   for (const entry of entries) {
-    if (exclude.includes(entry.name)) continue;
+    if (exclude.includes(entry.name) || isRuntimeProvenance(entry.name)) continue;
 
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -107,7 +112,12 @@ export function loadManifest(dir) {
     return null;
   }
   try {
-    return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (manifest?.files && Object.hasOwn(manifest.files, SOURCE_MARKER_FILE)) {
+      manifest.files = { ...manifest.files };
+      delete manifest.files[SOURCE_MARKER_FILE];
+    }
+    return manifest;
   } catch {
     return null;
   }

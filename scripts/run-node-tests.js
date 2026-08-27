@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -8,6 +9,8 @@ const TEST_ROOTS = [
   path.join(ROOT, 'cli', 'lib', '__tests__'),
   path.join(ROOT, 'cli', 'lib', 'runtime', '__tests__'),
   path.join(ROOT, 'skills', 'activity-monitor', 'scripts', '__tests__'),
+  path.join(ROOT, 'skills', 'commitment-core', 'scripts', '__tests__'),
+  path.join(ROOT, 'skills', 'work-intake', 'scripts', '__tests__'),
 ];
 
 function walk(dir, files = []) {
@@ -28,6 +31,8 @@ function isNodeTest(file) {
   if (rel.startsWith('cli/lib/__tests__/')) return true;
   if (rel.startsWith('cli/lib/runtime/__tests__/')) return true;
   if (rel.startsWith('skills/activity-monitor/scripts/__tests__/')) return true;
+  if (rel.startsWith('skills/commitment-core/scripts/__tests__/')) return true;
+  if (rel.startsWith('skills/work-intake/scripts/__tests__/')) return true;
   return false;
 }
 
@@ -43,8 +48,29 @@ if (testFiles.length === 0) {
 }
 
 console.log(`Running ${testFiles.length} Node test files`);
-const result = spawnSync(process.execPath, ['--experimental-test-module-mocks', '--test', ...testFiles], {
-  stdio: 'inherit',
-});
+// Some CLI modules resolve ~/zylos eagerly at import time and their rollback
+// tests intentionally remove installation files. Never let an ordinary test
+// invocation inherit the live runtime directory.
+const isolatedHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-node-tests-home-'));
+const isolatedZylosDir = path.join(isolatedHomeDir, 'zylos');
+fs.mkdirSync(isolatedZylosDir, { recursive: true });
+let result;
+try {
+  result = spawnSync(
+    process.execPath,
+    ['--experimental-test-module-mocks', '--test-concurrency=1', '--test', ...testFiles],
+    {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        HOME: isolatedHomeDir,
+        ZYLOS_DIR: isolatedZylosDir,
+        ZYLOS_TEST_ISOLATED: '1',
+      },
+    },
+  );
+} finally {
+  fs.rmSync(isolatedHomeDir, { recursive: true, force: true });
+}
 
-process.exit(result.status ?? 1);
+process.exit(result?.status ?? 1);

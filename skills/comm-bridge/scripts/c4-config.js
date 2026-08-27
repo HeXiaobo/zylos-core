@@ -21,6 +21,10 @@ export const ENTER_VERIFY_WAIT_MS = 500;
 // For legacy require_idle / external block_queue_until_idle messages:
 // minimum sustained idle seconds before delivery.
 export const REQUIRE_IDLE_MIN_SECONDS = 3;
+// A durable started turn may be reconciled only after the monitor has reported
+// sustained healthy idle. This is deliberately longer than ordinary delivery
+// admission so transient status gaps cannot terminate a live turn.
+export const RUNTIME_TURN_RECOVERY_IDLE_SECONDS = 30;
 // For legacy require_idle / external block_queue_until_idle messages:
 // allow execution time before dispatching the next message.
 export const REQUIRE_IDLE_POST_SEND_HOLD_MS = 5000;

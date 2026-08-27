@@ -118,7 +118,7 @@ describe('runUpgrade owns the final baseline commit (#715)', () => {
     const failed = runUpgradeE2E(name, sourceV2);
 
     expect(failed.success).toBe(false);
-    expect(failed.failedStep).toBe(4);
+    expect(failed.failedStep).toBe(5);
     expect(readFile(dest, 'a.js')).toBe('v1');
     expect(readFile(dest, '.zylos/manifest.json')).toBe(manifestV1);
     expect(readFile(dest, '.zylos/originals/a.js')).toBe('v1');
@@ -145,7 +145,7 @@ describe('runUpgrade owns the final baseline commit (#715)', () => {
 
     expect(result.success).toBe(true);
     expect(result.steps.at(-1).name).toBe('commit_baseline');
-    expect(result.steps.at(-1).step).toBe(9);
+    expect(result.steps.at(-1).step).toBe(10);
     expect(readFile(dest, '.zylos/originals/a.js')).toBe('v2');
   });
 
@@ -159,7 +159,7 @@ describe('runUpgrade owns the final baseline commit (#715)', () => {
     const result = runUpgradeE2E(name, sourceV2, { failBaselineCommit: true });
 
     expect(result.success).toBe(false);
-    expect(result.failedStep).toBe(9);
+    expect(result.failedStep).toBe(10);
     expect(result.steps.at(-1).name).toBe('commit_baseline');
     expect(result.rollback.performed).toBe(true);
     expect(readFile(dest, 'a.js')).toBe('v1');
