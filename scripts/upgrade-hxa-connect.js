@@ -7,8 +7,10 @@
  * upgrade command. It accepts only an immutable repository/SHA and an
  * explicit release/agent/report binding, then inspects the target and a
  * staged archive without acquiring a runtime lock or touching the installed
- * component. Execute is deliberately left unsupported until its transaction
- * and postcheck evidence contract is implemented.
+ * component. Execute uses Core's existing component transaction module after
+ * the same release-bound checks have passed. This wrapper owns the immutable
+ * binding, target identity, component lock, and private evidence report; it
+ * does not implement a second generic upgrade path.
  */
 
 import crypto from 'node:crypto';
@@ -17,6 +19,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import yaml from 'js-yaml';
+import { acquireLock, releaseLock } from '../cli/lib/lock.js';
+import { runUpgrade } from '../cli/lib/upgrade.js';
 
 const COMPONENT = 'hxa-connect';
 const PACKAGE_NAME = 'zylos-hxa-connect';
@@ -174,12 +179,32 @@ function validateToolCandidate(candidate, { system = false } = {}) {
   try {
     const resolved = fs.realpathSync.native(candidate);
     const stat = fs.statSync(resolved);
-    const parent = fs.statSync(path.dirname(resolved));
     if (!stat.isFile() || (stat.mode & 0o111) === 0) return null;
-    if ((stat.mode & 0o022) !== 0 || (parent.mode & 0o022) !== 0) return null;
-    if (system && (stat.uid !== 0 || parent.uid !== 0)) return null;
-    if (!system && typeof process.getuid === 'function' && ![0, process.getuid()].includes(stat.uid)) return null;
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if ((stat.mode & 0o022) !== 0) return null;
+    if (system && stat.uid !== 0) return null;
+    if (!system && currentUid !== null && ![0, currentUid].includes(stat.uid)) return null;
+    let ancestor = path.dirname(resolved);
+    while (true) {
+      const ancestorStat = fs.statSync(ancestor);
+      if ((ancestorStat.mode & 0o022) !== 0) return null;
+      if (system && ancestorStat.uid !== 0) return null;
+      if (!system && currentUid !== null && ![0, currentUid].includes(ancestorStat.uid)) return null;
+      const next = path.dirname(ancestor);
+      if (next === ancestor) break;
+      ancestor = next;
+    }
     return resolved;
+  } catch {
+    return null;
+  }
+}
+
+function validateInjectedToolCandidate(candidate) {
+  try {
+    const resolved = fs.realpathSync.native(candidate);
+    const stat = fs.statSync(resolved);
+    return stat.isFile() && (stat.mode & 0o111) !== 0 ? resolved : null;
   } catch {
     return null;
   }
@@ -193,12 +218,41 @@ function resolveTrustedTool(name, candidates, options = {}) {
   throw new HoldError(`trusted ${name} executable is unavailable`, 'TOOL_UNVERIFIED');
 }
 
+function resolvePathTool(name) {
+  const pathEntries = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  return resolveTrustedTool(
+    name,
+    pathEntries.map((entry) => path.join(entry, name)),
+  );
+}
+
 function resolveTools(injected = null) {
   if (injected) {
-    for (const [name, command] of Object.entries(injected)) {
-      if (!path.isAbsolute(command)) throw new HoldError(`injected ${name} tool must be absolute`, 'TOOL_UNVERIFIED');
+    const explicitlyTrusted = injected.trusted === true;
+    const commands = Object.entries(injected).filter(([name]) => name !== 'trusted');
+    const canonical = {};
+    for (const [name, command] of commands) {
+      if (typeof command !== 'string' || !path.isAbsolute(command)) {
+        throw new HoldError(`injected ${name} tool must be absolute`, 'TOOL_UNVERIFIED');
+      }
+      const resolved = explicitlyTrusted
+        ? validateInjectedToolCandidate(command)
+        : validateToolCandidate(command);
+      if (!resolved) throw new HoldError(`injected ${name} tool is not a regular executable`, 'TOOL_UNVERIFIED');
+      canonical[name] = resolved;
     }
-    return { ...injected };
+    return {
+      ...canonical,
+      // Dry-run and pre-transaction lock gates do not need npm. Resolve an
+      // omitted injected npm lazily immediately before execute so a child
+      // runtime's PATH cannot mask an earlier, more useful gate result.
+      npm: injected.npm ? canonical.npm : null,
+      // Runtime injection is an explicit test/platform seam. Production CLI
+      // execution never reaches this branch; generic calls may therefore
+      // trust the canonicalized test executables without weakening default
+      // PATH resolution.
+      trusted: explicitlyTrusted,
+    };
   }
   const userHome = os.userInfo().homedir;
   return {
@@ -213,6 +267,7 @@ function resolveTools(injected = null) {
       '/usr/bin/pm2',
       '/bin/pm2',
     ]),
+    npm: resolvePathTool('npm'),
   };
 }
 
@@ -251,6 +306,57 @@ function atomicWriteJson(filePath, value) {
     try { fs.rmSync(temporaryPath, { force: true }); } catch {}
     throw error;
   }
+}
+
+function persistTerminalSummary(summaryPath, summary) {
+  if (!summaryPath) return { summary, persisted: false, path: null, attempted: false };
+  try {
+    atomicWriteJson(summaryPath, summary);
+    return { summary, persisted: true, path: summaryPath, attempted: true };
+  } catch {
+    // Fall through to an adjacent terminal record. The caller must still
+    // report a non-zero result even when this fallback is successful.
+  }
+
+  const fallbackPath = path.join(path.dirname(summaryPath), `terminal-summary-${summary.executionId}.json`);
+  const fallbackSummary = {
+    ...summary,
+    code: 'SUMMARY_WRITE_FAILED',
+    checks: {
+      ...summary.checks,
+      terminalSummary: {
+        status: 'FALLBACK',
+        primary: 'FAILED',
+        path: path.basename(fallbackPath),
+      },
+    },
+  };
+  if (fallbackPath) {
+    try {
+      atomicWriteJson(fallbackPath, fallbackSummary);
+      return { summary: fallbackSummary, persisted: true, path: fallbackPath, attempted: true };
+    } catch {
+      // No filesystem evidence could be persisted. Return the safe terminal
+      // object for stdout/stderr rather than leaving a RUNNING-looking state.
+    }
+  }
+  return {
+    summary: {
+      ...fallbackSummary,
+      checks: {
+        ...fallbackSummary.checks,
+        terminalSummary: {
+          ...fallbackSummary.checks.terminalSummary,
+          status: 'FAILED',
+          primary: 'FAILED',
+          path: null,
+        },
+      },
+    },
+    persisted: false,
+    path: null,
+    attempted: true,
+  };
 }
 
 function parseArgs(argv) {
@@ -369,9 +475,18 @@ function parseSkillMetadata(skillDir) {
   const skillPath = path.join(skillDir, 'SKILL.md');
   if (!isRegular(skillPath)) throw new HoldError('HXA SKILL.md is missing or not a regular file', 'TARGET_INVALID');
   const content = fs.readFileSync(skillPath, 'utf8');
-  const frontmatter = content.match(/^---\n([\s\S]*?)\n---/m)?.[1] || '';
-  const readScalar = (name) => frontmatter.match(new RegExp(`^${name}:\\s*(.+)$`, 'm'))?.[1]?.trim() || null;
-  return { name: readScalar('name'), version: readScalar('version') };
+  const frontmatterText = content.match(/^---\n([\s\S]*?)\n---/m)?.[1] || '';
+  let frontmatter = {};
+  try {
+    frontmatter = yaml.load(frontmatterText, { schema: yaml.JSON_SCHEMA }) || {};
+  } catch (error) {
+    throw new HoldError(`HXA SKILL.md frontmatter is invalid: ${error.message}`, 'TARGET_INVALID');
+  }
+  return {
+    name: typeof frontmatter.name === 'string' ? frontmatter.name.trim() : null,
+    version: typeof frontmatter.version === 'string' ? frontmatter.version.trim() : null,
+    frontmatter,
+  };
 }
 
 function readPackage(skillDir, label) {
@@ -482,6 +597,7 @@ function inspectIdentity(
   reportRoot,
   { agent: expectedAgent, profileId: expectedProfileId, hostname: expectedHostname },
   childEnvAdditions = {},
+  receiptName = 'identity-receipt.json',
 ) {
   const configPath = path.join(zylosDir, 'components', COMPONENT, 'config.json');
   if (!isRegular(configPath)) throw new HoldError('HXA runtime config is missing or unsafe', 'IDENTITY_UNVERIFIED');
@@ -538,7 +654,10 @@ function inspectIdentity(
     source: 'HxaConnectClient.getProfile',
   };
   const receiptBytes = `${JSON.stringify(receipt, null, 2)}\n`;
-  const receiptPath = path.join(reportRoot, 'identity-receipt.json');
+  if (!SAFE_NAME.test(path.basename(receiptName)) || path.dirname(receiptName) !== '.') {
+    throw new HoldError('identity receipt name is invalid', 'REPORT_FAILED');
+  }
+  const receiptPath = path.join(reportRoot, receiptName);
   fs.writeFileSync(receiptPath, receiptBytes, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   return {
     name: actualAgent,
@@ -552,12 +671,12 @@ function inspectIdentity(
   };
 }
 
-function inspectEmptyDirectory(directoryPath, label, unsafeCode) {
+function inspectEmptyDirectory(directoryPath, label, unsafeCode, { ignoreEntries = [] } = {}) {
   let stat;
   try {
     stat = fs.lstatSync(directoryPath);
   } catch (error) {
-    if (error?.code === 'ENOENT') return { status: 'PASS', path: directoryPath, entries: [], absent: true };
+    if (error?.code === 'ENOENT') return { status: 'PASS', path: directoryPath, entries: [], ignoredEntries: [], absent: true };
     throw new HoldError(`${label} is unreadable`, unsafeCode);
   }
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new HoldError(`${label} is not a real directory`, unsafeCode);
@@ -565,12 +684,27 @@ function inspectEmptyDirectory(directoryPath, label, unsafeCode) {
   try { entries = fs.readdirSync(directoryPath).sort(); } catch {
     throw new HoldError(`${label} is unreadable`, unsafeCode);
   }
-  if (entries.length > 0) throw new HoldError(`${label} is not empty: ${entries.join(', ')}`, 'CONCURRENT_UPGRADE');
-  return { status: 'PASS', path: directoryPath, entries, absent: false };
+  const ignored = new Set(ignoreEntries);
+  const visibleEntries = entries.filter((entry) => !ignored.has(entry));
+  if (visibleEntries.length > 0) {
+    throw new HoldError(`${label} is not empty: ${visibleEntries.join(', ')}`, 'CONCURRENT_UPGRADE');
+  }
+  return {
+    status: 'PASS',
+    path: directoryPath,
+    entries: visibleEntries,
+    ignoredEntries: entries.filter((entry) => ignored.has(entry)),
+    absent: false,
+  };
 }
 
-function inspectLocks(zylosDir) {
-  return inspectEmptyDirectory(path.join(zylosDir, '.zylos', 'locks'), 'upgrade locks directory', 'LOCKS_UNSAFE');
+function inspectLocks(zylosDir, options = {}) {
+  return inspectEmptyDirectory(
+    path.join(zylosDir, '.zylos', 'locks'),
+    'upgrade locks directory',
+    'LOCKS_UNSAFE',
+    options,
+  );
 }
 
 function inspectUpgradeTransactions(zylosDir) {
@@ -820,6 +954,131 @@ function directoryBytes(root) {
   return total;
 }
 
+// These are runtime-owned artifacts rather than release source. They are
+// inspected for links/special files but excluded from source membership and
+// digest comparison.
+const EXACT_SOURCE_EXCLUDED_NAMES = new Set([
+  'node_modules',
+  '.backup',
+  '.zylos-source.json',
+  '.zylos',
+  '.zylos-data',
+  '.git',
+]);
+
+function hashRegularFile(filePath) {
+  const hash = crypto.createHash('sha256');
+  const descriptor = fs.openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  try {
+    let offset = 0;
+    while (true) {
+      const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, offset);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return hash.digest('hex');
+}
+
+function collectExactSourceTree(root, label) {
+  let rootStat;
+  try { rootStat = fs.lstatSync(root); } catch {
+    throw new HoldError(`${label} is missing or unreadable`, 'EXACT_SOURCE_UNVERIFIED');
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new HoldError(`${label} is not a real directory`, 'EXACT_SOURCE_UNVERIFIED');
+  }
+  const files = new Map();
+  const walk = (directory, relativePrefix, atRoot = false) => {
+    let entries;
+    try { entries = fs.readdirSync(directory).sort(); } catch {
+      throw new HoldError(`${label} cannot be read`, 'EXACT_SOURCE_UNVERIFIED');
+    }
+    for (const name of entries) {
+      const candidate = path.join(directory, name);
+      const relative = relativePrefix ? path.join(relativePrefix, name) : name;
+      let stat;
+      try { stat = fs.lstatSync(candidate); } catch {
+        throw new HoldError(`${label} changed while it was being inspected`, 'EXACT_SOURCE_UNVERIFIED');
+      }
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
+        throw new HoldError(`${label} contains a link or special entry: ${relative}`, 'EXACT_SOURCE_UNVERIFIED');
+      }
+      if (atRoot && EXACT_SOURCE_EXCLUDED_NAMES.has(name)) continue;
+      if (stat.isDirectory()) {
+        walk(candidate, relative, false);
+      } else {
+        files.set(relative.replaceAll(path.sep, '/'), {
+          bytes: stat.size,
+          sha256: hashRegularFile(candidate),
+        });
+      }
+    }
+  };
+  walk(root, '', true);
+  return files;
+}
+
+function sourceTreeDigest(files) {
+  const digest = crypto.createHash('sha256');
+  for (const [relative, metadata] of [...files.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    digest.update(`${relative}\0${metadata.bytes}\0${metadata.sha256}\n`);
+  }
+  return digest.digest('hex');
+}
+
+function freezeExactSourceTree(root, label) {
+  const files = collectExactSourceTree(root, label);
+  return Object.freeze({
+    files,
+    sha256: sourceTreeDigest(files),
+  });
+}
+
+function verifyExactSourceTree(installedDir, frozenCandidate) {
+  const installed = collectExactSourceTree(installedDir, 'installed HXA source');
+  const staged = frozenCandidate?.files instanceof Map
+    ? frozenCandidate.files
+    : collectExactSourceTree(frozenCandidate, 'staged HXA source');
+  const missing = [];
+  const extra = [];
+  const mismatched = [];
+  for (const relative of staged.keys()) {
+    if (!installed.has(relative)) {
+      missing.push(relative);
+      continue;
+    }
+    const expected = staged.get(relative);
+    const actual = installed.get(relative);
+    if (expected.bytes !== actual.bytes || expected.sha256 !== actual.sha256) mismatched.push(relative);
+  }
+  for (const relative of installed.keys()) {
+    if (!staged.has(relative)) extra.push(relative);
+  }
+  if (missing.length > 0 || extra.length > 0 || mismatched.length > 0) {
+    const detail = [
+      missing.length > 0 ? `missing=${missing.join(',')}` : null,
+      extra.length > 0 ? `extra=${extra.join(',')}` : null,
+      mismatched.length > 0 ? `mismatched=${mismatched.join(',')}` : null,
+    ].filter(Boolean).join('; ');
+    throw new HoldError(`installed HXA source is not an exact candidate: ${detail}`, 'EXACT_SOURCE_NOT_APPLIED');
+  }
+  return {
+    status: 'PASS',
+    mode: 'overwrite',
+    comparedFiles: staged.size,
+    candidateSha256: frozenCandidate?.sha256 || sourceTreeDigest(staged),
+    missing: [],
+    extra: [],
+    mismatched: [],
+    excludedNames: [...EXACT_SOURCE_EXCLUDED_NAMES].sort(),
+  };
+}
+
 function cleanupStaging(stageDir) {
   if (!stageDir) return { status: 'PASS', removed: false };
   try {
@@ -876,6 +1135,55 @@ function stageArchive(reportRoot, repo, sha, zylosDir, tools, childEnvAdditions 
   }
 }
 
+// HXA dec6 declares the standard lifecycle hooks. post-install is accepted as
+// an install-time hook for source compatibility but is not run by this upgrade
+// transaction; only pre/post-upgrade are executed by cli/lib/upgrade.js.
+const ALLOWED_CANDIDATE_HOOKS = new Map([
+  ['post-install', 'hooks/post-install.js'],
+  ['pre-upgrade', 'hooks/pre-upgrade.js'],
+  ['post-upgrade', 'hooks/post-upgrade.js'],
+]);
+
+function assertNoSymlinkPath(rootDir, candidatePath, label) {
+  const relative = path.relative(path.resolve(rootDir), path.resolve(candidatePath));
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new HoldError(`${label} escapes component directory`, 'HOOK_INVALID');
+  }
+  let current = path.resolve(rootDir);
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    let stat;
+    try { stat = fs.lstatSync(current); } catch {
+      throw new HoldError(`${label} is missing`, 'HOOK_INVALID');
+    }
+    if (stat.isSymbolicLink()) throw new HoldError(`${label} traverses a symbolic link`, 'HOOK_INVALID');
+  }
+}
+
+function validateCandidateHooks(sourceDir, skill) {
+  const declared = skill?.frontmatter?.lifecycle?.hooks;
+  if (declared === undefined || declared === null) {
+    return { status: 'PASS', entries: [] };
+  }
+  if (!declared || typeof declared !== 'object' || Array.isArray(declared)) {
+    throw new HoldError('candidate lifecycle hooks must be a mapping', 'HOOK_INVALID');
+  }
+  const entries = [];
+  for (const [name, value] of Object.entries(declared)) {
+    const expectedPath = ALLOWED_CANDIDATE_HOOKS.get(name);
+    if (!expectedPath || value !== expectedPath) {
+      throw new HoldError(`candidate lifecycle hook ${name} is not an approved exact hook`, 'HOOK_UNSUPPORTED');
+    }
+    const hookPath = path.resolve(sourceDir, value);
+    assertNoSymlinkPath(sourceDir, hookPath, `${name} hook`);
+    if (!isRegular(hookPath)) {
+      throw new HoldError(`${name} hook is not a regular non-symlink file`, 'HOOK_INVALID');
+    }
+    entries.push({ name, path: value, phase: name === 'post-install' ? 'install-only' : 'upgrade' });
+  }
+  return { status: 'PASS', entries };
+}
+
 function validateCandidate(sourceDir, { repo, sha, version }) {
   const pkg = readPackage(sourceDir, 'candidate HXA');
   if (pkg.version !== version) {
@@ -891,6 +1199,7 @@ function validateCandidate(sourceDir, { repo, sha, version }) {
   if (!isRegular(path.join(sourceDir, 'src', 'bot.js'))) {
     throw new HoldError('candidate HXA executable src/bot.js is missing', 'SOURCE_INVALID');
   }
+  const hooks = validateCandidateHooks(sourceDir, skill);
   const declaredRepo = normalizeRepository(
     typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url,
   );
@@ -914,6 +1223,7 @@ function validateCandidate(sourceDir, { repo, sha, version }) {
     repo,
     sha,
     refType: 'commit',
+    hooks,
   };
 }
 
@@ -924,6 +1234,89 @@ function summarizeCurrent(current) {
     registryVersion: current.entry.version || null,
     registryRepo: current.entry.repo || null,
     sourceMarker: current.sourceMarker,
+  };
+}
+
+function verifyPostUpgrade(zylosDir, args, tools, childEnvAdditions = {}) {
+  const current = validateCurrentTarget(zylosDir, args.agent);
+  if (current.packageVersion !== args.version || current.skillVersion !== args.version) {
+    throw new HoldError(
+      `installed HXA version mismatch after execute: expected ${args.version}, found ${current.packageVersion}`,
+      'POSTCHECK_FAILED',
+    );
+  }
+  const installedRepo = normalizeRepository(current.entry.repo);
+  if (installedRepo !== args.repo) {
+    throw new HoldError(
+      `installed HXA repository mismatch after execute: expected ${args.repo}, found ${installedRepo || 'missing'}`,
+      'POSTCHECK_FAILED',
+    );
+  }
+  const marker = current.sourceMarker;
+  if (
+    !marker
+    || marker.repo !== args.repo
+    || marker.sha !== args.sha
+    || marker.ref !== args.sha
+    || marker.refType !== 'commit'
+    || marker.version !== args.version
+  ) {
+    throw new HoldError('installed HXA source marker does not prove the immutable target', 'SOURCE_PROVENANCE_MISSING');
+  }
+  const pm2 = inspectPm2(current.skillDir, tools, childEnvAdditions);
+  return {
+    status: 'PASS',
+    packageVersion: current.packageVersion,
+    registryVersion: current.entry.version,
+    registryRepo: installedRepo,
+    source: marker,
+    pm2,
+  };
+}
+
+// The generic transaction commits the source marker and registry only in its
+// final step.  Therefore the pre-commit runtime check must not require those
+// two pieces of metadata to have the candidate version yet.  It verifies the
+// files and PM2 process that the transaction has just installed, while the
+// wrapper's verifyPostUpgrade() above performs the metadata/provenance check
+// after runUpgrade returns successfully.
+function verifyPostUpgradeRuntime(zylosDir, args, tools, childEnvAdditions = {}) {
+  const componentsPath = path.join(zylosDir, '.zylos', 'components.json');
+  validateOwnedRegularFile(componentsPath, 'installed components registry');
+  const components = readJson(componentsPath, 'installed components registry');
+  const entry = components?.[COMPONENT];
+  if (!entry || typeof entry !== 'object') {
+    throw new HoldError('hxa-connect is not registered after execute', 'POSTCHECK_FAILED');
+  }
+
+  const skillDir = skillDirFor(zylosDir);
+  if (!isDirectory(skillDir)) {
+    throw new HoldError('installed HXA skill directory is missing after execute', 'POSTCHECK_FAILED');
+  }
+  if (entry.skillDir && path.resolve(entry.skillDir) !== path.resolve(skillDir)) {
+    throw new HoldError('registered HXA skillDir changed during execute', 'POSTCHECK_FAILED');
+  }
+
+  const pkg = readPackage(skillDir, 'installed HXA after execute');
+  const skill = parseSkillMetadata(skillDir);
+  if (skill.name && skill.name.replace(/^zylos-/, '') !== COMPONENT) {
+    throw new HoldError('installed HXA skill name does not identify hxa-connect after execute', 'POSTCHECK_FAILED');
+  }
+  if (pkg.version !== args.version || skill.version !== args.version) {
+    throw new HoldError(
+      `installed HXA runtime version mismatch before metadata commit: expected ${args.version}, found ${pkg.version}`,
+      'POSTCHECK_FAILED',
+    );
+  }
+  if (!isRegular(path.join(skillDir, 'src', 'bot.js'))) {
+    throw new HoldError('installed HXA executable is missing after execute', 'POSTCHECK_FAILED');
+  }
+  const pm2 = inspectPm2(skillDir, tools, childEnvAdditions);
+  return {
+    status: 'PASS',
+    packageVersion: pkg.version,
+    skillVersion: skill.version,
+    pm2,
   };
 }
 
@@ -965,30 +1358,77 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
   let summary = baseSummary(args, executionId);
   let summaryPath = null;
   let stageDir = null;
-  try {
-    if (args.mode === 'execute') {
-      throw new HoldError('execute mode is not implemented by this preflight wrapper', 'EXECUTE_UNSUPPORTED');
+  let lockHeld = false;
+  let committedHold = false;
+  const releaseOwnedLock = () => {
+    if (!lockHeld) return { success: true, alreadyReleased: true };
+    const result = releaseLock(COMPONENT);
+    if (!result.success) {
+      summary.checks.lockRelease = {
+        status: 'HOLD',
+        error: result.error || 'component lock release was not confirmed',
+      };
+      throw new HoldError('HXA component lock release was not confirmed', 'LOCK_RELEASE_FAILED');
     }
-
+    lockHeld = false;
+    summary.checks.lockRelease = { status: 'PASS' };
+    return result;
+  };
+  try {
     const zylosDir = resolveZylosDir();
     ensureReportRoot(args.reportRoot, zylosDir);
     summaryPath = path.join(args.reportRoot, 'summary.json');
     atomicWriteJson(summaryPath, summary);
     const tools = resolveTools(runtime.tools || null);
-    const current = validateCurrentTarget(zylosDir, args.agent);
+    const childEnvAdditions = runtime.childEnvAdditions || {};
+
+    // Acquire the component lock before reading identity or preparing any
+    // mutation inputs.  A read-only lock-directory check protects against an
+    // unsafe/symlinked directory; acquireLock then closes the component-level
+    // race.  The owned lock is ignored by the second check below, while any
+    // unrelated lock remains a hard concurrent-upgrade hold.
+    if (args.mode === 'execute') {
+      summary.checks.locks = inspectLocks(zylosDir);
+      const lock = acquireLock(COMPONENT);
+      if (!lock.success) {
+        throw new HoldError(lock.error || 'HXA component is already being upgraded', 'CONCURRENT_UPGRADE');
+      }
+      lockHeld = true;
+      summary.runtimeMutation = 'component-only';
+      summary.checks.transaction = {
+        status: 'RUNNING',
+        executionId,
+        lock: 'acquired',
+        module: 'cli/lib/upgrade.js',
+      };
+      atomicWriteJson(summaryPath, summary);
+    }
+
+    let current = validateCurrentTarget(zylosDir, args.agent);
     summary.current = summarizeCurrent(current);
+    if (args.mode === 'execute') {
+      const installedFiles = collectExactSourceTree(current.skillDir, 'installed HXA source');
+      summary.checks.installedSource = {
+        status: 'PASS',
+        comparedFiles: installedFiles.size,
+        excludedNames: [...EXACT_SOURCE_EXCLUDED_NAMES].sort(),
+      };
+    }
     summary.checks.identity = { status: 'RUNNING' };
-    const identity = inspectIdentity(zylosDir, args.reportRoot, args, runtime.childEnvAdditions || {});
+    const identity = inspectIdentity(zylosDir, args.reportRoot, args, childEnvAdditions);
     summary.checks.identity = { status: 'PASS', ...identity };
 
-    summary.checks.locks = inspectLocks(zylosDir);
+    summary.checks.locks = inspectLocks(
+      zylosDir,
+      args.mode === 'execute' ? { ignoreEntries: [`${COMPONENT}.lock`] } : {},
+    );
     summary.checks.transactions = inspectUpgradeTransactions(zylosDir);
     summary.checks.processes = inspectUpgradeProcesses(tools, zylosDir);
-    summary.checks.pm2 = inspectPm2(current.skillDir, tools, runtime.childEnvAdditions || {});
+    summary.checks.pm2 = inspectPm2(current.skillDir, tools, childEnvAdditions);
     summary.checks.disk = inspectRuntimeCapacity(zylosDir);
     summary.checks.stagingCapacity = inspectStagingCapacity(zylosDir);
 
-    const staged = stageArchive(args.reportRoot, args.repo, args.sha, zylosDir, tools, runtime.childEnvAdditions || {});
+    const staged = stageArchive(args.reportRoot, args.repo, args.sha, zylosDir, tools, childEnvAdditions);
     stageDir = staged.stageDir;
     summary.checks.source = {
       ...validateCandidate(staged.sourceDir, args),
@@ -1001,12 +1441,61 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
       extractedBytes: staged.extractedBytes,
       marker: fs.existsSync(path.join(staged.sourceDir, '.zylos-source.json')) ? 'MATCHED' : 'ABSENT',
     };
+    // Freeze the validated candidate before any lifecycle hook runs. A
+    // pre-upgrade hook executes with the candidate as its cwd and must not be
+    // able to redefine the bytes later used as provenance evidence.
+    const frozenCandidate = freezeExactSourceTree(staged.sourceDir, 'validated HXA source snapshot');
+    summary.checks.sourceSnapshot = {
+      status: 'PASS',
+      comparedFiles: frozenCandidate.files.size,
+      sha256: frozenCandidate.sha256,
+      excludedNames: [...EXACT_SOURCE_EXCLUDED_NAMES].sort(),
+    };
     summary.checks.package = {
       status: 'PASS',
       name: summary.checks.source.packageName,
       version: summary.checks.source.version,
     };
     summary.checks.diskAfterStaging = inspectRuntimeCapacity(zylosDir);
+
+    // Staging can take long enough for a target identity, lock, process, or
+    // PM2 state to change.  Re-read every execute gate while we still hold the
+    // lock and immediately before runUpgrade performs its durable backup.
+    if (args.mode === 'execute') {
+      const preExecuteCurrent = validateCurrentTarget(zylosDir, args.agent);
+      const preExecuteIdentity = inspectIdentity(
+        zylosDir,
+        args.reportRoot,
+        args,
+        childEnvAdditions,
+        'identity-receipt-pre-execute.json',
+      );
+      const preExecuteLocks = inspectLocks(zylosDir, { ignoreEntries: [`${COMPONENT}.lock`] });
+      const preExecuteTransactions = inspectUpgradeTransactions(zylosDir);
+      const preExecuteProcesses = inspectUpgradeProcesses(tools, zylosDir);
+      const preExecutePm2 = inspectPm2(preExecuteCurrent.skillDir, tools, childEnvAdditions);
+      const preExecuteDisk = inspectRuntimeCapacity(zylosDir);
+      const preExecuteInstalledFiles = collectExactSourceTree(preExecuteCurrent.skillDir, 'installed HXA source');
+      summary.current = summarizeCurrent(preExecuteCurrent);
+      summary.checks.identity = { ...summary.checks.identity, preExecute: preExecuteIdentity };
+      summary.checks.preExecute = {
+        status: 'PASS',
+        identity: preExecuteIdentity,
+        locks: preExecuteLocks,
+        transactions: preExecuteTransactions,
+        processes: preExecuteProcesses,
+        pm2: preExecutePm2,
+        disk: preExecuteDisk,
+        installedSource: {
+          status: 'PASS',
+          comparedFiles: preExecuteInstalledFiles.size,
+          excludedNames: [...EXACT_SOURCE_EXCLUDED_NAMES].sort(),
+        },
+      };
+      summary.checks.pm2 = preExecutePm2;
+      current = preExecuteCurrent;
+    }
+
     summary.checks.runtime = {
       status: 'PASS',
       install: false,
@@ -1018,6 +1507,236 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
       configWrite: false,
       sourceMarkerWrite: false,
     };
+
+    if (args.mode === 'dry-run') {
+      summary.checks.cleanup = cleanupStaging(stageDir);
+      stageDir = null;
+      if (summary.checks.cleanup.status !== 'PASS') {
+        throw new HoldError(
+          `staging cleanup failed; residue retained at ${summary.checks.cleanup.path}`,
+          'STAGING_CLEANUP_FAILED',
+        );
+      }
+      summary.status = 'PASS';
+      summary.result = 'PRECHECK_ONLY';
+      summary.finishedAt = new Date().toISOString();
+      atomicWriteJson(summaryPath, summary);
+      process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+      return 0;
+    }
+
+    const source = {
+      type: 'github-release',
+      repo: args.repo,
+      ref: args.sha,
+      refType: 'commit',
+      ...(current.entry.installedAt ? { installedAt: current.entry.installedAt } : {}),
+    };
+    let upgradeResult;
+    try {
+      const upgradeNpm = tools.npm || resolvePathTool('npm');
+      upgradeResult = runUpgrade(COMPONENT, {
+        tempDir: staged.sourceDir,
+        newVersion: args.version,
+        // HXA release execution is bound to an immutable source.  Merge mode
+        // can preserve local candidate code, so use the generic module's
+        // exact overwrite contract and reject any preservation evidence below.
+        mode: 'overwrite',
+        jsonOutput: true,
+        source,
+        registryEntry: current.entry,
+        postUpgradeCheck: (transactionContext) => {
+          const stopStep = transactionContext.steps.find((step) => step.name === 'stop_service');
+          const startStep = transactionContext.steps.find((step) => step.name === 'start_service');
+          if (stopStep?.status !== 'done' || startStep?.status !== 'done') {
+            throw new Error('HXA transaction did not confirm both service stop and restart');
+          }
+          const preservedOrMerged = [
+            ...(transactionContext.mergeKept || []),
+            ...(transactionContext.mergePreserved || []),
+            ...(transactionContext.mergedFiles || []),
+            ...(transactionContext.mergeConflicts || []).map((item) => item.file || item),
+          ];
+          if (preservedOrMerged.length > 0) {
+            throw new Error('HXA transaction preserved or merged local component files');
+          }
+          const exactSource = verifyExactSourceTree(
+            transactionContext.skillDir,
+            frozenCandidate,
+          );
+          const runtime = verifyPostUpgradeRuntime(
+            zylosDir,
+            args,
+            tools,
+            childEnvAdditions,
+          );
+          return { status: 'PASS', exactSource, runtime };
+        },
+        tools: {
+          pm2: tools.pm2,
+          npm: upgradeNpm,
+          trusted: tools.trusted === true,
+        },
+      });
+    } catch (error) {
+      summary.checks.transaction = {
+        status: 'HOLD',
+        executionId,
+        module: 'cli/lib/upgrade.js',
+        error: error.message,
+      };
+      summary.checks.rollback = {
+        status: 'NOT_RUN',
+        reason: 'upgrade module did not return a terminal result',
+      };
+      throw new HoldError(`HXA component transaction failed: ${error.message}`, 'UPGRADE_FAILED');
+    }
+
+    summary.checks.transaction = {
+      status: upgradeResult.success ? 'PASS' : 'HOLD',
+      executionId,
+      module: 'cli/lib/upgrade.js',
+      result: upgradeResult,
+    };
+    if (upgradeResult.committedHold || upgradeResult.rollback?.status === 'COMMITTED_HOLD') {
+      committedHold = true;
+      summary.checks.rollback = {
+        status: 'HOLD',
+        performed: false,
+        reason: 'authoritative baseline was committed; rollback is not safe',
+        steps: upgradeResult.rollback?.steps || [],
+      };
+      throw new HoldError(
+        `HXA component transaction committed but requires recovery: ${upgradeResult.error || 'unknown failure'}`,
+        'COMMITTED_HOLD',
+      );
+    }
+    if (!upgradeResult.success) {
+      const rollbackSteps = upgradeResult.rollback?.steps || [];
+      const rollbackComplete = upgradeResult.rollback?.performed === false
+        || (rollbackSteps.length > 0 && rollbackSteps.every((step) => step.success === true));
+      summary.checks.rollback = {
+        status: rollbackComplete ? 'PASS' : 'HOLD',
+        performed: Boolean(upgradeResult.rollback?.performed),
+        steps: rollbackSteps,
+      };
+      throw new HoldError(
+        `HXA component transaction failed: ${upgradeResult.error || 'unknown upgrade error'}`,
+        'UPGRADE_FAILED',
+      );
+    }
+
+    // The generic module has committed the baseline by this point. Any later
+    // verification or cleanup failure is therefore a committed hold, never a
+    // claim that the previous runtime was rolled back.
+    committedHold = true;
+
+    const mergeStep = upgradeResult.steps?.find((step) => step.name === 'smart_merge');
+    const mergePreservation = [
+      ...(upgradeResult.mergeKept || []),
+      ...(upgradeResult.mergePreserved || []),
+      ...(upgradeResult.mergedFiles || []),
+      ...(upgradeResult.mergeConflicts || []).map((item) => item.file || item),
+    ];
+    if (mergePreservation.length > 0) {
+      summary.checks.transaction = {
+        ...summary.checks.transaction,
+        status: 'HOLD',
+        result: upgradeResult,
+      };
+      summary.checks.exactSource = {
+        status: 'HOLD',
+        mode: 'overwrite',
+        preservedOrMerged: mergePreservation,
+        step: mergeStep,
+      };
+      throw new HoldError(
+        'HXA transaction preserved or merged local component files; exact source was not proven',
+        'EXACT_SOURCE_NOT_APPLIED',
+      );
+    }
+    summary.checks.exactSource = {
+      ...(upgradeResult.postUpgradeCheck?.exactSource || {
+        status: 'HOLD',
+        mode: 'overwrite',
+        error: 'pre-commit exact source check was not recorded',
+      }),
+      preservedOrMerged: [],
+      step: mergeStep,
+    };
+    if (summary.checks.exactSource.status !== 'PASS') {
+      throw new HoldError('HXA transaction did not record an exact source check', 'EXACT_SOURCE_NOT_APPLIED');
+    }
+
+    if (upgradeResult.metadataRecoveryPending) {
+      summary.checks.metadataRecovery = {
+        status: 'HOLD',
+        required: true,
+        reason: 'source metadata recovery is pending',
+      };
+      summary.checks.transaction = {
+        ...summary.checks.transaction,
+        status: 'HOLD',
+      };
+      committedHold = true;
+      throw new HoldError(
+        'HXA transaction left source metadata recovery pending',
+        'METADATA_RECOVERY_PENDING',
+      );
+    }
+
+    const stopStep = upgradeResult.steps?.find((step) => step.name === 'stop_service');
+    const startStep = upgradeResult.steps?.find((step) => step.name === 'start_service');
+    if (stopStep?.status !== 'done' || startStep?.status !== 'done') {
+      summary.checks.runtime = {
+        status: 'HOLD',
+        stop: stopStep,
+        start: startStep,
+      };
+      summary.checks.transaction = {
+        ...summary.checks.transaction,
+        status: 'HOLD',
+      };
+      throw new HoldError(
+        'HXA transaction did not confirm both service stop and restart',
+        'RUNTIME_TRANSITION_UNVERIFIED',
+      );
+    }
+
+    const backupStep = upgradeResult.steps?.find((step) => step.name === 'backup');
+    if (!upgradeResult.backupDir || backupStep?.status !== 'done' || !isDirectory(upgradeResult.backupDir)) {
+      throw new HoldError('HXA transaction did not leave a verifiable component backup', 'BACKUP_UNVERIFIED');
+    }
+    summary.checks.backup = {
+      status: 'PASS',
+      path: upgradeResult.backupDir,
+      step: backupStep,
+    };
+
+    summary.checks.postcheck = verifyPostUpgrade(
+      zylosDir,
+      args,
+      tools,
+      runtime.childEnvAdditions || {},
+    );
+    summary.checks.provenance = {
+      status: 'PASS',
+      source: summary.checks.postcheck.source,
+      verifiedBy: 'installed package, registry, source marker, and PM2 postcheck',
+    };
+    const step = (name) => upgradeResult.steps?.find((candidate) => candidate.name === name);
+    summary.checks.runtime = {
+      status: 'PASS',
+      install: step('npm_install')?.status === 'done',
+      backup: backupStep.status === 'done',
+      stop: step('stop_service')?.status === 'done',
+      hooks: ['pre_upgrade_hook', 'post_upgrade_hook'].some((name) => step(name)?.status === 'done'),
+      pm2Mutation: step('start_service')?.status === 'done',
+      registryWrite: true,
+      configWrite: ['pre_upgrade_hook', 'post_upgrade_hook'].some((name) => step(name)?.status === 'done'),
+      sourceMarkerWrite: true,
+    };
+
     summary.checks.cleanup = cleanupStaging(stageDir);
     stageDir = null;
     if (summary.checks.cleanup.status !== 'PASS') {
@@ -1026,8 +1745,9 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
         'STAGING_CLEANUP_FAILED',
       );
     }
+    releaseOwnedLock();
     summary.status = 'PASS';
-    summary.result = 'PRECHECK_ONLY';
+    summary.result = 'EXECUTE_COMPLETE';
     summary.finishedAt = new Date().toISOString();
     atomicWriteJson(summaryPath, summary);
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
@@ -1044,16 +1764,36 @@ export function runHxaUpgrade(argv = process.argv.slice(2), runtime = {}) {
         );
       }
     }
+    if (lockHeld) {
+      try {
+        releaseOwnedLock();
+      } catch (releaseError) {
+        error = releaseError;
+      }
+    }
+    if (args.mode === 'execute' && summary.checks.transaction?.status === 'RUNNING') {
+      summary.checks.transaction = {
+        ...summary.checks.transaction,
+        status: 'HOLD',
+        error: error.message,
+      };
+    }
     summary.status = 'HOLD';
-    summary.result = 'HOLD';
+    summary.result = committedHold ? 'COMMITTED_HOLD' : 'HOLD';
     summary.code = error.code || 'PREFLIGHT_FAILED';
     summary.error = error.message;
     summary.finishedAt = new Date().toISOString();
-    if (summaryPath) {
-      try { atomicWriteJson(summaryPath, summary); } catch {}
+    const terminalSummary = persistTerminalSummary(summaryPath, summary);
+    summary = terminalSummary.summary;
+    if (terminalSummary.attempted && !terminalSummary.persisted) {
+      process.stderr.write('HXA terminal summary persistence failed; terminal state is available only in this response\n');
     }
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
     return 1;
+  } finally {
+    if (lockHeld) {
+      try { releaseOwnedLock(); } catch {}
+    }
   }
 }
 
