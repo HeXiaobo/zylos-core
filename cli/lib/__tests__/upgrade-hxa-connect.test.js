@@ -60,14 +60,19 @@ test('HXA fixed-SHA dry-run validates the target and does not mutate runtime sta
       'utf8',
     );
     const sdkDir = path.join(skillDir, 'node_modules', '@coco-xyz', 'hxa-connect-sdk');
-    fs.mkdirSync(sdkDir, { recursive: true });
+    fs.mkdirSync(path.join(sdkDir, 'dist'), { recursive: true });
     fs.writeFileSync(path.join(sdkDir, 'package.json'), JSON.stringify({
       name: '@coco-xyz/hxa-connect-sdk',
       version: '0.0.0-test',
       type: 'module',
-      main: 'index.js',
+      exports: {
+        '.': {
+          types: './dist/index.d.ts',
+          import: './dist/index.js',
+        },
+      },
     }));
-    fs.writeFileSync(path.join(sdkDir, 'index.js'), [
+    fs.writeFileSync(path.join(sdkDir, 'dist', 'index.js'), [
       'export class HxaConnectClient {',
       "  async getProfile() { return { name: process.env.ZYLOS_TEST_PROFILE_NAME || 'ss', id: process.env.ZYLOS_TEST_PROFILE_ID || 'profile-ss' }; }",
       '}',
