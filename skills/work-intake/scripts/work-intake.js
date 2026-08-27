@@ -8,10 +8,16 @@ const AGENT_ID = /^agent:[a-z0-9][a-z0-9._-]{0,62}$/;
 const DURABLE_ACTION = /(?:整理|跟进|准备|完成|制作|更新|复盘|提交|联系|回访|安排|检查|核对|推进|撰写|汇总|发送|发布|删除|付款|转账|审批|部署|创建|修复|实现|测试|调查|监控|提醒|预约|对账|归档)/u;
 const HIGH_RISK_ACTION = /(?:付款|转账|打款|退款|报销|签署|签约|盖章|删除|清空|注销|发布(?!人)|群发|发送邮件|发邮件|发消息|联系客户|提交审批|审批通过|拒绝审批|部署到生产|上线生产|修改权限|开放权限|授权|移除成员|邀请外部|下单|购买|卖出|买入)/u;
 const VAGUE_TIME = /(?:尽快|抓紧|有空(?:时)?|回头|晚点|稍后|抽空|这两天|过几天|改天|近期|下周找时间|月底左右|差不多|合适的时候)/u;
-const DUE_TEXT = /(?:今天|明天|后天|本周[一二三四五六日天]?|下周[一二三四五六日天]?|周[一二三四五六日天]|(?:20\d{2}[年\-/])?\d{1,2}[月\-/]\d{1,2}日?)(?:\s*(?:上午|中午|下午|晚上|凌晨)?\s*\d{1,2}(?::|点)\d{0,2}分?)?\s*(?:之前|以前|前|截止)?/u;
+const UUID = /\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/giu;
+const DUE_TEXT = /(?:今天|明天|后天|本周[一二三四五六日天]?|下周[一二三四五六日天]?|周[一二三四五六日天]|(?<!\d)(?:(?:20\d{2}[年\-/])?(?:1[0-2]|0?[1-9])(?:月|[-/])(?:3[01]|[12]\d|0?[1-9]))(?:日|(?!\d)))(?:\s*(?:上午|中午|下午|晚上|凌晨)?\s*\d{1,2}(?::|点)\d{0,2}分?)?\s*(?:之前|以前|前|截止)?/u;
 const REMINDER_TEXT = /提前\s*(\d+)\s*(分钟|小时|天)(?:\s*(?:提醒|通知))?/u;
 const QUESTION = /(?:[?？]\s*$|^(?:什么|为什么|怎么|如何|是否|能否|可以|有没有|哪里|谁|几点|多少|请问|我想(?:知道|了解)|想问(?:一下)?|能告诉我|可否告诉我))/u;
 const ONE_SHOT_REQUEST = /(?:告诉我|解释一下|查一下|查询一下|搜一下|翻译一下|总结这段|看看这张|分析一下|回答一下|推荐一下|计算一下|改写一下|润色一下|生成一段|现在几点|天气怎么样)/u;
+const RELEASE_CANARY_RESPONSE = /^ZYL-P0-(FEISHU|HXA)-([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})[：:]\s*这是\s+[\p{L}\p{N}._@-]{1,64}\s+发布前通信\s+canary[，,]\s*请\s*只回复[“"]ACK\s+\1-\2[”"][。.!！]?\s*$/iu;
+const RELEASE_CANARY_CHANNELS = Object.freeze({
+  FEISHU: 'feishu',
+  HXA: 'hxa-connect',
+});
 const ACKNOWLEDGEMENT_ONLY = /^(?:已?(?:确认|授权|同意|批准)|确认(?:添加|执行|继续|处理|发送|发布|安装|升级)?|同意(?:添加|执行|继续|处理|发送|发布|安装|升级)?|可以|行|好(?:的)?|收到|知道了|明白(?:了)?|继续|执行|开始|搞定|没问题|ok(?:ay)?|yes|confirm|approved?)[。！!，,\s]*$/iu;
 const AMBIGUOUS_REQUEST = /(?:看看(?:这个|这件事|这个事|一下)?|跟一下(?:这个|这件事|这个事)?|处理一下(?:这个|这件事|这个事)?|弄一下|关注一下|推进一下|安排一下|记一下|搞一下|留意一下|盯一下)/u;
 const HUMAN_ASSIGNMENT = /(?:交给|让|安排)\s*@?([\p{L}\p{N}_-]{1,20}?)\s*(?:来|负责|处理|完成|跟进|整理|推进)/u;
@@ -82,7 +88,13 @@ function explicitAgentAssignment(text, profile) {
 }
 
 function extractDueText(text) {
-  return text.match(DUE_TEXT)?.[0]?.replace(/\s+/g, '') ?? null;
+  return text.replace(UUID, '').match(DUE_TEXT)?.[0]?.replace(/\s+/g, '') ?? null;
+}
+
+function isReleaseCanaryResponse(text, sourceChannel) {
+  const match = text.match(RELEASE_CANARY_RESPONSE);
+  return match !== null
+    && RELEASE_CANARY_CHANNELS[match[1].toUpperCase()] === sourceChannel.toLowerCase();
 }
 
 function extractReminderMinutes(text, dueText) {
@@ -236,6 +248,13 @@ export function classify(input, options) {
       : 'ONE_SHOT_REQUEST');
   }
 
+  // The release canary grammar binds its channel and UUID to the requested ACK.
+  // Keep this deliberately narrower than a general "only reply" exception so
+  // a risky command cannot bypass the confirmation gate by appending one.
+  if (!explicitTask && isReleaseCanaryResponse(directiveText, envelope.source.channel)) {
+    return result(envelope, 'chat_only', 'RESPONSE_ONLY_INSTRUCTION');
+  }
+
   // Acknowledgements authorize or confirm an already established interaction;
   // they are never a new unit of work on their own. This must run before the
   // high-risk verb gate because short replies such as “已授权” contain a risky
@@ -262,7 +281,7 @@ export function classify(input, options) {
     );
   }
 
-  if (REMINDER_TEXT.test(directiveText) && !DUE_TEXT.test(directiveText)) {
+  if (REMINDER_TEXT.test(directiveText) && extractDueText(directiveText) === null) {
     return result(
       envelope,
       'confirm',
@@ -289,7 +308,7 @@ export function classify(input, options) {
     );
   }
 
-  const hasDue = DUE_TEXT.test(directiveText);
+  const hasDue = extractDueText(directiveText) !== null;
   const durableAction = DURABLE_ACTION.test(directiveText);
   if (agentAssigned && durableAction && !ONE_SHOT_REQUEST.test(directiveText)) {
     return result(
