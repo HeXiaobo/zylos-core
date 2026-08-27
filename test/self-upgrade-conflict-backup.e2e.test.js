@@ -61,6 +61,7 @@ beforeEach(() => {
   }));
   for (const relativePath of [
     'skills/comm-bridge/scripts/c4-send.js',
+    'skills/comm-bridge/scripts/c4-outbound-policy.js',
     'skills/comm-bridge/scripts/c4-receive.js',
     'skills/comm-bridge/scripts/c4-dispatcher.js',
     'skills/comm-bridge/scripts/c4-response-stream-supervisor.js',

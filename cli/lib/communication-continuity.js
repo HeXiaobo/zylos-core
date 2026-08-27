@@ -23,6 +23,7 @@ const WORK_INTAKE_ENV_KEYS = Object.freeze([
 ]);
 export const COMMUNICATION_CRITICAL_ASSETS = Object.freeze([
   'comm-bridge/scripts/c4-send.js',
+  'comm-bridge/scripts/c4-outbound-policy.js',
   'comm-bridge/scripts/c4-receive.js',
   'comm-bridge/scripts/c4-dispatcher.js',
   'comm-bridge/scripts/c4-response-stream-supervisor.js',
