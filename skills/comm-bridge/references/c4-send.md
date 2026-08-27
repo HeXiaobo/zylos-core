@@ -10,7 +10,53 @@ Your message here. Quotes, $vars, `backticks` — all safe.
 EOF
 ```
 
-Messages are piped via stdin using a heredoc. This bypasses shell argument parsing entirely, so any content (quotes, variables, markdown) is delivered verbatim.
+New callers pipe messages via stdin using a heredoc. This bypasses shell argument parsing entirely, so any content (quotes, variables, markdown) is delivered verbatim.
+
+Launchers that cannot pipe stdin may write the body to a private temporary file
+and pass one content-free option. The option is safe in strict mode and is part
+of the published Core capability contract:
+
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js \
+  <channel> <endpoint_id> --body-file=/absolute/path/to/reply.txt
+```
+
+Use exactly one `--body-file=<path>` option. Do not combine it with `--stdin` or
+a positional message. An unreadable or empty file fails before dispatch. The
+body itself never appears in argv.
+
+The exact endpoint-addressed legacy form remains accepted by default during
+the compatibility phase. It exists to keep older HXA/OpenMAX/channel callers
+working during rolling upgrades; do not use it for new calls.
+
+### Compatibility and recovery policy
+
+Only the unambiguous legacy form `<channel> <endpoint_id> <message>` is
+accepted. Broadcast and `void` arg-mode remain disabled. Every use writes a
+`legacy_arg_mode_used` deprecation event without the message body, so operators
+can verify that old callers have been removed.
+
+After all callers have demonstrably migrated, an operator may opt in to strict
+mode. The script reads both flags directly from `~/zylos/.env`, so changes take
+effect on the next send without restarting the runtime:
+
+```dotenv
+C4_STRICT_STDIN_ONLY=1
+```
+
+If strict mode interrupts communication, add the break-glass override
+immediately; it takes precedence over strict mode:
+
+```dotenv
+C4_LEGACY_ARG_MODE=1
+```
+
+Self-upgrade runs a hermetic reply-path canary. Compatibility mode proves stdin
+and the exact legacy call. Explicit strict mode proves stdin and body-file
+delivery, then proves that a positional body is rejected without dispatch.
+Before mutation, the target must declare both `c4.reply.argv-compat:1` and
+`c4.reply.body-file:1`. A failed canary restores the backed-up Core Skills and
+restarts the previously running services.
 
 ### Important safety rule
 
@@ -20,9 +66,18 @@ Messages are piped via stdin using a heredoc. This bypasses shell argument parsi
 
 ### How it works
 
-1. When stdin is piped, c4-send.js reads the full message from stdin.
-2. The heredoc content is raw bytes — no shell escaping needed.
+1. When stdin is piped, c4-send.js reads the full message from stdin; when
+   `--body-file=<path>` is present, it reads that file instead.
+2. Neither safe transport places the body in argv.
 3. c4-send.js passes the message to the channel's `send.js` script via `spawn()`.
+   The child receives `C4_DELIVERY_ID=c4.outbound.<conversation-id>`, derived
+   from the persisted outbound C4 row before dispatch. Channel adapters may
+   use this opaque, content-free identity to make an ambiguous transport retry
+   idempotent. Streamed assistant replies additionally receive their separate
+   `C4_ASSISTANT_REQUEST_ID`; the two identities are not interchangeable.
+   Core advertises this channel contract as `c4.outbound-delivery-id:1` through
+   `zylos capabilities --json`; components that depend on proactive delivery
+   idempotency must require it before install or upgrade.
 
 ## Examples
 

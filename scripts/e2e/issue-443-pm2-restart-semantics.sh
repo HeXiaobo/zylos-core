@@ -45,6 +45,7 @@ chmod +x "$BIN_DIR/pm2"
 cat > "$BIN_DIR/codex" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = "login" ] && [ "${2:-}" = "status" ]; then
+  echo "Logged in using ChatGPT"
   exit 0
 fi
 exit 0

@@ -3,6 +3,7 @@ import {
   WATCHDOG_INTERRUPT_AVAILABLE_IN_SEC,
   evaluateToolWatchdogTransition,
 } from './tool-watchdog.js';
+import { TOOL_SESSION_TTL_MS } from './tool-pipeline.js';
 
 export class MonitorOrchestrator {
   constructor(deps) {
@@ -205,9 +206,15 @@ export class MonitorOrchestrator {
 
   summarizeApiActivity({ currentTime, apiActivity }) {
     const apiUpdatedSec = apiActivity?.updated_at ? Math.floor(apiActivity.updated_at / 1000) : 0;
-    const activeTools = apiActivity?.active_tools ?? 0;
-    const thinking = apiActivity?.active === true || activeTools > 0;
     const hookFresh = apiUpdatedSec > 0 && (currentTime - apiUpdatedSec) < 60;
+    const activeTools = apiActivity?.active_tools ?? 0;
+    const promptFresh = apiUpdatedSec > 0
+      && (currentTime - apiUpdatedSec) < (TOOL_SESSION_TTL_MS / 1000);
+    const promptActive = promptFresh && (
+      apiActivity?.in_prompt === true
+      || (apiActivity?.active === true && activeTools === 0)
+    );
+    const thinking = activeTools > 0 || promptActive;
 
     return {
       apiUpdatedSec,
@@ -604,7 +611,7 @@ export class MonitorOrchestrator {
 
     const { engine, taskScheduler } = this.components;
     const inactiveSeconds = currentTime - activity;
-    const state = (activeTools > 0 || inactiveSeconds < idleThreshold) ? 'busy' : 'idle';
+    const state = (thinking || activeTools > 0 || inactiveSeconds < idleThreshold) ? 'busy' : 'idle';
 
     let nextIdleSince = idleSince;
     if (state === 'idle' && lastState !== 'idle') {

@@ -116,8 +116,8 @@ Browser uploads are stored under `~/zylos/web-console/media/` and delivered to t
 Agent replies can include a single media row using the same C4 convention as other channels:
 
 ```bash
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console "[MEDIA:image]/absolute/path/to/image.png"
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console "[MEDIA:file]/absolute/path/to/report.pdf"
+echo "[MEDIA:image]/absolute/path/to/image.png" | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console
+echo "[MEDIA:file]/absolute/path/to/report.pdf" | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js web-console console
 ```
 
 The browser only requests media by C4 message id. The server rechecks the row is an outbound web-console console message, resolves the target with `realpath`, and serves only paths under `ZYLOS_DIR` or `/tmp`.

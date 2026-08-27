@@ -37,7 +37,7 @@ function createDownloadTmpDir() {
  *
  * @param {string} repo - GitHub repo in "org/name" format
  * @param {string} ref - Git ref (tag name or branch name)
- * @param {'tag'|'branch'} refType - Whether the ref is a tag or branch
+ * @param {'tag'|'branch'|'commit'} refType - Whether the ref is a tag, branch, or immutable commit
  * @param {string} tarballPath - Destination file path for the tarball
  */
 function curlDownload(repo, ref, refType, tarballPath) {
@@ -51,7 +51,9 @@ function curlDownloadOnce(repo, ref, refType, tarballPath) {
   // 1. Try public endpoint first (no auth needed for public repos)
   const publicUrl = refType === 'tag'
     ? `https://github.com/${repo}/archive/refs/tags/${ref}.tar.gz`
-    : `https://github.com/${repo}/archive/refs/heads/${ref}.tar.gz`;
+    : refType === 'commit'
+      ? `https://github.com/${repo}/archive/${ref}.tar.gz`
+      : `https://github.com/${repo}/archive/refs/heads/${ref}.tar.gz`;
   let publicError;
   try {
     execFileSync('curl', ['-fsSL', '-o', tarballPath, publicUrl], {
@@ -258,7 +260,8 @@ export function downloadBranch(repo, branch, destDir) {
 
   try {
     fs.mkdirSync(destDir, { recursive: true });
-    curlDownload(repo, branch, 'branch', tarballPath);
+    const refType = /^[0-9a-f]{40}$/i.test(branch) ? 'commit' : 'branch';
+    curlDownload(repo, branch, refType, tarballPath);
     const result = extractTarball(tarballPath, destDir);
     fs.rmSync(tmpDir, { recursive: true, force: true });
     return result;

@@ -11,7 +11,7 @@ const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-utils-spill-test-'));
 process.env.ZYLOS_DIR = TMP_DIR;
 
 // Dynamic import so the env var is set before c4-config.js evaluates.
-const { truncateForDelivery } = await import(new URL('../c4-utils.js', import.meta.url));
+const { buildReplyViaSuffix, truncateForDelivery } = await import(new URL('../c4-utils.js', import.meta.url));
 const { FILE_SIZE_THRESHOLD } = await import(new URL('../c4-config.js', import.meta.url));
 
 // Restore env after module load.
@@ -77,6 +77,16 @@ describe('truncateForDelivery conv-id spill naming', () => {
     const content = 'E'.repeat(FILE_SIZE_THRESHOLD + 100);
     const p = spillPathOf(truncateForDelivery(content, '', 0));
     assert.ok(p.includes(`${path.sep}conv-0${path.sep}`), `expected conv-0 dir, got: ${p}`);
+  });
+});
+
+describe('reply route instruction', () => {
+  it('makes stdin-only delivery explicit without embedding the reply body', () => {
+    const suffix = buildReplyViaSuffix('openmax', 'conversation-1');
+
+    assert.match(suffix, /reply via: node .*c4-send\.js "openmax" "conversation-1"/);
+    assert.match(suffix, /stdin only/i);
+    assert.match(suffix, /do not append.*message argument/i);
   });
 });
 

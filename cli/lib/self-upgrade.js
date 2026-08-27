@@ -38,8 +38,71 @@ import {
 import { deployManifestTemplate } from './runtime/tmux-env.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
+import {
+  verifyCommunicationAssets,
+  verifyCommunicationContinuity,
+} from './communication-continuity.js';
+import { readEnvFile } from './env.js';
+import {
+  assertExactSkillsInventory,
+  captureExactSkillsInventory,
+  verifyExactSkillsBackup,
+  verifyPostSyncSkillsContinuity,
+} from './skills-continuity.js';
 
-const REPO = 'zylos-ai/zylos-core';
+// Services that must be present for upgraded Core behavior to function. During
+// an upgrade we start one only when the machine was already running Zylos and
+// PM2 has no record of that service at all. A deliberately stopped process is
+// therefore preserved, while a process introduced by the new release is not
+// silently omitted from the old process list.
+const UPGRADE_REQUIRED_CORE_SERVICES = [
+  {
+    name: 'c4-response-stream-supervisor',
+    script: ['comm-bridge', 'scripts', 'c4-response-stream-supervisor.js'],
+  },
+];
+
+const DEFAULT_FINALIZER_TIMEOUT_MS = 900_000;
+const MIN_FINALIZER_TIMEOUT_MS = 180_000;
+
+export function resolveSelfUpgradeFinalizerTimeoutMs(processEnv = process.env) {
+  const raw = String(processEnv.ZYLOS_SELF_UPGRADE_FINALIZER_TIMEOUT_MS || '').trim();
+  if (!raw) return DEFAULT_FINALIZER_TIMEOUT_MS;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FINALIZER_TIMEOUT_MS;
+  return Math.max(Math.trunc(parsed), MIN_FINALIZER_TIMEOUT_MS);
+}
+
+// Patch #6 (3AI fork layer): allow self-upgrade to target an alternate repo
+// (e.g. the 3AI fork) via the ZYLOS_SELF_UPGRADE_REPO env var. Value is an
+// `owner/repo` slug (e.g. `HeXiaobo/zylos-core`). Default stays canonical, so
+// normal upgrades on machines that do not set it are unaffected, and it makes
+// fork-based upgrades ratifiable without hand-editing installed code on every
+// machine.
+//   NOTE — deliberately NOT named ZYLOS_REPO: scripts/install.sh already uses
+//   ZYLOS_REPO with a DIFFERENT meaning (a full URL, for fresh installs). Same
+//   name + two meanings (URL vs slug) would silently mis-resolve here, so the
+//   self-upgrade override gets its own name.
+//   The same variable is consumed by doctor, activity-monitor, the installer,
+//   and changelog lookup so check and download sources cannot drift apart.
+//   Stable no-branch upgrades still require a release tag in the selected repo.
+export function resolveCoreRepository({ processEnv = process.env, readEnv = readEnvFile } = {}) {
+  const processValue = String(processEnv.ZYLOS_SELF_UPGRADE_REPO || '').trim();
+  if (processValue) return processValue;
+
+  try {
+    const fileValue = String(readEnv().get('ZYLOS_SELF_UPGRADE_REPO') || '').trim();
+    if (fileValue) return fileValue;
+  } catch {
+    // An absent or unreadable persisted config must not make the CLI unusable.
+  }
+
+  return 'zylos-ai/zylos-core';
+}
+
+export const CORE_REPO = resolveCoreRepository();
+const REPO = CORE_REPO;
 
 // ---------------------------------------------------------------------------
 // Version helpers
@@ -468,7 +531,7 @@ export function generateMigrationHints(templatesDir, deps = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// 11-step self-upgrade pipeline
+// 15-stage self-upgrade pipeline (steps 0-14)
 // ---------------------------------------------------------------------------
 
 /**
@@ -486,8 +549,12 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     backupDir: null,
     servicesStopped: [],
     servicesWereRunning: [],
+    cronServicesWereRunning: [],
+    servicesExpectedAfterUpgrade: [],
+    servicesStartedByUpgrade: [],
     mergeConflicts: [],
     mergedFiles: [],
+    preUpgradeSkillsInventory: null,
     // Results
     steps: [],
     from: null,
@@ -495,6 +562,66 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     success: false,
     error: null,
   };
+}
+
+/**
+ * Step 0: fail closed before mutation unless the target release declares both
+ * the rolling legacy compatibility seam and the safe file-backed reply seam.
+ */
+export function step0_verifyTargetCommunicationCompatibility(ctx, deps = {}) {
+  const startTime = Date.now();
+  const fsApi = deps.fs ?? fs;
+  const manifestPath = path.join(ctx.tempDir || '', 'capabilities.json');
+
+  try {
+    const target = JSON.parse(fsApi.readFileSync(manifestPath, 'utf8'));
+    const requiredProtocols = ['c4.reply.argv-compat', 'c4.reply.body-file'];
+    const protocolVersions = {};
+    for (const protocol of requiredProtocols) {
+      const actual = target?.protocols?.[protocol];
+      if (!Number.isInteger(actual) || actual < 1) {
+        return {
+          step: 0,
+          name: 'verify_target_communication_compatibility',
+          status: 'failed',
+          error: `Protocol ${protocol} requires >= 1, found ${actual ?? 'missing'}`,
+          duration: Date.now() - startTime,
+        };
+      }
+      protocolVersions[protocol] = actual;
+    }
+    const assets = verifyCommunicationAssets({
+      skillsDir: path.join(ctx.tempDir || '', 'skills'),
+      fsApi,
+    });
+    if (!assets.compatible) {
+      return {
+        step: 0,
+        name: 'verify_target_communication_compatibility',
+        status: 'failed',
+        error: assets.error,
+        duration: Date.now() - startTime,
+      };
+    }
+    return {
+      step: 0,
+      name: 'verify_target_communication_compatibility',
+      status: 'done',
+      message: requiredProtocols
+        .map((protocol) => `${protocol}=${protocolVersions[protocol]}`)
+        .concat(`${assets.checked.length} critical assets`)
+        .join('; '),
+      duration: Date.now() - startTime,
+    };
+  } catch (err) {
+    return {
+      step: 0,
+      name: 'verify_target_communication_compatibility',
+      status: 'failed',
+      error: `Target capabilities could not be read: ${err.message}`,
+      duration: Date.now() - startTime,
+    };
+  }
 }
 
 /**
@@ -513,10 +640,48 @@ export function step1_backupCoreSkills(ctx, deps = {}) {
   try {
     fsApi.mkdirSync(backupDir, { recursive: true });
 
-    // Backup the skills directory (include .zylos manifests — needed for correct rollback)
-    if (fsApi.existsSync(skillsDir)) {
-      copyTreeFn(skillsDir, path.join(backupDir, 'skills'), { excludes: ['node_modules'] });
+    const mustBackupCorePackage = Boolean(deps.corePackageDir || ctx.globalCoreDir || ctx.coreDir);
+    const resolveInstalledCorePackageDir = deps.resolveInstalledCorePackageDir
+      ?? (() => resolveInstalledPackageScript());
+    const corePackageDir = deps.corePackageDir
+      ?? ctx.globalCoreDir
+      ?? (mustBackupCorePackage ? resolveInstalledCorePackageDir() : null);
+    if (mustBackupCorePackage) {
+      if (!corePackageDir || !fsApi.existsSync(corePackageDir)) {
+        throw new Error('Installed global Core package not found');
+      }
     }
+
+    const targetSkillsCandidate = ctx.tempDir ? path.join(ctx.tempDir, 'skills') : null;
+    const targetSkillsDir = targetSkillsCandidate && fsApi.existsSync(targetSkillsCandidate)
+      ? targetSkillsCandidate
+      : null;
+    const installedCoreSkillsCandidate = deps.installedCoreSkillsDir
+      ?? (corePackageDir ? path.join(corePackageDir, 'skills') : null);
+    const installedCoreSkillsDir = installedCoreSkillsCandidate
+      && fsApi.existsSync(installedCoreSkillsCandidate)
+      ? installedCoreSkillsCandidate
+      : null;
+    ctx.preUpgradeSkillsInventory = captureExactSkillsInventory({
+      skillsDir,
+      incomingSkillsDir: targetSkillsDir,
+      installedCoreSkillsDir,
+      classifyOwnership: true,
+      fsApi,
+    });
+
+    if (mustBackupCorePackage) {
+      copyTreeFn(corePackageDir, path.join(backupDir, 'core-package'));
+      ctx.globalCoreDir = corePackageDir;
+    }
+
+    // Backup the skills directory (include .zylos manifests — needed for correct rollback)
+    copyTreeFn(skillsDir, path.join(backupDir, 'skills'), { excludes: ['node_modules'] });
+    const backupInventory = captureExactSkillsInventory({
+      skillsDir: path.join(backupDir, 'skills'),
+      fsApi,
+    });
+    verifyExactSkillsBackup(ctx.preUpgradeSkillsInventory, backupInventory);
 
     const ecosystemSrc = deps.ecosystemPath ?? path.join(zylosDir, 'pm2', 'ecosystem.config.cjs');
     if (fsApi.existsSync(ecosystemSrc)) {
@@ -545,7 +710,8 @@ function step2_preUpgradeHook(ctx) {
  * Find PM2 services running from SKILLS_DIR by matching exec paths.
  * This catches ALL zylos-managed services regardless of SKILL.md declarations.
  *
- * @returns {{ name: string, status: string }[]} PM2 processes whose scripts are under SKILLS_DIR
+ * @returns {{ name: string, status: string, autorestart: boolean|null, cronRestart: string|null }[]}
+ * PM2 processes whose scripts are under SKILLS_DIR
  */
 function getSkillsServices(deps = {}) {
   const execSyncFn = deps.execSync ?? execSync;
@@ -559,7 +725,12 @@ function getSkillsServices(deps = {}) {
         const execPath = proc.pm2_env?.pm_exec_path || '';
         return execPath.startsWith(resolved + '/');
       })
-      .map(proc => ({ name: proc.name, status: proc.pm2_env?.status }));
+      .map(proc => ({
+        name: proc.name,
+        status: proc.pm2_env?.status,
+        autorestart: proc.pm2_env?.autorestart ?? null,
+        cronRestart: proc.pm2_env?.cron_restart ?? null,
+      }));
   } catch {
     return [];
   }
@@ -568,7 +739,7 @@ function getSkillsServices(deps = {}) {
 /**
  * Step 3: stop core services
  */
-function step3_stopCoreServices(ctx, deps = {}) {
+export function step3_stopCoreServices(ctx, deps = {}) {
   const startTime = Date.now();
   const execSyncFn = deps.execSync ?? execSync;
   const getServices = deps.getSkillsServices ?? (() => getSkillsServices(deps));
@@ -579,6 +750,9 @@ function step3_stopCoreServices(ctx, deps = {}) {
   // Find all PM2 services running from skills directory
   const services = getServices();
   const onlineServices = services.filter(s => s.status === 'online');
+  ctx.cronServicesWereRunning = Array.isArray(ctx.cronServicesWereRunning)
+    ? ctx.cronServicesWereRunning
+    : [];
 
   if (services.length === 0) {
     return { step: 3, name: 'stop_core_services', status: 'skipped', message: 'no services found', duration: Date.now() - startTime };
@@ -590,6 +764,9 @@ function step3_stopCoreServices(ctx, deps = {}) {
 
   for (const svc of onlineServices) {
     ctx.servicesWereRunning.push(svc.name);
+    if (svc.autorestart === false && String(svc.cronRestart || '').trim()) {
+      ctx.cronServicesWereRunning.push(svc.name);
+    }
     try {
       stopService(svc.name);
       ctx.servicesStopped.push(svc.name);
@@ -628,7 +805,7 @@ function step4_npmInstallGlobal(ctx, deps = {}) {
     const tarballPath = path.join(ctx.tempDir, tarballName);
 
     // Install from tarball — npm copies files into global node_modules
-    execSyncFn(`npm install -g "${tarballPath}"`, {
+    execSyncFn(`npm install -g --ignore-scripts "${tarballPath}"`, {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ZYLOS_SKIP_POSTINSTALL: '1' },  // Skip postinstall — we sync skills ourselves
@@ -646,6 +823,7 @@ export function step5_syncCoreSkills(ctx, deps = {}) {
   const startTime = Date.now();
   const fsApi = deps.fs ?? fs;
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
   const syncCoreSkillsFn = deps.syncCoreSkills ?? syncCoreSkills;
 
   const newSkillsSrc = path.join(ctx.tempDir, 'skills');
@@ -686,7 +864,29 @@ export function step5_syncCoreSkills(ctx, deps = {}) {
       return { step: 5, name: 'sync_core_skills', status: 'failed', error: syncResult.errors.join('; '), duration: Date.now() - startTime };
     }
 
-    return { step: 5, name: 'sync_core_skills', status: 'done', message: msg, duration: Date.now() - startTime };
+    if (ctx.preUpgradeSkillsInventory) {
+      const installedInventory = captureExactSkillsInventory({ skillsDir, fsApi });
+      verifyPostSyncSkillsContinuity(ctx.preUpgradeSkillsInventory, installedInventory);
+    }
+
+    const assets = verifyCommunicationAssets({ skillsDir, fsApi });
+    if (!assets.compatible) {
+      return {
+        step: 5,
+        name: 'sync_core_skills',
+        status: 'failed',
+        error: assets.error,
+        duration: Date.now() - startTime,
+      };
+    }
+
+    return {
+      step: 5,
+      name: 'sync_core_skills',
+      status: 'done',
+      message: `${msg}; ${assets.checked.length} critical assets verified`,
+      duration: Date.now() - startTime,
+    };
   } catch (err) {
     return { step: 5, name: 'sync_core_skills', status: 'failed', error: err.message, duration: Date.now() - startTime };
   }
@@ -1219,7 +1419,11 @@ export function step11_startCoreServices(ctx, deps = {}) {
   const fsApi = deps.fs ?? fs;
   const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
   const exec = deps.execSync ?? execSync;
+  const restartScheduledFn = deps.restartScheduledProcess ?? ((name) => {
+    exec(`pm2 restart ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
+  });
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
 
   if (ctx.servicesWereRunning.length === 0) {
     return { step: 11, name: 'start_core_services', status: 'skipped', message: 'no services to restart', duration: Date.now() - startTime };
@@ -1248,16 +1452,63 @@ export function step11_startCoreServices(ctx, deps = {}) {
   }
   ecosystemPath = ecosystemPath ?? ecosystemDest;
 
+  const servicesToStart = [...new Set(ctx.servicesWereRunning)];
+  ctx.servicesStartedByUpgrade = Array.isArray(ctx.servicesStartedByUpgrade)
+    ? ctx.servicesStartedByUpgrade
+    : [];
+  const requiredServices = deps.requiredCoreServices ?? UPGRADE_REQUIRED_CORE_SERVICES;
+  const availableRequiredServices = requiredServices.filter(service =>
+    fsApi.existsSync(path.join(skillsDir, ...service.script))
+  );
+
+  if (availableRequiredServices.length > 0) {
+    const getPm2ProcessNames = deps.getPm2ProcessNames ?? (() => {
+      const output = exec('pm2 jlist 2>/dev/null', { encoding: 'utf8', stdio: 'pipe' });
+      const processes = JSON.parse(String(output));
+      return processes.map(process => process.name).filter(Boolean);
+    });
+
+    let pm2ProcessNames;
+    try {
+      pm2ProcessNames = new Set(getPm2ProcessNames());
+    } catch (err) {
+      const detail = err?.message ? `: ${err.message}` : '';
+      return {
+        step: 11,
+        name: 'start_core_services',
+        status: 'failed',
+        error: `failed to inspect PM2 process list before core restart${detail}`,
+        duration: Date.now() - startTime,
+      };
+    }
+
+    for (const service of availableRequiredServices) {
+      if (!pm2ProcessNames.has(service.name) && !servicesToStart.includes(service.name)) {
+        servicesToStart.push(service.name);
+        ctx.servicesStartedByUpgrade.push(service.name);
+      }
+    }
+  }
+
+  ctx.servicesExpectedAfterUpgrade = [...servicesToStart];
+
   const started = [];
   const failed = [];
+  const scheduledServices = new Set(ctx.cronServicesWereRunning || []);
 
-  for (const name of ctx.servicesWereRunning) {
+  for (const name of servicesToStart) {
     try {
-      restartFn(name, {
-        ecosystemPath,
-        stdio: 'pipe',
-        fallbackToPlainRestartOnError: true,
-      });
+      if (scheduledServices.has(name)) {
+        // Preserve the process's own cron_restart/autorestart definition.
+        // The Core ecosystem does not necessarily declare component one-shots.
+        restartScheduledFn(name);
+      } else {
+        restartFn(name, {
+          ecosystemPath,
+          stdio: 'pipe',
+          fallbackToPlainRestartOnError: true,
+        });
+      }
       started.push(name);
     } catch {
       failed.push(name);
@@ -1301,14 +1552,23 @@ export function step11_startCoreServices(ctx, deps = {}) {
 /**
  * Step 12: verify services
  *
- * Polls up to 30 seconds (every 2 s) for all services to come online.
- * Some services (e.g. component bots) take longer than 2 s to start after
- * PM2 restarts them — a one-shot check caused spurious rollbacks.
+ * Polls up to 30 seconds (every 2 s) for all runtime processes to become
+ * healthy. Daemons must be online. A PM2 cron one-shot (`autorestart: false`
+ * plus `cron_restart`) is also healthy while stopped between successful runs;
+ * treating that expected idle state as a dead daemon causes false rollbacks.
  */
-function step12_verifyServices(ctx) {
+export function step12_verifyServices(ctx, deps = {}) {
   const startTime = Date.now();
+  const exec = deps.execSync ?? execSync;
+  const fsApi = deps.fs ?? fs;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
+  const requiredServices = deps.requiredCoreServices ?? UPGRADE_REQUIRED_CORE_SERVICES;
+  const requiredByName = new Map(requiredServices.map((service) => [service.name, service]));
+  const servicesToVerify = ctx.servicesExpectedAfterUpgrade?.length > 0
+    ? ctx.servicesExpectedAfterUpgrade
+    : ctx.servicesWereRunning;
 
-  if (ctx.servicesWereRunning.length === 0) {
+  if (servicesToVerify.length === 0) {
     return { step: 12, name: 'verify_services', status: 'skipped', message: 'no services to verify', duration: Date.now() - startTime };
   }
 
@@ -1316,16 +1576,67 @@ function step12_verifyServices(ctx) {
   const TIMEOUT_MS = 30000;
 
   while (Date.now() - startTime < TIMEOUT_MS) {
-    try { execSync('sleep 2', { stdio: 'pipe' }); } catch { /* ignore */ }
+    try { exec('sleep 2', { stdio: 'pipe' }); } catch { /* ignore */ }
 
     try {
-      const output = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
+      const output = exec('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
       const processes = JSON.parse(output);
 
-      const notOnline = ctx.servicesWereRunning.filter(name => {
+      const isHealthyScheduledIdle = (proc) => {
+        const pm2Env = proc?.pm2_env || {};
+        const cronRestart = String(pm2Env.cron_restart || '').trim();
+        const unstableRestarts = Number(pm2Env.unstable_restarts || 0);
+        return pm2Env.status === 'stopped'
+          && pm2Env.autorestart === false
+          && cronRestart.length > 0
+          && Number(pm2Env.exit_code) === 0
+          && unstableRestarts === 0;
+      };
+
+      const notOnline = servicesToVerify.filter(name => {
         const proc = processes.find(p => p.name === name);
-        return !proc || proc.pm2_env?.status !== 'online';
+        return !proc
+          || (proc.pm2_env?.status !== 'online' && !isHealthyScheduledIdle(proc));
       });
+
+      const invalidExecutables = [];
+      for (const name of servicesToVerify) {
+        const proc = processes.find((candidate) => candidate.name === name);
+        if (!proc) continue;
+        const runtimeIsHealthy = proc.pm2_env?.status === 'online'
+          || isHealthyScheduledIdle(proc);
+        if (!runtimeIsHealthy) continue;
+        const execPath = proc.pm2_env?.pm_exec_path;
+        let isFile = false;
+        try {
+          isFile = Boolean(execPath) && fsApi.statSync(execPath).isFile();
+        } catch {
+          isFile = false;
+        }
+        if (!isFile) {
+          invalidExecutables.push(`${name} missing executable: ${execPath || '(unset)'}`);
+          continue;
+        }
+        const required = requiredByName.get(name);
+        if (required) {
+          const expectedPath = path.resolve(skillsDir, ...required.script);
+          if (path.resolve(execPath) !== expectedPath) {
+            invalidExecutables.push(
+              `${name} executable mismatch: expected ${expectedPath}, found ${path.resolve(execPath)}`,
+            );
+          }
+        }
+      }
+
+      if (invalidExecutables.length > 0) {
+        return {
+          step: 12,
+          name: 'verify_services',
+          status: 'failed',
+          error: invalidExecutables.join('; '),
+          duration: Date.now() - startTime,
+        };
+      }
 
       if (notOnline.length === 0) {
         return { step: 12, name: 'verify_services', status: 'done', duration: Date.now() - startTime };
@@ -1344,22 +1655,77 @@ function step12_verifyServices(ctx) {
   return { step: 12, name: 'verify_services', status: 'failed', error: `Timed out after ${TIMEOUT_MS / 1000}s`, duration: Date.now() - startTime };
 }
 
+/** Verify both C4 reply contracts without contacting an external channel. */
+export function step13_verifyCommunicationContinuity(_ctx, deps = {}) {
+  const startTime = Date.now();
+  const verify = deps.verify ?? verifyCommunicationContinuity;
+  const c4SendPath = deps.c4SendPath
+    ?? path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-send.js');
+  const c4ReceivePath = deps.c4ReceivePath
+    ?? path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-receive.js');
+  const c4DbPath = deps.c4DbPath
+    ?? path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-db.js');
+
+  try {
+    const result = verify({
+      c4SendPath,
+      c4ReceivePath,
+      c4DbPath,
+      zylosDir: deps.zylosDir ?? ZYLOS_DIR,
+    });
+    if (!result.compatible) {
+      return {
+        step: 13,
+        name: 'verify_communication_continuity',
+        status: 'failed',
+        error: result.error || 'C4 reply contract canary failed',
+        duration: Date.now() - startTime,
+      };
+    }
+    const passed = result.checks
+      .filter(({ status }) => status === 'passed')
+      .map(({ name }) => name);
+    return {
+      step: 13,
+      name: 'verify_communication_continuity',
+      status: 'done',
+      message: passed.join(', '),
+      duration: Date.now() - startTime,
+    };
+  } catch (err) {
+    return {
+      step: 13,
+      name: 'verify_communication_continuity',
+      status: 'failed',
+      error: err.message,
+      duration: Date.now() - startTime,
+    };
+  }
+}
+
 /** Commit every Core Skill baseline after the complete self-upgrade succeeds. */
-function step13_commitSkillBaselines(ctx) {
+export function step14_commitSkillBaselines(ctx, deps = {}) {
   const startTime = Date.now();
   try {
+    const fsApi = deps.fs ?? fs;
+    const skillsDir = deps.skillsDir ?? SKILLS_DIR;
+    if (ctx.preUpgradeSkillsInventory) {
+      const installedInventory = captureExactSkillsInventory({ skillsDir, fsApi });
+      verifyPostSyncSkillsContinuity(ctx.preUpgradeSkillsInventory, installedInventory);
+    }
+
     for (const baseline of ctx.pendingBaselines || []) {
       saveMergeBaseline(baseline.destDir, baseline.srcDir, baseline.manifest);
     }
     return {
-      step: 13,
+      step: 14,
       name: 'commit_skill_baselines',
       status: 'done',
       message: `${(ctx.pendingBaselines || []).length} committed`,
       duration: Date.now() - startTime,
     };
   } catch (err) {
-    return { step: 13, name: 'commit_skill_baselines', status: 'failed', error: err.message, duration: Date.now() - startTime };
+    return { step: 14, name: 'commit_skill_baselines', status: 'failed', error: err.message, duration: Date.now() - startTime };
   }
 }
 
@@ -1375,9 +1741,35 @@ export function rollbackSelf(ctx, deps = {}) {
   const fsApi = deps.fs ?? fs;
   const syncTreeFn = deps.syncTree ?? syncTree;
   const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
+  const execSyncFn = deps.execSync ?? execSync;
+  const removeFn = deps.removeManagedProcess ?? ((name) => {
+    execSyncFn(`pm2 delete ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
+  });
+  const savePm2Fn = deps.savePm2 ?? (() => {
+    execSyncFn('pm2 save 2>/dev/null', { stdio: 'pipe' });
+  });
+  const restartScheduledFn = deps.restartScheduledProcess ?? ((name) => {
+    execSyncFn(`pm2 restart ${JSON.stringify(name)} 2>/dev/null`, { stdio: 'pipe' });
+  });
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
   const skillsDir = deps.skillsDir ?? SKILLS_DIR;
   const ecosystemPath = deps.ecosystemPath ?? getCoreEcosystemPath();
+
+  const backupCorePackage = ctx.backupDir
+    ? path.join(ctx.backupDir, 'core-package')
+    : null;
+  const corePackageDir = deps.corePackageDir
+    ?? ctx.globalCoreDir
+    ?? resolveInstalledPackageScript();
+  if (backupCorePackage && fsApi.existsSync(backupCorePackage)) {
+    try {
+      if (!corePackageDir) throw new Error('Installed global Core package not found');
+      syncTreeFn(backupCorePackage, corePackageDir);
+      results.push({ action: 'restore_global_core_package', success: true });
+    } catch (err) {
+      results.push({ action: 'restore_global_core_package', success: false, error: err.message });
+    }
+  }
 
   // Restore Core Skills from backup (include .zylos manifests to keep them in sync with files)
   if (ctx.backupDir && fsApi.existsSync(path.join(ctx.backupDir, 'skills'))) {
@@ -1402,17 +1794,54 @@ export function rollbackSelf(ctx, deps = {}) {
     }
   }
 
-  // Restart services if they were running
-  for (const name of ctx.servicesWereRunning) {
+  // A failed target may have introduced a PM2 service that did not exist in
+  // the baseline (for example c4-response-stream-supervisor). Restoring the
+  // old skills removes its entrypoint, so retaining that process would leave
+  // a fake-online/orphan service and poison the next upgrade preflight.
+  const originallyRunning = new Set(ctx.servicesWereRunning || []);
+  const targetOnlyServices = [...new Set(ctx.servicesStartedByUpgrade || [])]
+    .filter((name) => !originallyRunning.has(name));
+  let removedTargetOnlyService = false;
+  for (const name of targetOnlyServices) {
     try {
-      restartFn(name, {
-        ecosystemPath,
-        stdio: 'pipe',
-        fallbackToPlainRestartOnError: true,
-      });
+      removeFn(name);
+      removedTargetOnlyService = true;
+      results.push({ action: `remove_target_only_${name}`, success: true });
+    } catch (err) {
+      results.push({ action: `remove_target_only_${name}`, success: false, error: err.message });
+    }
+  }
+
+  // Restart services if they were running
+  const scheduledServices = new Set(ctx.cronServicesWereRunning || []);
+  let restartedBaselineService = false;
+  for (const name of ctx.servicesWereRunning || []) {
+    try {
+      if (scheduledServices.has(name)) {
+        restartScheduledFn(name);
+      } else {
+        restartFn(name, {
+          ecosystemPath,
+          stdio: 'pipe',
+          fallbackToPlainRestartOnError: true,
+        });
+      }
+      restartedBaselineService = true;
       results.push({ action: `restart_${name}`, success: true });
     } catch (err) {
       results.push({ action: `restart_${name}`, success: false, error: err.message });
+    }
+  }
+
+  // Persist only after the baseline services have been restarted. Otherwise
+  // a reboot could resurrect the removed target-only process from the PM2 dump
+  // or retain a snapshot in which baseline services are still stopped.
+  if (removedTargetOnlyService || restartedBaselineService) {
+    try {
+      savePm2Fn();
+      results.push({ action: 'save_pm2_rollback_state', success: true });
+    } catch (err) {
+      results.push({ action: 'save_pm2_rollback_state', success: false, error: err.message });
     }
   }
 
@@ -1432,7 +1861,8 @@ const POST_INSTALL_STEPS = [
   step10_ensureCodexConfig,
   step11_startCoreServices,
   step12_verifyServices,
-  step13_commitSkillBaselines,
+  step13_verifyCommunicationContinuity,
+  step14_commitSkillBaselines,
 ];
 
 function buildSelfUpgradeResult(ctx, failedStep, rollbackResults = null, rollbackPerformed = Boolean(rollbackResults)) {
@@ -1489,11 +1919,16 @@ export function createFinalizeState(ctx) {
     schemaVersion: 1,
     tempDir: ctx.tempDir,
     backupDir: ctx.backupDir,
+    ...(ctx.globalCoreDir ? { globalCoreDir: ctx.globalCoreDir } : {}),
     servicesWereRunning: ctx.servicesWereRunning,
+    cronServicesWereRunning: ctx.cronServicesWereRunning || [],
     from: ctx.from,
     to: ctx.to,
     newVersion: ctx.newVersion,
     mode: ctx.mode,
+    ...(ctx.preUpgradeSkillsInventory
+      ? { preUpgradeSkillsInventory: ctx.preUpgradeSkillsInventory }
+      : {}),
   };
 }
 
@@ -1506,7 +1941,7 @@ function writeFinalizeState(ctx) {
   return statePath;
 }
 
-function runInstalledFinalizer(ctx) {
+function runInstalledFinalizer(ctx, { timeoutMs = resolveSelfUpgradeFinalizerTimeoutMs() } = {}) {
   const finalizeScript = resolveInstalledPackageScript('cli', 'lib', 'self-upgrade-finalize.js');
   if (!finalizeScript) {
     throw new Error('newly installed self-upgrade finalizer not found');
@@ -1516,7 +1951,7 @@ function runInstalledFinalizer(ctx) {
   const result = spawnSync(process.execPath, [finalizeScript, statePath], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 180000,
+    timeout: timeoutMs,
   });
 
   if (result.error) {
@@ -1558,12 +1993,34 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
     mode: state.mode,
   });
   ctx.backupDir = state.backupDir || null;
+  ctx.globalCoreDir = state.globalCoreDir || null;
   ctx.servicesWereRunning = Array.isArray(state.servicesWereRunning) ? [...state.servicesWereRunning] : [];
+  ctx.cronServicesWereRunning = Array.isArray(state.cronServicesWereRunning)
+    ? [...state.cronServicesWereRunning]
+    : [];
   ctx.from = state.from || null;
   ctx.to = state.to || state.newVersion || null;
+  ctx.preUpgradeSkillsInventory = state.preUpgradeSkillsInventory || null;
+
+  try {
+    assertExactSkillsInventory(ctx.preUpgradeSkillsInventory);
+  } catch (err) {
+    const failedStep = {
+      step: 5,
+      name: 'verify_pre_mutation_skills_inventory',
+      status: 'failed',
+      error: err.message,
+      total: deps.total || 15,
+      duration: 0,
+    };
+    ctx.error = failedStep.error;
+    ctx.steps.push(failedStep);
+    const rollbackFn = deps.rollbackSelf ?? rollbackSelf;
+    return buildSelfUpgradeResult(ctx, failedStep, rollbackFn(ctx), true);
+  }
 
   const steps = deps.steps || POST_INSTALL_STEPS;
-  const total = deps.total || 13;
+  const total = deps.total || 15;
   let failedStep = null;
 
   for (const stepFn of steps) {
@@ -1579,14 +2036,16 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
   }
 
   if (failedStep) {
-    return buildSelfUpgradeResult(ctx, failedStep, null, false);
+    const rollbackFn = deps.rollbackSelf ?? rollbackSelf;
+    const rollbackResults = rollbackFn(ctx);
+    return buildSelfUpgradeResult(ctx, failedStep, rollbackResults, true);
   }
 
   return buildSelfUpgradeResult(ctx, null);
 }
 
 /**
- * Run the 13-step self-upgrade pipeline.
+ * Run the 15-stage self-upgrade pipeline (steps 0-14).
  * Template migration and Claude restart are handled by Claude after this completes.
  * Lock must be acquired by caller.
  *
@@ -1605,13 +2064,14 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
   ctx.to = newVersion || null;
 
   const preInstallSteps = deps.preInstallSteps ?? [
+    (stepCtx) => step0_verifyTargetCommunicationCompatibility(stepCtx, deps.step0),
     (stepCtx) => step1_backupCoreSkills(stepCtx, deps.step1),
     step2_preUpgradeHook,
     (stepCtx) => step3_stopCoreServices(stepCtx, deps.step3),
     (stepCtx) => step4_npmInstallGlobal(stepCtx, deps.step4),
   ];
 
-  const total = 13;
+  const total = 15;
   let failedStep = null;
 
   for (const stepFn of preInstallSteps) {
@@ -1633,9 +2093,13 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
     return buildSelfUpgradeResult(ctx, failedStep, rollbackResults);
   }
 
+  const now = deps.now ?? Date.now;
+  const finalizerTimeoutMs = deps.finalizerTimeoutMs ?? resolveSelfUpgradeFinalizerTimeoutMs();
+  const finalizerStartedAt = now();
+
   try {
     const finalizerFn = deps.runInstalledFinalizer ?? runInstalledFinalizer;
-    const finalizeResult = finalizerFn(ctx);
+    const finalizeResult = finalizerFn(ctx, { timeoutMs: finalizerTimeoutMs });
     const finalizeSteps = Array.isArray(finalizeResult.steps) ? finalizeResult.steps : [];
     for (const step of finalizeSteps) {
       ctx.steps.push(step);
@@ -1648,18 +2112,25 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
       backupDir: finalizeResult.backupDir || ctx.backupDir,
     };
   } catch (err) {
-    const error = err.stderr?.toString().trim() || err.message;
+    const elapsed = Math.max(0, now() - finalizerStartedAt);
+    const detail = err.stderr?.toString().trim() || err.message;
+    const timedOut = err.code === 'ETIMEDOUT' || /\bETIMEDOUT\b|timed?\s*out/i.test(detail || '');
+    const error = timedOut
+      ? `Self-upgrade finalizer timed out after ${Math.ceil(finalizerTimeoutMs / 1000)}s: ${detail}`
+      : detail;
     failedStep = {
       step: 5,
       name: 'run_new_upgrade_finalizer',
       status: 'failed',
       error,
       total,
-      duration: 0,
+      duration: elapsed,
     };
     ctx.steps.push(failedStep);
     if (onStep) onStep(failedStep);
-    return buildSelfUpgradeResult(ctx, failedStep, null, false);
+    const rollbackFn = deps.rollbackSelf ?? rollbackSelf;
+    const rollbackResults = rollbackFn(ctx);
+    return buildSelfUpgradeResult(ctx, failedStep, rollbackResults, true);
   }
 }
 

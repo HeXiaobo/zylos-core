@@ -35,9 +35,84 @@ const {
   getHeartbeatPhase,
   isRecoveryHeartbeatPhase,
   shouldAutoAckHeartbeat,
+  findBlockingAssistantRun,
+  shouldDeferConversationForRuntime,
+  shouldRecoverRuntimeTurnAdmission,
+  projectPendingAssistantTurnBindings,
+  runtimeTurnAdmissionsEnabled,
   readJsonFileWithRetry,
   getDeliveryContent
 } = mod;
+
+describe('runtime turn admission scope', () => {
+  it('enables hook-fenced admissions only for Claude', () => {
+    assert.equal(runtimeTurnAdmissionsEnabled('claude'), true);
+    assert.equal(runtimeTurnAdmissionsEnabled('codex'), false);
+  });
+});
+
+describe('durable assistant binding projection', () => {
+  const projection = {
+    admissionId: 17,
+    runtimeSessionId: 'recovered-session',
+    requestId: 'assistant.feishu.recovered-request',
+    bindingReason: 'completed_from_final_output',
+    bindingProjectionObservedAtMs: 12_345,
+  };
+
+  it('closes and acknowledges the exact pending admission', () => {
+    const calls = [];
+    const responseStream = {
+      queryPendingRuntimeTurnBindingProjections: () => [projection],
+      ackRuntimeTurnBindingProjection(input) {
+        calls.push(['ack', input]);
+        return { acknowledged: true };
+      },
+    };
+    const result = projectPendingAssistantTurnBindings(responseStream, {
+      writeBinding(sessionId, state) {
+        calls.push(['write', sessionId, state]);
+        return { sessionId, ...state };
+      },
+    });
+
+    assert.equal(result.projected, 1);
+    assert.deepEqual(calls, [[
+      'write',
+      'recovered-session',
+      {
+        mode: 'closed',
+        requestId: 'assistant.feishu.recovered-request',
+        reason: 'completed_from_final_output',
+        nowMs: 12_345,
+      },
+    ], ['ack', { admissionId: 17 }]]);
+  });
+
+  it('leaves the durable row pending when the file projection fails, then retries it', () => {
+    let acknowledgements = 0;
+    const responseStream = {
+      queryPendingRuntimeTurnBindingProjections: () => [projection],
+      ackRuntimeTurnBindingProjection() {
+        acknowledgements += 1;
+        return { acknowledged: true };
+      },
+    };
+    assert.throws(
+      () => projectPendingAssistantTurnBindings(responseStream, {
+        writeBinding() { throw new Error('injected projection failure'); },
+      }),
+      /injected projection failure/,
+    );
+    assert.equal(acknowledgements, 0);
+
+    const retried = projectPendingAssistantTurnBindings(responseStream, {
+      writeBinding(sessionId, state) { return { sessionId, ...state }; },
+    });
+    assert.equal(retried.projected, 1);
+    assert.equal(acknowledgements, 1);
+  });
+});
 
 after(() => {
   if (origZylosDir === undefined) {
@@ -428,6 +503,36 @@ describe('getDeliveryContent', () => {
     assert.ok(result.includes('"telegram" "123"'));
   });
 
+  it('routes durable assistant responses through displayed text instead of a completed send command', () => {
+    const result = getDeliveryContent({
+      type: 'conversation',
+      channel: 'feishu',
+      endpoint_id: 'oc_1|type:p2p|msg:om_1',
+      assistant_request_id: 'assistant.feishu.om_1',
+      content: 'hello',
+    });
+
+    assert.match(result, /reply directly in this runtime turn/i);
+    assert.match(result, /displayed assistant text is delivered automatically/i);
+    assert.match(result, /assistant\.feishu\.om_1/);
+    assert.equal(result.includes('c4-send.js'), false);
+    assert.equal(result.includes('oc_1|type:p2p|msg:om_1'), false);
+  });
+
+  it('uses explicit request-scoped c4-send completion on Codex', () => {
+    const result = getDeliveryContent({
+      type: 'conversation',
+      channel: 'feishu',
+      endpoint_id: 'oc_1|type:p2p|msg:om_1',
+      assistant_request_id: 'assistant.feishu.om_1',
+      content: 'hello',
+    }, 'codex');
+
+    assert.match(result, /c4-send\.js/);
+    assert.match(result, /--request-id "assistant\.feishu\.om_1"/);
+    assert.equal(result.includes('displayed assistant text is delivered automatically'), false);
+  });
+
   it('does not add reply routing for conversation items without endpoints', () => {
     assert.equal(getDeliveryContent({
       type: 'conversation',
@@ -568,5 +673,81 @@ describe('isCodexExitLifecycleControl', () => {
       isCodexExitLifecycleControl({ type: 'control', content: '/exit now' }, 'codex'),
       false
     );
+  });
+});
+
+describe('assistant turn admission', () => {
+  it('serializes every conversation while the runtime is in another turn', () => {
+    assert.equal(
+      shouldDeferConversationForRuntime({ type: 'conversation' }, { state: 'busy' }),
+      true,
+    );
+    assert.equal(
+      shouldDeferConversationForRuntime({ type: 'conversation' }, { state: 'idle' }),
+      false,
+    );
+    assert.equal(
+      shouldDeferConversationForRuntime({ type: 'control' }, { state: 'busy' }),
+      false,
+    );
+  });
+
+  it('defers every conversation behind an older started assistant request', () => {
+    const calls = [];
+    const responseStream = {
+      findStartedRequest(options) {
+        calls.push(options);
+        return {
+          requestId: 'assistant.feishu.request-a',
+          sourceId: 'om_a',
+          status: 'started',
+        };
+      },
+    };
+
+    const blocking = findBlockingAssistantRun({
+      type: 'conversation',
+      assistant_request_id: 'assistant.feishu.request-b',
+    }, responseStream);
+
+    assert.equal(blocking.requestId, 'assistant.feishu.request-a');
+    assert.deepEqual(calls, [{ excludingRequestId: 'assistant.feishu.request-b' }]);
+  });
+
+  it('does not apply the conversation gate to control-plane items', () => {
+    const responseStream = {
+      findStartedRequest() {
+        throw new Error('control items must not query assistant admission');
+      },
+    };
+    assert.equal(findBlockingAssistantRun({ type: 'control' }, responseStream), null);
+  });
+
+  it('recovers a started admission only after sustained healthy idle', () => {
+    const admission = { status: 'started', admissionId: 7, updatedAt: 100 };
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'idle', health: 'ok', healthy: true, idleSeconds: 30,
+    }, 30, 130), true);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'idle', health: 'ok', healthy: true, idleSeconds: 29,
+    }, 30, 130), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'busy', health: 'ok', healthy: true, idleSeconds: 300,
+    }, 30, 130), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(admission, {
+      state: 'idle', health: 'recovering', healthy: true, idleSeconds: 300,
+    }, 30, 130), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(
+      { ...admission, updatedAt: 101 },
+      { state: 'idle', health: 'ok', healthy: true, idleSeconds: 300 },
+      30,
+      130,
+    ), false);
+    assert.equal(shouldRecoverRuntimeTurnAdmission(
+      { status: 'submitted', admissionId: 8, updatedAt: 1 },
+      { state: 'idle', health: 'ok', healthy: true, idleSeconds: 300 },
+      30,
+      130,
+    ), false);
   });
 });

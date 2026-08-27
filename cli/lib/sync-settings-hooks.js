@@ -171,6 +171,22 @@ export function desiredClaudeHooks({
     'skills/activity-monitor/scripts/hook-activity.js',
     { async: true, timeout: 5 }
   );
+  const promptActivityHook = commandHook(
+    'skills/activity-monitor/scripts/hook-activity.js',
+    // The turn binding/rejection must be durable before any tool hook runs.
+    { async: false, timeout: 5 }
+  );
+  const lifecycleBoundaryHook = commandHook(
+    'skills/activity-monitor/scripts/hook-activity.js',
+    // PreToolUse is the legacy start fence and Stop is the terminal fence.
+    // Both must complete before Claude can advance to the next lifecycle phase.
+    { async: false, timeout: 5 }
+  );
+  const messageDisplayHook = commandHook(
+    'skills/activity-monitor/scripts/hook-activity.js',
+    // MessageDisplay batches must reach the durable stream in source order.
+    { async: false, timeout: 5 }
+  );
 
   return {
     SessionStart: ['startup', 'clear', 'compact'].map(matcher => ({
@@ -179,13 +195,13 @@ export function desiredClaudeHooks({
     })),
     UserPromptSubmit: [
       {
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...promptActivityHook }],
       },
     ],
     PreToolUse: [
       {
         matcher: '',
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...lifecycleBoundaryHook }],
       },
     ],
     PermissionRequest: [
@@ -210,15 +226,20 @@ export function desiredClaudeHooks({
         hooks: [{ ...activityHook }],
       },
     ],
+    MessageDisplay: [
+      {
+        hooks: [{ ...messageDisplayHook }],
+      },
+    ],
     Stop: [
       {
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...lifecycleBoundaryHook }],
       },
     ],
     Notification: [
       {
         matcher: 'idle_prompt',
-        hooks: [{ ...activityHook }],
+        hooks: [{ ...lifecycleBoundaryHook }],
       },
     ],
   };
@@ -508,10 +529,16 @@ export function syncHooks(installedSettings, _templateSettings, {
             }
             added++;
             log(`  + ${event}[${matcherValue}]: ${templateCmd.command}`);
-          } else if (existing.command !== templateCmd.command || existing.timeout !== templateCmd.timeout) {
+          } else if (
+            existing.command !== templateCmd.command
+            || existing.timeout !== templateCmd.timeout
+            || existing.async !== templateCmd.async
+          ) {
             if (!dryRun) {
               existing.command = templateCmd.command;
               if (templateCmd.timeout !== undefined) existing.timeout = templateCmd.timeout;
+              if (templateCmd.async !== undefined) existing.async = templateCmd.async;
+              else delete existing.async;
             }
             updated++;
             log(`  ~ ${event}[${matcherValue}]: ${templateCmd.command}`);

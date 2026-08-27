@@ -155,8 +155,13 @@ describe('c4-session-init', () => {
     });
   });
 
-  it('triggers Memory Sync instruction when over threshold', () => {
-    withTmpDir(({ env }) => {
+  it('triggers Memory Sync with the mechanically resolved Deployment Profile', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      fs.mkdirSync(path.join(tmpDir, '.zylos'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, '.zylos', 'config.json'),
+        JSON.stringify({ profiles: { agent: 'mylos', deployment: '3ai' } }),
+      );
       // CHECKPOINT_THRESHOLD is 15; insert 31 messages (well over threshold)
       for (let i = 1; i <= 31; i++) {
         receive(['--channel', 'system', '--no-reply', '--content', `msg${i}`], env);
@@ -166,6 +171,8 @@ describe('c4-session-init', () => {
       assert.equal(status, 0);
       assert.ok(stdout.includes('=== ACTION REQUIRED ==='));
       assert.ok(stdout.includes('zylos-memory'));
+      assert.match(stdout, /Deployment Profile "3ai"/);
+      assert.match(stdout, /sha256 [a-f0-9]{64}/);
       // Should show limited conversations (SESSION_INIT_RECENT_COUNT = 6)
       assert.ok(stdout.includes('msg31'));
       assert.ok(stdout.includes('msg26'));

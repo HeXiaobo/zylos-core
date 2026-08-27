@@ -254,6 +254,165 @@ describe('c4-receive basic intake', () => {
       assert.equal(row.require_idle, 1);
     });
   });
+
+  it('atomically queues a task envelope with its inbound conversation', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
+      const envelope = {
+        idempotencyKey: 'feishu:om_cli:task-intent',
+        source: {
+          channel: 'feishu',
+          externalId: 'om_cli',
+          senderId: 'ou_owner',
+        },
+        task: {
+          title: '回访重点客户',
+          ownerId: 'ou_owner',
+        },
+      };
+      const r = cliRaw([
+        '--channel', 'feishu',
+        '--endpoint', 'chat_cli',
+        '--json',
+        '--content', '请创建客户回访任务',
+        '--task-envelope-json', JSON.stringify(envelope),
+      ], env);
+
+      assert.equal(r.status, 0, r.stderr || r.stdout);
+      const out = parseJsonStdout(r.stdout);
+      const db = openDb(tmpDir);
+      const intake = db.prepare(`
+        SELECT conversation_id, idempotency_key, payload_json, status
+        FROM commitment_intake_queue
+      `).get();
+      db.close();
+
+      assert.equal(intake.conversation_id, out.id);
+      assert.equal(intake.idempotency_key, envelope.idempotencyKey);
+      assert.equal(intake.status, 'pending');
+      assert.deepEqual(JSON.parse(intake.payload_json), {
+        ...envelope,
+        task: {
+          ...envelope.task,
+          description: null,
+          acceptorId: 'ou_owner',
+          assigneeId: null,
+        },
+      });
+    });
+  });
+
+  it('replays the same task envelope without a second conversation', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
+      const envelopeJson = JSON.stringify({
+        idempotencyKey: 'feishu:om_cli_replay:task-intent',
+        source: { channel: 'feishu', externalId: 'om_cli_replay' },
+        task: { title: 'CLI 幂等重放', ownerId: 'ou_owner' },
+      });
+      const args = [
+        '--channel', 'feishu',
+        '--endpoint', 'chat_cli_replay',
+        '--json',
+        '--content', '重复投递任务事件',
+        '--task-envelope-json', envelopeJson,
+      ];
+
+      const first = cliRaw(args, env);
+      const replay = cliRaw(args, env);
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      assert.equal(replay.status, 0, replay.stderr || replay.stdout);
+      assert.equal(parseJsonStdout(replay.stdout).action, 'already_pending');
+
+      const db = openDb(tmpDir);
+      const conversations = db.prepare('SELECT count(*) AS count FROM conversations').get().count;
+      const intakes = db.prepare('SELECT count(*) AS count FROM commitment_intake_queue').get().count;
+      db.close();
+      assert.equal(conversations, 1);
+      assert.equal(intakes, 1);
+    });
+  });
+
+  it('fails closed on terminal intake replay until an operator explicitly retries it', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
+      const envelopeJson = JSON.stringify({
+        idempotencyKey: 'feishu:om_cli_redrive:task-intent',
+        source: { channel: 'feishu', externalId: 'om_cli_redrive' },
+        task: { title: '失败后重投', ownerId: 'ou_owner' },
+      });
+      const args = [
+        '--channel', 'feishu',
+        '--endpoint', 'chat_cli_redrive',
+        '--json',
+        '--content', '重新投递终态失败任务',
+        '--task-envelope-json', envelopeJson,
+      ];
+
+      const first = cliRaw(args, env);
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      const database = openDb(tmpDir);
+      database.prepare(`
+        UPDATE commitment_intake_queue
+        SET status = 'failed', retry_count = 3, last_error = 'injected failure'
+      `).run();
+      database.close();
+
+      const redriven = cliRaw(args, env);
+      assert.equal(redriven.status, 1, redriven.stderr || redriven.stdout);
+      assert.equal(parseJsonStdout(redriven.stdout).error.code, 'TASK_INTAKE_FAILED');
+
+      const reloaded = openDb(tmpDir);
+      const intake = reloaded.prepare(`
+        SELECT status, retry_count, last_error FROM commitment_intake_queue
+      `).get();
+      const conversations = reloaded.prepare('SELECT count(*) AS count FROM conversations').get().count;
+      reloaded.close();
+      assert.deepEqual(intake, { status: 'failed', retry_count: 3, last_error: 'injected failure' });
+      assert.equal(conversations, 1);
+    });
+  });
+
+  it('rejects an idempotency key reused for different normalized task content', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
+      const sharedArgs = [
+        '--channel', 'feishu',
+        '--endpoint', 'chat_cli_conflict',
+        '--json',
+        '--content', '幂等键冲突事件',
+      ];
+      const original = {
+        idempotencyKey: 'feishu:om_cli_conflict:task-intent',
+        source: { channel: 'feishu', externalId: 'om_cli_conflict' },
+        task: { title: '原任务', ownerId: 'ou_owner' },
+      };
+      const conflicting = {
+        ...original,
+        task: { title: '不同任务', ownerId: 'ou_owner' },
+      };
+
+      const first = cliRaw([
+        ...sharedArgs,
+        '--task-envelope-json', JSON.stringify(original),
+      ], env);
+      const second = cliRaw([
+        ...sharedArgs,
+        '--task-envelope-json', JSON.stringify(conflicting),
+      ], env);
+
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      assert.equal(second.status, 1, second.stderr || second.stdout);
+      assert.equal(parseJsonStdout(second.stdout).error.code, 'IDEMPOTENCY_CONFLICT');
+
+      const db = openDb(tmpDir);
+      const conversations = db.prepare('SELECT count(*) AS count FROM conversations').get().count;
+      const intakes = db.prepare('SELECT count(*) AS count FROM commitment_intake_queue').get().count;
+      db.close();
+      assert.equal(conversations, 1);
+      assert.equal(intakes, 1);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -352,6 +511,65 @@ describe('c4-receive validation', () => {
       assert.equal(out.ok, false);
       assert.equal(out.error.code, 'INVALID_ARGS');
       assert.match(out.error.message, /channel/i);
+    });
+  });
+
+  it('rejects a task envelope without the required object shape before persistence', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const r = cliRaw([
+        '--no-reply',
+        '--json',
+        '--content', 'invalid task intent',
+        '--task-envelope-json', JSON.stringify({
+          idempotencyKey: 'feishu:om_invalid:task-intent',
+          source: {},
+          task: null,
+        }),
+      ], env);
+
+      assert.equal(r.status, 1);
+      const out = parseJsonStdout(r.stdout);
+      assert.equal(out.error.code, 'INVALID_ARGS');
+      assert.match(out.error.message, /task/i);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+    });
+  });
+
+  it('rejects malformed task envelope JSON before persistence', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const r = cliRaw([
+        '--no-reply',
+        '--json',
+        '--content', 'broken task intent',
+        '--task-envelope-json', '{not-json',
+      ], env);
+
+      assert.equal(r.status, 1);
+      const out = parseJsonStdout(r.stdout);
+      assert.equal(out.error.code, 'INVALID_ARGS');
+      assert.match(out.error.message, /json/i);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+    });
+  });
+
+  it('rejects invalid required task-envelope fields before persistence', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const r = cliRaw([
+        '--no-reply',
+        '--json',
+        '--content', 'invalid envelope field',
+        '--task-envelope-json', JSON.stringify({
+          idempotencyKey: 'feishu:om_bad_field:task-intent',
+          source: { channel: 'feishu', externalId: 42 },
+          task: { title: '坏字段不能入队', ownerId: 'ou_owner' },
+        }),
+      ], env);
+
+      assert.equal(r.status, 1);
+      const out = parseJsonStdout(r.stdout);
+      assert.equal(out.error.code, 'INVALID_ARGS');
+      assert.match(out.error.message, /source\.externalId/);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
     });
   });
 });

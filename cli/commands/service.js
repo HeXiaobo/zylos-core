@@ -10,7 +10,16 @@ import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../lib/config.js';
 import { bold, dim, green, red, yellow, cyan, success, error, warn, heading } from '../lib/colors.js';
 import { commandExists } from '../lib/shell-utils.js';
 import { getActiveAdapter } from '../lib/runtime/index.js';
-import { getCoreEcosystemPath, restartFromEcosystem, restartManagedProcess } from '../lib/pm2.js';
+import { getCoreEcosystemPath, restartManagedProcess } from '../lib/pm2.js';
+
+const CORE_SERVICE_NAMES = [
+  'activity-monitor',
+  'scheduler',
+  'c4-dispatcher',
+  'c4-intake-supervisor',
+  'c4-response-stream-supervisor',
+  'web-console',
+];
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
@@ -26,49 +35,33 @@ function buildPm2EnvFlags(envString) {
 }
 
 export function restartServicesWithDeps({
-  restartFromEcosystemFn = restartFromEcosystem,
   restartManagedProcessFn = restartManagedProcess,
   getCoreEcosystemPathFn = getCoreEcosystemPath,
   execSyncFn = execSync,
   logSuccess = console.log,
   logError = console.error,
 } = {}) {
-  const services = ['activity-monitor', 'scheduler', 'c4-dispatcher', 'web-console'];
+  const services = CORE_SERVICE_NAMES;
   const ecosystemPath = getCoreEcosystemPathFn();
-  const fallbackServices = [];
-  let saveNeeded = false;
 
   for (const name of services) {
     try {
-      restartFromEcosystemFn([name], { ecosystemPath, stdio: 'inherit' });
-      saveNeeded = true;
+      restartManagedProcessFn(name, {
+        ecosystemPath,
+        stdio: 'inherit',
+        fallbackToPlainRestartOnError: true,
+      });
     } catch {
-      try {
-        restartManagedProcessFn(name, {
-          ecosystemPath,
-          stdio: 'inherit',
-          fallbackToPlainRestartOnError: true,
-        });
-        fallbackServices.push(name);
-        saveNeeded = true;
-      } catch {
-        if (saveNeeded) {
-          execSyncFn('pm2 save 2>/dev/null', { stdio: 'inherit' });
-        }
-        logError(error('Failed to restart services'));
-        return false;
-      }
+      // Keep the prior PM2 dump intact when any service fails its online
+      // postcondition. The successfully restarted services remain live, but a
+      // reboot still has the last fully verified process set.
+      logError(error('Failed to restart services'));
+      return false;
     }
   }
 
-  if (saveNeeded) {
-    execSyncFn('pm2 save 2>/dev/null', { stdio: 'inherit' });
-  }
-  if (fallbackServices.length > 0) {
-    logSuccess(success(`Services restarted. Plain PM2 fallback used for: ${fallbackServices.join(', ')}.`));
-  } else {
-    logSuccess(success('Services restarted.'));
-  }
+  execSyncFn('pm2 save 2>/dev/null', { stdio: 'inherit' });
+  logSuccess(success('Services restarted.'));
   return true;
 }
 
@@ -246,6 +239,8 @@ export function startServices() {
     { name: 'activity-monitor', script: path.join(SKILLS_DIR, 'self-maintenance', 'activity-monitor.js') },
     { name: 'scheduler', script: path.join(SKILLS_DIR, 'scheduler', 'scheduler.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR}` },
     { name: 'c4-dispatcher', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-dispatcher.js') },
+    { name: 'c4-intake-supervisor', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-intake-supervisor.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR}` },
+    { name: 'c4-response-stream-supervisor', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-response-stream-supervisor.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR} C4_RESPONSE_STREAM_AUTOSTART=1` },
     { name: 'web-console', script: path.join(SKILLS_DIR, 'web-console', 'server.js'), env: `WEB_CONSOLE_PORT=3456 ZYLOS_DIR=${ZYLOS_DIR}` },
   ];
 
@@ -283,7 +278,7 @@ export function startServices() {
 
 export function stopServices() {
   console.log(heading('Stopping Zylos services...'));
-  const services = ['activity-monitor', 'scheduler', 'c4-dispatcher', 'web-console'];
+  const services = CORE_SERVICE_NAMES;
   try {
     execSync(`pm2 stop ${services.join(' ')} 2>/dev/null || true`, { stdio: 'inherit' });
     console.log(success('Services stopped.'));

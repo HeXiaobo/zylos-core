@@ -1,7 +1,7 @@
 ---
 name: comm-bridge
 description: >-
-  C4 communication bridge — central gateway for ALL external communication (Telegram, Lark, etc.).
+  C4 communication bridge — central gateway for ALL external communication (Telegram, Feishu, etc.).
   Use when replying to users via the "reply via" path, sending proactive messages to external channels,
   querying recent conversations or checkpoint status (prefer c4-db.js CLI; sqlite3 OK for unsupported queries),
   fetching conversation history for Memory Sync, or creating checkpoints after sync.
@@ -18,7 +18,7 @@ Central message hub - ALL communication with Claude goes through C4.
 ```
 Web Console ──┐
 Telegram    ───┼──► C4 Bridge ◄──► Claude
-Lark        ───┘
+Feishu      ───┘
 ```
 
 ## Components
@@ -26,6 +26,8 @@ Lark        ───┘
 | Script | Purpose | Reference |
 |--------|---------|-----------|
 | `c4-receive.js` | External → Claude (queue incoming messages) | [c4-receive](references/c4-receive.md) |
+| `c4-intake-supervisor.js` | Bounded periodic intake drain (PM2 core service) | [task intake](references/c4-intake-worker.md) |
+| `c4-intake-worker.js` | Claim one durable task envelope → Commitment Core | [task intake](references/c4-intake-worker.md) |
 | `c4-send.js` | Claude → External (route outgoing messages) | [c4-send](references/c4-send.md) |
 | `c4-control.js` | System control plane (heartbeat, maintenance) | [c4-control](references/c4-control.md) |
 | `c4-dispatcher.js` | PM2 daemon: polls pending queue, delivers to tmux | — |
@@ -42,14 +44,45 @@ cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js telegra
 Hello! Quotes, $vars, **markdown** — all safe via stdin.
 EOF
 
-# Send to Lark group thread
-cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js lark "chat_xxx|type:group|root:msg_yyy"
+# Send to Feishu group thread
+cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js feishu "chat_xxx|type:group|root:msg_yyy"
 Report ready.
 EOF
 ```
 
-Always pipe messages via stdin heredoc — never pass as CLI arguments. See [c4-send](references/c4-send.md) for full reference.
+Always generate new calls with stdin/heredoc. The exact legacy
+`<channel> <endpoint_id> <message>` form remains accepted by default only to
+preserve communication across rolling upgrades; it emits content-free
+deprecation telemetry. Do not add new argv callers. See
+[c4-send](references/c4-send.md) for the compatibility and recovery policy.
 Treat the heredoc wrapper as fixed shell syntax: only the message body goes between the start line and the closing terminator line, and the terminator itself must never be copied into the actual outgoing message.
+
+For a fixed launcher that cannot pipe stdin, write the body to a private file
+and pass exactly one `--body-file=/absolute/path` option. This is the only
+non-stdin body transport permitted by strict mode; never append message content
+as a positional argument.
+
+### Streamed reply exception
+
+When an inbound message ends with `---- streamed reply:`, reply directly as
+normal assistant text in the current runtime turn. Do **not** call `c4-send`
+for that response. For meaningful steps, emit a short requester-safe work note
+on its own line with the exact prefix `[PUBLIC_REASONING] `. This is a public
+summary protocol, never permission to expose hidden chain-of-thought, tool
+inputs, raw tool results, paths, credentials, or secrets. Write the final
+answer as normal unprefixed text.
+
+Claude Code's synchronous `MessageDisplay` hook separates those marked work
+notes into runtime-neutral `PublicReasoningDelta` events and publishes the
+remaining displayed text as `OutputDelta`; `Stop` records the unmarked final
+message as canonical `RunCompleted.output`. With Codex, Activity Monitor tails
+the active rollout and consumes only public `reasoning.summary`, user-visible
+`commentary`, `final_answer`, and `task_complete` fields. It never reads
+`raw_content` or `encrypted_content`. The Feishu Adapter renders both streams
+on the existing CardKit card.
+
+All messages without the streamed marker continue to use `c4-send` exactly as
+described above.
 
 ## Database
 
@@ -57,6 +90,49 @@ SQLite at `~/zylos/comm-bridge/c4.db`:
 - `conversations`: All messages (in/out) with priority, status, retry tracking
 - `checkpoints`: Recovery points with conversation id ranges
 - `control_queue`: System control messages (heartbeat, maintenance) with priority, ack deadlines, and status lifecycle
+- `commitment_intake_queue`: Durable task envelopes linked 1:1 to inbound conversations, consumed idempotently by Commitment Core
+- `work_intake_decisions`: First classifier result for each immutable source key, retained across classifier upgrades
+- `work_intake_confirmations`: Durable ambiguous WorkIntake decisions; no Task exists until the human confirms
+
+## Commitment Intake
+
+Channel Adapters may add `--task-envelope-json <json>` to `c4-receive.js`.
+Use the canonical channel name `feishu` for Feishu events and idempotency keys.
+Explicit task intents are atomically stored as a conversation plus intake row
+before health routing or any later trigger runs. Plain C4 messages keep their
+existing behavior and do not create intake rows.
+
+Natural-language adapters instead add `--work-intake-envelope-json <json>`.
+C4 invokes the channel-neutral WorkIntake `classify` Interface. `chat_only`
+continues through ordinary C4 dispatch, `create_task` is atomically adapted to
+the same durable Commitment intake above, and `confirm` is recorded with
+`delivery_action=work-intake-confirmation-required` without dispatch or task
+creation. The two envelope flags are mutually exclusive.
+The strict Task envelope preserves optional canonical `dueAt` and
+`reminderMinutesBeforeDue`; a reminder without a deadline fails before queue
+persistence.
+
+Confirmation callbacks use `--work-intake-confirmation-json <json>` with exact
+fields `sourceKey`, `action`, authenticated `actorId`, and `capability`. The
+capability is a short-lived HMAC attestation issued by the trusted Channel
+Adapter after platform callback verification. Both processes must receive the
+same `C4_WORK_INTAKE_CAPABILITY_SECRET` (at least 32 bytes). C4 binds the token
+to the source, action, and actor without importing a platform SDK, then loads
+the persisted envelope/decision, records the first choice durably, rejects
+conflicting later choices, and performs any Commitment conversion inside Core.
+
+Confirmation effects have a durable `pending`/`applied` receipt. Chat promotion
+reuses the original conversation and task promotion acknowledges only after the
+Commitment intake exists. An `edit` response includes a stable `effectKey` and
+remains redrivable until the adapter durably sends its guidance, then calls
+`--work-intake-confirmation-effect-json` with exact fields `sourceKey`, `action`,
+`actorId`, `effectKey`, and a fresh `capability`.
+
+The `c4-intake-supervisor` PM2 core service consumes the queue in isolated,
+bounded batches. It does not share a loop or failure domain with
+`c4-dispatcher`, so intake failures cannot interrupt ordinary C4 delivery.
+See [task intake](references/c4-intake-worker.md) for the envelope contract,
+retry lifecycle, and recovery guarantees.
 
 ## Health & Status
 
@@ -91,4 +167,7 @@ Any process with access to `c4-control.js` can enqueue keystroke controls. This 
 pm2 status c4-dispatcher
 pm2 logs c4-dispatcher
 pm2 restart c4-dispatcher
+
+pm2 status c4-intake-supervisor
+pm2 logs c4-intake-supervisor
 ```

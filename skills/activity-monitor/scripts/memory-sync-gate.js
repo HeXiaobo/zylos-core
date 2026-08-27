@@ -1,9 +1,31 @@
+import os from 'node:os';
+import path from 'node:path';
+
+import { createMemorySyncProfileDirective } from '../../zylos-memory/scripts/deployment-profile.js';
+
 const DEFAULT_IN_FLIGHT_TTL_SECONDS = 1800;
 
-export function createMemorySyncControlPrompt({ pct, thresholdPct }) {
+export function createMemorySyncControlPrompt({
+  pct,
+  thresholdPct,
+  zylosDir,
+  env,
+  profileRoot,
+}) {
+  const effectiveEnv = env ?? process.env;
+  const effectiveZylosDir = zylosDir
+    ?? effectiveEnv.ZYLOS_DIR
+    ?? path.join(os.homedir(), 'zylos');
+  const profileDirective = createMemorySyncProfileDirective({
+    zylosDir: effectiveZylosDir,
+    env: effectiveEnv,
+    ...(profileRoot === undefined ? {} : { profileRoot }),
+  });
   return `Context usage at ${pct}% (approaching ${thresholdPct}% session-switch threshold). Run Memory Sync now as a background maintenance task so it completes before the session switch.
 
-Launch exactly one background subagent for memory sync following ~/zylos/.claude/skills/zylos-memory/SKILL.md. The subagent is maintenance-only: it must not reply through C4, process user-facing tasks, modify business/project repositories, install or upgrade components, restart services, or apply runtime changes outside the memory sync flow.
+Launch exactly one background subagent for memory sync following ${path.join(effectiveZylosDir, '.claude', 'skills', 'zylos-memory', 'SKILL.md')}. The subagent is maintenance-only: it must not reply through C4, process user-facing tasks, modify business/project repositories, install or upgrade components, restart services, or apply runtime changes outside the memory sync flow.
+
+${profileDirective}
 
 Do NOT wait for completion - continue normal work.`;
 }

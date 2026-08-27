@@ -134,6 +134,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { MessageRouter } from './message-router.js';
 import { MonitorOrchestrator } from './monitor-orchestrator.js';
+import { createCodexResponseStreamAdapter } from './codex-response-stream.js';
 import { canTreatPaneAsRecovered } from './tool-pipeline.js';
 import { readInitialStatus, writeStatus } from './status-writer.js';
 import {
@@ -148,6 +149,7 @@ import {
 import { createActivityMonitorTaskScheduler } from './tasks/activity-monitor-tasks.js';
 import { readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
+import { openAssistantResponseStream } from '../../comm-bridge/scripts/assistant-response-stream.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
 // the deployed path — the CLI lives in the globally installed zylos npm package.
@@ -206,6 +208,7 @@ const TOOL_EVENT_STREAM_STATE_FILE = path.join(MONITOR_DIR, 'tool-event-stream-s
 const SESSION_TOOL_STATE_FILE = path.join(MONITOR_DIR, 'session-tool-state.json');
 const TOOL_WATCHDOG_STATE_FILE = path.join(MONITOR_DIR, 'tool-watchdog-state.json');
 const FOREGROUND_SESSION_FILE = path.join(MONITOR_DIR, 'foreground-session.json');
+const CODEX_RESPONSE_STREAM_STATE_FILE = path.join(MONITOR_DIR, 'codex-response-stream-state.json');
 
 // Conversation directory - auto-detect based on working directory
 const ZYLOS_PATH = ZYLOS_DIR.replace(/\//g, '-');
@@ -305,6 +308,7 @@ let toolPipeline;    // initialized in init()
 let orchestrator;    // initialized in init()
 let messageRouterServer; // initialized in init()
 let contextMonitor;  // initialized in init() if adapter provides one (Codex only)
+let codexResponseStream; // initialized in init() only for the Codex runtime
 
 // Timezone: reuse scheduler's tz.js (.env TZ → process.env.TZ → UTC)
 import { loadTimezone } from '../../scheduler/scripts/tz.js';
@@ -1002,6 +1006,14 @@ async function monitorLoop() {
   const currentTime = Math.floor(Date.now() / 1000);
   const currentTimeHuman = new Date().toISOString().replace('T', ' ').substring(0, 19);
 
+  if (codexResponseStream) {
+    try {
+      codexResponseStream.tick();
+    } catch (err) {
+      log(`Codex response stream tick failed: ${err.message}`);
+    }
+  }
+
   const tickState = await orchestrator.handleMonitorTick({
     currentTime,
     currentTimeHuman,
@@ -1069,6 +1081,14 @@ function init() {
     engine,
     contextMonitor,
   } = orchestrator.start());
+
+  codexResponseStream = adapter.runtimeId === 'codex'
+    ? createCodexResponseStreamAdapter({
+        stateFile: CODEX_RESPONSE_STREAM_STATE_FILE,
+        responseStream: openAssistantResponseStream(),
+        log,
+      })
+    : null;
 }
 
 try {
@@ -1084,6 +1104,7 @@ log(`=== Activity Monitor Started (v25 - RuntimeAdapter: ${adapter.displayName} 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
     engine?.destroy();
+    codexResponseStream?.close();
     stopMessageRouterServer();
     process.exit(0);
   });
