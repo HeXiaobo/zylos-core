@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -49,6 +50,14 @@ function withTmpDir(fn) {
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+}
+
+function setupOutboundPolicy(tmpDir, policy) {
+  const policyPath = path.join(tmpDir, '.zylos', 'c4-outbound-policy.json');
+  const auditPath = path.join(tmpDir, 'comm-bridge', 'outbound-policy-audit.jsonl');
+  fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+  fs.writeFileSync(policyPath, JSON.stringify(policy));
+  return { policyPath, auditPath };
 }
 
 /**
@@ -162,6 +171,368 @@ describe('c4-send basic', () => {
       assert.notEqual(first, second);
       assert.match(first, /^c4\.outbound\.\d+$/);
       assert.match(second, /^c4\.outbound\.\d+$/);
+    });
+  });
+
+  it('rejects configured banned content before DB or adapter delivery and writes a safe audit record', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'before DO_NOT_SEND after',
+      );
+
+      assert.equal(status, 3, stderr);
+      assert.match(stderr, /outbound policy/i);
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+
+      const [audit] = fs.readFileSync(auditPath, 'utf8').trim().split('\n').map(JSON.parse);
+      assert.equal(audit.event, 'outbound_policy_blocked');
+      assert.equal(audit.ruleRefs.length, 1);
+      assert.match(audit.ruleRefs[0], /^[a-f0-9]{64}$/);
+      assert.equal(audit.bodySha256.length, 64);
+      assert.equal(audit.bodyBytes, Buffer.byteLength('before DO_NOT_SEND after', 'utf8'));
+      assert.doesNotMatch(JSON.stringify(audit), /DO_NOT_SEND|restricted-marker/);
+    });
+  });
+
+  it('keeps allowed content unchanged when a configured rule does not match', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+      const body = 'safe "quotes", $vars, and\nmultiple lines';
+
+      const { status, stderr } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        body,
+      );
+
+      assert.equal(status, 0, stderr);
+      assert.deepEqual(JSON.parse(fs.readFileSync(sentFile, 'utf8')), ['endpoint1', body]);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'outbound-policy-audit.jsonl')), false);
+    });
+  });
+
+  it('enforces configured policy before rejecting an unknown external channel', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      const { stderr, status } = cli(
+        ['unknown-external-channel', 'endpoint1'],
+        env,
+        'DO_NOT_SEND',
+      );
+
+      assert.equal(status, 3, stderr);
+      assert.match(stderr, /outbound policy/i);
+      assert.doesNotMatch(stderr, /directory not found/i);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      assert.equal(fs.readFileSync(auditPath, 'utf8').trim().split('\n').length, 1);
+    });
+  });
+
+  it('reports an unknown external channel after an allowed policy decision', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      const { stderr, status } = cli(
+        ['unknown-external-channel', 'endpoint1'],
+        env,
+        'safe content',
+      );
+
+      assert.equal(status, 1);
+      assert.match(stderr, /directory not found/i);
+      assert.doesNotMatch(stderr, /outbound policy rejected/i);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'outbound-policy-audit.jsonl')), false);
+    });
+  });
+
+  it('matches configured Unicode code points without embedding a policy in Core', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'configured-code-point', codePoints: [0x1F6AB] }],
+      });
+      const body = `prefix ${String.fromCodePoint(0x1F6AB)} suffix`;
+
+      const { stderr, status } = cli(
+        ['unknown-external-channel', 'endpoint1'],
+        env,
+        body,
+      );
+
+      assert.equal(status, 3, stderr);
+      assert.match(stderr, /outbound policy/i);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.ruleRefs.length, 1);
+      assert.doesNotMatch(JSON.stringify(audit), /1F6AB|configured-code-point|DO_NOT_SEND/);
+    });
+  });
+
+  it('fails closed when the managed policy has no rules', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const { auditPath } = setupOutboundPolicy(tmpDir, { version: 1, rules: [] });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.event, 'outbound_policy_configuration_error');
+      assert.equal(audit.errorCode, 'POLICY_SCHEMA_INVALID');
+    });
+  });
+
+  it('requires the managed policy to declare version 1', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_SCHEMA_INVALID');
+    });
+  });
+
+  it('fails closed when the managed policy contains an unknown field', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND', regex: '.*' }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      assert.equal(fs.existsSync(sentFile), false);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_SCHEMA_INVALID');
+      assert.doesNotMatch(JSON.stringify(audit), /regex|safe-looking content/);
+    });
+  });
+
+  it('fails closed when the managed policy repeats a rule id', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [
+          { id: 'same-rule', contains: 'one' },
+          { id: 'same-rule', contains: 'two' },
+        ],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_SCHEMA_INVALID');
+    });
+  });
+
+  it('fails closed when the managed policy contains an invalid Unicode code point', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'invalid-code-point', codePoints: [0xD800] }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_SCHEMA_INVALID');
+    });
+  });
+
+  it('audits UTF-8 bytes and hashes without exposing an emoji/CJK body or rule value', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const body = '中文🚫 TOP_SECRET';
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'confidential-ref', contains: 'TOP_SECRET' }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        body,
+      );
+
+      assert.equal(status, 3, stderr);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.bodyBytes, Buffer.byteLength(body, 'utf8'));
+      assert.equal(audit.bodySha256, crypto.createHash('sha256').update(body).digest('hex'));
+      assert.doesNotMatch(JSON.stringify(audit), /中文|TOP_SECRET|confidential-ref/);
+    });
+  });
+
+  it('fails closed when a configured literal exceeds its size bound', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'oversized-literal', contains: 'x'.repeat(4097) }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_SCHEMA_INVALID');
+      assert.doesNotMatch(JSON.stringify(audit), /oversized-literal/);
+    });
+  });
+
+  it('fails closed when the configured policy contains too many rules', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: Array.from({ length: 257 }, (_, index) => ({
+          id: `rule-${index + 1}`,
+          contains: `marker-${index + 1}`,
+        })),
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_SCHEMA_INVALID');
+    });
+  });
+
+  it('fails closed and records metadata when an outbound body exceeds the policy bound', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'never-match' }],
+      });
+      const body = 'x'.repeat(4 * 1024 * 1024 + 1);
+
+      const { stderr, status } = cli(['mock-channel', 'endpoint1'], env, body);
+
+      assert.equal(status, 3, stderr);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.event, 'outbound_policy_configuration_error');
+      assert.equal(audit.errorCode, 'MESSAGE_TOO_LARGE');
+      assert.equal(audit.bodyBytes, Buffer.byteLength(body, 'utf8'));
+    });
+  });
+
+  it('fails closed when the managed policy path is a symbolic link', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const policyPath = path.join(tmpDir, '.zylos', 'c4-outbound-policy.json');
+      const realPolicyPath = path.join(tmpDir, 'real-policy.json');
+      const auditPath = path.join(tmpDir, 'comm-bridge', 'outbound-policy-audit.jsonl');
+      fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+      fs.writeFileSync(realPolicyPath, JSON.stringify({
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      }));
+      fs.symlinkSync(realPolicyPath, policyPath);
+
+      const { stderr, status } = cli(['mock-channel', 'endpoint1'], env, 'safe content');
+
+      assert.equal(status, 3, stderr);
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_FILE_UNAVAILABLE');
+    });
+  });
+
+  it('fails closed when the managed policy is writable by other users', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const { policyPath, auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+      fs.chmodSync(policyPath, 0o666);
+
+      const { stderr, status } = cli(['mock-channel', 'endpoint1'], env, 'safe content');
+
+      assert.equal(status, 3, stderr);
+      assert.equal(fs.existsSync(sentFile), false);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.errorCode, 'POLICY_FILE_UNAVAILABLE');
+    });
+  });
+
+  it('fails closed when the audit destination is a symbolic link', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+      const auditPath = path.join(tmpDir, 'comm-bridge', 'outbound-policy-audit.jsonl');
+      const realAuditPath = path.join(tmpDir, 'real-audit.jsonl');
+      fs.mkdirSync(path.dirname(auditPath), { recursive: true });
+      fs.writeFileSync(realAuditPath, '');
+      fs.symlinkSync(realAuditPath, auditPath);
+
+      const { stderr, status } = cli(['mock-channel', 'endpoint1'], env, 'DO_NOT_SEND');
+
+      assert.equal(status, 3, stderr);
+      assert.match(stderr, /audit is unavailable|outbound policy/i);
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      assert.equal(fs.readFileSync(realAuditPath, 'utf8'), '');
     });
   });
 });
@@ -324,6 +695,103 @@ describe('c4-send validation', () => {
     });
   });
 
+  it('deliberately rejects --allow-banned instead of providing an un-audited bypass', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1', '--allow-banned'],
+        env,
+        'DO_NOT_SEND',
+      );
+
+      assert.equal(status, 1);
+      assert.match(stderr, /--allow-banned is deliberately unsupported/i);
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      assert.equal(fs.existsSync(auditPath), false);
+    });
+  });
+
+  it('rejects --allow-banned variants instead of interpreting them as a bypass', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      for (const option of ['--allow-banned=true', '--allow-banned=1']) {
+        const { stderr, status } = cli(
+          ['mock-channel', 'endpoint1', option],
+          env,
+          'DO_NOT_SEND',
+        );
+        assert.equal(status, 1, `${option}: ${stderr}`);
+        assert.match(stderr, /--allow-banned is deliberately unsupported/i);
+      }
+
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(auditPath), false);
+    });
+  });
+
+  it('ignores policy and audit path environment overrides so they cannot bypass the managed seam', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const { auditPath } = setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        {
+          ...env,
+          C4_OUTBOUND_POLICY_FILE: '/dev/null',
+          C4_OUTBOUND_POLICY_AUDIT: '/dev/null',
+          C4_ALLOW_BANNED: '1',
+          C4_OUTBOUND_POLICY_ALLOW_BANNED: '1',
+        },
+        'DO_NOT_SEND',
+      );
+
+      assert.equal(status, 3, stderr);
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      assert.equal(fs.readFileSync(auditPath, 'utf8').trim().split('\n').length, 1);
+    });
+  });
+
+  it('fails closed and audits when the managed policy cannot be loaded', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const sentFile = setupMockChannel(tmpDir, 'mock-channel');
+      const policyPath = path.join(tmpDir, '.zylos', 'c4-outbound-policy.json');
+      const auditPath = path.join(tmpDir, 'comm-bridge', 'outbound-policy-audit.jsonl');
+      fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+      fs.writeFileSync(policyPath, '{invalid json');
+
+      const { stderr, status } = cli(
+        ['mock-channel', 'endpoint1'],
+        env,
+        'safe-looking content',
+      );
+
+      assert.equal(status, 3, stderr);
+      assert.match(stderr, /outbound policy/i);
+      assert.equal(fs.existsSync(sentFile), false);
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'c4.db')), false);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.event, 'outbound_policy_configuration_error');
+      assert.equal(audit.errorCode, 'POLICY_FILE_INVALID');
+      assert.doesNotMatch(JSON.stringify(audit), /safe-looking content/);
+    });
+  });
+
   it('rejects an unreadable body file before dispatch without falling back to stdin', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
@@ -382,6 +850,25 @@ describe('c4-send void channel', () => {
       assert.equal(rows.length, 1);
       assert.equal(rows[0].channel, 'void');
       assert.equal(rows[0].content, message);
+    });
+  });
+
+  it('keeps internal void records outside the external content policy', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      setupOutboundPolicy(tmpDir, {
+        version: 1,
+        rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+      });
+
+      const { stdout, status } = cli(['void', 'session-handoff'], env, 'DO_NOT_SEND');
+      assert.equal(status, 0);
+      assert.ok(stdout.includes('recorded on void channel'));
+
+      const rows = dbRecent(env);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].channel, 'void');
+      assert.equal(rows[0].content, 'DO_NOT_SEND');
+      assert.equal(fs.existsSync(path.join(tmpDir, 'comm-bridge', 'outbound-policy-audit.jsonl')), false);
     });
   });
 

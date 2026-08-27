@@ -50,10 +50,9 @@ Report ready.
 EOF
 ```
 
-Always generate new calls with stdin/heredoc. The exact legacy
-`<channel> <endpoint_id> <message>` form remains accepted by default only to
-preserve communication across rolling upgrades; it emits content-free
-deprecation telemetry. Do not add new argv callers. See
+Always generate new calls with stdin/heredoc. Positional message bodies are
+rejected with exit code 2, and `C4_LEGACY_ARG_MODE` cannot re-enable argv body
+mode. Do not add new argv callers. See
 [c4-send](references/c4-send.md) for the compatibility and recovery policy.
 Treat the heredoc wrapper as fixed shell syntax: only the message body goes between the start line and the closing terminator line, and the terminator itself must never be copied into the actual outgoing message.
 
@@ -61,6 +60,16 @@ For a fixed launcher that cannot pipe stdin, write the body to a private file
 and pass exactly one `--body-file=/absolute/path` option. This is the only
 non-stdin body transport permitted by strict mode; never append message content
 as a positional argument.
+
+External delivery also passes through the managed outbound content policy at
+`$ZYLOS_DIR/.zylos/c4-outbound-policy.json`; blocked attempts are audited at
+`$ZYLOS_DIR/comm-bridge/outbound-policy-audit.jsonl` without recording message
+bodies. The paths are fixed and cannot be overridden by callers. The internal
+record-only `void` channel is outside this external policy and never dispatches
+to an adapter. `--allow-banned` and similarly named environment variables are
+rejected or ignored; they cannot bypass the policy.
+Channel `send.js` files are adapters behind `c4-send.js`; invoking one directly
+bypasses policy and audit and is unsupported for external delivery.
 
 ### Streamed reply exception
 
