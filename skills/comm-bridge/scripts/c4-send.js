@@ -11,10 +11,9 @@
  * Safe file-backed usage for launchers that cannot pipe stdin:
  *     node c4-send.js <channel> <endpoint_id> --body-file=/absolute/path
  *
- * The exact legacy channel + endpoint + message form remains accepted during
- * the compatibility phase and emits a content-free deprecation event. Set
- * C4_STRICT_STDIN_ONLY=1 only after every caller has migrated. If strict mode
- * causes an outage, C4_LEGACY_ARG_MODE=1 is the break-glass override.
+ * Message bodies passed as CLI arguments (arg-mode) are rejected with exit code
+ * 2. C4_STRICT_STDIN_ONLY and C4_LEGACY_ARG_MODE remain readable for rollout
+ * and diagnostics, but no configuration can re-enable argv message bodies.
  *
  * Special channel 'void' (#689): internal-only messages (e.g. session
  * handoffs). The message is recorded in c4.db like any other conversation
@@ -36,7 +35,7 @@ import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 function printUsage() {
-  console.log('Usage (preferred message body via stdin):');
+  console.log('Usage (message body via stdin/heredoc or --body-file; arg-mode exits 2):');
   console.log('  node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
   console.log('  message content');
   console.log('  EOF');
@@ -121,9 +120,20 @@ function readZylosEnvFlag(name) {
   return false;
 }
 
-function legacyArgModeEnabled() {
-  if (readZylosEnvFlag('C4_LEGACY_ARG_MODE')) return true;
-  return !readZylosEnvFlag('C4_STRICT_STDIN_ONLY');
+function argModeConfig() {
+  return {
+    strictStdinOnly: readZylosEnvFlag('C4_STRICT_STDIN_ONLY'),
+    legacyArgModeRequested: readZylosEnvFlag('C4_LEGACY_ARG_MODE'),
+  };
+}
+
+function rejectArgMode(config) {
+  const policy = config.strictStdinOnly ? 'strict stdin-only policy' : 'stdin-only policy';
+  console.error(`[c4-send] arg-mode disabled by ${policy}: pass the message via stdin/heredoc or --body-file.`);
+  if (config.legacyArgModeRequested) {
+    console.error('[c4-send] C4_LEGACY_ARG_MODE is ignored; argv message bodies are never accepted.');
+  }
+  process.exit(2);
 }
 
 async function main() {
@@ -141,7 +151,7 @@ async function main() {
   const hasStdinFlag = parsed.hasStdinFlag;
   const bodyFile = parsed.bodyFile;
   const stdinAvailable = !process.stdin.isTTY;
-  const legacyArgMode = legacyArgModeEnabled();
+  const argModePolicy = argModeConfig();
 
   const channel = cleanArgs[0];
   let endpoint = null;
@@ -158,17 +168,8 @@ async function main() {
   } else if (bodyFile !== null) {
     console.error('Error: --body-file cannot be combined with a positional message');
     process.exit(1);
-  } else if (cleanArgs.length === 3 && legacyArgMode && cleanArgs[0] !== 'void') {
-    endpoint = cleanArgs[1];
-    message = cleanArgs[2];
-    console.error(`[c4-send] ${JSON.stringify({
-      event: 'legacy_arg_mode_used',
-      channel,
-      endpointPresent: true,
-    })}`);
   } else if (cleanArgs.length > 2) {
-    console.error('[c4-send] arg-mode disabled by strict stdin-only policy: pass the message via stdin/heredoc.');
-    process.exit(2);
+    rejectArgMode(argModePolicy);
   } else if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
     // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin
     endpoint = cleanArgs[1];
@@ -181,8 +182,7 @@ async function main() {
   } else {
     // 2 args with a TTY means the second positional can only be an arg-mode
     // message or an endpoint with a missing stdin body. Both are unsafe.
-    console.error('[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.');
-    process.exit(2);
+    rejectArgMode(argModePolicy);
   }
 
   if (!message) {

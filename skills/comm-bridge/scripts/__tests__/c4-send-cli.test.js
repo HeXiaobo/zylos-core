@@ -197,21 +197,20 @@ describe('c4-send validation', () => {
     });
   });
 
-  it('keeps exact endpoint message arg-mode working during the compatibility phase', () => {
+  it('rejects endpoint message arg-mode unconditionally with exit 2', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
 
       const { stderr, status } = cli(['mock-channel', 'endpoint1', 'unsafe $message'], env);
 
-      assert.equal(status, 0);
-      assert.match(stderr, /legacy_arg_mode_used/);
+      assert.equal(status, 2);
+      assert.match(stderr, /arg-mode disabled/i);
       assert.doesNotMatch(stderr, /unsafe \$message/);
-      const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
-      assert.deepEqual(sent, ['endpoint1', 'unsafe $message']);
+      assert.equal(fs.existsSync(sentFile), false);
     });
   });
 
-  it('accepts the explicit legacy flag as a break-glass override', () => {
+  it('does not let the explicit legacy flag re-enable argv message mode', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
 
@@ -220,15 +219,14 @@ describe('c4-send validation', () => {
         { ...env, C4_LEGACY_ARG_MODE: '1' },
       );
 
-      assert.equal(status, 0);
-      assert.match(stderr, /legacy_arg_mode_used/);
+      assert.equal(status, 2);
+      assert.match(stderr, /arg-mode disabled/i);
       assert.doesNotMatch(stderr, /legacy message with \$vars/);
-      const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
-      assert.deepEqual(sent, ['endpoint1', 'legacy message with $vars']);
+      assert.equal(fs.existsSync(sentFile), false);
     });
   });
 
-  it('rejects endpoint message arg-mode only when strict stdin-only policy is explicit', () => {
+  it('rejects endpoint message arg-mode under strict stdin-only policy', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
 
@@ -244,34 +242,34 @@ describe('c4-send validation', () => {
     });
   });
 
-  it('allows the break-glass flag to override strict stdin-only policy', () => {
+  it('does not let the break-glass flag override strict stdin-only policy', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
 
-      const { status } = cli(
+      const { stderr, status } = cli(
         ['mock-channel', 'endpoint1', 'recovery message'],
         { ...env, C4_STRICT_STDIN_ONLY: '1', C4_LEGACY_ARG_MODE: '1' },
       );
 
-      assert.equal(status, 0);
-      const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
-      assert.deepEqual(sent, ['endpoint1', 'recovery message']);
+      assert.equal(status, 2);
+      assert.match(stderr, /arg-mode disabled/i);
+      assert.equal(fs.existsSync(sentFile), false);
     });
   });
 
-  it('reads the migration flag from the Zylos env file without a runtime restart', () => {
+  it('reads the legacy break-glass config without permitting argv message mode', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
       fs.writeFileSync(path.join(tmpDir, '.env'), 'C4_LEGACY_ARG_MODE=1\n');
 
-      const { status } = cli(
+      const { stderr, status } = cli(
         ['mock-channel', 'endpoint1', 'legacy after upgrade'],
         env,
       );
 
-      assert.equal(status, 0);
-      const sent = JSON.parse(fs.readFileSync(sentFile, 'utf8'));
-      assert.deepEqual(sent, ['endpoint1', 'legacy after upgrade']);
+      assert.equal(status, 2);
+      assert.match(stderr, /arg-mode disabled/i);
+      assert.equal(fs.existsSync(sentFile), false);
     });
   });
 
