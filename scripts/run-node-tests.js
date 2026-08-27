@@ -8,6 +8,8 @@ const TEST_ROOTS = [
   path.join(ROOT, 'cli', 'lib', '__tests__'),
   path.join(ROOT, 'cli', 'lib', 'runtime', '__tests__'),
   path.join(ROOT, 'skills', 'activity-monitor', 'scripts', '__tests__'),
+  path.join(ROOT, 'skills', 'commitment-core', 'scripts', '__tests__'),
+  path.join(ROOT, 'skills', 'work-intake', 'scripts', '__tests__'),
 ];
 
 function walk(dir, files = []) {
@@ -28,6 +30,8 @@ function isNodeTest(file) {
   if (rel.startsWith('cli/lib/__tests__/')) return true;
   if (rel.startsWith('cli/lib/runtime/__tests__/')) return true;
   if (rel.startsWith('skills/activity-monitor/scripts/__tests__/')) return true;
+  if (rel.startsWith('skills/commitment-core/scripts/__tests__/')) return true;
+  if (rel.startsWith('skills/work-intake/scripts/__tests__/')) return true;
   return false;
 }
 

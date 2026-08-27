@@ -6,13 +6,31 @@ import {
   ATTACHMENTS_DIR,
   CONTENT_PREVIEW_CHARS
 } from './c4-config.js';
+import { PUBLIC_REASONING_LINE_PREFIX } from './assistant-public-reasoning.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export function buildReplyViaSuffix(channel, endpointId) {
+export function buildReplyViaSuffix(channel, endpointId, assistantRequestId = null) {
   if (!channel || !endpointId) return '';
-  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"`;
+  const requestOption = assistantRequestId
+    ? ` --request-id "${assistantRequestId}"`
+    : '';
+  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"${requestOption} (stdin only: pipe the complete reply body; do not append it as a message argument)`;
+}
+
+export function buildStreamedReplySuffix(assistantRequestId) {
+  if (!assistantRequestId) return '';
+  return [
+    ' ---- streamed reply:',
+    'Reply directly in this runtime turn.',
+    'Do not call c4-send for this reply.',
+    'Your displayed assistant text is delivered automatically.',
+    `Before or after meaningful steps, you may write one concise user-facing work summary on its own line prefixed exactly ${PUBLIC_REASONING_LINE_PREFIX}.`,
+    'These summaries must describe only safe progress and conclusions; never reveal hidden chain-of-thought, tool inputs, raw tool results, paths, credentials, or secrets.',
+    'Write the final answer as normal unprefixed user-facing text.',
+    `assistant request: "${assistantRequestId}"`,
+  ].join(' ');
 }
 
 export function hasLegacyReplyViaSuffix(content = '') {

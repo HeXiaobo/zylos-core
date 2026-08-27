@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -124,7 +127,13 @@ describe('memory sync gate', () => {
   });
 
   it('builds a maintenance-only control prompt', () => {
-    const prompt = createMemorySyncControlPrompt({ pct: 61, thresholdPct: 75 });
+    const zylosDir = path.join(os.tmpdir(), 'zylos-memory-sync-no-config');
+    const prompt = createMemorySyncControlPrompt({
+      pct: 61,
+      thresholdPct: 75,
+      zylosDir,
+      env: {},
+    });
 
     assert.match(prompt, /Run Memory Sync now/);
     assert.match(prompt, /maintenance-only/);
@@ -132,5 +141,32 @@ describe('memory sync gate', () => {
     assert.match(prompt, /process user-facing tasks/);
     assert.match(prompt, /modify business\/project repositories/);
     assert.match(prompt, /Do NOT wait for completion/);
+    assert.match(prompt, /runtime-neutral default Deployment Profile/);
+    assert.match(
+      prompt,
+      new RegExp(`${zylosDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.claude/skills/zylos-memory/SKILL\\.md`),
+    );
+  });
+
+  it('binds a selected Deployment Profile into the actual control prompt', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-memory-sync-profile-'));
+    try {
+      fs.mkdirSync(path.join(zylosDir, '.zylos'), { recursive: true });
+      fs.writeFileSync(
+        path.join(zylosDir, '.zylos', 'config.json'),
+        JSON.stringify({ profiles: { agent: 'mylos', deployment: '3ai' } }),
+      );
+      const prompt = createMemorySyncControlPrompt({
+        pct: 61,
+        thresholdPct: 75,
+        zylosDir,
+        env: {},
+      });
+
+      assert.match(prompt, /Deployment Profile "3ai"/);
+      assert.match(prompt, /sha256 [a-f0-9]{64}/);
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
   });
 });

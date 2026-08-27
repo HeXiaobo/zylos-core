@@ -32,16 +32,31 @@ function makeFixture() {
   return { root, zylosDir };
 }
 
-function makeTarball(root, { name = COMPONENT, version = '1.0.0' } = {}) {
+function makeTarball(root, {
+  name = COMPONENT,
+  version = '1.0.0',
+  postInstallScript = null,
+  capabilities = null,
+} = {}) {
   const wrapper = path.join(root, `zylos-${name}`);
   fs.mkdirSync(wrapper, { recursive: true });
   const versionLine = version ? `\nversion: ${version}` : '';
+  const lifecycle = postInstallScript
+    ? '\nlifecycle:\n  hooks:\n    post-install: hooks/post-install.js'
+    : '';
   fs.writeFileSync(
     path.join(wrapper, 'SKILL.md'),
-    `---\nname: ${name}${versionLine}\ndescription: Official file delivery E2E fixture\n---\n\n# Fixture\n`,
+    `---\nname: ${name}${versionLine}${lifecycle}\ndescription: Official file delivery E2E fixture\n---\n\n# Fixture\n`,
     'utf8'
   );
   fs.writeFileSync(path.join(wrapper, 'payload.txt'), `${name} payload\n`, 'utf8');
+  if (postInstallScript) {
+    fs.mkdirSync(path.join(wrapper, 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(wrapper, 'hooks', 'post-install.js'), postInstallScript, 'utf8');
+  }
+  if (capabilities) {
+    fs.writeFileSync(path.join(wrapper, 'capabilities.json'), JSON.stringify(capabilities), 'utf8');
+  }
   const tarball = path.join(root, `zylos-${name}-${version || 'unversioned'}.tar.gz`);
   execFileSync('tar', ['czf', tarball, '-C', root, path.basename(wrapper)]);
   fs.rmSync(wrapper, { recursive: true, force: true });
@@ -134,6 +149,100 @@ describe('zylos add --file official delivery E2E', () => {
     const skillDir = path.join(zylosDir, '.claude', 'skills', COMPONENT);
     assert.equal(fs.readFileSync(path.join(skillDir, 'payload.txt'), 'utf8'), `${COMPONENT} payload\n`);
     assert.equal(fs.existsSync(path.join(skillDir, '.zylos', 'manifest.json')), true);
+  });
+
+  it('fails closed with no registered install when post-install rejects JSON mode', () => {
+    const { root, zylosDir } = makeFixture();
+    const marker = path.join(root, 'post-install-ran');
+    const dataDir = path.join(zylosDir, 'components', COMPONENT);
+    const envFile = path.join(zylosDir, '.env');
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'config.json'), '{"state":"old"}', 'utf8');
+    fs.writeFileSync(envFile, 'KEEP_ME=old\n', 'utf8');
+    const tarball = makeTarball(root, {
+      postInstallScript: `import fs from 'node:fs';\nimport path from 'node:path';\nfs.writeFileSync(process.env.POST_INSTALL_MARKER, 'ran');\nconst dataDir = path.join(process.env.ZYLOS_DIR, 'components', '${COMPONENT}');\nfs.writeFileSync(path.join(dataDir, 'config.json'), '{"state":"new"}');\nfs.writeFileSync(path.join(dataDir, 'failed-hook-file'), 'remove');\nfs.writeFileSync(path.join(process.env.ZYLOS_DIR, '.env'), 'KEEP_ME=new\\n');\nconsole.error('install gate rejected');\nprocess.exit(31);\n`,
+    });
+    const net = poisonNetwork(root);
+
+    const result = runCli({
+      cwd: root,
+      zylosDir,
+      env: { ...net.env, POST_INSTALL_MARKER: marker },
+      args: ['add', `${COMPONENT}@1.0.0`, '--file', tarball, '--sha256', sha256(tarball), '--json'],
+    });
+
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.success, false);
+    assert.equal(output.error, 'post_install_failed');
+    assert.match(output.message, /install gate rejected/);
+    assert.equal(fs.existsSync(marker), true);
+    assertNoResidue(zylosDir);
+    assert.equal(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'), '{"state":"old"}');
+    assert.equal(fs.existsSync(path.join(dataDir, 'failed-hook-file')), false);
+    assert.equal(fs.readFileSync(envFile, 'utf8'), 'KEEP_ME=old\n');
+    net.assertNoNetwork();
+  });
+
+  it('commits a JSON-mode install after its post-install hook succeeds', () => {
+    const { root, zylosDir } = makeFixture();
+    const marker = path.join(root, 'successful-post-install');
+    const tarball = makeTarball(root, {
+      postInstallScript: `import fs from 'node:fs';\nfs.writeFileSync(process.env.POST_INSTALL_MARKER, 'ok');\n`,
+    });
+    const net = poisonNetwork(root);
+
+    const result = runCli({
+      cwd: root,
+      zylosDir,
+      env: { ...net.env, POST_INSTALL_MARKER: marker },
+      args: ['add', `${COMPONENT}@1.0.0`, '--file', tarball, '--sha256', sha256(tarball), '--json'],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.success, true);
+    assert.equal(output.skill.hooks, null);
+    assert.deepEqual(output.skill.executedHooks, {
+      'post-install': { hook: 'hooks/post-install.js', status: 'done' },
+    });
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'ok');
+    assert.equal(readComponents(zylosDir)[COMPONENT].version, '1.0.0');
+    assert.equal(fs.existsSync(path.join(zylosDir, '.claude', 'skills', COMPONENT)), true);
+    net.assertNoNetwork();
+  });
+
+  it('rejects an incompatible component capability contract before install hooks or state writes', () => {
+    const { root, zylosDir } = makeFixture();
+    const marker = path.join(root, 'incompatible-hook-ran');
+    const tarball = makeTarball(root, {
+      capabilities: {
+        schemaVersion: 1,
+        product: 'fixture',
+        requires: {
+          'zylos-core': { schemaVersion: 1, protocols: { 'c4.reply': 99 } },
+        },
+      },
+      postInstallScript: `import fs from 'node:fs';\nfs.writeFileSync(process.env.POST_INSTALL_MARKER, 'ran');\n`,
+    });
+    const net = poisonNetwork(root);
+
+    const result = runCli({
+      cwd: root,
+      zylosDir,
+      env: { ...net.env, POST_INSTALL_MARKER: marker },
+      args: ['add', `${COMPONENT}@1.0.0`, '--file', tarball, '--sha256', sha256(tarball), '--json'],
+    });
+
+    assert.equal(result.status, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.success, false);
+    assert.equal(output.error, 'incompatible_capabilities');
+    assert.match(output.message, /c4\.reply requires >= 99/);
+    assert.equal(fs.existsSync(marker), false);
+    assertNoResidue(zylosDir);
+    assert.equal(fs.existsSync(path.join(zylosDir, 'components', COMPONENT)), false);
+    net.assertNoNetwork();
   });
 
   it('fails closed with no residue when the target version mismatches the archive', () => {

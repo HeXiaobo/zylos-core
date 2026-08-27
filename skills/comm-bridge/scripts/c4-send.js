@@ -3,17 +3,18 @@
  * C4 Communication Bridge - Send Interface
  * Sends messages from Claude to external channels
  *
- * Usage:
- *   Recommended (stdin — safe for any content):
+ * Preferred usage (stdin):
  *     node c4-send.js <channel> <endpoint_id> <<'EOF'
  *     message with "quotes", $vars, and special chars
  *     EOF
  *
- *   Simple messages (CLI arg — backward compatible):
- *     node c4-send.js <channel> [endpoint_id] "short message"
+ * Safe file-backed usage for launchers that cannot pipe stdin:
+ *     node c4-send.js <channel> <endpoint_id> --body-file=/absolute/path
  *
- * When no message argument is provided, the message is read from stdin.
- * This avoids shell escaping issues with quotes and special characters.
+ * The exact legacy channel + endpoint + message form remains accepted during
+ * the compatibility phase and emits a content-free deprecation event. Set
+ * C4_STRICT_STDIN_ONLY=1 only after every caller has migrated. If strict mode
+ * causes an outage, C4_LEGACY_ARG_MODE=1 is the break-glass override.
  *
  * Special channel 'void' (#689): internal-only messages (e.g. session
  * handoffs). The message is recorded in c4.db like any other conversation
@@ -27,18 +28,61 @@
 
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { spawn } from 'child_process';
 import { insertConversation, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
+import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 function printUsage() {
-  console.log('Usage: node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
-  console.log('       message content');
-  console.log('       EOF');
-  console.log('       node c4-send.js <channel> [endpoint_id] "message"');
-  console.log('Example: node c4-send.js telegram 8101553026 "Hello!"');
+  console.log('Usage (preferred message body via stdin):');
+  console.log('  node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
+  console.log('  message content');
+  console.log('  EOF');
+  console.log('  node c4-send.js <channel> <endpoint_id> --body-file=/absolute/path');
+  console.log('Example:');
+  console.log('  node c4-send.js telegram 8101553026 <<\'EOF\'');
+  console.log('  Hello!');
+  console.log('  EOF');
   process.exit(1);
+}
+
+function parseArgs(args) {
+  const positional = [];
+  let requestId = null;
+  let hasStdinFlag = false;
+  let bodyFile = null;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--stdin') {
+      hasStdinFlag = true;
+      continue;
+    }
+    if (arg.startsWith('--body-file=')) {
+      const value = arg.slice('--body-file='.length);
+      if (bodyFile !== null || !value) {
+        return { error: '--body-file requires exactly one non-empty =path value' };
+      }
+      bodyFile = value;
+      continue;
+    }
+    if (arg === '--request-id') {
+      if (requestId !== null || index + 1 >= args.length) {
+        return { error: '--request-id requires one value' };
+      }
+      requestId = args[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--')) return { error: `Unknown option: ${arg}` };
+    positional.push(arg);
+  }
+  if (bodyFile !== null && hasStdinFlag) {
+    return { error: '--body-file and --stdin are mutually exclusive' };
+  }
+  return { positional, requestId, hasStdinFlag, bodyFile };
 }
 
 /**
@@ -54,49 +98,109 @@ function readStdin() {
   });
 }
 
+function publicAssistantOutput(message) {
+  return /^\[MEDIA:(?:image|file)\].+/s.test(message) ? '' : message;
+}
+
+function readZylosEnvFlag(name) {
+  if (process.env[name] !== undefined) return process.env[name] === '1';
+  const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+  try {
+    const content = fs.readFileSync(path.join(zylosDir, '.env'), 'utf8');
+    for (const rawLine of content.split('\n')) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const match = line.match(new RegExp(`^${name}\\s*=\\s*(.+)$`));
+      if (!match) continue;
+      const value = match[1].trim().replace(/^(['"])(.*)\1$/, '$2');
+      return value === '1';
+    }
+  } catch {
+    // Missing/unreadable env files leave the flag disabled.
+  }
+  return false;
+}
+
+function legacyArgModeEnabled() {
+  if (readZylosEnvFlag('C4_LEGACY_ARG_MODE')) return true;
+  return !readZylosEnvFlag('C4_STRICT_STDIN_ONLY');
+}
+
 async function main() {
   const args = process.argv.slice(2);
-
-  if (args.length < 2) {
+  const parsed = parseArgs(args);
+  if (parsed.error) {
+    console.error(`Error: ${parsed.error}`);
+    process.exit(1);
+  }
+  if (parsed.positional.length < 1) {
     printUsage();
   }
 
-  // Remove --stdin flag if present (backward compat)
-  const cleanArgs = args.filter(a => a !== '--stdin');
-  const hasStdinFlag = cleanArgs.length !== args.length;
+  const cleanArgs = parsed.positional;
+  const hasStdinFlag = parsed.hasStdinFlag;
+  const bodyFile = parsed.bodyFile;
   const stdinAvailable = !process.stdin.isTTY;
+  const legacyArgMode = legacyArgModeEnabled();
 
   const channel = cleanArgs[0];
   let endpoint = null;
   let message = null;
 
-  if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
+  if (bodyFile !== null && cleanArgs.length <= 2) {
+    endpoint = cleanArgs[1] ?? null;
+    try {
+      message = fs.readFileSync(bodyFile, 'utf8').trimEnd();
+    } catch {
+      console.error('Error: Unable to read body file');
+      process.exit(1);
+    }
+  } else if (bodyFile !== null) {
+    console.error('Error: --body-file cannot be combined with a positional message');
+    process.exit(1);
+  } else if (cleanArgs.length === 3 && legacyArgMode && cleanArgs[0] !== 'void') {
+    endpoint = cleanArgs[1];
+    message = cleanArgs[2];
+    console.error(`[c4-send] ${JSON.stringify({
+      event: 'legacy_arg_mode_used',
+      channel,
+      endpointPresent: true,
+    })}`);
+  } else if (cleanArgs.length > 2) {
+    console.error('[c4-send] arg-mode disabled by strict stdin-only policy: pass the message via stdin/heredoc.');
+    process.exit(2);
+  } else if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
     // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin
     endpoint = cleanArgs[1];
     message = (await readStdin()).trimEnd();
   } else if (cleanArgs.length === 1 && (stdinAvailable || hasStdinFlag)) {
     // 1 arg (channel only) with piped stdin: read from stdin
     message = (await readStdin()).trimEnd();
-  } else if (cleanArgs.length === 2) {
-    // 2 args, no stdin: channel + message (no endpoint)
-    process.stderr.write('[c4-send] Deprecated: passing message as CLI argument. Use stdin/heredoc mode instead.\n');
-    message = cleanArgs[1];
-    // Unescape literal \n sequences that shell may have preserved when passing
-    // multi-line content as a CLI argument (defense-in-depth; prefer stdin mode)
-    message = message.replace(/\\n/g, '\n');
+  } else if (cleanArgs.length === 1) {
+    printUsage();
   } else {
-    // 3+ args: channel + endpoint + message
-    process.stderr.write('[c4-send] Deprecated: passing message as CLI argument. Use stdin/heredoc mode instead.\n');
-    endpoint = cleanArgs[1];
-    message = cleanArgs[2];
-    // Same defense for the 3-arg form
-    message = message.replace(/\\n/g, '\n');
+    // 2 args with a TTY means the second positional can only be an arg-mode
+    // message or an endpoint with a missing stdin body. Both are unsafe.
+    console.error('[c4-send] arg-mode disabled: pass the message via stdin/heredoc, not as a CLI argument.');
+    process.exit(2);
   }
 
   if (!message) {
+    if (bodyFile !== null) {
+      console.error('[c4-send] Message is required, but the body file was empty.');
+      process.exit(2);
+    }
+    if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
+      console.error('[c4-send] Message is required, but stdin was empty.');
+      console.error('  CLI message arguments are disabled; pipe the body via stdin/heredoc.');
+      process.exit(2);
+    }
+    if (cleanArgs.length === 1) printUsage();
     console.error('Error: Message is required');
     process.exit(1);
   }
+
+  const assistantRequestId = parsed.requestId;
 
   // Virtual 'void' channel (#689): record-only, never dispatched.
   // No skill directory exists for it, so skip channel-path validation and
@@ -145,8 +249,24 @@ async function main() {
     }
   }
 
+  if (assistantRequestId) {
+    try {
+      const responseStream = openAssistantResponseStream();
+      const stream = responseStream.query({ requestId: assistantRequestId });
+      responseStream.close();
+      if (!stream) throw new Error('assistant request does not exist');
+      if (stream.request.route.channel !== channel || stream.request.route.endpointId !== endpoint) {
+        throw new Error('assistant request does not match its channel route');
+      }
+    } catch (err) {
+      console.error(`[C4] Invalid assistant request: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  let outboundConversation = null;
   try {
-    insertConversation('out', channel, endpoint, message);
+    outboundConversation = insertConversation('out', channel, endpoint, message);
   } catch (err) {
     console.error(`[C4] Warning: DB audit write failed: ${err.stack}`);
   } finally {
@@ -162,21 +282,72 @@ async function main() {
   }
 
   const scriptArgs = endpoint ? [endpoint, message] : [message];
+  const childEnv = { ...process.env };
+  // The persisted outbound row is the delivery identity. Channel adapters use
+  // it to retry an ambiguous transport result without creating a second
+  // message. Never inherit a possibly stale delivery id from the parent.
+  if (outboundConversation) {
+    childEnv.C4_DELIVERY_ID = `c4.outbound.${outboundConversation.id}`;
+  } else {
+    delete childEnv.C4_DELIVERY_ID;
+  }
+  if (assistantRequestId) childEnv.C4_ASSISTANT_REQUEST_ID = assistantRequestId;
+  else delete childEnv.C4_ASSISTANT_REQUEST_ID;
 
   const child = spawn('node', [channelScript, ...scriptArgs], {
-    stdio: 'inherit'
+    stdio: 'inherit',
+    env: childEnv,
   });
 
   child.on('close', (code) => {
-    if (code === 0) {
-      console.log(`[C4] Message sent via ${channel}`);
-    } else {
-      console.log(`[C4] Failed to send message via ${channel} (exit code: ${code})`);
+    let terminalWriteFailed = false;
+    if (assistantRequestId) {
+      try {
+        const responseStream = openAssistantResponseStream();
+        responseStream.execute(code === 0
+          ? {
+              type: 'CompleteRun',
+              requestId: assistantRequestId,
+              output: publicAssistantOutput(message),
+            }
+          : {
+              type: 'FailRun',
+              requestId: assistantRequestId,
+              code: 'CHANNEL_DELIVERY_FAILED',
+              retryable: true,
+            });
+        responseStream.close();
+      } catch (err) {
+        terminalWriteFailed = true;
+        console.error(`[C4] Warning: failed to record assistant terminal event: ${err.message}`);
+      }
     }
-    process.exit(code);
+    const exitCode = terminalWriteFailed ? 1 : code;
+    if (exitCode === 0) {
+      console.log(`[C4] Message sent via ${channel}`);
+    } else if (code !== 0) {
+      console.log(`[C4] Failed to send message via ${channel} (exit code: ${code})`);
+    } else {
+      console.log(`[C4] Failed to complete message via ${channel} (exit code: ${exitCode})`);
+    }
+    process.exit(exitCode);
   });
 
   child.on('error', (err) => {
+    if (assistantRequestId) {
+      try {
+        const responseStream = openAssistantResponseStream();
+        responseStream.execute({
+          type: 'FailRun',
+          requestId: assistantRequestId,
+          code: 'CHANNEL_ADAPTER_UNAVAILABLE',
+          retryable: true,
+        });
+        responseStream.close();
+      } catch (streamError) {
+        console.error(`[C4] Warning: failed to record assistant failure event: ${streamError.message}`);
+      }
+    }
     console.error(`[C4] Error executing channel script: ${err.stack}`);
     process.exit(1);
   });

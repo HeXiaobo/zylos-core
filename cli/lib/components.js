@@ -6,29 +6,58 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { COMPONENTS_FILE } from './config.js';
+import { updateComponentsRegistry } from './components-registry.js';
 import { loadRegistry, loadLocalRegistry } from './registry.js';
 import { fetchLatestTag } from './github.js';
 import { inspectLocalSource, resolveLocalPath } from './download.js';
+import { recoverUpgradeMetadataTransactions } from './upgrade-metadata.js';
+
+const loadedSnapshots = new WeakMap();
+
+function rememberSnapshot(components) {
+  loadedSnapshots.set(components, structuredClone(components));
+  return components;
+}
 
 /**
  * Load installed components from components.json
  */
 export function loadComponents() {
+  recoverUpgradeMetadataTransactions();
   if (fs.existsSync(COMPONENTS_FILE)) {
     try {
-      return JSON.parse(fs.readFileSync(COMPONENTS_FILE, 'utf8'));
+      return rememberSnapshot(JSON.parse(fs.readFileSync(COMPONENTS_FILE, 'utf8')));
     } catch {
-      return {};
+      return rememberSnapshot({});
     }
   }
-  return {};
+  return rememberSnapshot({});
 }
 
 /**
  * Save installed components to components.json
  */
 export function saveComponents(components) {
-  fs.writeFileSync(COMPONENTS_FILE, JSON.stringify(components, null, 2));
+  const before = loadedSnapshots.get(components);
+  const saved = updateComponentsRegistry(current => {
+    if (!before) return structuredClone(components);
+
+    const next = { ...current };
+    const names = new Set([...Object.keys(before), ...Object.keys(components)]);
+    for (const name of names) {
+      const hadBefore = Object.hasOwn(before, name);
+      const hasNow = Object.hasOwn(components, name);
+      if (hadBefore && !hasNow) {
+        delete next[name];
+      } else if (!hadBefore || JSON.stringify(before[name]) !== JSON.stringify(components[name])) {
+        next[name] = structuredClone(components[name]);
+      }
+    }
+    return next;
+  });
+  for (const name of Object.keys(components)) delete components[name];
+  Object.assign(components, structuredClone(saved));
+  loadedSnapshots.set(components, structuredClone(saved));
 }
 
 /**

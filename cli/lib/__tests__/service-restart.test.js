@@ -27,7 +27,17 @@ describe('restartServicesWithDeps', () => {
     });
 
     assert.equal(ok, true);
-    assert.equal(ecosystemCalls.length, 4);
+    assert.deepStrictEqual(
+      ecosystemCalls.map((call) => call.names[0]),
+      [
+        'activity-monitor',
+        'scheduler',
+        'c4-dispatcher',
+        'c4-intake-supervisor',
+        'c4-response-stream-supervisor',
+        'web-console',
+      ],
+    );
     assert.deepStrictEqual(managedCalls, [{
       name: 'scheduler',
       opts: {

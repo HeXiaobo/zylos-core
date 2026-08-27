@@ -73,5 +73,107 @@ CREATE TABLE IF NOT EXISTS status_notice_cooldowns (
 CREATE INDEX IF NOT EXISTS idx_status_notice_cooldowns_expires_at
   ON status_notice_cooldowns(expires_at);
 
+-- Durable handoff from channel intake to Commitment Core
+CREATE TABLE IF NOT EXISTS commitment_intake_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    retry_generation INTEGER NOT NULL DEFAULT 0 CHECK (retry_generation >= 0),
+    available_at INTEGER NOT NULL,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_commitment_intake_queue_ready
+  ON commitment_intake_queue(status, available_at, id);
+CREATE INDEX IF NOT EXISTS idx_commitment_intake_queue_stale
+  ON commitment_intake_queue(status, updated_at);
+
+-- Runtime-neutral assistant response streams.  The event payloads in this
+-- ledger are consumed by channel adapters; no channel SDK/CardKit fields live
+-- here.
+CREATE TABLE IF NOT EXISTS assistant_requests (
+    request_id TEXT PRIMARY KEY,
+    conversation_id INTEGER UNIQUE,
+    route_channel TEXT NOT NULL,
+    route_endpoint TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    status TEXT NOT NULL
+      CHECK (status IN ('queued', 'started', 'completed', 'failed')),
+    runtime_session_id TEXT,
+    next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
+    output_text TEXT NOT NULL DEFAULT '',
+    accepted_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    terminal_at INTEGER,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+);
+
+-- First-result receipts keep classifier upgrades from reinterpreting a replay.
+CREATE TABLE IF NOT EXISTS work_intake_decisions (
+    source_key TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+-- Ambiguous WorkIntake decisions awaiting an authenticated human choice.
+-- These rows are not Commitment tasks and are never consumed by the task worker.
+CREATE TABLE IF NOT EXISTS work_intake_confirmations (
+    source_key TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL UNIQUE,
+    envelope_json TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    resolved_action TEXT,
+    resolved_by TEXT,
+    resolved_at INTEGER,
+    effect_status TEXT CHECK (effect_status IN ('pending', 'applied')),
+    effect_applied_at INTEGER,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_requests_status_time
+  ON assistant_requests(status, accepted_at, request_id);
+CREATE INDEX IF NOT EXISTS idx_assistant_requests_runtime
+  ON assistant_requests(runtime_session_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_assistant_requests_route
+  ON assistant_requests(route_channel, route_endpoint, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS assistant_response_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    idempotency_key TEXT,
+    delivery_status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
+    available_at INTEGER NOT NULL,
+    lease_token TEXT,
+    lease_expires_at INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    delivered_at INTEGER,
+    FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+    UNIQUE (request_id, sequence),
+    UNIQUE (request_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_response_events_delivery
+  ON assistant_response_events(delivery_status, available_at, id);
+CREATE INDEX IF NOT EXISTS idx_assistant_response_events_request
+  ON assistant_response_events(request_id, sequence);
+
 -- Create initial checkpoint
 INSERT INTO checkpoints (summary) VALUES ('initial');

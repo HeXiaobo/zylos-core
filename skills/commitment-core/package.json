@@ -1,0 +1,14 @@
+{
+  "name": "zylos-commitment-core",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Durable commitment and task state for Zylos",
+  "scripts": {
+    "gate:business-mvp": "node scripts/business-mvp-gate.js",
+    "test": "node --test scripts/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2"
+  }
+}

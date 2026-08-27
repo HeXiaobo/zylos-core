@@ -5,6 +5,250 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.9] - 2026-08-27
+
+### Fixed
+- Component upgrades now commit `.zylos-source.json` from the actual immutable
+  ref through a durable journal tied to the authoritative baseline commit.
+  Exact commits persist `repo`, full `sha`, ref type, installed version, and
+  upgrade time. A crash after the baseline commit rolls metadata forward; a
+  crash before it preserves the journal and fails closed instead of erasing
+  evidence while business rollback is unknown.
+- `components.json` source routing is updated under one process-identity and
+  fencing-token protected registry transaction, so concurrent component
+  writers cannot lose one another's updates. Commit-point recovery distinguishes
+  committed, provably uncommitted, and unknown/corrupt baseline states; unknown
+  state is always retained for recovery. Runtime provenance is excluded from
+  business-file change detection and no longer appears as a local modification
+  on the next upgrade.
+
+## [0.7.2-rc.8] - 2026-08-27
+
+### Added
+- The capability manifest now declares runtime modes explicitly: Claude uses
+  display-hook response streaming and runtime-turn admission, while Codex uses
+  request-scoped `c4-send` completion until it has an equivalent display/turn
+  completion boundary.
+
+### Fixed
+- Submitted admissions abandoned by a failed or ambiguous tmux verification
+  can be reclaimed after 60 seconds. Started turns never expire by age; they
+  recover only after 30 seconds of both healthy monitor idle and lifecycle
+  inactivity, with a persisted generation compare-and-swap preventing a new
+  Prompt or tool event from racing an old idle snapshot.
+- Claude prompt, legacy PreTool, Stop, and idle-notification hooks are
+  synchronous lifecycle fences. Tool completion and display events can touch only an already
+  started admission, so late events from turn A cannot start, bind, or finish
+  turn B. Missing/corrupt best-effort binding state remains fail-closed while B
+  is still submitted. Every durable lifecycle mutation also compares its
+  process observation time inside the admission transaction, so an upgrade-era
+  asynchronous Stop or PostTool from A cannot finish or publish progress into
+  B after B has started. New admissions establish that lower bound at
+  acquisition, and active legacy rows receive a conservative migration-time
+  baseline before any hook may mutate them.
+- Long-running tools remain busy even when their hook timestamp exceeds the
+  short freshness window. Prompt-only state has a bounded one-hour lifetime so
+  a missing Stop cannot keep the runtime busy forever, and legacy installs
+  missing UserPromptSubmit can still start safely at synchronous PreToolUse.
+- Codex no longer creates Claude-only runtime admissions that would remain
+  submitted. Assistant requests use the explicit `--request-id` reply command,
+  preserving durable completion without claiming unsupported display hooks.
+
+## [0.7.2-rc.7] - 2026-08-27
+
+### Added
+- C4 now persists a single active runtime-turn admission for every ordinary
+  conversation, including HXA and OpenMax messages that have no assistant
+  request ID. Admission begins before tmux submission and closes only on the
+  matching runtime `Stop`; the durable lifecycle ledger makes cross-channel
+  queueing observable and survives a dispatcher restart. Control-plane items retain
+  their existing bypass behavior.
+- `c4.assistant-response-stream:3` advertises serialized Claude conversation
+  admission so paired deployments can distinguish this release from response
+  streaming that only isolated Feishu request IDs.
+- Assistant turn binding decisions now append a content-free per-turn JSONL
+  audit record while retaining the compact last-known-state file. Future reply
+  attribution incidents can reconstruct marker acceptance and rejection instead
+  of reporting that historical hook visibility is unknowable.
+
+### Fixed
+- Claude prompt activity now remains busy through tool-to-tool gaps until the
+  terminal `Stop` hook. The dispatcher also defers every ordinary conversation
+  behind an older started assistant run. Together these gates prevent a new
+  Feishu, HXA, OpenMax, or other channel message from being inserted into a
+  still-running turn and shifting replies back by one request.
+- A tmux paste that definitely did not submit releases its admission for a safe
+  retry; an ambiguous Enter verification remains fail-closed instead of risking
+  a second prompt in the same runtime turn.
+
+## [0.7.2-rc.6] - 2026-08-27
+
+### Fixed
+- Claude `UserPromptSubmit` hooks now require the terminal assistant-request
+  marker before binding a turn to a streamed response. Unmarked HXA, OpenMax,
+  local, and control turns fail closed instead of claiming the only pending
+  Feishu response card and shifting every later answer back by one request.
+  The compatibility fallback remains available only when the prompt hook was
+  genuinely absent, where later lifecycle hooks can still bind an unambiguous
+  request.
+
+## [0.7.2-rc.5] - 2026-08-27
+
+### Added
+- A deterministic Core + Feishu fork-pair upgrade runner stages both targets
+  by immutable commit SHA, validates fork routing and critical assets before
+  mutation, and writes structured `PASS`/`HOLD` evidence for operators.
+- The communication continuity canary now proves that deployed `c4-receive`
+  durably persists a hermetic inbound message as well as proving outbound reply
+  contracts.
+- An immutable SS HXA recovery runner restores the exact audited
+  `zylos-hxa-connect@1.7.3` source from the user fork without replacing its data
+  or configuration, then verifies a real PM2 PID/executable and live profile and
+  peer API access.
+- A second immutable SS recovery runner restores only the two code trees that
+  block Core step 12: WeChat `0.3.2@67f5142` and WeCom
+  `0.1.5@781a51f`. It stages and installs both before mutation, preserves their
+  data/config hashes, keeps HXA genuinely online, and rejects PM2 fake-online
+  states after restart.
+- `c4-send` now provides a canonical `--body-file=<path>` transport for strict
+  runtimes and advertises it as `c4.reply.body-file:1`; launchers that cannot
+  pipe stdin no longer depend on an untracked per-host patch.
+
+### Fixed
+- Self-upgrade rejects a target or post-sync deployment that lacks a critical
+  communication entrypoint, including `c4-receive` and the response supervisor.
+- PM2 service verification rejects fake-online processes whose executable is
+  missing or whose required service points at the wrong script.
+- The fork-pair preflight now rejects every PM2 process that claims to be online
+  while its executable is missing, preventing a later Core step-12 rollback for
+  already-broken component services.
+- HXA recovery probes no longer assume an org label named `hxa`; the component
+  CLI selects its configured default (or first enabled) org. A recovery that
+  already installed the exact pinned code can safely resume postchecks instead
+  of being rejected as an unexpected existing directory.
+- GitHub component and Core downloads accept full commit SHAs through immutable
+  archive URLs, so a checked target cannot drift with a movable branch.
+- Failed self-upgrades now remove target-only PM2 services before restoring the
+  baseline, restart the original services, and persist the final rollback
+  process list. This prevents a new-release daemon from surviving with an
+  executable that the restored release no longer contains.
+- The immutable pair runner can repair that exact historical response-supervisor
+  rollback orphan when its canonical live entrypoint is absent and the pinned
+  target contains the replacement. All path drift and unrelated broken
+  processes remain fail-closed.
+- Core upgrade and rollback now preserve PM2 cron one-shots through their own
+  process definitions. Service verification accepts a scheduled task while it
+  is normally stopped between successful runs, but still requires a real
+  executable, `autorestart: false`, a cron expression, exit code zero, and zero
+  unstable restarts; long-running daemons still must be online.
+- Both self-upgrade step 0 and the immutable fork-pair runner reject a Core target
+  that does not declare the body-file reply contract, preventing a late
+  rollback after a host-local copy silently loses that historical patch.
+- The pair runner keeps Core target capabilities separate from the protocols a
+  Feishu release requires from Core, so a new Core-only safety seam cannot be
+  misclassified as a missing capability in an otherwise compatible Feishu SHA.
+
+## [0.7.2-rc.4] - 2026-08-26
+
+### Fixed
+- Self-upgrade communication continuity now honors an explicit strict-stdin
+  runtime policy without enabling the legacy argv break-glass override. It
+  proves stdin and body-file delivery, plus the exact policy rejection and
+  zero-delivery outcome for an argv body; compatibility-mode deployments keep
+  the existing argv delivery canary.
+
+## [0.7.2-rc.3] - 2026-08-26
+
+### Added
+- Canonical Tasks can persist a `reminderMinutesBeforeDue` policy alongside an
+  RFC 3339 deadline; `task-reminder:1` lets paired components reject an older
+  Core before they start reminder-aware projection.
+- `zylos task create --reminder-minutes-before-due <n>` exposes the same
+  channel-neutral reminder policy through the supported CLI Adapter.
+- Natural-language WorkIntake recognizes offsets such as `提前1小时提醒`,
+  carries them through C4's strict Task envelope, and asks for confirmation
+  instead of dropping a reminder that has no deadline.
+
+### Fixed
+- Existing Task databases add the nullable reminder column in place, preserve
+  older idempotency fingerprints, and keep reminder-free Tasks replayable.
+
+## [0.7.2-rc.2] - 2026-08-26
+
+### Fixed
+- Self-upgrade and bootstrap installs now suppress npm lifecycle scripts before the transaction owns live state; `ZYLOS_SKIP_POSTINSTALL=1` is also a strict zero-write guard.
+- The installed finalizer has a 15-minute default timeout with a three-minute minimum, and timeout failures report their real elapsed duration instead of zero.
+- Self-upgrade snapshots and restores the complete globally installed Core package on both partial npm-install failures and later finalizer failures.
+
+## [0.7.2-rc.1] - 2026-08-26
+
+### Added
+- Runtime-neutral Agent/Deployment Profile selection. The default loads no organization-specific governance; managed deployments can explicitly opt in through `.zylos/config.json` or environment variables.
+- Stable C4 outbound delivery identities let channel components update one proactive message instead of creating mixed card/plain-text replies; `c4.outbound-delivery-id:1` exposes that contract to component upgrade gates.
+- `external-task-adapter:1` advertises the validated external completion mapper so channel upgrades fail before mutation when the installed Core cannot map native completion to review.
+
+### Changed
+- Mylos/3AI Memory Sync governance is packaged as the optional `3ai` Deployment Profile instead of changing the Core default for every local, Codex, Claude, or COCO-hosted agent.
+- Fork release metadata now uses a runtime-neutral release-candidate name.
+
+### Fixed
+- Claude and Codex streamed replies bind to the exact assistant request for the active turn and fail closed for unknown, terminal, conflicting, ambiguous, or unmarked follow-up turns.
+- Component upgrades enforce capability checks before mutation and roll back code, configuration, data, Caddy, PM2, and installed-finalizer failures within the supported transaction boundary.
+- Work intake resolves Agent identity from deployment configuration instead of embedding a 玥然-specific default.
+- The offline business-MVP gate requires an explicit Agent ID or Agent Profile and fails closed when neither is selected.
+- Task comment authorship now waits for canonical `CommentAdded` evidence during out-of-order delivery, and audience resolution no longer truncates participants at the ordinary conversation query limit.
+
+## [0.7.2-3ai.6] - 2026-08-26
+
+### Fixed
+- Claude streamed replies now persist a synchronous turn-level binding or rejection before tool hooks run. Unknown, terminal, conflicting, and non-terminal request markers remain fail-closed through tool progress, displayed output, and stop handling instead of falling back to a session candidate.
+- A valid explicit new turn atomically supersedes an abandoned active request on the same Claude session, while every later event writes by the saved request ID rather than re-resolving the session.
+- Codex accepts only the terminal system-appended request marker and clears the previous association on every new user turn, preventing an earlier user-authored marker or an unmarked next turn from inheriting response output.
+
+## [0.7.2-3ai.5] - 2026-08-26
+
+### Fixed
+- Claude response streams now bind the runtime session to the explicit `assistant request` marker carried by the delivered prompt, so a newer request cannot inherit output merely because an older request was queued first.
+- The legacy single-candidate binding path now fails closed when more than one unbound run is eligible. Ambiguous output is withheld instead of being projected into an arbitrary response card.
+
+## [0.7.2-3ai.4] - 2026-08-25
+
+### Fixed
+- Self-upgrade, doctor, changelog lookup, and the detached activity-monitor upgrade check now resolve `ZYLOS_SELF_UPGRADE_REPO` from the target instance's `ZYLOS_DIR/.env` when the live process does not override it. This keeps fork routing persistent across global npm installs, non-Git working directories, different home directories, shells, and service restarts without loading unrelated `.env` credentials into child processes.
+- Missing or unreadable persisted configuration retains the canonical repository fallback instead of making the CLI unusable.
+
+## [0.7.2-3ai.3] - 2026-08-25
+
+### Added
+- A pre-mutation self-upgrade capability gate plus a hermetic post-install communication canary. Future targets must declare rolling reply compatibility before services stop, and deployed code must prove both stdin and exact legacy argv replies without contacting an external channel.
+- The `c4.reply.argv-compat` capability declares rolling-upgrade compatibility for older endpoint-addressed callers.
+
+### Fixed
+- Self-upgrade now restores backed-up Core Skills and PM2 configuration, then restarts previously running services, when any installed-finalizer step fails or the finalizer crashes.
+- Exact legacy `<channel> <endpoint_id> <message>` calls remain accepted by default, preventing a Core upgrade from disconnecting agents whose callers have not migrated yet. `C4_STRICT_STDIN_ONLY=1` is an explicit post-migration policy; `C4_LEGACY_ARG_MODE=1` overrides it as a no-restart break-glass recovery.
+
+### Changed
+- New and generated callers continue to use stdin; compatibility mode is deprecated and emits content-free telemetry.
+
+## [0.7.2-3ai.2] - 2026-08-25
+
+### Added
+- A machine-readable `zylos capabilities --json` protocol contract for paired component upgrades.
+- A bounded `C4_LEGACY_ARG_MODE=1` migration path for endpoint-addressed legacy replies, loaded directly from the Zylos env file and recorded with content-free deprecation telemetry.
+
+### Changed
+- C4 reply-route instructions now state the stdin-only message contract explicitly.
+
+## [0.7.2-3ai.1] - 2026-08-25
+
+### Added
+- Commitment Core task/run state, durable SQLite intake, projection outbox, WorkIntake, response streaming, and Feishu task integration seams from the task-management MVP integration branch.
+- Mylos memory anti-recurrence gates, crash-loop diagnosis guidance, and fork-aware self-upgrade routing through `ZYLOS_SELF_UPGRADE_REPO`.
+
+### Changed
+- `c4-send` now accepts message bodies through stdin only. CLI argument mode fails before dispatch with exit code 2.
+- Core upgrade checks, changelog reads, doctor output, activity-monitor checks, and branch installs consistently honor the configured fork repository.
+
 ## [0.7.1] - 2026-08-18
 
 ### Added

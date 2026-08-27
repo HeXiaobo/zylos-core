@@ -160,6 +160,34 @@ describe('desiredClaudeHooks', () => {
     assert.ok(groups[0].hooks.some(h => h.command.includes('hook-activity.js')));
     assert.equal(path.isAbsolute(extractScriptPath(groups[0].hooks[0].command)), true);
   });
+
+  it('registers MessageDisplay synchronously so answer batches stay ordered', () => {
+    const groups = desiredClaudeHooks().MessageDisplay || [];
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].hooks.length, 1);
+    assert.ok(groups[0].hooks[0].command.includes('hook-activity.js'));
+    assert.equal(groups[0].hooks[0].async, false);
+    assert.equal(groups[0].hooks[0].timeout, 5);
+  });
+
+  it('registers UserPromptSubmit synchronously so turn binding precedes tool hooks', () => {
+    const groups = desiredClaudeHooks().UserPromptSubmit || [];
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].hooks.length, 1);
+    assert.ok(groups[0].hooks[0].command.includes('hook-activity.js'));
+    assert.equal(groups[0].hooks[0].async, false);
+    assert.equal(groups[0].hooks[0].timeout, 5);
+  });
+
+  it('registers lifecycle boundary hooks synchronously', () => {
+    const hooks = desiredClaudeHooks();
+    for (const event of ['PreToolUse', 'Stop', 'Notification']) {
+      assert.equal(hooks[event].length, 1);
+      assert.equal(hooks[event][0].hooks.length, 1);
+      assert.equal(hooks[event][0].hooks[0].async, false);
+      assert.equal(hooks[event][0].hooks[0].timeout, 5);
+    }
+  });
 });
 
 describe('Activity monitor threshold fallback', () => {
@@ -808,7 +836,7 @@ describe('syncHooks SessionStart orchestrator convergence', () => {
 
     // Removing migration-prompt subtracts one command from each of the three
     // SessionStart matchers; retired per-step hooks remain unchanged.
-    assert.deepEqual(result, { added: 34, updated: 0, removed: 12 });
+    assert.deepEqual(result, { added: 35, updated: 0, removed: 12 });
     assertSessionStartUsesOrchestrator(installed);
   });
 
@@ -1220,6 +1248,30 @@ describe('syncHooks forward pass', () => {
 
     assert.equal(result.updated, 1);
     assert.equal(installed.hooks.SessionStart[0].hooks[0].timeout, 10000);
+  });
+
+  it('repairs async drift for ordered MessageDisplay hooks', () => {
+    const command = 'node ~/zylos/.claude/skills/activity-monitor/scripts/hook-activity.js';
+    const installed = {
+      hooks: {
+        MessageDisplay: [{ hooks: [
+          { type: 'command', command, async: true, timeout: 5 },
+        ]}],
+      },
+    };
+    const desired = {
+      MessageDisplay: [{ hooks: [
+        { type: 'command', command, async: false, timeout: 5 },
+      ]}],
+    };
+
+    const result = syncHooks(installed, { hooks: desired }, {
+      log: noopLog,
+      desiredHooks: desired,
+    });
+
+    assert.equal(result.updated, 1);
+    assert.equal(installed.hooks.MessageDisplay[0].hooks[0].async, false);
   });
 
   it('handles the full migration scenario: catch-all → specific matchers', () => {

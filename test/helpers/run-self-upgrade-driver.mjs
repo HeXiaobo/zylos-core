@@ -24,16 +24,24 @@ const {
   createFinalizeState,
   runSelfUpgrade,
   runSelfUpgradeFinalize,
+  rollbackSelf,
   step5_syncCoreSkills,
 } = await import('../../cli/lib/self-upgrade.js');
 const { printStep } = await import('../../cli/commands/component.js');
 
 const transactionBackupDir = path.join(zylosDir, 'transaction-backup');
+const globalCoreDir = path.join(zylosDir, 'global', 'node_modules', 'zylos');
 const npmCommands = [];
 const stoppedServices = [];
+const restartedServices = [];
 const launcherOutput = [];
 const originalLog = console.log;
 console.log = (...args) => launcherOutput.push(args.join(' '));
+fs.mkdirSync(globalCoreDir, { recursive: true });
+fs.writeFileSync(path.join(globalCoreDir, 'package.json'), JSON.stringify({
+  name: 'zylos',
+  version: '0.5.3',
+}));
 
 let result;
 try {
@@ -48,6 +56,7 @@ try {
       zylosDir,
       skillsDir: path.join(zylosDir, '.claude', 'skills'),
       backupDir: transactionBackupDir,
+      corePackageDir: globalCoreDir,
     },
     step3: {
       getSkillsServices: () => [{ name: 'fixture-service', status: 'online' }],
@@ -56,6 +65,12 @@ try {
     step4: {
       execSync: (command) => {
         npmCommands.push(command);
+        if (command.startsWith('npm install -g')) {
+          fs.writeFileSync(path.join(globalCoreDir, 'package.json'), JSON.stringify({
+            name: 'zylos',
+            version: '0.5.4-test',
+          }));
+        }
         return command.startsWith('npm pack') ? 'zylos-fixture.tgz\n' : '';
       },
     },
@@ -71,7 +86,14 @@ try {
           error: 'injected later failure',
         }));
       }
-      return runSelfUpgradeFinalize(createFinalizeState(ctx), { steps });
+      return runSelfUpgradeFinalize(createFinalizeState(ctx), {
+        steps,
+        rollbackSelf: (finalizerCtx) => rollbackSelf(finalizerCtx, {
+          zylosDir,
+          skillsDir: path.join(zylosDir, '.claude', 'skills'),
+          restartManagedProcess: (name) => restartedServices.push(name),
+        }),
+      });
     },
   });
 
@@ -89,5 +111,7 @@ originalLog(JSON.stringify({
   launcherOutput,
   npmCommands,
   stoppedServices,
+  restartedServices,
   transactionBackupDir,
+  globalCoreVersion: JSON.parse(fs.readFileSync(path.join(globalCoreDir, 'package.json'), 'utf8')).version,
 }));

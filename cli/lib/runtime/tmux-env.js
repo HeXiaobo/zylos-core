@@ -12,6 +12,19 @@ const PROXY_VARS = [
   'http_proxy', 'https_proxy', 'no_proxy',
 ];
 
+// Core instance/profile selectors are part of runtime identity, not optional
+// ambient application settings. Every clean Claude/Codex child must receive
+// them without requiring each deployment to duplicate an inherit manifest.
+const CORE_RUNTIME_VARS = [
+  'ZYLOS_DIR',
+  'ZYLOS_AGENT_ID',
+  'ZYLOS_AGENT_PROFILE',
+  'ZYLOS_AGENT_LABEL',
+  'ZYLOS_AGENT_ALIASES',
+  'ZYLOS_DEPLOYMENT_PROFILE',
+  'C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID',
+];
+
 const EMPTY_MANIFEST = Object.freeze({
   envNames: [], inheritNames: [], pathPrepend: [], pathAppend: [],
 });
@@ -235,6 +248,13 @@ export function buildCleanEnv({ processEnv, dotenvVars, manifest, platform, uid,
   // 4. Built-in allowlist exceptions (auto-inherit from processEnv)
   for (const name of PROXY_VARS) {
     if (processEnv[name]) env[name] = processEnv[name];
+  }
+  for (const name of CORE_RUNTIME_VARS) {
+    if (processEnv[name] !== undefined) {
+      env[name] = processEnv[name];
+    } else if (dotenvVars[name] !== undefined) {
+      env[name] = dotenvVars[name];
+    }
   }
   if (processEnv.IS_SANDBOX) {
     env.IS_SANDBOX = processEnv.IS_SANDBOX;

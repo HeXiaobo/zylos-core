@@ -12,6 +12,15 @@ import { commandExists } from '../lib/shell-utils.js';
 import { getActiveAdapter } from '../lib/runtime/index.js';
 import { getCoreEcosystemPath, restartFromEcosystem, restartManagedProcess } from '../lib/pm2.js';
 
+const CORE_SERVICE_NAMES = [
+  'activity-monitor',
+  'scheduler',
+  'c4-dispatcher',
+  'c4-intake-supervisor',
+  'c4-response-stream-supervisor',
+  'web-console',
+];
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -33,7 +42,7 @@ export function restartServicesWithDeps({
   logSuccess = console.log,
   logError = console.error,
 } = {}) {
-  const services = ['activity-monitor', 'scheduler', 'c4-dispatcher', 'web-console'];
+  const services = CORE_SERVICE_NAMES;
   const ecosystemPath = getCoreEcosystemPathFn();
   const fallbackServices = [];
   let saveNeeded = false;
@@ -246,6 +255,8 @@ export function startServices() {
     { name: 'activity-monitor', script: path.join(SKILLS_DIR, 'self-maintenance', 'activity-monitor.js') },
     { name: 'scheduler', script: path.join(SKILLS_DIR, 'scheduler', 'scheduler.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR}` },
     { name: 'c4-dispatcher', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-dispatcher.js') },
+    { name: 'c4-intake-supervisor', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-intake-supervisor.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR}` },
+    { name: 'c4-response-stream-supervisor', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-response-stream-supervisor.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR} C4_RESPONSE_STREAM_AUTOSTART=1` },
     { name: 'web-console', script: path.join(SKILLS_DIR, 'web-console', 'server.js'), env: `WEB_CONSOLE_PORT=3456 ZYLOS_DIR=${ZYLOS_DIR}` },
   ];
 
@@ -283,7 +294,7 @@ export function startServices() {
 
 export function stopServices() {
   console.log(heading('Stopping Zylos services...'));
-  const services = ['activity-monitor', 'scheduler', 'c4-dispatcher', 'web-console'];
+  const services = CORE_SERVICE_NAMES;
   try {
     execSync(`pm2 stop ${services.join(' ')} 2>/dev/null || true`, { stdio: 'inherit' });
     console.log(success('Services stopped.'));

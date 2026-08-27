@@ -23,6 +23,15 @@ import { doctorCommand } from './commands/doctor.js';
 import { shellCommand } from './commands/shell.js';
 import { runtimeCommand } from './commands/runtime.js';
 import { migrateInstructionsCommand } from './commands/migrate-instructions.js';
+import { capabilitiesCommand } from './commands/capabilities.js';
+
+// Commitment Core has a native SQLite dependency installed with its deployed
+// Skill. Keep it off the root CLI startup path so setup/help remain available
+// before that Skill has been installed.
+async function taskCommand(args) {
+  const taskModule = await import('./commands/task.js');
+  return taskModule.taskCommand(args);
+}
 
 const commands = {
   // Environment setup
@@ -32,7 +41,9 @@ const commands = {
   doctor: doctorCommand,
   shell: shellCommand,
   runtime: runtimeCommand,
+  capabilities: capabilitiesCommand,
   'migrate-instructions': migrateInstructionsCommand,
+  task: taskCommand,
   // Service management
   status: showStatus,
   logs: showLogs,
@@ -98,9 +109,12 @@ Setup:
   shell               Interactive CLI mode (REPL)
   runtime <name>      Switch agent runtime (claude|codex)
   runtime status      Show currently configured runtime
+  capabilities        Show Core protocol capabilities (--json)
   migrate-instructions  Analyze/migrate legacy mixed instructions (dry-run by default)
                       --apply  Create durable backup and activate split instructions
                       --user-content <file>  User-only content for conservative C-class migration
+  task                Manage local commitments and tasks
+                      Run "zylos task --help" for subcommands and options
 
 Service Management:
   status              Show system status
@@ -116,7 +130,7 @@ Component Management:
                       --check   Show component info without installing
                       --yes/-y  Skip confirmation prompts
   info <name>         Show component details (--json)
-  upgrade <name>      Upgrade a component (9-step pipeline)
+  upgrade <name>      Upgrade a component (validated pipeline)
   upgrade --all       Upgrade all components
   upgrade --self      Upgrade zylos-core itself
   uninstall <name>    Remove a component (--purge, --force)
@@ -134,6 +148,8 @@ Examples:
   zylos config set protocol http
   zylos status
   zylos logs activity
+  zylos task list
+  zylos task create --title "Follow up customer" --owner owner-id
 
   zylos add telegram
   zylos add telegram@0.2.0

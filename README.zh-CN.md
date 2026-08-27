@@ -243,6 +243,11 @@ graph TB
 | 活动监控 | 崩溃恢复、心跳、健康检查 | PM2、多层保护 |
 | HTTP 层 | Web 访问、文件共享、组件路由 | Caddy、自动 HTTPS |
 
+智能体身份与部署专属运行策略通过显式的
+[Agent/Deployment Profile](docs/agent-deployment-profiles.md) 选择。Core 默认
+不加载任何组织专属治理规则，因此同一个候选版本可在本地或托管环境中运行，
+也可以使用 Claude 或 Codex runtime。
+
 ---
 
 ## 特性

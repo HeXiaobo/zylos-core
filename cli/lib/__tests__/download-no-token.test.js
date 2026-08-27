@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 const origEnv = {};
@@ -10,7 +11,7 @@ for (const key of ['ZYLOS_GH_RETRY_DELAY_MS', 'GITHUB_TOKEN', 'GH_TOKEN', 'PATH'
 }
 const tmpDirs = [];
 
-const { downloadArchive } = await import('../download.js');
+const { downloadArchive, downloadBranch } = await import('../download.js');
 
 beforeEach(() => {
   delete process.env.GITHUB_TOKEN;
@@ -82,5 +83,44 @@ describe('downloadArchive no-token fallback (fake curl on PATH)', () => {
     assert.match(result.error, /403/);
     // 1 public call per retry round: initial attempt + one configured retry
     assert.equal(fake.calls(), 2);
+  });
+});
+
+describe('immutable commit downloads', () => {
+  it('downloads a full commit SHA through the immutable archive URL', () => {
+    const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-download-commit-fixture-'));
+    const archiveRoot = path.join(fixtureDir, 'repo-commit');
+    const archivePath = path.join(fixtureDir, 'archive.tar.gz');
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-download-commit-bin-'));
+    const callsPath = path.join(fakeBin, 'curl.calls');
+    tmpDirs.push(fixtureDir, fakeBin);
+
+    fs.mkdirSync(archiveRoot, { recursive: true });
+    fs.writeFileSync(path.join(archiveRoot, 'package.json'), '{"name":"fixture"}\n');
+    execFileSync('tar', ['czf', archivePath, '-C', fixtureDir, 'repo-commit']);
+    fs.writeFileSync(path.join(fakeBin, 'curl'), `#!/bin/sh
+printf '%s\n' "$@" > "${callsPath}"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    cp "${archivePath}" "$2"
+    exit 0
+  fi
+  shift
+done
+exit 2
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(fakeBin, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    process.env.PATH = `${fakeBin}${path.delimiter}${process.env.PATH}`;
+
+    const sha = '0123456789abcdef0123456789abcdef01234567';
+    const destDir = makeDestDir();
+    const result = downloadBranch('org/repo', sha, destDir);
+
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(fs.existsSync(path.join(destDir, 'package.json')), true);
+    assert.match(
+      fs.readFileSync(callsPath, 'utf8'),
+      new RegExp(`https://github\\.com/org/repo/archive/${sha}\\.tar\\.gz`),
+    );
   });
 });

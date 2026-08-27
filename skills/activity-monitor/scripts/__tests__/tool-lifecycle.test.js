@@ -63,6 +63,36 @@ describe('tool-lifecycle', () => {
     assert.equal(snapshot.in_prompt, true);
   });
 
+  it('keeps the runtime turn active across tool gaps until Stop', () => {
+    const state = createToolLifecycleState();
+    applyOrderedToolEvents(state, [
+      { ts: 900, pid: 42, session_id: 's1', event: 'prompt' },
+      createPreEvent({ ts: 1000 }),
+      createPostEvent({ ts: 2000 }),
+    ], { nowMs: 2500 });
+
+    const betweenTools = getSessionSnapshot(state, 's1', 's1');
+    assert.equal(betweenTools.running_tools.length, 0);
+    assert.equal(betweenTools.in_prompt, true);
+
+    applyOrderedToolEvents(state, [
+      { ts: 3000, pid: 42, session_id: 's1', event: 'stop' },
+    ], { nowMs: 3000 });
+    assert.equal(getSessionSnapshot(state, 's1', 's1').in_prompt, false);
+  });
+
+  it('ignores an idle notification observed before the current prompt', () => {
+    const state = createToolLifecycleState();
+    applyOrderedToolEvents(state, [
+      { ts: 2000, pid: 42, session_id: 's1', event: 'prompt' },
+      { ts: 1500, pid: 42, session_id: 's1', event: 'idle' },
+    ], { nowMs: 2100 });
+
+    const snapshot = getSessionSnapshot(state, 's1', 's1');
+    assert.equal(snapshot.in_prompt, true);
+    assert.equal(snapshot.last_event, 'prompt');
+  });
+
   it('clears a tool on normal completion', () => {
     const state = createToolLifecycleState();
     applyOrderedToolEvents(state, [
@@ -475,7 +505,7 @@ describe('pruneToolLifecycleState', () => {
     assert.equal(state.sessions['active-session'].running_tools.length, 1);
   });
 
-  it('preserves sessions with live pids even past TTL', () => {
+  it('expires a prompt-only session past TTL even when the runtime pid is still alive', () => {
     const state = createToolLifecycleState();
     applyOrderedToolEvents(state, [
       { ts: 1000, pid: 777, session_id: 'live-session', event: 'prompt' }
@@ -487,7 +517,7 @@ describe('pruneToolLifecycleState', () => {
       sessionTtlMs: 3_600_000
     });
 
-    assert.ok(state.sessions['live-session']);
+    assert.equal(state.sessions['live-session'], undefined);
   });
 });
 

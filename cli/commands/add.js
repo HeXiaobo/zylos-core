@@ -11,26 +11,30 @@
  *      Otherwise, write to .env for legacy components
  *   4. Run post-install hook → start PM2 service
  *
- * JSON mode (--json): Mechanical installation only
- *   1. Resolve target → download → npm install → manifest → register
- *   2. Output SKILL.md metadata for Claude to handle config/hooks/service
+ * JSON mode (--json): Non-interactive transactional installation
+ *   1. Resolve target → capability gate → download → npm install
+ *   2. Run post-install non-interactively; register only after it succeeds
+ *   3. Output remaining SKILL.md metadata for Claude to handle config/service
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
-import { SKILLS_DIR, COMPONENTS_DIR, BIN_DIR } from '../lib/config.js';
+import { execSync, spawnSync } from 'node:child_process';
+import { SKILLS_DIR, COMPONENTS_DIR, BIN_DIR, ENV_FILE } from '../lib/config.js';
 import { loadComponents, saveComponents, resolveTarget, loadTargetRegistryInfo, outputTask } from '../lib/components.js';
 import { acquireSource, resolveLocalPath } from '../lib/download.js';
 import { sha256File, isValidSha256Hex } from '../lib/checksum.js';
 import { generateManifest, saveMergeBaseline } from '../lib/manifest.js';
 import { parseSkillMd, detectComponentType } from '../lib/skill.js';
-import { linkBins } from '../lib/bin.js';
-import { applyCaddyRoutes } from '../lib/caddy.js';
+import { linkBins, unlinkBins } from '../lib/bin.js';
+import { applyCaddyRoutes, removeCaddyRoutes } from '../lib/caddy.js';
 import { promptYesNo, prompt, promptSecret } from '../lib/prompts.js';
 import { writeEnvEntries } from '../lib/env.js';
 import { hasConfigureHook, runConfigureHook } from '../lib/configure-hook.js';
 import { registerService } from '../lib/service.js';
+import { verifyTargetCapabilities } from '../lib/capability-compatibility.js';
+import { copyTree, syncTree } from '../lib/fs-utils.js';
 import { bold, dim, green, red, yellow, cyan, success, error, warn, heading } from '../lib/colors.js';
 
 function printManualCaddyRoutes(result) {
@@ -399,6 +403,25 @@ export async function addComponent(args) {
 
   if (!jsonOutput) console.log(`  ${success('Download complete.')}`);
 
+  // Capability requirements are a pre-install gate, not merely lifecycle
+  // documentation. Reject before npm, hooks, data directories, registration,
+  // routes, bins, or services can mutate the host.
+  const compatibility = verifyTargetCapabilities(skillDir);
+  if (compatibility.status === 'incompatible') {
+    const message = `Incompatible component: ${compatibility.errors.join('; ')}`;
+    cleanup(skillDir);
+    if (jsonOutput) {
+      console.log(JSON.stringify({
+        action: 'add', component: resolved.name, success: false,
+        error: 'incompatible_capabilities', message,
+        reply: `Failed to install ${resolved.name}: ${message}`,
+      }, null, 2));
+    } else {
+      console.error(error(message));
+    }
+    process.exit(1);
+  }
+
   // 8. Commit the authoritative install baseline (manifest + originals)
   try {
     const manifest = generateManifest(skillDir);
@@ -477,8 +500,27 @@ async function installDeclarative(resolved, skillDir, skipConfirm, jsonOutput, b
 
   // Step 2: Create data directory
   const dataDir = path.join(COMPONENTS_DIR, resolved.name);
+  const installStateSnapshot = hooks['post-install'] ? snapshotInstallData(dataDir) : null;
   fs.mkdirSync(dataDir, { recursive: true });
   if (!jsonOutput) console.log(`  ${dim('Data directory:')} ${dim(dataDir)}`);
+
+  // JSON mode is the mechanical install path used by agents. Execute the
+  // component's declared gate before registering the component or creating
+  // routes/bin links, so a rejected install has no committed state.
+  if (jsonOutput && hooks['post-install']) {
+    const hookResult = runStrictInstallHook(skillDir, hooks['post-install'], { jsonOutput });
+    if (!hookResult.success) {
+      cleanup(skillDir);
+      restoreInstallData(installStateSnapshot, dataDir);
+      console.log(JSON.stringify({
+        action: 'add', component: resolved.name, success: false,
+        error: 'post_install_failed', message: hookResult.error,
+        reply: `Failed to install ${resolved.name}: post-install hook rejected the installation.`,
+      }, null, 2));
+      process.exit(1);
+    }
+    discardInstallDataSnapshot(installStateSnapshot);
+  }
 
   // Step 3: Update components.json
   const components = loadComponents();
@@ -533,6 +575,11 @@ async function installDeclarative(resolved, skillDir, skipConfirm, jsonOutput, b
   // JSON mode: output metadata for Claude to handle
   if (jsonOutput) {
     const requiredConfig = config.required;
+    const pendingHooks = { ...hooks };
+    delete pendingHooks['post-install'];
+    const executedHooks = hooks['post-install']
+      ? { 'post-install': { hook: hooks['post-install'], status: 'done' } }
+      : null;
     let reply = branch
       ? `${resolved.name} installed (branch: ${branch})`
       : `${resolved.name} installed (v${componentVersion})`;
@@ -552,7 +599,8 @@ async function installDeclarative(resolved, skillDir, skipConfirm, jsonOutput, b
       skillDir,
       dataDir,
       skill: {
-        hooks: Object.keys(hooks).length > 0 ? hooks : null,
+        hooks: Object.keys(pendingHooks).length > 0 ? pendingHooks : null,
+        executedHooks,
         configure: configureHook ? {
           hook: configureHook,
           input: 'stdin_json',
@@ -628,19 +676,20 @@ async function installDeclarative(resolved, skillDir, skipConfirm, jsonOutput, b
 
   // Step 7: Run post-install hook
   if (hooks['post-install']) {
-    const hookPath = path.resolve(skillDir, hooks['post-install']);
-    if (fs.existsSync(hookPath)) {
-      console.log(`  ${cyan('Running post-install hook...')}`);
-      try {
-        execSync(`node "${hookPath}"`, {
-          cwd: skillDir,
-          stdio: 'inherit',
-        });
-        console.log(`  ${success('Post-install hook complete.')}`);
-      } catch {
-        console.log(`  ${warn('Post-install hook had issues (non-fatal).')}`);
-      }
+    console.log(`  ${cyan('Running post-install hook...')}`);
+    const hookResult = runStrictInstallHook(skillDir, hooks['post-install'], { jsonOutput: false });
+    if (!hookResult.success) {
+      delete components[resolved.name];
+      saveComponents(components);
+      if (binResult) unlinkBins(binResult);
+      if (caddyResult?.success) removeCaddyRoutes(resolved.name);
+      cleanup(skillDir);
+      restoreInstallData(installStateSnapshot, dataDir);
+      console.error(`  ${error(`Post-install hook failed: ${hookResult.error}`)}`);
+      process.exit(1);
     }
+    discardInstallDataSnapshot(installStateSnapshot);
+    console.log(`  ${success('Post-install hook complete.')}`);
   }
 
   // Step 8: Start service
@@ -669,6 +718,73 @@ async function installDeclarative(resolved, skillDir, skipConfirm, jsonOutput, b
     console.log(`\n${dim(`Note: Run the following to use ${bold(cmds)} in this terminal:`)}`);
     console.log(dim('  export PATH="$HOME/zylos/bin:$PATH"'));
     console.log(dim('Or restart your terminal for the change to take effect.'));
+  }
+}
+
+function runStrictInstallHook(skillDir, hookRef, { jsonOutput }) {
+  const hookPath = path.resolve(skillDir, hookRef);
+  const relativePath = path.relative(skillDir, hookPath);
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    return { success: false, error: `Hook path escapes component directory: ${hookRef}` };
+  }
+  if (!fs.existsSync(hookPath)) {
+    return { success: false, error: `Hook not found: ${hookRef}` };
+  }
+
+  const realSkillDir = fs.realpathSync(skillDir);
+  const realHookPath = fs.realpathSync(hookPath);
+  const realRelativePath = path.relative(realSkillDir, realHookPath);
+  if (realRelativePath.startsWith('..') || path.isAbsolute(realRelativePath)) {
+    return { success: false, error: `Hook path escapes component directory: ${hookRef}` };
+  }
+
+  const child = spawnSync(process.execPath, [hookPath], {
+    cwd: skillDir,
+    encoding: 'utf8',
+    stdio: jsonOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+    timeout: 300000,
+  });
+  if (child.error) return { success: false, error: `Hook failed to start: ${child.error.message}` };
+  if (child.status !== 0) {
+    const detail = child.stderr?.trim() || child.stdout?.trim() || `exit code ${child.status}`;
+    return { success: false, error: `post-install hook failed: ${detail}` };
+  }
+  return { success: true };
+}
+
+function snapshotInstallData(dataDir) {
+  const snapshotRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-add-data-'));
+  const backupDir = path.join(snapshotRoot, 'data');
+  const existed = fs.existsSync(dataDir);
+  if (existed) copyTree(dataDir, backupDir, { excludes: [] });
+  const envBackupPath = path.join(snapshotRoot, 'zylos.env');
+  const envExisted = fs.existsSync(ENV_FILE);
+  if (envExisted) fs.copyFileSync(ENV_FILE, envBackupPath);
+  return { snapshotRoot, backupDir, existed, envBackupPath, envExisted };
+}
+
+function restoreInstallData(snapshot, dataDir) {
+  if (!snapshot) return;
+  try {
+    if (snapshot.existed) {
+      syncTree(snapshot.backupDir, dataDir, { excludes: [] });
+    } else {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+    if (snapshot.envExisted) {
+      fs.mkdirSync(path.dirname(ENV_FILE), { recursive: true });
+      fs.copyFileSync(snapshot.envBackupPath, ENV_FILE);
+    } else {
+      fs.rmSync(ENV_FILE, { force: true });
+    }
+  } finally {
+    discardInstallDataSnapshot(snapshot);
+  }
+}
+
+function discardInstallDataSnapshot(snapshot) {
+  if (snapshot?.snapshotRoot) {
+    fs.rmSync(snapshot.snapshotRoot, { recursive: true, force: true });
   }
 }
 
