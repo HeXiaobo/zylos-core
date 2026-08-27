@@ -4,19 +4,12 @@ import { describe, it } from 'node:test';
 const { restartServicesWithDeps } = await import('../../commands/service.js');
 
 describe('restartServicesWithDeps', () => {
-  it('falls back only for the service that failed ecosystem restart', () => {
-    const ecosystemCalls = [];
+  it('routes every service through the managed online postcondition before saving', () => {
     const managedCalls = [];
     const execCalls = [];
     const messages = [];
 
     const ok = restartServicesWithDeps({
-      restartFromEcosystemFn: (names, opts) => {
-        ecosystemCalls.push({ names, opts });
-        if (names[0] === 'scheduler') {
-          throw new Error('bad ecosystem');
-        }
-      },
       restartManagedProcessFn: (name, opts) => {
         managedCalls.push({ name, opts });
       },
@@ -28,7 +21,7 @@ describe('restartServicesWithDeps', () => {
 
     assert.equal(ok, true);
     assert.deepStrictEqual(
-      ecosystemCalls.map((call) => call.names[0]),
+      managedCalls.map((call) => call.name),
       [
         'activity-monitor',
         'scheduler',
@@ -38,31 +31,23 @@ describe('restartServicesWithDeps', () => {
         'web-console',
       ],
     );
-    assert.deepStrictEqual(managedCalls, [{
-      name: 'scheduler',
-      opts: {
-        ecosystemPath: '/tmp/ecosystem.config.cjs',
-        stdio: 'inherit',
-        fallbackToPlainRestartOnError: true,
-      },
-    }]);
+    assert.equal(managedCalls.every((call) =>
+      call.opts.ecosystemPath === '/tmp/ecosystem.config.cjs'
+      && call.opts.stdio === 'inherit'
+      && call.opts.fallbackToPlainRestartOnError === true
+    ), true);
     assert.deepStrictEqual(execCalls, [{
       cmd: 'pm2 save 2>/dev/null',
       opts: { stdio: 'inherit' },
     }]);
-    assert.equal(messages.some((msg) => String(msg).includes('scheduler')), true);
+    assert.equal(messages.some((msg) => String(msg).includes('Services restarted')), true);
   });
 
-  it('persists already-restarted services before returning false on a later failure', () => {
+  it('keeps the prior PM2 dump when a later service fails its postcondition', () => {
     const execCalls = [];
     const messages = [];
 
     const ok = restartServicesWithDeps({
-      restartFromEcosystemFn: (names) => {
-        if (names[0] === 'web-console') {
-          throw new Error('ecosystem failed');
-        }
-      },
       restartManagedProcessFn: (name) => {
         if (name === 'web-console') {
           throw new Error('fallback failed');
@@ -75,10 +60,7 @@ describe('restartServicesWithDeps', () => {
     });
 
     assert.equal(ok, false);
-    assert.deepStrictEqual(execCalls, [{
-      cmd: 'pm2 save 2>/dev/null',
-      opts: { stdio: 'inherit' },
-    }]);
+    assert.deepStrictEqual(execCalls, []);
     assert.equal(messages.some((msg) => String(msg).includes('Failed to restart services')), true);
   });
 });

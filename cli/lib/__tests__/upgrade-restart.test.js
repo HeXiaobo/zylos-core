@@ -176,16 +176,16 @@ describe('step8_startService', () => {
     fs.writeFileSync(path.join(skillDir, 'ecosystem.config.cjs'), 'module.exports = { apps: [] };\n', 'utf8');
 
     const calls = [];
+    let restartAttempts = 0;
     const result = step8_startService({
       component: 'demo',
       skillDir,
       serviceWasRunning: true,
     }, {
-      restartManagedProcess: () => {
-        throw new Error('process missing');
-      },
-      restartFromEcosystem: (names, opts) => {
-        calls.push({ type: 'ecosystem', names, opts });
+      restartManagedProcess: (name, opts) => {
+        restartAttempts += 1;
+        calls.push({ type: 'managed', name, opts });
+        if (restartAttempts === 1) throw new Error('process missing');
       },
       execSync: (cmd) => {
         calls.push({ type: 'exec', cmd });
@@ -194,7 +194,7 @@ describe('step8_startService', () => {
     });
 
     assert.equal(result.status, 'done');
-    assert.equal(calls.some((call) => call.type === 'ecosystem' && call.names[0] === 'zylos-demo'), true);
+    assert.equal(calls.filter((call) => call.type === 'managed' && call.name === 'zylos-demo').length, 2);
     assert.equal(calls.some((call) => call.type === 'exec' && call.cmd === 'pm2 start zylos-demo 2>/dev/null'), false);
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -217,9 +217,6 @@ describe('step8_startService', () => {
       restartManagedProcess: (name, opts) => {
         calls.push({ name, opts });
       },
-      restartFromEcosystem: () => {
-        throw new Error('should not reach ecosystem fallback on the happy path');
-      },
       existsSync: (file) => file === ecosystemPath,
     });
 
@@ -240,29 +237,65 @@ describe('step8_startService', () => {
     fs.writeFileSync(path.join(skillDir, 'SKILL.md'), `---\nname: demo\nlifecycle:\n  service:\n    name: zylos-demo\n---\n`, 'utf8');
     fs.writeFileSync(ecosystemPath, 'module.exports = { apps: [] };\n', 'utf8');
 
-    const ecosystemCalls = [];
+    const restartCalls = [];
+    let restartAttempts = 0;
     const result = step8_startService({
       component: 'demo',
       skillDir,
       serviceWasRunning: true,
     }, {
-      restartManagedProcess: () => {
-        throw new Error('process missing');
-      },
-      restartFromEcosystem: (names, opts) => {
-        ecosystemCalls.push({ names, opts });
+      restartManagedProcess: (name, opts) => {
+        restartAttempts += 1;
+        restartCalls.push({ name, opts });
+        if (restartAttempts === 1) throw new Error('process missing');
       },
       execSync: () => {},
       existsSync: (file) => file === ecosystemPath,
     });
 
     assert.equal(result.status, 'done');
-    assert.deepStrictEqual(ecosystemCalls, [{
-      names: ['zylos-demo'],
-      opts: { ecosystemPath, stdio: 'pipe', save: true },
-    }]);
+    assert.deepStrictEqual(restartCalls, [
+      { name: 'zylos-demo', opts: { ecosystemPath, stdio: 'pipe', save: true } },
+      { name: 'zylos-demo', opts: { ecosystemPath, stdio: 'pipe', save: true } },
+    ]);
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('fails a component restart when ecosystem start is a zero-exit no-op', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-step8-noop-'));
+    const skillDir = path.join(tmpDir, 'demo');
+    const binDir = path.join(tmpDir, 'bin');
+    const ecosystemPath = path.join(skillDir, 'ecosystem.config.cjs');
+    const logPath = path.join(tmpDir, 'pm2.log');
+    const statePath = path.join(tmpDir, 'worker.status');
+    const pm2Path = path.join(binDir, 'pm2');
+    const originalPath = process.env.PATH;
+
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), `---\nname: demo\nlifecycle:\n  service:\n    name: zylos-demo\n---\n`, 'utf8');
+    fs.writeFileSync(ecosystemPath, 'module.exports = { apps: [] };\n', 'utf8');
+    fs.writeFileSync(statePath, 'stopped\n', 'utf8');
+    fs.writeFileSync(pm2Path, `#!/bin/sh\necho "$@" >> "${logPath}"\nif [ "$1" = "delete" ]; then echo missing > "${statePath}"; fi\nif [ "$1" = "jlist" ]; then status=$(cat "${statePath}"); if [ "$status" = "missing" ]; then echo '[]'; else echo "[{\\"name\\":\\"zylos-demo\\",\\"pm_id\\":31,\\"pm2_env\\":{\\"status\\":\\"$status\\"}}]"; fi; fi\n`, { mode: 0o755 });
+    process.env.PATH = `${binDir}:${originalPath}`;
+
+    try {
+      const result = step8_startService({
+        component: 'demo',
+        skillDir,
+        serviceWasRunning: true,
+      });
+
+      const log = fs.readFileSync(logPath, 'utf8');
+      assert.equal(result.status, 'failed');
+      assert.equal((log.match(/^start .*--only zylos-demo/gm) || []).length, 2);
+      assert.match(log, /^delete zylos-demo$/m);
+      assert.doesNotMatch(log, /^save$/m);
+    } finally {
+      process.env.PATH = originalPath;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -556,6 +589,50 @@ describe('step11_startCoreServices', () => {
       assert.match(fs.readFileSync(logPath, 'utf8'), /^jlist$/m);
       assert.doesNotMatch(fs.readFileSync(logPath, 'utf8'), /^env activity-monitor$/m);
       assert.match(fs.readFileSync(logPath, 'utf8'), /save/);
+    } finally {
+      process.env.PATH = originalPath;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reactivates a stopped worker that is not declared by the core ecosystem', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-step11-component-worker-'));
+    const binDir = path.join(tmpDir, 'bin');
+    const logPath = path.join(tmpDir, 'pm2.log');
+    const statePath = path.join(tmpDir, 'worker.status');
+    const ecosystemPath = path.join(tmpDir, 'ecosystem.config.cjs');
+    const pm2Path = path.join(binDir, 'pm2');
+    const originalPath = process.env.PATH;
+
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(ecosystemPath, 'module.exports = { apps: [] };\n', 'utf8');
+    fs.writeFileSync(statePath, 'stopped\n', 'utf8');
+    fs.writeFileSync(pm2Path, `#!/bin/sh\necho "$@" >> "${logPath}"\nif [ "$1" = "restart" ] && [ "$2" = "zylos-feishu-task-comments" ]; then echo online > "${statePath}"; fi\nif [ "$1" = "jlist" ]; then status=$(cat "${statePath}"); echo "[{\\"name\\":\\"zylos-feishu-task-comments\\",\\"pm_id\\":30,\\"pm2_env\\":{\\"status\\":\\"$status\\"}}]"; fi\n`, { mode: 0o755 });
+
+    process.env.PATH = `${binDir}:${originalPath}`;
+
+    try {
+      const result = step11_startCoreServices({
+        tempDir: null,
+        servicesWereRunning: ['zylos-feishu-task-comments'],
+        cronServicesWereRunning: [],
+      }, {
+        fs: {
+          existsSync: (file) => file === ecosystemPath,
+          mkdirSync: () => {},
+          copyFileSync: () => {},
+        },
+        ecosystemPath,
+        requiredCoreServices: [],
+      });
+
+      const log = fs.readFileSync(logPath, 'utf8');
+      assert.equal(result.status, 'done');
+      assert.match(log, /start .*ecosystem\.config\.cjs.*--only zylos-feishu-task-comments/);
+      assert.equal((log.match(/^jlist$/gm) || []).length, 2);
+      assert.match(log, /^restart zylos-feishu-task-comments$/m);
+      assert.match(log, /^save$/m);
+      assert.equal(fs.readFileSync(statePath, 'utf8').trim(), 'online');
     } finally {
       process.env.PATH = originalPath;
       fs.rmSync(tmpDir, { recursive: true, force: true });

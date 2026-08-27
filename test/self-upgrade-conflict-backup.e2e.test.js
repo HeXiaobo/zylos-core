@@ -127,6 +127,7 @@ describe('self-upgrade durable conflict backups (#717)', () => {
         { action: 'restore_global_core_package', success: true },
         { action: 'restore_core_skills', success: true },
         { action: 'restart_fixture-service', success: true },
+        { action: 'save_pm2_rollback_state', success: true },
       ],
     });
     expect(globalCoreVersion).toBe('0.5.3');

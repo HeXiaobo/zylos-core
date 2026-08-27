@@ -5,6 +5,21 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-rc.12] - 2026-08-27
+
+### Fixed
+- Self-upgrade now detects when `pm2 start ecosystem --only <service>` exits
+  successfully without starting a service that is absent from the ecosystem.
+  Existing component workers are reactivated through their cached PM2
+  definition and must read back as online before step 11 can succeed. Missing
+  status, inspection failures, failed cached restarts, and workers that remain
+  stopped now fail closed before the PM2 dump is saved.
+- Component upgrades and `zylos service restart` now use the same managed
+  online postcondition; a zero-exit ecosystem no-op cannot be reported or
+  persisted as success.
+- Self-upgrade rollback now saves the restored PM2 state after reactivating
+  baseline services, including failures that introduced no target-only process.
+
 ## [0.7.2-rc.11] - 2026-08-27
 
 ### Fixed

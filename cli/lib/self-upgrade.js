@@ -1814,6 +1814,7 @@ export function rollbackSelf(ctx, deps = {}) {
 
   // Restart services if they were running
   const scheduledServices = new Set(ctx.cronServicesWereRunning || []);
+  let restartedBaselineService = false;
   for (const name of ctx.servicesWereRunning || []) {
     try {
       if (scheduledServices.has(name)) {
@@ -1825,6 +1826,7 @@ export function rollbackSelf(ctx, deps = {}) {
           fallbackToPlainRestartOnError: true,
         });
       }
+      restartedBaselineService = true;
       results.push({ action: `restart_${name}`, success: true });
     } catch (err) {
       results.push({ action: `restart_${name}`, success: false, error: err.message });
@@ -1834,7 +1836,7 @@ export function rollbackSelf(ctx, deps = {}) {
   // Persist only after the baseline services have been restarted. Otherwise
   // a reboot could resurrect the removed target-only process from the PM2 dump
   // or retain a snapshot in which baseline services are still stopped.
-  if (removedTargetOnlyService) {
+  if (removedTargetOnlyService || restartedBaselineService) {
     try {
       savePm2Fn();
       results.push({ action: 'save_pm2_rollback_state', success: true });

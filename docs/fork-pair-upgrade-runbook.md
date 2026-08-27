@@ -280,7 +280,7 @@ Core `0.7.2-rc.10` 的 `scripts/run-node-tests.js` 不再信任调用者是否�
 
 SS 在一次成功升级后发现项目级业务 Skill 目录缺失。现有证据只能证明缺失发生在
 升级窗口附近，不能证明具体删除源码路径；因此事故根因保持 `EVIDENCE_GAP`，不得
-把时间相关性写成已证实机制。Core `0.7.2-rc.11` 在任何 live mutation 前扫描当前
+把时间相关性写成已证实机制。Core `0.7.2-rc.12` 在任何 live mutation 前扫描当前
 skills root，逐顶层目录记录归属、文件数、`SKILL.md`、`scripts/`、脚本数及
 frontmatter 声明入口，并在事务备份完成后用同一口径复扫。备份少一个目录、文件数
 不等或关键入口缺失，升级在同步前失败。
@@ -305,6 +305,17 @@ tmp 顶层，且 path/realpath/dev/ino/mtime、非 symlink 目录和 zylos packa
 public Core command 修复，必须带 owner/acceptor actor、正整数 expected version、
 非负 minutes-before-due 与稳定 idempotency key。禁止用 SQLite 直写伪造 receipt 或
 projection event。
+
+`rc.11` 首次执行还暴露了一处 PM2 假成功：三个已经登记但不在 Core ecosystem 中的
+飞书任务 worker 被 stop 后，`pm2 start ecosystem --only <name>` 以 0 退出却没有拉起
+进程，step 11 因而误报成功，step 12 等待 30 秒后回滚。`rc.12` 在 ecosystem 启动后
+立即读取该进程状态；若仍非 online，则使用原 PM2 缓存定义精确 restart，并再次回读
+为 online 后才允许 step 11 保存 PM2 dump。状态读取失败、进程缺失、cached restart
+失败或二次仍 stopped 都必须 fail closed。随后 step 12 继续校验 executable、online
+与 unstable restart。失败回滚重新拉起 baseline 服务后也必须重新 `pm2 save`，即使
+本次升级没有引入 target-only process。回归测试必须同时覆盖 helper、完整 step 11
+、component upgrade、`zylos service restart` 和 baseline-only rollback 路径。所有
+入口只能在全部目标回读 online 后保存 PM2 dump；禁止靠延长 30 秒超时掩盖此类 no-op。
 
 SS 业务技能恢复采用冻结观察集而非“全量缺失”口径：当前观察集为 7 个名字，其中
 5 个已通过 verify/dry-run/execute 并回读为 `ALREADY_EXACT`，2 个因源不完整保持
@@ -469,7 +480,7 @@ curl -fsSL \
   | bash -s -- \
       --core-sha "${CORE_SHA}" \
       --feishu-sha "${FEISHU_SHA}" \
-      --core-version '0.7.2-rc.11' \
+      --core-version '0.7.2-rc.12' \
       --feishu-version '0.3.7-rc.7' \
       --agent '<agent-id>' \
       --execute

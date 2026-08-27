@@ -20,7 +20,7 @@ import { fetchLatestTag, fetchRawFile, compareSemverDesc, sanitizeError } from '
 import { copyTree, syncTree } from './fs-utils.js';
 import { applyCaddyRoutes, removeCaddyRoutes } from './caddy.js';
 import { smartSync, formatMergeResult } from './smart-merge.js';
-import { restartFromEcosystem, restartManagedProcess } from './pm2.js';
+import { restartManagedProcess } from './pm2.js';
 import { verifyTargetCapabilities } from './capability-compatibility.js';
 import {
   abortUpgradeMetadataTransaction,
@@ -755,7 +755,6 @@ export function step8_startService(ctx, deps = {}) {
   const exec = deps.execSync ?? execSync;
   const exists = deps.existsSync ?? fs.existsSync;
   const restartManaged = deps.restartManagedProcess ?? restartManagedProcess;
-  const restartViaEcosystem = deps.restartFromEcosystem ?? restartFromEcosystem;
 
   if (!ctx.serviceWasRunning) {
     return { step: 9, name: 'start_service', status: 'skipped', message: 'was not running', duration: Date.now() - startTime };
@@ -776,7 +775,7 @@ export function step8_startService(ctx, deps = {}) {
         throw new Error(`ecosystem config not found: ${ecosystemPath}`);
       }
       try { exec(`pm2 delete "${serviceName}" 2>/dev/null`, { stdio: 'pipe' }); } catch {}
-      restartViaEcosystem([serviceName], { ecosystemPath, stdio: 'pipe', save: true });
+      restartManaged(serviceName, { ecosystemPath, stdio: 'pipe', save: true });
       return { step: 9, name: 'start_service', status: 'done', message: `${serviceName} (restarted from ecosystem)`, duration: Date.now() - startTime };
     } catch {
       return { step: 9, name: 'start_service', status: 'failed', error: `Failed to restart ${serviceName}`, duration: Date.now() - startTime };

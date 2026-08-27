@@ -1101,6 +1101,26 @@ describe('self-upgrade backup and rollback', () => {
     assert.equal(results.some((item) => item.action === 'save_pm2_rollback_state' && item.success), true);
   });
 
+  it('saves rollback state after reactivating baseline services', () => {
+    const calls = [];
+
+    const results = rollbackSelf({
+      servicesWereRunning: ['activity-monitor'],
+      servicesStartedByUpgrade: [],
+    }, {
+      restartManagedProcess: (name) => calls.push(`restart:${name}`),
+      savePm2: () => calls.push('save'),
+    });
+
+    assert.deepStrictEqual(calls, [
+      'restart:activity-monitor',
+      'save',
+    ]);
+    assert.equal(results.some((item) =>
+      item.action === 'save_pm2_rollback_state' && item.success
+    ), true);
+  });
+
   it('reactivates a baseline cron one-shot with its preserved PM2 definition during rollback', () => {
     const calls = [];
 

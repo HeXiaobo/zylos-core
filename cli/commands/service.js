@@ -10,7 +10,7 @@ import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../lib/config.js';
 import { bold, dim, green, red, yellow, cyan, success, error, warn, heading } from '../lib/colors.js';
 import { commandExists } from '../lib/shell-utils.js';
 import { getActiveAdapter } from '../lib/runtime/index.js';
-import { getCoreEcosystemPath, restartFromEcosystem, restartManagedProcess } from '../lib/pm2.js';
+import { getCoreEcosystemPath, restartManagedProcess } from '../lib/pm2.js';
 
 const CORE_SERVICE_NAMES = [
   'activity-monitor',
@@ -35,7 +35,6 @@ function buildPm2EnvFlags(envString) {
 }
 
 export function restartServicesWithDeps({
-  restartFromEcosystemFn = restartFromEcosystem,
   restartManagedProcessFn = restartManagedProcess,
   getCoreEcosystemPathFn = getCoreEcosystemPath,
   execSyncFn = execSync,
@@ -44,40 +43,25 @@ export function restartServicesWithDeps({
 } = {}) {
   const services = CORE_SERVICE_NAMES;
   const ecosystemPath = getCoreEcosystemPathFn();
-  const fallbackServices = [];
-  let saveNeeded = false;
 
   for (const name of services) {
     try {
-      restartFromEcosystemFn([name], { ecosystemPath, stdio: 'inherit' });
-      saveNeeded = true;
+      restartManagedProcessFn(name, {
+        ecosystemPath,
+        stdio: 'inherit',
+        fallbackToPlainRestartOnError: true,
+      });
     } catch {
-      try {
-        restartManagedProcessFn(name, {
-          ecosystemPath,
-          stdio: 'inherit',
-          fallbackToPlainRestartOnError: true,
-        });
-        fallbackServices.push(name);
-        saveNeeded = true;
-      } catch {
-        if (saveNeeded) {
-          execSyncFn('pm2 save 2>/dev/null', { stdio: 'inherit' });
-        }
-        logError(error('Failed to restart services'));
-        return false;
-      }
+      // Keep the prior PM2 dump intact when any service fails its online
+      // postcondition. The successfully restarted services remain live, but a
+      // reboot still has the last fully verified process set.
+      logError(error('Failed to restart services'));
+      return false;
     }
   }
 
-  if (saveNeeded) {
-    execSyncFn('pm2 save 2>/dev/null', { stdio: 'inherit' });
-  }
-  if (fallbackServices.length > 0) {
-    logSuccess(success(`Services restarted. Plain PM2 fallback used for: ${fallbackServices.join(', ')}.`));
-  } else {
-    logSuccess(success('Services restarted.'));
-  }
+  execSyncFn('pm2 save 2>/dev/null', { stdio: 'inherit' });
+  logSuccess(success('Services restarted.'));
   return true;
 }
 
