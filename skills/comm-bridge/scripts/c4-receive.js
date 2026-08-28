@@ -673,6 +673,10 @@ async function main() {
   let route;
   let taskIntake = null;
   let taskRecord = null;
+  const isWorkIntakeTask = (
+    workIntakeEnvelope !== null
+    && workIntakeDecision?.decision === 'create_task'
+  ) || workIntakeConfirmation?.action === 'create_task';
   const workIntakeSuccessDetails = (replayed) => {
     if (workIntakeConfirmation) {
       return {
@@ -700,7 +704,10 @@ async function main() {
           channel,
           endpointId: replyEndpoint,
           content,
-          status: 'pending',
+          // A WorkIntake task is consumed by the durable intake queue. Mark
+          // its audit conversation delivered before routing so a crash after
+          // the queue commit cannot hand the same request to the Agent.
+          status: isWorkIntakeTask ? 'delivered' : 'pending',
           priority,
           requireIdle,
         },
@@ -736,7 +743,13 @@ async function main() {
     route = await queryRoute(channel, endpoint, noReply);
   }
 
-  const dbStatus = route.recovered ? 'pending' : 'delivered';
+  // WorkIntake task envelopes already have a durable Core intake. Their
+  // conversation is only the audit record for that protocol, not another
+  // Agent turn. Leaving it pending would make the dispatcher deliver the same
+  // natural-language request to the task skill and create a second task.
+  const dbStatus = isWorkIntakeTask
+    ? 'delivered'
+    : route.recovered ? 'pending' : 'delivered';
   let cooldown = null;
   const recordInbound = (storedContent, deliveryAction = null) => {
     if (taskRecord) {
