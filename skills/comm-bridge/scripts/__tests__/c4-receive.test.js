@@ -302,6 +302,95 @@ describe('c4-receive basic intake', () => {
     });
   });
 
+  it('does not re-deliver a WorkIntake task to the Agent after healthy routing', async () => {
+    await withTmpDirAsync(async ({ tmpDir, env }) => {
+      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
+      const envelope = {
+        source: {
+          channel: 'feishu',
+          messageId: 'om_work_intake_dedup',
+          conversationId: 'oc_work_intake_dedup',
+          conversationType: 'direct',
+          threadId: null,
+        },
+        sender: { id: 'ou_owner', kind: 'human' },
+        text: '请玥然在周五前整理 A 客户的跟进记录',
+        intentRevision: 1,
+        receivedAt: '2026-08-25T02:00:00.000Z',
+        timeZone: 'Asia/Shanghai',
+        people: [],
+      };
+      const workIntakeEnv = {
+        ...env,
+        ZYLOS_AGENT_ID: 'agent:yueran',
+        ZYLOS_AGENT_ALIASES: '["玥然"]',
+      };
+      let conversationDuringRoute = null;
+
+      await withRouteServer(tmpDir, (request) => {
+        const db = openDb(tmpDir);
+        conversationDuringRoute = db.prepare(`
+          SELECT status, delivery_action
+          FROM conversations
+          ORDER BY id DESC
+          LIMIT 1
+        `).get();
+        db.close();
+        return {
+          version: 1,
+          requestId: request.requestId,
+          recovered: true,
+          health: 'ok',
+        };
+      }, async () => {
+        const result = await cliRawAsync([
+          '--channel', 'feishu',
+          '--endpoint', 'oc_work_intake_dedup|type:p2p|msg:om_work_intake_dedup',
+          '--json',
+          '--work-intake-envelope-json', JSON.stringify(envelope),
+          '--assistant-request-id', 'assistant.feishu.work-intake-dedup',
+          '--assistant-source-id', 'om_work_intake_dedup',
+          '--content', `[Feishu DM] Sender said: ${envelope.text}`,
+        ], workIntakeEnv);
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = parseJsonStdout(result.stdout);
+        assert.equal(output.workIntake.decision, 'create_task');
+        assert.deepEqual(conversationDuringRoute, {
+          status: 'delivered',
+          delivery_action: null,
+        });
+
+        const db = openDb(tmpDir);
+        const conversation = db.prepare(`
+          SELECT status, delivery_action
+          FROM conversations
+          WHERE id = ?
+        `).get(Number(output.id));
+        const pendingConversations = db.prepare(`
+          SELECT count(*) AS count
+          FROM conversations
+          WHERE direction = 'in' AND status = 'pending'
+        `).get().count;
+        const intakeCount = db.prepare(
+          'SELECT count(*) AS count FROM commitment_intake_queue',
+        ).get().count;
+        const assistantRequestCount = db.prepare(
+          'SELECT count(*) AS count FROM assistant_requests',
+        ).get().count;
+        db.close();
+
+        assert.deepEqual(conversation, {
+          status: 'delivered',
+          delivery_action: null,
+        });
+        assert.equal(pendingConversations, 0);
+        assert.equal(intakeCount, 1);
+        assert.equal(assistantRequestCount, 0);
+      });
+    });
+  });
+
   it('replays the same task envelope without a second conversation', () => {
     withTmpDir(({ tmpDir, env }) => {
       fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
