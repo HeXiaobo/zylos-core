@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.18] - 2026-08-29
+
+### Fixed
+- `upgrade --mode merge` now validates every JavaScript file in the merged
+  tree with `node --check` before restarting services. Syntax failures report
+  the file, line, duplicate identifier when available, and raw diagnostic,
+  then restore the pre-merge baseline without restarting.
+
 ## [0.7.2-rc.17] - 2026-08-29
 
 ### Fixed
