@@ -21,7 +21,7 @@ function writeSkill(dir, { version, payload, lifecycle = '' }) {
   fs.writeFileSync(path.join(dir, 'payload.txt'), `${payload}\n`, 'utf8');
   fs.writeFileSync(
     path.join(dir, 'package.json'),
-    JSON.stringify({ name: 'demo', version }, null, 2),
+    JSON.stringify({ name: 'demo', version, type: 'module' }, null, 2),
     'utf8',
   );
 }

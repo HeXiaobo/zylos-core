@@ -41,9 +41,9 @@ function installV1(name) {
   const dest = path.join(skillsDir, name);
   const source = mkTmp();
   writeFile(source, 'a.js', 'v1');
-  writeFile(source, 'package.json', JSON.stringify({ name, version: '1.0.0' }));
+  writeFile(source, 'package.json', JSON.stringify({ name, version: '1.0.0', type: 'module' }));
   writeFile(dest, 'a.js', 'v1');
-  writeFile(dest, 'package.json', JSON.stringify({ name, version: '1.0.0' }));
+  writeFile(dest, 'package.json', JSON.stringify({ name, version: '1.0.0', type: 'module' }));
   saveMergeBaseline(dest, source, generateManifest(source));
   return dest;
 }
@@ -51,7 +51,7 @@ function installV1(name) {
 function makeV2(name) {
   const source = mkTmp();
   writeFile(source, 'a.js', 'v2');
-  writeFile(source, 'package.json', JSON.stringify({ name, version: '2.0.0' }));
+  writeFile(source, 'package.json', JSON.stringify({ name, version: '2.0.0', type: 'module' }));
   return source;
 }
 

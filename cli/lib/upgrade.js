@@ -20,6 +20,7 @@ import { fetchLatestTag, fetchRawFile, compareSemverDesc, sanitizeError } from '
 import { copyTree, syncTree } from './fs-utils.js';
 import { applyCaddyRoutes, removeCaddyRoutes } from './caddy.js';
 import { smartSync, formatMergeResult } from './smart-merge.js';
+import { checkJavaScriptSyntax } from './syntax-check.js';
 import { restartManagedProcess } from './pm2.js';
 import { verifyTargetCapabilities } from './capability-compatibility.js';
 import {
@@ -600,6 +601,7 @@ function createContext(component, {
     mergeAdded: [],
     mergeDeleted: [],
     mergePreserved: [],
+    syntaxCheck: null,
     // Results
     steps: [],
     from: null,
@@ -781,7 +783,43 @@ function step4_smartMerge(ctx) {
 
     ctx.nextManifest = mergeResult.nextManifest;
 
-    return { step: 4, name: 'smart_merge', status: 'done', message: msg, duration: Date.now() - startTime };
+    ctx.syntaxCheck = ctx.mode === 'merge'
+      ? checkJavaScriptSyntax(ctx.skillDir)
+      : {
+        status: 'SKIPPED',
+        checkedFiles: [],
+        failures: [],
+        reason: 'syntax validation applies to merge mode only',
+      };
+    if (ctx.syntaxCheck.status === 'UNMEASURABLE') {
+      return {
+        step: 4,
+        name: 'smart_merge',
+        status: 'failed',
+        error: `UNMEASURABLE: ${ctx.syntaxCheck.reason}`,
+        syntaxCheck: ctx.syntaxCheck,
+        duration: Date.now() - startTime,
+      };
+    }
+    if (ctx.syntaxCheck.status === 'FAIL') {
+      return {
+        step: 4,
+        name: 'smart_merge',
+        status: 'failed',
+        error: ctx.syntaxCheck.error,
+        syntaxCheck: ctx.syntaxCheck,
+        duration: Date.now() - startTime,
+      };
+    }
+
+    return {
+      step: 4,
+      name: 'smart_merge',
+      status: 'done',
+      message: msg,
+      syntaxCheck: ctx.syntaxCheck,
+      duration: Date.now() - startTime,
+    };
   } catch (err) {
     return { step: 4, name: 'smart_merge', status: 'failed', error: `Merge failed: ${err.message}`, duration: Date.now() - startTime };
   }
@@ -1389,6 +1427,7 @@ export function runUpgrade(component, {
         mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
         mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
         mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
+        syntaxCheck: ctx.syntaxCheck,
       };
     }
     const rollbackNeeded = ctx.serviceStopped || ctx.serviceTransitionAttempted || ctx.mutationStarted;
@@ -1441,6 +1480,7 @@ export function runUpgrade(component, {
       mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
       mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
       mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
+      syntaxCheck: ctx.syntaxCheck,
     };
   }
 
@@ -1493,6 +1533,7 @@ export function runUpgrade(component, {
       mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
       mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
       mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
+      syntaxCheck: ctx.syntaxCheck,
     };
   } catch (err) {
     return {
@@ -1523,6 +1564,7 @@ export function runUpgrade(component, {
       mergeAdded: ctx.mergeAdded.length > 0 ? ctx.mergeAdded : null,
       mergeDeleted: ctx.mergeDeleted.length > 0 ? ctx.mergeDeleted : null,
       mergePreserved: ctx.mergePreserved.length > 0 ? ctx.mergePreserved : null,
+      syntaxCheck: ctx.syntaxCheck,
     };
   }
 }
