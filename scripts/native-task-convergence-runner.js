@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -28,12 +29,28 @@ class RunnerError extends Error {
 }
 
 function atomicWriteJson(filePath, value) {
-  const temporary = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  });
-  fs.renameSync(temporary, filePath);
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(12).toString('hex')}`;
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  try {
+    let fileHandle = null;
+    try {
+      fileHandle = fs.openSync(temporary, 'wx', 0o600);
+      fs.writeFileSync(fileHandle, content, 'utf8');
+      fs.fsyncSync(fileHandle);
+    } finally {
+      if (fileHandle !== null) fs.closeSync(fileHandle);
+    }
+    fs.renameSync(temporary, filePath);
+    const directoryHandle = fs.openSync(path.dirname(filePath), 'r');
+    try {
+      fs.fsyncSync(directoryHandle);
+    } finally {
+      fs.closeSync(directoryHandle);
+    }
+  } catch (error) {
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 function readJson(filePath, field) {

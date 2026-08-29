@@ -118,9 +118,28 @@ function commandIdentityMatches(identity, step) {
 }
 
 function atomicWriteJson(filePath, value, fsApi = fs) {
-  const temporary = `${filePath}.${process.pid}.tmp`;
-  fsApi.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  fsApi.renameSync(temporary, filePath);
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(12).toString('hex')}`;
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  try {
+    let fileHandle = null;
+    try {
+      fileHandle = fsApi.openSync(temporary, 'wx', 0o600);
+      fsApi.writeFileSync(fileHandle, content, 'utf8');
+      fsApi.fsyncSync(fileHandle);
+    } finally {
+      if (fileHandle !== null) fsApi.closeSync(fileHandle);
+    }
+    fsApi.renameSync(temporary, filePath);
+    const directoryHandle = fsApi.openSync(path.dirname(filePath), 'r');
+    try {
+      fsApi.fsyncSync(directoryHandle);
+    } finally {
+      fsApi.closeSync(directoryHandle);
+    }
+  } catch (error) {
+    try { fsApi.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 function parseArgs(argv) {
