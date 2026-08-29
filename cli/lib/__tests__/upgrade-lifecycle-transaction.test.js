@@ -11,7 +11,7 @@ const { runUpgrade } = await import(new URL('../upgrade.js', import.meta.url));
 
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-function writeSkill(dir, { version, payload, lifecycle = '' }) {
+function writeSkill(dir, { version, payload, lifecycle = '', packageType = null }) {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, 'SKILL.md'),
@@ -19,6 +19,13 @@ function writeSkill(dir, { version, payload, lifecycle = '' }) {
     'utf8',
   );
   fs.writeFileSync(path.join(dir, 'payload.txt'), `${payload}\n`, 'utf8');
+  if (packageType) {
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
+      name: path.basename(dir),
+      version,
+      type: packageType,
+    }), 'utf8');
+  }
 }
 
 test('a failing target pre-upgrade hook leaves installed files and service untouched', () => {
@@ -85,6 +92,7 @@ test('a failing post-upgrade hook rolls installed files back to the previous rel
   writeSkill(targetDir, {
     version: '2.0.0',
     payload: 'new',
+    packageType: 'module',
     lifecycle: 'lifecycle:\n  hooks:\n    post-upgrade: hooks/post-upgrade.js\n',
   });
   fs.mkdirSync(path.join(targetDir, 'hooks'), { recursive: true });
@@ -129,6 +137,7 @@ test('post-upgrade rollback restores component data changed by the rejected hook
   writeSkill(targetDir, {
     version: '2.0.0',
     payload: 'new',
+    packageType: 'module',
     lifecycle: 'lifecycle:\n  hooks:\n    post-upgrade: hooks/post-upgrade.js\n',
   });
   fs.mkdirSync(path.join(targetDir, 'hooks'), { recursive: true });
@@ -175,6 +184,7 @@ test('post-upgrade rollback returns a previously online service to running state
   writeSkill(targetDir, {
     version: '2.0.0',
     payload: 'new',
+    packageType: 'module',
     lifecycle: `${serviceLifecycle}  hooks:\n    post-upgrade: hooks/post-upgrade.js\n`,
   });
   fs.mkdirSync(path.join(targetDir, 'hooks'), { recursive: true });
