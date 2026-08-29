@@ -189,12 +189,24 @@ function openDatabase(dbPath) {
       channel TEXT NOT NULL,
       endpoint_id TEXT,
       content TEXT NOT NULL,
+      assistant_request_id TEXT,
       status TEXT DEFAULT 'pending',
       delivery_action TEXT,
       priority INTEGER DEFAULT 3,
       require_idle INTEGER DEFAULT 0,
       retry_count INTEGER DEFAULT 0
     );
+  `);
+  const conversationColumns = new Set(
+    database.prepare('PRAGMA table_info(conversations)').all().map(column => column.name),
+  );
+  if (!conversationColumns.has('assistant_request_id')) {
+    database.exec('ALTER TABLE conversations ADD COLUMN assistant_request_id TEXT');
+  }
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_assistant_request_out
+      ON conversations(assistant_request_id)
+      WHERE direction = 'out' AND assistant_request_id IS NOT NULL
   `);
   return { database, ownsDatabase: true };
 }
@@ -523,6 +535,41 @@ export function openAssistantResponseStream({
       )
     );
     return valid ? candidate : null;
+  }
+
+  function recordTerminalOutbound(request, {
+    content,
+    status,
+    deliveryAction,
+  }) {
+    const existing = database.prepare(`
+      SELECT id, direction, channel, endpoint_id, content, status,
+             delivery_action, assistant_request_id
+      FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = ?
+      LIMIT 1
+    `).get(request.request_id);
+    if (existing) return existing;
+
+    const inserted = database.prepare(`
+      INSERT INTO conversations (
+        direction, channel, endpoint_id, content, status, delivery_action,
+        priority, require_idle, assistant_request_id
+      ) VALUES ('out', ?, ?, ?, ?, ?, 3, 0, ?)
+    `).run(
+      request.route_channel,
+      request.route_endpoint,
+      content,
+      status,
+      deliveryAction,
+      request.request_id,
+    );
+    return database.prepare(`
+      SELECT id, direction, channel, endpoint_id, content, status,
+             delivery_action, assistant_request_id
+      FROM conversations
+      WHERE id = ?
+    `).get(Number(inserted.lastInsertRowid));
   }
 
   const acceptTransaction = database.transaction(command => {
@@ -1304,6 +1351,11 @@ export function openAssistantResponseStream({
           'consumed',
           'CANONICAL_RUN_COMPLETED',
         );
+        recordTerminalOutbound(request, {
+          content: output,
+          status: 'delivered',
+          deliveryAction: 'assistant-response',
+        });
         return {
           request: toRequest(selectRequest.get(requestId)),
           events: emitted,
@@ -1369,6 +1421,11 @@ export function openAssistantResponseStream({
           'invalidated',
           code,
         );
+        recordTerminalOutbound(request, {
+          content: '',
+          status: 'failed',
+          deliveryAction: `assistant-response-failed:${code}`,
+        });
         return {
           request: toRequest(selectRequest.get(request.request_id)),
           events: [failed.event],

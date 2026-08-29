@@ -67,6 +67,11 @@ fs.writeFileSync(path.join(process.env.ZYLOS_DIR, 'send-result.json'), JSON.stri
 
     const database = new Database(path.join(temp, 'comm-bridge', 'c4.db'));
     const conversations = database.prepare('SELECT count(*) AS count FROM conversations WHERE direction = \'in\'').get().count;
+    const outboundRows = database.prepare(`
+      SELECT direction, channel, endpoint_id, content, status, assistant_request_id
+      FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = 'assistant.feishu.om_1'
+    `).all();
     const events = database.prepare(`
       SELECT event_type FROM assistant_response_events
       WHERE request_id = 'assistant.feishu.om_1'
@@ -74,6 +79,14 @@ fs.writeFileSync(path.join(process.env.ZYLOS_DIR, 'send-result.json'), JSON.stri
     `).all().map(row => row.event_type);
     database.close();
     assert.equal(conversations, 1);
+    assert.deepEqual(outboundRows, [{
+      direction: 'out',
+      channel: 'feishu',
+      endpoint_id: 'oc_1|type:p2p|msg:om_1',
+      content: '完整答案',
+      status: 'delivered',
+      assistant_request_id: 'assistant.feishu.om_1',
+    }]);
     assert.deepEqual(events, [
       'AssistantRequestAccepted',
       'RunQueued',
@@ -136,11 +149,27 @@ test('unavailable runtime produces a durable failed terminal without a second ch
       WHERE request_id = 'assistant.feishu.om_unavailable'
     `).get();
     const outbound = database.prepare(`
-      SELECT count(*) AS count FROM conversations WHERE direction = 'out'
+      SELECT count(*) AS count FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = 'assistant.feishu.om_unavailable'
     `).get().count;
+    const outboundRecord = database.prepare(`
+      SELECT direction, channel, endpoint_id, content, status, delivery_action,
+             assistant_request_id
+      FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = 'assistant.feishu.om_unavailable'
+    `).get();
     database.close();
     assert.equal(request.status, 'failed');
-    assert.equal(outbound, 0);
+    assert.equal(outbound, 1);
+    assert.deepEqual(outboundRecord, {
+      direction: 'out',
+      channel: 'feishu',
+      endpoint_id: 'oc_1|type:p2p|msg:om_unavailable',
+      content: '',
+      status: 'failed',
+      delivery_action: 'assistant-response-failed:RUNTIME_UNAVAILABLE',
+      assistant_request_id: 'assistant.feishu.om_unavailable',
+    });
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }

@@ -553,6 +553,49 @@ describe('insertConversation', () => {
     const row = db.prepare('SELECT delivery_action FROM conversations WHERE id = ?').get(conv.id);
     assert.equal(row.delivery_action, 'suppressed');
   });
+
+  it('links an outbound conversation to one assistant response request', () => {
+    const conv = mod.insertConversation(
+      'out',
+      'feishu',
+      'oc_1|type:p2p|msg:om_1',
+      'reply',
+      null,
+      3,
+      false,
+      'assistant-response',
+      'assistant.feishu.om_1',
+    );
+
+    assert.equal(conv.assistant_request_id, 'assistant.feishu.om_1');
+    const row = db.prepare(`
+      SELECT direction, endpoint_id, content, status, delivery_action, assistant_request_id
+      FROM conversations
+      WHERE id = ?
+    `).get(conv.id);
+    assert.deepEqual(row, {
+      direction: 'out',
+      endpoint_id: 'oc_1|type:p2p|msg:om_1',
+      content: 'reply',
+      status: 'delivered',
+      delivery_action: 'assistant-response',
+      assistant_request_id: 'assistant.feishu.om_1',
+    });
+    assert.throws(
+      () => mod.insertConversation(
+        'out',
+        'feishu',
+        'oc_1|type:p2p|msg:om_1',
+        'duplicate',
+        null,
+        3,
+        false,
+        'assistant-response',
+        'assistant.feishu.om_1',
+      ),
+      /UNIQUE constraint failed/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
