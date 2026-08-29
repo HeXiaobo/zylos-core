@@ -1222,6 +1222,496 @@ function inspectQuarantineGeneration(generationPath, { fsApi = fs, rootPath, roo
   }
 }
 
+const CORE_BACKUP_RETENTION_REPAIR_AUDIT_SCHEMA = 'zylos.core-backup-retention-repair/v1';
+
+function pathIsWithin(rootPath, candidatePath) {
+  const root = path.resolve(rootPath);
+  const candidate = path.resolve(candidatePath);
+  const relative = path.relative(root, candidate);
+  return relative === ''
+    || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+function repairStatIdentity(stat, { includeTimes = false } = {}) {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    uid: stat.uid,
+    gid: stat.gid,
+    mode: stat.mode & 0o7777,
+    ...(includeTimes ? {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+    } : {}),
+  };
+}
+
+function sameRepairStatIdentity(actual, expected, { includeTimes = false } = {}) {
+  const fields = ['dev', 'ino', 'uid', 'gid', 'mode'];
+  if (includeTimes) fields.push('size', 'mtimeMs', 'ctimeMs');
+  return fields.every(field => actual[field] === expected[field]);
+}
+
+function retentionRepairAuthorizationPaths(authorization) {
+  const retention = authorization?.retentionAuthorization ?? authorization;
+  return {
+    retention,
+    paths: retention?.approvedDeletePaths
+      ?? retention?.approvedPaths
+      ?? authorization?.approvedDeletePaths
+      ?? [],
+    authorizedBy: retention?.authorizedBy
+      ?? authorization?.authorizedBy
+      ?? authorization?.identity
+      ?? null,
+  };
+}
+
+/**
+ * Validate an explicit, exact-path retention repair authorization.
+ *
+ * The repair intentionally accepts no directory prefix, glob, basename, or
+ * realpath alias. The path in the receipt must be the same path the owner
+ * authorized. This is an authorization check only; the quarantine marker and
+ * inode/device checks below still independently prove what can be unlinked.
+ */
+export function validateRetentionRepairAuthorization({ quarantinePath, authorization } = {}) {
+  const requested = typeof quarantinePath === 'string' ? quarantinePath : '';
+  if (!requested || !path.isAbsolute(requested) || path.resolve(requested) !== requested) {
+    return { ok: false, error: 'retention repair requires an absolute, normalized quarantine path' };
+  }
+  const { retention, paths, authorizedBy } = retentionRepairAuthorizationPaths(authorization);
+  if (authorization?.status && authorization.status !== 'PASS') {
+    return { ok: false, error: `retention repair authorization status is ${authorization.status}` };
+  }
+  if (authorization?.deploymentAuthorized === false) {
+    return { ok: false, error: 'retention repair authorization is not deployment-authorized' };
+  }
+  if (retention?.mustMatchExactly !== true) {
+    return { ok: false, error: 'retention repair authorization must set mustMatchExactly=true' };
+  }
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return { ok: false, error: 'retention repair authorization has no approved delete paths' };
+  }
+  if (!paths.includes(requested) || paths.some(candidate => (
+    typeof candidate !== 'string'
+      || !path.isAbsolute(candidate)
+      || path.resolve(candidate) !== candidate
+  ))) {
+    return { ok: false, error: 'quarantine path is not an explicitly approved exact path' };
+  }
+  if (typeof authorizedBy !== 'string' || !authorizedBy.trim()) {
+    return { ok: false, error: 'retention repair authorization has no author identity' };
+  }
+  return {
+    ok: true,
+    approvedPath: requested,
+    authorizedBy: authorizedBy.trim(),
+  };
+}
+
+function validateRetentionRepairAuditPath(auditPath, quarantinePath, fsApi = fs) {
+  const requested = typeof auditPath === 'string' ? auditPath : '';
+  if (!requested || !path.isAbsolute(requested) || path.resolve(requested) !== requested) {
+    throw new HoldError('retention repair requires an absolute, normalized audit path', 'RETENTION_REPAIR_AUDIT_INVALID');
+  }
+  if (pathIsWithin(quarantinePath, requested)) {
+    throw new HoldError('retention repair audit path must be outside the quarantine', 'RETENTION_REPAIR_AUDIT_INVALID');
+  }
+  const parentPath = path.dirname(requested);
+  const parentStat = fsApi.lstatSync(parentPath);
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new HoldError('retention repair audit parent must be a direct directory', 'RETENTION_REPAIR_AUDIT_INVALID');
+  }
+  const parentRealPath = fsApi.realpathSync(parentPath);
+  const quarantineRealPath = fsApi.realpathSync(quarantinePath);
+  if (pathIsWithin(quarantineRealPath, parentRealPath)) {
+    throw new HoldError('retention repair audit path must resolve outside the quarantine', 'RETENTION_REPAIR_AUDIT_INVALID');
+  }
+  const existing = fsApi.lstatSync(requested, { throwIfNoEntry: false });
+  if (existing && (existing.isSymbolicLink() || !existing.isFile())) {
+    throw new HoldError('retention repair audit path must be a regular non-symlink file', 'RETENTION_REPAIR_AUDIT_INVALID');
+  }
+  return requested;
+}
+
+function repairGenerationIdentity(generation, fsApi = fs) {
+  const rootStat = fsApi.lstatSync(generation.path);
+  const objectsPath = path.join(generation.path, 'objects');
+  const objectsStat = fsApi.lstatSync(objectsPath);
+  const markerStat = fsApi.lstatSync(generation.markerPath);
+  const expectedObjects = generation.marker.identity ?? {};
+  if (
+    rootStat.isSymbolicLink()
+    || !rootStat.isDirectory()
+    || !sameRepairStatIdentity(repairStatIdentity(rootStat), repairStatIdentity(generation.stat))
+    || objectsStat.isSymbolicLink()
+    || !objectsStat.isDirectory()
+    || objectsStat.dev !== rootStat.dev
+    || objectsStat.dev !== expectedObjects.objectsDev
+    || objectsStat.ino !== expectedObjects.objectsIno
+    || objectsStat.uid !== rootStat.uid
+    || objectsStat.gid !== rootStat.gid
+    || (objectsStat.mode & 0o777) !== expectedObjects.objectsMode
+    || markerStat.isSymbolicLink()
+    || !markerStat.isFile()
+    || markerStat.dev !== rootStat.dev
+    || markerStat.uid !== rootStat.uid
+    || markerStat.gid !== rootStat.gid
+    || (markerStat.mode & 0o777) !== 0o600
+  ) {
+    throw new HoldError('quarantine generation identity changed; refusing retention repair', 'RETENTION_REPAIR_IDENTITY_CHANGED');
+  }
+  return {
+    root: repairStatIdentity(rootStat),
+    objects: repairStatIdentity(objectsStat),
+    marker: repairStatIdentity(markerStat, { includeTimes: true }),
+  };
+}
+
+function isNpmBinSymlink(generationPath, candidatePath) {
+  if (!pathIsWithin(generationPath, candidatePath)) return false;
+  const relativeParts = path.relative(generationPath, candidatePath).split(path.sep);
+  return relativeParts.length >= 4
+    && relativeParts.at(-2) === '.bin'
+    && relativeParts.at(-3) === 'node_modules'
+    && relativeParts.at(-1) !== ''
+    && relativeParts.at(-1) !== '.'
+    && relativeParts.at(-1) !== '..';
+}
+
+function collectRetentionRepairLinks(generation, fsApi = fs) {
+  const identity = repairGenerationIdentity(generation, fsApi);
+  const pending = [generation.path];
+  const directories = new Map();
+  const links = [];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const currentStat = fsApi.lstatSync(current);
+    if (
+      currentStat.isSymbolicLink()
+      || !currentStat.isDirectory()
+      || currentStat.dev !== identity.root.dev
+      || !pathIsWithin(generation.path, current)
+    ) {
+      throw new HoldError(`retention repair found an unsafe directory: ${current}`, 'RETENTION_REPAIR_UNSAFE_TREE');
+    }
+    const currentIdentity = repairStatIdentity(currentStat);
+    directories.set(current, currentIdentity);
+    const names = fsApi.readdirSync(current);
+    const afterReadStat = fsApi.lstatSync(current);
+    if (!sameRepairStatIdentity(repairStatIdentity(afterReadStat), currentIdentity)) {
+      throw new HoldError(`retention repair directory changed while scanning: ${current}`, 'RETENTION_REPAIR_RACE');
+    }
+    for (const name of names) {
+      const child = path.join(current, name);
+      if (!pathIsWithin(generation.path, child)) {
+        throw new HoldError(`retention repair found an out-of-tree entry: ${child}`, 'RETENTION_REPAIR_UNSAFE_TREE');
+      }
+      const childStat = fsApi.lstatSync(child);
+      if (childStat.dev !== identity.root.dev) {
+        throw new HoldError(`retention repair found a cross-device entry: ${child}`, 'RETENTION_REPAIR_CROSS_DEVICE');
+      }
+      if (childStat.isSymbolicLink()) {
+        if (!isNpmBinSymlink(generation.path, child)) {
+          throw new HoldError(`retention repair found an unknown symlink: ${child}`, 'RETENTION_REPAIR_UNKNOWN_SYMLINK');
+        }
+        let target;
+        try {
+          // readlink reads link metadata only. Never stat or realpath the target.
+          target = fsApi.readlinkSync(child);
+        } catch (error) {
+          throw new HoldError(`retention repair could not read symlink metadata: ${child}`, 'RETENTION_REPAIR_RACE');
+        }
+        links.push({
+          path: child,
+          relativePath: path.relative(generation.path, child).split(path.sep).join('/'),
+          target,
+          dev: childStat.dev,
+          ino: childStat.ino,
+          parentPath: current,
+          parentIdentity: currentIdentity,
+        });
+      } else if (childStat.isDirectory()) {
+        pending.push(child);
+      }
+    }
+  }
+  return { identity, directories, links };
+}
+
+function repairAuditBase({ quarantinePath, generation, authorization, auditPath, mode, links, identity }) {
+  return {
+    schema: CORE_BACKUP_RETENTION_REPAIR_AUDIT_SCHEMA,
+    status: 'RUNNING',
+    mode,
+    result: 'REPAIR_PLANNED',
+    quarantinePath,
+    generation: {
+      generationId: generation.marker.generationId,
+      rootPath: generation.marker.rootPath,
+      objectsPath: generation.marker.objectsPath,
+      markerPath: generation.markerPath,
+      status: generation.marker.status,
+      identity,
+    },
+    authorization: {
+      approvedPath: authorization.approvedPath,
+      authorizedBy: authorization.authorizedBy,
+      authorizationSha256: sha256(JSON.stringify(authorization.source)),
+    },
+    auditPath,
+    links: links.map(link => ({
+      path: link.path,
+      relativePath: link.relativePath,
+      target: link.target,
+      dev: link.dev,
+      ino: link.ino,
+    })),
+    actions: links.map(link => ({
+      path: link.path,
+      status: 'PLANNED',
+    })),
+    startedAt: new Date().toISOString(),
+  };
+}
+
+function persistRetentionRepairAudit(audit, auditPath, fsApi = fs) {
+  atomicWriteJson(auditPath, audit, fsApi);
+}
+
+function finishRetentionRepairAudit(audit, status, result, error = null) {
+  audit.status = status;
+  audit.result = result;
+  audit.finishedAt = new Date().toISOString();
+  if (error) audit.error = error;
+  return audit;
+}
+
+/**
+ * Repair only npm-generated `.bin` symlink entries in one explicitly
+ * authorized, retired quarantine generation.
+ *
+ * `apply` defaults to false so callers must opt into unlinking. The target of
+ * every symlink is intentionally never resolved or traversed; only the link
+ * directory entry is unlinked after the quarantine generation, parent
+ * directory, device, and inode identities are rechecked. Any unknown link,
+ * mount, identity drift, or audit failure returns HOLD without proceeding.
+ */
+export function repairCoreBackupQuarantine({
+  quarantinePath,
+  authorization,
+  auditPath,
+  apply = false,
+  fsApi = fs,
+  homeDir = os.homedir(),
+} = {}) {
+  const authorizationCheck = validateRetentionRepairAuthorization({ quarantinePath, authorization });
+  if (!authorizationCheck.ok) {
+    return {
+      status: 'HOLD',
+      result: 'NO_MUTATION',
+      code: 'RETENTION_REPAIR_NOT_AUTHORIZED',
+      error: authorizationCheck.error,
+    };
+  }
+  const normalizedQuarantinePath = authorizationCheck.approvedPath;
+  let normalizedAuditPath;
+  try {
+    normalizedAuditPath = validateRetentionRepairAuditPath(auditPath, normalizedQuarantinePath, fsApi);
+  } catch (error) {
+    return {
+      status: 'HOLD',
+      result: 'NO_MUTATION',
+      code: error.code || 'RETENTION_REPAIR_AUDIT_INVALID',
+      error: error.message,
+    };
+  }
+
+  let generation;
+  let repairTree;
+  try {
+    const rootPath = path.dirname(normalizedQuarantinePath);
+    const rootStat = fsApi.lstatSync(rootPath);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new HoldError('retention repair root is not a direct directory', 'RETENTION_REPAIR_UNSAFE_ROOT');
+    }
+    const rootRealPath = fsApi.realpathSync(rootPath);
+    generation = inspectQuarantineGeneration(normalizedQuarantinePath, {
+      fsApi,
+      rootPath,
+      rootRealPath,
+    });
+    if (!generation) {
+      throw new HoldError('quarantine generation is unverified; refusing retention repair', 'RETENTION_REPAIR_UNVERIFIED');
+    }
+    repairTree = collectRetentionRepairLinks(generation, fsApi);
+  } catch (error) {
+    const minimalAudit = {
+      schema: CORE_BACKUP_RETENTION_REPAIR_AUDIT_SCHEMA,
+      status: 'HOLD',
+      mode: apply ? 'apply' : 'dry-run',
+      result: 'NO_MUTATION',
+      code: error.code || 'RETENTION_REPAIR_FAILED',
+      quarantinePath: normalizedQuarantinePath,
+      auditPath: normalizedAuditPath,
+      error: error.message,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    };
+    try { persistRetentionRepairAudit(minimalAudit, normalizedAuditPath, fsApi); } catch {}
+    return minimalAudit;
+  }
+
+  const auditAuthorization = {
+    ...authorizationCheck,
+    source: authorization,
+  };
+  const audit = repairAuditBase({
+    quarantinePath: normalizedQuarantinePath,
+    generation,
+    authorization: auditAuthorization,
+    auditPath: normalizedAuditPath,
+    mode: apply ? 'apply' : 'dry-run',
+    links: repairTree.links,
+    identity: repairTree.identity,
+  });
+  try {
+    persistRetentionRepairAudit(audit, normalizedAuditPath, fsApi);
+  } catch (error) {
+    return {
+      ...finishRetentionRepairAudit(audit, 'HOLD', 'NO_MUTATION', error.message),
+      code: 'RETENTION_REPAIR_AUDIT_WRITE_FAILED',
+    };
+  }
+
+  if (!apply) {
+    for (const action of audit.actions) action.status = 'WOULD_UNLINK';
+    finishRetentionRepairAudit(
+      audit,
+      'PASS',
+      audit.actions.length > 0 ? 'PRECHECK_ONLY' : 'NOOP',
+    );
+    try { persistRetentionRepairAudit(audit, normalizedAuditPath, fsApi); } catch (error) {
+      return {
+        ...audit,
+        status: 'HOLD',
+        result: 'AUDIT_WRITE_FAILED',
+        error: error.message,
+        code: 'RETENTION_REPAIR_AUDIT_WRITE_FAILED',
+      };
+    }
+    return audit;
+  }
+
+  const lock = acquireCoreBackupRetentionLock(homeDir, fsApi);
+  if (!lock) {
+    finishRetentionRepairAudit(audit, 'HOLD', 'NO_MUTATION', 'Core backup retention is locked by another run');
+    try { persistRetentionRepairAudit(audit, normalizedAuditPath, fsApi); } catch {}
+    return { ...audit, code: 'RETENTION_REPAIR_LOCKED' };
+  }
+
+  try {
+    // Re-scan after acquiring the lock. This closes the window between the
+    // initial audit and the first unlink, and makes the planned set immutable.
+    const rootPath = path.dirname(normalizedQuarantinePath);
+    const rootRealPath = fsApi.realpathSync(rootPath);
+    const recheckedGeneration = inspectQuarantineGeneration(normalizedQuarantinePath, {
+      fsApi,
+      rootPath,
+      rootRealPath,
+    });
+    if (!recheckedGeneration) {
+      throw new HoldError('quarantine generation changed before retention repair', 'RETENTION_REPAIR_IDENTITY_CHANGED');
+    }
+    const recheckedTree = collectRetentionRepairLinks(recheckedGeneration, fsApi);
+    if (
+      recheckedGeneration.stat.dev !== generation.stat.dev
+      || recheckedGeneration.stat.ino !== generation.stat.ino
+      || recheckedTree.links.length !== repairTree.links.length
+      || recheckedTree.links.some((link, index) => (
+        link.path !== repairTree.links[index].path
+          || link.ino !== repairTree.links[index].ino
+          || link.dev !== repairTree.links[index].dev
+          || link.target !== repairTree.links[index].target
+      ))
+    ) {
+      throw new HoldError('quarantine entries changed before retention repair', 'RETENTION_REPAIR_RACE');
+    }
+
+    for (const [index, planned] of repairTree.links.entries()) {
+      const action = audit.actions[index];
+      action.status = 'ATTEMPTED';
+      action.attemptedAt = new Date().toISOString();
+      persistRetentionRepairAudit(audit, normalizedAuditPath, fsApi);
+
+      const currentIdentity = repairGenerationIdentity(recheckedGeneration, fsApi);
+      if (
+        !sameRepairStatIdentity(currentIdentity.root, repairTree.identity.root)
+        || !sameRepairStatIdentity(currentIdentity.objects, repairTree.identity.objects)
+        || !sameRepairStatIdentity(currentIdentity.marker, repairTree.identity.marker, { includeTimes: true })
+      ) {
+        throw new HoldError(`retention repair generation identity changed before unlink: ${planned.path}`, 'RETENTION_REPAIR_RACE');
+      }
+      const parentStat = fsApi.lstatSync(planned.parentPath);
+      const linkStat = fsApi.lstatSync(planned.path);
+      if (
+        parentStat.isSymbolicLink()
+        || !parentStat.isDirectory()
+        || !sameRepairStatIdentity(repairStatIdentity(parentStat), planned.parentIdentity)
+        || !linkStat.isSymbolicLink()
+        || linkStat.dev !== planned.dev
+        || linkStat.ino !== planned.ino
+        || !pathIsWithin(normalizedQuarantinePath, planned.path)
+      ) {
+        throw new HoldError(`retention repair identity changed before unlink: ${planned.path}`, 'RETENTION_REPAIR_RACE');
+      }
+      // unlinkSync removes the directory entry and never follows a symlink.
+      fsApi.unlinkSync(planned.path);
+      fsyncDirectory(planned.parentPath, fsApi);
+      const after = fsApi.lstatSync(planned.path, { throwIfNoEntry: false });
+      if (after) {
+        action.status = 'RACE_DETECTED';
+        throw new HoldError(`retention repair found a replacement after unlink: ${planned.path}`, 'RETENTION_REPAIR_RACE');
+      }
+      action.status = 'UNLINKED';
+      action.finishedAt = new Date().toISOString();
+      persistRetentionRepairAudit(audit, normalizedAuditPath, fsApi);
+    }
+
+    const finalGeneration = inspectQuarantineGeneration(normalizedQuarantinePath, {
+      fsApi,
+      rootPath: path.dirname(normalizedQuarantinePath),
+      rootRealPath: fsApi.realpathSync(path.dirname(normalizedQuarantinePath)),
+    });
+    if (!finalGeneration) {
+      throw new HoldError('quarantine generation became unverifiable after retention repair', 'RETENTION_REPAIR_IDENTITY_CHANGED');
+    }
+    const finalTree = collectRetentionRepairLinks(finalGeneration, fsApi);
+    if (finalTree.links.length > 0) {
+      throw new HoldError('retention repair left symlink entries behind', 'RETENTION_REPAIR_INCOMPLETE');
+    }
+    finishRetentionRepairAudit(
+      audit,
+      'PASS',
+      audit.actions.length > 0 ? 'REPAIRED' : 'NOOP',
+    );
+    persistRetentionRepairAudit(audit, normalizedAuditPath, fsApi);
+    return audit;
+  } catch (error) {
+    finishRetentionRepairAudit(audit, 'HOLD', 'PARTIAL_HOLD', error.message);
+    try { persistRetentionRepairAudit(audit, normalizedAuditPath, fsApi); } catch {}
+    return { ...audit, code: error.code || 'RETENTION_REPAIR_FAILED' };
+  } finally {
+    releaseCoreBackupRetentionLock(lock, fsApi);
+  }
+}
+
+export function repairCoreBackupRetention(options) {
+  return repairCoreBackupQuarantine(options);
+}
+
 function assertSafeRecursiveTree(targetPath, expectedDev, fsApi = fs) {
   const pending = [targetPath];
   while (pending.length > 0) {
