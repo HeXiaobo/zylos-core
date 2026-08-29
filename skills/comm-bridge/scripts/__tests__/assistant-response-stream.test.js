@@ -1655,6 +1655,51 @@ test('leases deliveries with fencing and recovers stale requests as RunFailed', 
   stream.close();
 });
 
+test('keeps a started request alive while its runtime admission sends a fresh heartbeat', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({
+    dbPath: ':memory:',
+    clock: () => now,
+  });
+  const accepted = accept(stream, {
+    requestId: 'assistant.feishu.heartbeat-protected',
+    sourceId: 'om_heartbeat_protected',
+    route: { channel: 'feishu', endpointId: 'oc_1|type:p2p|msg:om_heartbeat_protected' },
+  });
+  stream.acquireRuntimeTurn({
+    conversationId: accepted.request.conversationId,
+    requestId: accepted.request.requestId,
+    routeChannel: 'feishu',
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  stream.startRuntimeTurn({ runtimeSessionId: 'heartbeat-session' });
+  stream.execute({
+    type: 'BindTurn',
+    requestId: accepted.request.requestId,
+    runtimeSessionId: 'heartbeat-session',
+  });
+
+  now = 2_000;
+  const heartbeat = stream.touchRuntimeTurn({ runtimeSessionId: 'heartbeat-session' });
+  assert.equal(heartbeat.touched, true);
+
+  const protectedRun = stream.execute({
+    type: 'ExpireStaleRuns',
+    staleBefore: 1_500,
+  });
+  assert.deepEqual(protectedRun.events, []);
+  assert.equal(stream.query({ requestId: accepted.request.requestId }).request.status, 'started');
+
+  now = 4_000;
+  const expired = stream.execute({
+    type: 'ExpireStaleRuns',
+    staleBefore: 2_500,
+  });
+  assert.equal(expired.events[0].type, 'RunFailed');
+  assert.equal(stream.query({ requestId: accepted.request.requestId }).request.status, 'failed');
+  stream.close();
+});
+
 test('delivery worker coalesces one request batch and retries adapter failure', async () => {
   const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => 5_000 });
   accept(stream);
