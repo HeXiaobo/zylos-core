@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.17] - 2026-08-29
+
 ### Fixed
 - Run native Task convergence business steps through a parent-bound watchdog
   with PID-reuse-resistant runner/child identities and process-group cleanup;
