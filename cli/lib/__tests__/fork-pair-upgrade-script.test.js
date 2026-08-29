@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +8,7 @@ import { describe, it } from 'node:test';
 import {
   buildUpgradeCommands,
   buildNativeTaskConservationCommand,
+  buildNativeTaskConservationEnv,
   buildNativeTaskConvergenceCommand,
   executeCoreBackupRetention,
   planCoreBackupRetention,
@@ -332,6 +334,44 @@ describe('fork-pair upgrade target contract', () => {
       appId: 'cli_yueran',
       agentAppIds: { 'agent:yueran': 'cli_other' },
     }).ok, false);
+  });
+
+  it('omits a missing App mapping from the real conservation child environment', () => {
+    const probe = (env) => spawnSync(process.execPath, [
+      '-e',
+      "process.stdout.write(JSON.stringify({ hasMapping: Object.hasOwn(process.env, 'FEISHU_TASK_V2_AGENT_APP_IDS'), mapping: process.env.FEISHU_TASK_V2_AGENT_APP_IDS ?? null }))",
+    ], { env, encoding: 'utf8' });
+    const baseEnv = {
+      ...process.env,
+      FEISHU_TASK_V2_AGENT_APP_IDS: 'stale-inherited-value',
+    };
+
+    const missing = probe(buildNativeTaskConservationEnv({
+      baseEnv,
+      zylosDir: '/runtime/zylos',
+      identity: { agentId: 'agent:veda', appId: 'cli_veda' },
+      defaultAssigneeId: 'agent:veda',
+      agentAppIds: null,
+    }));
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.deepEqual(JSON.parse(missing.stdout), {
+      hasMapping: false,
+      mapping: null,
+    });
+
+    const explicitValue = '{"agent:veda":"cli_veda"}';
+    const explicit = probe(buildNativeTaskConservationEnv({
+      baseEnv,
+      zylosDir: '/runtime/zylos',
+      identity: { agentId: 'agent:veda', appId: 'cli_veda' },
+      defaultAssigneeId: 'agent:veda',
+      agentAppIds: explicitValue,
+    }));
+    assert.equal(explicit.status, 0, explicit.stderr);
+    assert.deepEqual(JSON.parse(explicit.stdout), {
+      hasMapping: true,
+      mapping: explicitValue,
+    });
   });
 
   it('fails source validation when an immutable Core archive lacks c4-receive', () => {
