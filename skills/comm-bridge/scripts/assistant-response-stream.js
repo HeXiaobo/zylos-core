@@ -1435,11 +1435,25 @@ export function openAssistantResponseStream({
 
       case 'ExpireStaleRuns': {
         const staleBefore = requireInteger(command.staleBefore, 'staleBefore');
+        // A started runtime turn has an independent heartbeat. Do not let a
+        // quiet assistant request expire while its bound runtime is still
+        // alive; queued work has no such heartbeat and keeps the request clock.
         const stale = database.prepare(`
-          SELECT request_id
-          FROM assistant_requests
-          WHERE status IN ('queued', 'started') AND updated_at <= ?
-          ORDER BY updated_at ASC, request_id ASC
+          SELECT r.request_id
+          FROM assistant_requests AS r
+          LEFT JOIN runtime_turn_admissions AS a
+            ON a.request_id = r.request_id
+            AND a.runtime_session_id = r.runtime_session_id
+            AND a.status = 'started'
+          WHERE r.status IN ('queued', 'started')
+            AND (
+              CASE
+                WHEN r.status = 'started' AND a.id IS NOT NULL
+                  THEN MAX(r.updated_at, a.updated_at)
+                ELSE r.updated_at
+              END
+            ) <= ?
+          ORDER BY r.updated_at ASC, r.request_id ASC
         `).all(staleBefore);
         const events = [];
         for (const row of stale) {
