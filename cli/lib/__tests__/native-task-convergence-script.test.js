@@ -273,12 +273,18 @@ test('apply runs every business step under the controlled runner and verifies te
         ZYLOS_DIR: root,
         TEST_LOCK_PATH: lockPath,
         TEST_RUNNER_SEEN_PATH: markerPath,
+        TEST_PRIVATE_CREDENTIAL: 'must-not-be-persisted',
       },
       stdout: { write() {} },
     });
     assert.equal(report.status, 'PASS');
     assert.equal(fs.existsSync(lockPath), false);
     assert.equal(fs.readdirSync(reportDir).some(name => name.endsWith('.runner-result.json')), true);
+    const runnerJob = fs.readFileSync(
+      path.join(reportDir, '.core-plan.attempt-1.runner-job.json'),
+      'utf8',
+    );
+    assert.doesNotMatch(runnerJob, /TEST_PRIVATE_CREDENTIAL|must-not-be-persisted/);
     const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
     assert.equal(marker.phase, 'CHILD_RUNNING');
     assert.ok(marker.runner?.pid > 0);

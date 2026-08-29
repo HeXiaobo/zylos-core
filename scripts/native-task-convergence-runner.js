@@ -86,14 +86,6 @@ function validateJob(rawJob) {
   const cwd = path.resolve(requireText(rawJob.cwd, 'cwd'));
   const parent = requireIdentity(rawJob.parent, 'parent');
   const runnerToken = requireText(rawJob.runnerToken, 'runnerToken');
-  const env = rawJob.env && typeof rawJob.env === 'object' && !Array.isArray(rawJob.env)
-    ? { ...rawJob.env }
-    : null;
-  if (!env || Object.entries(env).some(([key, value]) => (
-    typeof key !== 'string' || typeof value !== 'string'
-  ))) {
-    throw new RunnerError('env must be an object of strings', 'INVALID_RUNNER_JOB');
-  }
   const timeoutMs = rawJob.timeoutMs === undefined ? 180_000 : Number(rawJob.timeoutMs);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 1_200_000) {
     throw new RunnerError('timeoutMs must be a positive bounded integer', 'INVALID_RUNNER_JOB');
@@ -106,7 +98,6 @@ function validateJob(rawJob) {
     command,
     args,
     cwd,
-    env,
     parent,
     runnerToken,
     timeoutMs,
@@ -274,7 +265,10 @@ async function runJob(job) {
   try {
     child = spawn(job.command, job.args, {
       cwd: job.cwd,
-      env: job.env,
+      // The parent supplies the exact child environment to this runner. Keep
+      // credentials out of the durable job receipt and inherit them only in
+      // process memory.
+      env: process.env,
       detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],

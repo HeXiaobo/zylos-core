@@ -43,11 +43,6 @@ test('controlled runner records itself before the business command starts', () =
       command: process.execPath,
       args: ['--input-type=module', '-e', businessScript],
       cwd: root,
-      env: {
-        ...process.env,
-        TEST_LOCK_PATH: lockPath,
-        TEST_MARKER_PATH: markerPath,
-      },
       resultPath,
     })}\n`, { mode: 0o600 });
 
@@ -55,6 +50,11 @@ test('controlled runner records itself before the business command starts', () =
       cwd: root,
       encoding: 'utf8',
       timeout: 30_000,
+      env: {
+        ...process.env,
+        TEST_LOCK_PATH: lockPath,
+        TEST_MARKER_PATH: markerPath,
+      },
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(fs.readFileSync(resultPath, 'utf8')).status, 'PASS');
@@ -96,7 +96,6 @@ test('controlled runner refuses to start a business command without a live paren
       command: process.execPath,
       args: ['--input-type=module', '-e', businessScript],
       cwd: root,
-      env: { ...process.env, TEST_MARKER_PATH: markerPath },
       resultPath,
     })}\n`, { mode: 0o600 });
 
@@ -104,6 +103,7 @@ test('controlled runner refuses to start a business command without a live paren
       cwd: root,
       encoding: 'utf8',
       timeout: 30_000,
+      env: { ...process.env, TEST_MARKER_PATH: markerPath },
     });
     assert.equal(result.status, 1);
     assert.equal(JSON.parse(fs.readFileSync(resultPath, 'utf8')).status, 'UNKNOWN');
@@ -141,7 +141,7 @@ test('runner kills the business process group when its parent is SIGKILLed', asy
       "fs.writeFileSync(process.env.TEST_PARENT_PID_PATH, String(process.pid));",
       "fs.writeFileSync(lockPath, JSON.stringify({ schema: 'zylos.native-task-convergence-lock/v1', transactionId, hostname: process.env.TEST_HOSTNAME, parent, runnerToken: 'runner-token', phase: 'PARENT_READY' }));",
       "const businessScript = \"import fs from 'node:fs'; fs.writeFileSync(process.env.TEST_CHILD_STARTED_PATH, String(process.pid)); setTimeout(() => fs.writeFileSync(process.env.TEST_BUSINESS_MARKER_PATH, 'ran'), 5000);\";",
-      "fs.writeFileSync(jobPath, JSON.stringify({ schema: 'zylos.native-task-convergence-runner-job/v1', transactionId, lockPath, parent, runnerToken: 'runner-token', command: process.execPath, args: ['--input-type=module', '-e', businessScript], cwd: root, env: { ...process.env }, resultPath }));",
+      "fs.writeFileSync(jobPath, JSON.stringify({ schema: 'zylos.native-task-convergence-runner-job/v1', transactionId, lockPath, parent, runnerToken: 'runner-token', command: process.execPath, args: ['--input-type=module', '-e', businessScript], cwd: root, resultPath }));",
       "spawnSync(process.execPath, [process.env.TEST_RUNNER_PATH, '--job', jobPath], { cwd: root, encoding: 'utf8', timeout: 30000 });",
     ].join(' ');
     parent = spawn(process.execPath, ['--input-type=module', '-e', driverScript], {

@@ -618,7 +618,6 @@ function runControlledStep({
     command: step.command,
     args: step.args,
     cwd: process.cwd(),
-    env: environment,
     parent: lockHandle.parent,
     runnerToken: lockHandle.runnerToken,
     timeoutMs: 180_000,
@@ -631,7 +630,11 @@ function runControlledStep({
   }
   updateApplyLock(lockHandle, current => ({
     ...current,
-    phase: 'RUNNER_STARTING',
+    // Keep the lock safely reclaimable until the runner has persisted its own
+    // process identity. If the parent dies before spawn, no business process
+    // exists; if a runner was spawned, a replacement lock makes its ownership
+    // check fail before it can start the business command.
+    phase: 'PARENT_READY',
     step: { name: step.name, command: step.command, args: step.args, attempt },
     runner: null,
     child: null,
@@ -639,7 +642,7 @@ function runControlledStep({
   atomicWriteJson(jobPath, job, fsApi);
   const invocation = spawnSync(process.execPath, [RUNNER_PATH, '--job', jobPath], {
     cwd: process.cwd(),
-    env: { ...process.env, ...environment },
+    env: environment,
     encoding: 'utf8',
     maxBuffer: 8 * 1024 * 1024,
   });
