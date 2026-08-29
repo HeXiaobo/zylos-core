@@ -365,6 +365,7 @@ function parseArgs(argv) {
     ['--sha', 'sha'],
     ['--version', 'version'],
     ['--agent', 'agent'],
+    ['--org', 'org'],
     ['--profile-id', 'profileId'],
     ['--hostname', 'hostname'],
     ['--release-id', 'releaseId'],
@@ -405,6 +406,9 @@ function parseArgs(argv) {
   if (!VERSION.test(result.version)) throw new HoldError('--version must be a semantic version', 'INVALID_ARGS');
   if (!SAFE_NAME.test(result.agent)) throw new HoldError('--agent must be a simple identity name', 'INVALID_ARGS');
   if (result.agent === 'unknown') throw new HoldError('--agent must identify the target employee', 'INVALID_ARGS');
+  if (result.org !== undefined && !SAFE_NAME.test(result.org)) {
+    throw new HoldError('--org must identify one configured HXA org label', 'INVALID_ARGS');
+  }
   if (!SAFE_NAME.test(result.profileId) || result.profileId === 'unknown') {
     throw new HoldError('--profile-id must identify the exact target profile', 'INVALID_ARGS');
   }
@@ -595,7 +599,12 @@ function probeRemoteProfile(skillDir, configPath, orgLabel, childEnvAdditions = 
 function inspectIdentity(
   zylosDir,
   reportRoot,
-  { agent: expectedAgent, profileId: expectedProfileId, hostname: expectedHostname },
+  {
+    agent: expectedAgent,
+    org: expectedOrgLabel,
+    profileId: expectedProfileId,
+    hostname: expectedHostname,
+  },
   childEnvAdditions = {},
   receiptName = 'identity-receipt.json',
 ) {
@@ -618,11 +627,23 @@ function inspectIdentity(
     throw new HoldError('HXA config has pending schema migration; refusing to mutate it during dry-run', 'CONFIG_MIGRATION_REQUIRED');
   }
   const enabled = Object.entries(config.orgs).filter(([, org]) => org && typeof org === 'object' && org.enabled !== false);
-  const selected = enabled.find(([label]) => label === 'default') || enabled[0];
+  if (!expectedOrgLabel && enabled.length > 1) {
+    throw new HoldError(
+      'HXA config has multiple enabled org identities; --org is required',
+      'IDENTITY_UNVERIFIED',
+    );
+  }
+  const selected = expectedOrgLabel
+    ? enabled.find(([label]) => label === expectedOrgLabel)
+    : enabled[0];
   if (!selected) throw new HoldError('HXA config has no enabled org identity', 'IDENTITY_UNVERIFIED');
   const [orgLabel, org] = selected;
+  const configuredOrgId = typeof org.org_id === 'string' ? org.org_id.trim() : null;
   const configuredAgent = typeof org.agent_name === 'string' ? org.agent_name.trim() : null;
   const configuredProfileId = typeof org.agent_id === 'string' ? org.agent_id.trim() : null;
+  if (!configuredOrgId) {
+    throw new HoldError('HXA config did not return an org ID', 'IDENTITY_UNVERIFIED');
+  }
   if (configuredAgent !== expectedAgent) {
     throw new HoldError(`configured target identity mismatch: expected ${expectedAgent}, found ${configuredAgent || 'missing'}`, 'IDENTITY_MISMATCH');
   }
@@ -640,7 +661,12 @@ function inspectIdentity(
   const remote = probeRemoteProfile(skillDirFor(zylosDir), configPath, orgLabel, childEnvAdditions);
   const actualAgent = remote?.name || remote?.agent || remote?.agentName || null;
   const profileId = remote?.id || remote?.profileId || remote?.profile_id || null;
-  if (actualAgent !== expectedAgent || profileId !== expectedProfileId) {
+  const orgId = remote?.org_id || remote?.orgId || null;
+  if (
+    actualAgent !== expectedAgent
+    || profileId !== expectedProfileId
+    || orgId !== configuredOrgId
+  ) {
     throw new HoldError('fresh HXA Hub profile does not match the release target', 'IDENTITY_MISMATCH');
   }
   const observedAt = new Date().toISOString();
@@ -651,6 +677,7 @@ function inspectIdentity(
     profileId,
     hostname,
     orgLabel,
+    orgId,
     source: 'HxaConnectClient.getProfile',
   };
   const receiptBytes = `${JSON.stringify(receipt, null, 2)}\n`;
@@ -664,6 +691,7 @@ function inspectIdentity(
     profileId,
     hostname,
     orgLabel,
+    orgId,
     observedAt,
     receiptPath,
     receiptSha256: crypto.createHash('sha256').update(receiptBytes).digest('hex'),
@@ -1334,6 +1362,7 @@ function baseSummary(args, executionId) {
       sha: args.sha,
       version: args.version,
       agent: args.agent,
+      ...(args.org ? { org: args.org } : {}),
       profileId: args.profileId,
       hostname: args.hostname,
     },

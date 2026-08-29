@@ -74,7 +74,7 @@ test('HXA fixed-SHA dry-run validates the target and does not mutate runtime sta
     }));
     fs.writeFileSync(path.join(sdkDir, 'dist', 'index.js'), [
       'export class HxaConnectClient {',
-      "  async getProfile() { return { name: process.env.ZYLOS_TEST_PROFILE_NAME || 'ss', id: process.env.ZYLOS_TEST_PROFILE_ID || 'profile-ss' }; }",
+      "  async getProfile() { return { name: process.env.ZYLOS_TEST_PROFILE_NAME || 'ss', id: process.env.ZYLOS_TEST_PROFILE_ID || 'profile-ss', org_id: process.env.ZYLOS_TEST_ORG_ID || 'org-test' }; }",
       '}',
       '',
     ].join('\n'));
@@ -198,6 +198,57 @@ test('HXA fixed-SHA dry-run validates the target and does not mutate runtime sta
     assert.doesNotMatch(fs.readFileSync(calls, 'utf8'), /profile-cli/);
     assert.equal(fs.existsSync(path.join(reportRoot, 'summary.json')), true);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(reportRoot, 'summary.json'), 'utf8')), output);
+
+    const singleOrgConfig = JSON.parse(fs.readFileSync(hxaConfigPath, 'utf8'));
+    const multiOrgConfig = structuredClone(singleOrgConfig);
+    multiOrgConfig.orgs.secondary = {
+      enabled: true,
+      org_id: 'org-secondary',
+      agent_id: 'profile-secondary',
+      agent_name: 'ss-secondary',
+      agent_token: 'redacted-secondary-token',
+      access: { dmPolicy: 'open', groupPolicy: 'open', threads: {} },
+    };
+    fs.writeFileSync(hxaConfigPath, JSON.stringify(multiOrgConfig));
+    const ambiguousOrg = runWithInjectedRuntime([
+      '--dry-run',
+      '--repo', 'HeXiaobo/zylos-hxa-connect',
+      '--sha', SHA,
+      '--version', '1.7.5',
+      '--agent', 'ss',
+      '--profile-id', 'profile-ss',
+      '--hostname', HOSTNAME,
+      '--release-id', 'ZYL-TEST-MULTI-ORG-HOLD',
+      '--report-root', path.join(zylosDir, '.zylos', 'upgrade-reports', 'ZYL-TEST-MULTI-ORG-HOLD'),
+    ], {
+      cwd: fixtureRoot,
+      env: { ...process.env, ZYLOS_DIR: zylosDir },
+      tools,
+      childEnvAdditions,
+    });
+    assert.notEqual(ambiguousOrg.status, 0);
+    assert.equal(JSON.parse(ambiguousOrg.stdout).code, 'IDENTITY_UNVERIFIED');
+
+    const explicitOrg = runWithInjectedRuntime([
+      '--dry-run',
+      '--repo', 'HeXiaobo/zylos-hxa-connect',
+      '--sha', SHA,
+      '--version', '1.7.5',
+      '--agent', 'ss',
+      '--org', 'default',
+      '--profile-id', 'profile-ss',
+      '--hostname', HOSTNAME,
+      '--release-id', 'ZYL-TEST-MULTI-ORG-PASS',
+      '--report-root', path.join(zylosDir, '.zylos', 'upgrade-reports', 'ZYL-TEST-MULTI-ORG-PASS'),
+    ], {
+      cwd: fixtureRoot,
+      env: { ...process.env, ZYLOS_DIR: zylosDir },
+      tools,
+      childEnvAdditions,
+    });
+    assert.equal(explicitOrg.status, 0, `stdout:\n${explicitOrg.stdout}\nstderr:\n${explicitOrg.stderr}`);
+    assert.equal(JSON.parse(explicitOrg.stdout).target.org, 'default');
+    fs.writeFileSync(hxaConfigPath, JSON.stringify(singleOrgConfig));
 
     const markerPath = path.join(skillDir, '.zylos-source.json');
     const externalMarker = path.join(fixtureRoot, 'external-marker.json');
@@ -465,7 +516,7 @@ lifecycle:
     fs.writeFileSync(path.join(sdkDir, 'dist', 'index.js'), [
       "import fs from 'node:fs';",
       'export class HxaConnectClient {',
-      "  async getProfile() { const sequence = (process.env.ZYLOS_TEST_PROFILE_SEQUENCE || '').split(',').filter(Boolean); let index = 0; const sequenceFile = process.env.ZYLOS_TEST_PROFILE_SEQUENCE_FILE; if (sequenceFile && fs.existsSync(sequenceFile)) index = Number(fs.readFileSync(sequenceFile, 'utf8') || 0); const id = sequence[index] || 'profile-ss'; if (sequenceFile) fs.writeFileSync(sequenceFile, String(index + 1)); return { name: 'ss', id }; }",
+      "  async getProfile() { const sequence = (process.env.ZYLOS_TEST_PROFILE_SEQUENCE || '').split(',').filter(Boolean); let index = 0; const sequenceFile = process.env.ZYLOS_TEST_PROFILE_SEQUENCE_FILE; if (sequenceFile && fs.existsSync(sequenceFile)) index = Number(fs.readFileSync(sequenceFile, 'utf8') || 0); const id = sequence[index] || 'profile-ss'; if (sequenceFile) fs.writeFileSync(sequenceFile, String(index + 1)); return { name: 'ss', id, org_id: 'org-test' }; }",
       '}',
       '',
     ].join('\n'));
@@ -826,7 +877,7 @@ lifecycle:
     }));
     fs.writeFileSync(path.join(sdkDir, 'dist', 'index.js'), [
       'export class HxaConnectClient {',
-      "  async getProfile() { return { name: 'ss', id: 'profile-ss' }; }",
+      "  async getProfile() { return { name: 'ss', id: 'profile-ss', org_id: 'org-test' }; }",
       '}',
       '',
     ].join('\n'));

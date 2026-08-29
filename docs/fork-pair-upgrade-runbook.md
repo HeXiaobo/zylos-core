@@ -538,6 +538,32 @@ curl -fsSL \
       --execute
 ```
 
+若只读 conservation 报告发现可唯一判定的历史 native Task 漂移，先准备并审核
+一一对应的 Core adoption manifest 与 Feishu marker manifest。首次只追加以下参数
+并使用 `--dry-run`；该轮会对 Core、Feishu 和 status reconciliation 全部做 plan，
+不会写数据库或远端 Task：
+
+```text
+--native-task-core-manifest /absolute/evidence/core-adoption.json
+--native-task-feishu-manifest /absolute/evidence/feishu-adoption.json
+```
+
+若 drift 仍存在，整轮 pair dry-run 会因最终 conservation gate 保持 `HOLD`，但
+`native-task-convergence/summary.json` 必须是 `PLAN_COMPLETE/PASS`。只有两个 plan
+均通过且 owner 明确授权后，才改用 `--repair-only` 并追加稳定的授权回执：
+
+```text
+--repair-only
+--native-task-repair-authorization owner-issue-25
+```
+
+apply 固定按“补远端 marker、写 Core Task/link、修复唯一 linked status”执行；每步
+保存独立 JSON 与 SHA-256，随后仍必须通过 native Task conservation gate。两个
+manifest 的 GUID/Core ID 集合不完全一致、对象跨 App/Agent、候选有歧义或任何
+readback 不一致时均 `HOLD`。流程不删除 Task、评论、link、备份或历史证据。
+`repair-only` PASS 后必须重新跑普通 `--dry-run`；只有该轮完整 pair dry-run PASS，
+才允许最终 `--execute`。修复操作本身不会安装或切换 Core/Feishu 版本。
+
 脚本会在第一次修改前完成：
 
 - 两个不可变归档的下载、版本、产品、协议和关键文件校验；

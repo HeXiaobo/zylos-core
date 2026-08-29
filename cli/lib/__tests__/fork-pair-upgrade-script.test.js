@@ -7,10 +7,12 @@ import { describe, it } from 'node:test';
 import {
   buildUpgradeCommands,
   buildNativeTaskConservationCommand,
+  buildNativeTaskConvergenceCommand,
   executeCoreBackupRetention,
   planCoreBackupRetention,
   planPm2PreflightRepairs,
   pathsReferToSameFile as upgradePathsReferToSameFile,
+  parseForkPairArgs,
   validateCoreSource,
   validateFeishuSource,
   validateNativeTaskDeploymentIdentity,
@@ -69,7 +71,9 @@ function writeCoreFixture(root) {
     'skills/activity-monitor/scripts/assistant-turn-binding.js',
     'scripts/upgrade-fork-pair.js',
     'scripts/upgrade-fork-pair.sh',
+    'scripts/native-task-convergence.js',
     'cli/lib/native-task-conservation-inventory.js',
+    'skills/commitment-core/scripts/legacy-task-adoption.js',
   ]) {
     const filePath = path.join(root, relativePath);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -113,8 +117,12 @@ function writeFeishuFixture(root) {
     'scripts/native-task-closure-gate.js',
     'scripts/native-task-completion-gate.js',
     'scripts/native-task-conservation-gate.js',
+    'scripts/task-v2-legacy-adoption-bootstrap.js',
     'src/lib/native-task-conservation-gate.js',
     'src/lib/native-task-conservation-remote.js',
+    'src/lib/task-v2-legacy-adoption-bootstrap.js',
+    'src/lib/task-v2-deployment-identity.js',
+    'src/lib/task-v2-projection-worker.js',
     'src/lib/task-comment-worker.js',
     'src/lib/task-v2-projection.js',
   ]) {
@@ -242,6 +250,38 @@ describe('fork-pair upgrade target contract', () => {
     assert.match(missingAgent.error, /agent identity/);
   });
 
+  it('requires explicit manifests and authorization for a repair-only transaction', () => {
+    const common = [
+      '--core-sha', CORE_SHA,
+      '--feishu-sha', FEISHU_SHA,
+      '--core-version', '0.7.2-rc.5',
+      '--feishu-version', '0.3.7-rc.5',
+      '--staged-core', '/tmp/core',
+      '--agent', 'ss',
+    ];
+    assert.throws(
+      () => parseForkPairArgs(['--repair-only', ...common]),
+      error => error.code === 'INVALID_ARGS' && /requires both/.test(error.message),
+    );
+    assert.throws(
+      () => parseForkPairArgs([
+        '--repair-only', ...common,
+        '--native-task-core-manifest', '/evidence/core.json',
+        '--native-task-feishu-manifest', '/evidence/feishu.json',
+      ]),
+      error => error.code === 'REPAIR_NOT_AUTHORIZED',
+    );
+    const parsed = parseForkPairArgs([
+      '--repair-only', ...common,
+      '--native-task-core-manifest', '/evidence/core.json',
+      '--native-task-feishu-manifest', '/evidence/feishu.json',
+      '--native-task-repair-authorization', 'owner-issue-25',
+    ]);
+    assert.equal(parsed.repairOnly, true);
+    assert.equal(parsed.execute, false);
+    assert.equal(parsed.nativeTaskRepairAuthorization, 'owner-issue-25');
+  });
+
   it('binds the requested Agent, WorkIntake assignee, and Feishu App mapping', () => {
     assert.deepEqual(validateNativeTaskDeploymentIdentity({
       requestedAgent: 'yueran',
@@ -251,7 +291,26 @@ describe('fork-pair upgrade target contract', () => {
       agentAppIds: '{"agent:yueran":"cli_yueran"}',
     }), {
       ok: true,
-      identity: { agentId: 'agent:yueran', appId: 'cli_yueran' },
+      identity: {
+        agentId: 'agent:yueran',
+        appId: 'cli_yueran',
+        mappingSource: 'explicit',
+      },
+    });
+
+    assert.deepEqual(validateNativeTaskDeploymentIdentity({
+      requestedAgent: 'veda',
+      agentId: 'agent:veda',
+      defaultAssigneeId: 'agent:veda',
+      appId: 'cli_veda',
+      agentAppIds: undefined,
+    }), {
+      ok: true,
+      identity: {
+        agentId: 'agent:veda',
+        appId: 'cli_veda',
+        mappingSource: 'derived-single-agent',
+      },
     });
 
     assert.equal(validateNativeTaskDeploymentIdentity({
@@ -406,6 +465,32 @@ describe('fork-pair upgrade target contract', () => {
         '--core-inventory-command', '/usr/bin/node',
         '--core-inventory-arg', '/opt/zylos/cli/lib/native-task-conservation-inventory.js',
         '--timeout-ms', '90000',
+      ],
+    });
+  });
+
+  it('builds an explicitly authorized native Task convergence apply from exact manifests', () => {
+    const command = buildNativeTaskConvergenceCommand({
+      nodePath: '/usr/bin/node',
+      coreDir: '/opt/core',
+      feishuDir: '/opt/feishu',
+      coreManifest: '/evidence/core.json',
+      feishuManifest: '/evidence/feishu.json',
+      reportDir: '/evidence/report',
+      apply: true,
+      authorization: 'owner-issue-25',
+    });
+    assert.deepEqual(command, {
+      command: '/usr/bin/node',
+      args: [
+        '/opt/core/scripts/native-task-convergence.js',
+        '--apply',
+        '--core-manifest', '/evidence/core.json',
+        '--feishu-manifest', '/evidence/feishu.json',
+        '--core-dir', '/opt/core',
+        '--feishu-dir', '/opt/feishu',
+        '--report-dir', '/evidence/report',
+        '--authorization', 'owner-issue-25',
       ],
     });
   });

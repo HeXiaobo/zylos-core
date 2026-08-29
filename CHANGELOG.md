@@ -5,6 +5,22 @@ All notable changes to zylos-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Let the immutable pair preflight derive one exact current Agent-to-App
+  mapping when `FEISHU_TASK_V2_AGENT_APP_IDS` is absent, while preserving
+  strict validation for every explicit multi-Agent mapping.
+- Add a pair-upgrade native Task convergence workflow that plans Core and
+  Feishu adoption without writes, requires an explicit repair authorization
+  for apply, records hash-addressed step evidence, repairs only the exact
+  manifest pairs in a repair-only transaction, and requires the conservation
+  gate to pass before a later pair upgrade can mutate installed versions.
+- Make HXA upgrade identity selection explicit in multi-org runtimes. A
+  single-org runtime remains compatible; multiple enabled orgs now require
+  `--org`, and the fresh Hub profile must match that org's ID, configured
+  Agent name, profile ID, and exact runtime hostname.
+
 ## [0.7.2-rc.16] - 2026-08-28
 
 ### Fixed
