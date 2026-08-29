@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Run native Task convergence business steps through a parent-bound watchdog
+  with PID-reuse-resistant runner/child identities and process-group cleanup;
+  SIGKILL, ambiguous process state, and incomplete lock evidence now fail
+  closed instead of releasing a live repair lock.
+- Harden native Task `repair-only` as a resumable monotonic transaction: an
+  outer runtime lock prevents concurrent apply, every step records durable
+  attempted/running/pass/hold/unknown evidence, interrupted runs replay only
+  after fresh readback plans, and status repair must pass a second clean
+  reconciliation snapshot before the transaction can report success.
 - Omit `FEISHU_TASK_V2_AGENT_APP_IDS` from the native-task conservation
   subprocess environment when no mapping is configured, while preserving
   explicit mapping validation and preventing an inherited stale value from

@@ -11,6 +11,8 @@ import {
   buildNativeTaskConservationEnv,
   buildNativeTaskConvergenceCommand,
   executeCoreBackupRetention,
+  preparePersistentStagedSources,
+  validatePairResumeSummary,
   planCoreBackupRetention,
   planPm2PreflightRepairs,
   pathsReferToSameFile as upgradePathsReferToSameFile,
@@ -74,6 +76,7 @@ function writeCoreFixture(root) {
     'scripts/upgrade-fork-pair.js',
     'scripts/upgrade-fork-pair.sh',
     'scripts/native-task-convergence.js',
+    'scripts/native-task-convergence-runner.js',
     'cli/lib/native-task-conservation-inventory.js',
     'skills/commitment-core/scripts/legacy-task-adoption.js',
   ]) {
@@ -389,6 +392,21 @@ describe('fork-pair upgrade target contract', () => {
     }
   });
 
+  it('fails source validation when an immutable Core archive lacks the convergence runner', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
+    try {
+      writeCoreFixture(root);
+      fs.rmSync(path.join(root, 'scripts/native-task-convergence-runner.js'));
+
+      const result = validateCoreSource(root, '0.7.2-rc.5');
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, /native-task-convergence-runner\.js/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('fails source validation when an immutable Core archive lacks the outbound policy module', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
     try {
@@ -533,6 +551,174 @@ describe('fork-pair upgrade target contract', () => {
         '--authorization', 'owner-issue-25',
       ],
     });
+  });
+
+  it('accepts an explicit report transaction for a repair resume', () => {
+    const parsed = parseForkPairArgs([
+      '--repair-only',
+      '--resume',
+      '--report-dir', '/evidence/fork-pair-transaction',
+      '--core-sha', CORE_SHA,
+      '--feishu-sha', FEISHU_SHA,
+      '--core-version', '0.7.2-rc.5',
+      '--feishu-version', '0.3.7-rc.5',
+      '--staged-core', '/tmp/core',
+      '--agent', 'ss',
+      '--native-task-core-manifest', '/evidence/core.json',
+      '--native-task-feishu-manifest', '/evidence/feishu.json',
+      '--native-task-repair-authorization', 'owner-issue-25',
+    ]);
+    assert.equal(parsed.resume, true);
+    assert.equal(parsed.reportDir, '/evidence/fork-pair-transaction');
+  });
+
+  it('holds resume when the immutable pair target changes', () => {
+    const args = {
+      repairOnly: true,
+      execute: false,
+      dryRun: false,
+      resume: true,
+      agent: 'ss',
+      coreSha: CORE_SHA,
+      feishuSha: FEISHU_SHA,
+      coreVersion: '0.7.2-rc.5',
+      feishuVersion: '0.3.7-rc.5',
+      nativeTaskCoreManifest: '/evidence/core.json',
+      nativeTaskFeishuManifest: '/evidence/feishu.json',
+      nativeTaskRepairAuthorization: 'owner-issue-25',
+    };
+    const summary = {
+      schema: 'zylos.fork-pair-upgrade/v1',
+      status: 'HOLD',
+      mode: 'repair-only',
+      agent: 'ss',
+      transactionId: 'txn-issue-25',
+      reportDir: '/evidence/fork-pair-transaction',
+      target: {
+        core: { repo: 'HeXiaobo/zylos-core', sha: CORE_SHA, version: '0.7.2-rc.5' },
+        feishu: { repo: 'HeXiaobo/zylos-feishu', sha: FEISHU_SHA, version: '0.3.7-rc.5' },
+      },
+      nativeTaskInputs: {
+        coreManifest: '/evidence/core.json',
+        feishuManifest: '/evidence/feishu.json',
+        authorization: 'owner-issue-25',
+      },
+    };
+    assert.throws(
+      () => validatePairResumeSummary({
+        ...summary,
+        target: {
+          ...summary.target,
+          core: { ...summary.target.core, sha: 'c'.repeat(40) },
+        },
+      }, args, '/evidence/fork-pair-transaction'),
+      error => error.code === 'SOURCE_BINDING_MISMATCH',
+    );
+  });
+
+  it('binds convergence resume commands to the transaction and both immutable sources', () => {
+    const command = buildNativeTaskConvergenceCommand({
+      nodePath: '/usr/bin/node',
+      coreDir: '/evidence/staged/core',
+      feishuDir: '/evidence/staged/feishu',
+      coreManifest: '/evidence/core.json',
+      feishuManifest: '/evidence/feishu.json',
+      reportDir: '/evidence/fork-pair-transaction/native-task-convergence',
+      apply: true,
+      resume: true,
+      authorization: 'owner-issue-25',
+      transactionId: 'txn-issue-25',
+      coreSource: {
+        repo: 'HeXiaobo/zylos-core',
+        commit: CORE_SHA,
+        version: '0.7.2-rc.5',
+      },
+      feishuSource: {
+        repo: 'HeXiaobo/zylos-feishu',
+        commit: FEISHU_SHA,
+        version: '0.3.7-rc.5',
+      },
+    });
+    assert.deepEqual(command.args, [
+      '/evidence/staged/core/scripts/native-task-convergence.js',
+      '--apply',
+      '--resume',
+      '--core-manifest', '/evidence/core.json',
+      '--feishu-manifest', '/evidence/feishu.json',
+      '--core-dir', '/evidence/staged/core',
+      '--feishu-dir', '/evidence/staged/feishu',
+      '--report-dir', '/evidence/fork-pair-transaction/native-task-convergence',
+      '--authorization', 'owner-issue-25',
+      '--transaction-id', 'txn-issue-25',
+      '--core-source-repo', 'HeXiaobo/zylos-core',
+      '--core-source-commit', CORE_SHA,
+      '--core-source-version', '0.7.2-rc.5',
+      '--feishu-source-repo', 'HeXiaobo/zylos-feishu',
+      '--feishu-source-commit', FEISHU_SHA,
+      '--feishu-source-version', '0.3.7-rc.5',
+    ]);
+  });
+
+  it('persists staged Core and Feishu sources under the report transaction for later resume', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-fork-pair-staged-sources-'));
+    try {
+      const inputCore = path.join(root, 'input-core');
+      const reportDir = path.join(root, 'report');
+      const zylosDir = path.join(root, 'zylos');
+      const liveNodeModules = path.join(zylosDir, '.claude', 'skills', 'feishu', 'node_modules');
+      fs.mkdirSync(inputCore, { recursive: true });
+      writeCoreFixture(inputCore);
+      fs.mkdirSync(liveNodeModules, { recursive: true });
+      const args = {
+        stagedCoreDir: inputCore,
+        coreSha: CORE_SHA,
+        coreVersion: '0.7.2-rc.5',
+        feishuSha: FEISHU_SHA,
+        feishuVersion: '0.3.7-rc.5',
+      };
+      const result = preparePersistentStagedSources({
+        args,
+        reportDir,
+        zylosDir,
+        stageArchive(_repo, _sha, destination) {
+          fs.mkdirSync(destination, { recursive: true });
+          fs.writeFileSync(path.join(destination, 'package.json'), JSON.stringify({
+            name: 'zylos-feishu',
+            version: '0.3.7-rc.5',
+          }));
+          fs.writeFileSync(path.join(path.dirname(destination), 'feishu.tar.gz'), 'immutable archive');
+          return path.join(path.dirname(destination), 'feishu.tar.gz');
+        },
+      });
+
+      assert.equal(result.coreDir, path.join(reportDir, 'staged-sources', 'core'));
+      assert.equal(result.feishuDir, path.join(reportDir, 'staged-sources', 'feishu'));
+      assert.equal(fs.existsSync(result.coreDir), true);
+      assert.equal(fs.existsSync(result.feishuDir), true);
+      assert.equal(fs.existsSync(result.archivePath), true);
+      assert.equal(fs.realpathSync(path.join(result.feishuDir, 'node_modules')), fs.realpathSync(liveNodeModules));
+      assert.equal(fs.existsSync(path.join(inputCore, 'package.json')), true);
+
+      const resumed = preparePersistentStagedSources({
+        args,
+        reportDir,
+        zylosDir,
+        summary: {
+          stagedSources: {
+            root: result.root,
+            coreDir: result.coreDir,
+            feishuDir: result.feishuDir,
+            archivePath: result.archivePath,
+          },
+          sources: { core: result.core, feishu: result.feishu },
+        },
+        resume: true,
+      });
+      assert.equal(resumed.coreDir, result.coreDir);
+      assert.equal(resumed.feishuDir, result.feishuDir);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('holds before mutation when any online PM2 process has no real executable', () => {

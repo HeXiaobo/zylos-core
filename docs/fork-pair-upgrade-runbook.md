@@ -557,8 +557,14 @@ curl -fsSL \
 --native-task-repair-authorization owner-issue-25
 ```
 
-apply 固定按“补远端 marker、写 Core Task/link、修复唯一 linked status”执行；每步
-保存独立 JSON 与 SHA-256，随后仍必须通过 native Task conservation gate。两个
+apply 固定按“补远端 marker、写 Core Task/link、修复唯一 linked status、重新读取
+status reconciliation”执行。运行时独占锁禁止并发 repair；每步先持久化
+`ATTEMPTED/RUNNING` receipt，再以 `PASS/HOLD/UNKNOWN` 收口，并记录 transaction ID、
+manifest hash、命令、时间、退出码和报告 SHA-256。崩溃后仅允许在相同 host、
+`ZYLOS_DIR`、authorization 与 manifest hash 下恢复；恢复会先重跑全部 readback plan，
+再幂等重放 apply，不删除或逆向撤销已经成功的单调修复。最后一次 status readback
+必须 `consistent=true` 且 missing/unexpected/state/link/reminder/duplicate 集合全部为空，
+随后仍必须通过 native Task conservation gate。两个
 manifest 的 GUID/Core ID 集合不完全一致、对象跨 App/Agent、候选有歧义或任何
 readback 不一致时均 `HOLD`。流程不删除 Task、评论、link、备份或历史证据。
 `repair-only` PASS 后必须重新跑普通 `--dry-run`；只有该轮完整 pair dry-run PASS，
