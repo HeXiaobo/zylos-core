@@ -20,6 +20,7 @@ const LOCK_SCHEMA = 'zylos.native-task-convergence-lock/v1';
 const RUNNER_JOB_SCHEMA = 'zylos.native-task-convergence-runner-job/v1';
 const AUTHORIZATION = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{2,255}$/;
 const TRANSACTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const FULL_SHA = /^[0-9a-f]{40}$/i;
 const RUNNER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'native-task-convergence-runner.js');
 
 class ConvergenceError extends Error {
@@ -49,6 +50,73 @@ function sha256File(filePath, fsApi = fs) {
   return crypto.createHash('sha256').update(fsApi.readFileSync(filePath)).digest('hex');
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function sourceTreeSha256(root, fsApi = fs) {
+  const hash = crypto.createHash('sha256');
+  const visit = (current, relative = '') => {
+    const entries = fsApi.readdirSync(current, { withFileTypes: true })
+      .filter(entry => entry.name !== 'node_modules' && entry.name !== '.git')
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const child = path.join(current, entry.name);
+      const childRelative = path.join(relative, entry.name).split(path.sep).join('/');
+      const stat = fsApi.lstatSync(child);
+      if (stat.isSymbolicLink()) {
+        hash.update(`symlink\0${childRelative}\0${fsApi.readlinkSync(child)}\n`);
+      } else if (stat.isDirectory()) {
+        hash.update(`dir\0${childRelative}\0${stat.mode & 0o7777}\n`);
+        visit(child, childRelative);
+      } else if (stat.isFile()) {
+        hash.update(`file\0${childRelative}\0${stat.size}\0${stat.mode & 0o7777}\n`);
+        hash.update(fsApi.readFileSync(child));
+      }
+    }
+  };
+  visit(root);
+  return hash.digest('hex');
+}
+
+function sourceIdentity({ dir, repo, commit, version }, fsApi = fs) {
+  const resolvedDir = path.resolve(dir);
+  let realPath;
+  try {
+    realPath = fsApi.realpathSync(resolvedDir);
+  } catch (cause) {
+    throw new ConvergenceError(`source directory is not readable: ${resolvedDir}`, 'SOURCE_BINDING_MISMATCH', cause);
+  }
+  const packagePath = path.join(resolvedDir, 'package.json');
+  return {
+    dir: resolvedDir,
+    realPath,
+    repo,
+    commit,
+    version,
+    packageSha256: fsApi.existsSync(packagePath) ? sha256File(packagePath, fsApi) : null,
+    treeSha256: sourceTreeSha256(resolvedDir, fsApi),
+  };
+}
+
+function sourceIdentityEqual(left, right) {
+  return Boolean(left && right)
+    && ['dir', 'realPath', 'repo', 'commit', 'version', 'packageSha256', 'treeSha256']
+      .every(field => left[field] === right[field]);
+}
+
+function commandIdentity(step) {
+  const command = { command: step.command, args: [...step.args] };
+  return { ...command, sha256: sha256(JSON.stringify(command)) };
+}
+
+function commandIdentityMatches(identity, step) {
+  if (!identity || identity.command !== step.command || !Array.isArray(identity.args)) return false;
+  const expected = commandIdentity(step);
+  return identity.sha256 === expected.sha256
+    && identity.sha256 === sha256(JSON.stringify({ command: identity.command, args: identity.args }));
+}
+
 function atomicWriteJson(filePath, value, fsApi = fs) {
   const temporary = `${filePath}.${process.pid}.tmp`;
   fsApi.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -56,7 +124,19 @@ function atomicWriteJson(filePath, value, fsApi = fs) {
 }
 
 function parseArgs(argv) {
-  const options = { plan: false, apply: false, authorization: null };
+  const options = {
+    plan: false,
+    apply: false,
+    resume: false,
+    authorization: null,
+    transactionId: null,
+    coreSourceRepo: null,
+    coreSourceCommit: null,
+    coreSourceVersion: null,
+    feishuSourceRepo: null,
+    feishuSourceCommit: null,
+    feishuSourceVersion: null,
+  };
   const valueFlags = new Map([
     ['--core-manifest', 'coreManifest'],
     ['--feishu-manifest', 'feishuManifest'],
@@ -64,6 +144,13 @@ function parseArgs(argv) {
     ['--feishu-dir', 'feishuDir'],
     ['--report-dir', 'reportDir'],
     ['--authorization', 'authorization'],
+    ['--transaction-id', 'transactionId'],
+    ['--core-source-repo', 'coreSourceRepo'],
+    ['--core-source-commit', 'coreSourceCommit'],
+    ['--core-source-version', 'coreSourceVersion'],
+    ['--feishu-source-repo', 'feishuSourceRepo'],
+    ['--feishu-source-commit', 'feishuSourceCommit'],
+    ['--feishu-source-version', 'feishuSourceVersion'],
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -71,6 +158,11 @@ function parseArgs(argv) {
       const key = argument.slice(2);
       if (options[key]) throw new ConvergenceError(`duplicate flag: ${argument}`, 'INVALID_ARGUMENT');
       options[key] = true;
+      continue;
+    }
+    if (argument === '--resume') {
+      if (options.resume) throw new ConvergenceError(`duplicate flag: ${argument}`, 'INVALID_ARGUMENT');
+      options.resume = true;
       continue;
     }
     const key = valueFlags.get(argument);
@@ -97,6 +189,35 @@ function parseArgs(argv) {
   }
   if (options.plan && options.authorization !== null) {
     throw new ConvergenceError('--authorization is valid only with --apply', 'INVALID_ARGUMENT');
+  }
+  if (options.resume && !options.apply) {
+    throw new ConvergenceError('--resume is valid only with --apply', 'INVALID_ARGUMENT');
+  }
+  if (options.transactionId !== null && !TRANSACTION_ID.test(options.transactionId)) {
+    throw new ConvergenceError('--transaction-id must be a UUID', 'INVALID_ARGUMENT');
+  }
+  for (const prefix of ['core', 'feishu']) {
+    const fields = [`${prefix}SourceRepo`, `${prefix}SourceCommit`, `${prefix}SourceVersion`];
+    const supplied = fields.filter(field => options[field] !== null);
+    if (supplied.length > 0 && supplied.length !== fields.length) {
+      throw new ConvergenceError(
+        `--${prefix}-source-repo, --${prefix}-source-commit, and --${prefix}-source-version must be provided together`,
+        'INVALID_ARGUMENT',
+      );
+    }
+    if (options[`${prefix}SourceCommit`] !== null && !FULL_SHA.test(options[`${prefix}SourceCommit`])) {
+      throw new ConvergenceError(`--${prefix}-source-commit must be a full immutable 40-hex commit`, 'INVALID_ARGUMENT');
+    }
+  }
+  if (options.resume && (
+    options.coreSourceCommit === null
+    || options.feishuSourceCommit === null
+    || options.transactionId === null
+  )) {
+    throw new ConvergenceError(
+      '--resume requires both exact source identities and --transaction-id',
+      'SOURCE_BINDING_MISMATCH',
+    );
   }
   return options;
 }
@@ -143,6 +264,10 @@ export function buildNativeTaskConvergenceCommands({
   coreManifest,
   feishuManifest,
   apply = false,
+  resume = false,
+  transactionId,
+  coreSource,
+  feishuSource,
 } = {}) {
   const coreArgs = [
     path.join(coreDir, 'skills', 'commitment-core', 'scripts', 'legacy-task-adoption.js'),
@@ -175,6 +300,9 @@ export function buildNativeTaskConvergenceCommands({
       // the only authoritative proof that the status drift actually closed.
       { name: 'status-verify', command: nodePath, args: reconciliationArgs.filter(value => value !== '--repair-status') },
     ],
+    resume,
+    transactionId: transactionId ?? null,
+    sources: { core: coreSource ?? null, feishu: feishuSource ?? null },
   };
 }
 
@@ -224,6 +352,82 @@ function validateStepReport(name, report) {
       }
     }
   }
+}
+
+function buildSourceIdentities(options, fsApi = fs) {
+  const hasCore = options.coreSourceCommit !== null;
+  const hasFeishu = options.feishuSourceCommit !== null;
+  if (!hasCore && !hasFeishu) return null;
+  if (!hasCore || !hasFeishu) {
+    throw new ConvergenceError('both exact Core and Feishu source identities are required', 'SOURCE_BINDING_MISMATCH');
+  }
+  return {
+    core: sourceIdentity({
+      dir: options.coreDir,
+      repo: options.coreSourceRepo,
+      commit: options.coreSourceCommit,
+      version: options.coreSourceVersion,
+    }, fsApi),
+    feishu: sourceIdentity({
+      dir: options.feishuDir,
+      repo: options.feishuSourceRepo,
+      commit: options.feishuSourceCommit,
+      version: options.feishuSourceVersion,
+    }, fsApi),
+  };
+}
+
+function manifestHashIdentity(manifests) {
+  return {
+    core: manifests.core.sha256,
+    feishu: manifests.feishu.sha256,
+  };
+}
+
+function canonicalReceiptPath(reportDir, stepName) {
+  return path.join(reportDir, 'receipts', `${stepName}.json`);
+}
+
+function writeCanonicalStepReceipt({
+  reportDir,
+  step,
+  state,
+  transactionId,
+  manifests,
+  sources,
+  fsApi = fs,
+  details = {},
+  now = () => new Date().toISOString(),
+}) {
+  const filePath = canonicalReceiptPath(reportDir, step.name);
+  fsApi.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const previous = readOptionalJson(filePath, fsApi);
+  const attempt = state === 'attempted'
+    ? Number(previous?.attempt || 0) + 1
+    : Number(previous?.attempt || 1);
+  const event = {
+    state,
+    attempt,
+    at: now(),
+    ...details,
+  };
+  const receipt = {
+    schema: 'zylos.native-task-convergence-step-receipt/v1',
+    transactionId,
+    step: step.name,
+    attempt,
+    state,
+    status: state.toUpperCase(),
+    manifestHashes: manifestHashIdentity(manifests),
+    manifestSha256: manifestHashIdentity(manifests),
+    sources,
+    commandIdentity: commandIdentity(step),
+    command: { executable: step.command, args: [...step.args] },
+    history: [...(Array.isArray(previous?.history) ? previous.history : []), event],
+    ...details,
+  };
+  atomicWriteJson(filePath, receipt, fsApi);
+  return receipt;
 }
 
 function readOptionalJson(filePath, fsApi = fs) {
@@ -673,6 +877,7 @@ function commandReceipt({
   reportPath = null,
   reportSha256 = null,
   error = null,
+  sources = null,
 }) {
   return {
     schema: STEP_RECEIPT_SCHEMA,
@@ -680,8 +885,11 @@ function commandReceipt({
     manifestSha256,
     step: step.name,
     command: { executable: step.command, args: step.args },
+    commandIdentity: commandIdentity(step),
     attempt,
     status,
+    manifestHashes: manifestSha256,
+    sources,
     attemptedAt: startedAt,
     startedAt,
     finishedAt,
@@ -706,24 +914,105 @@ function previousStepReceipt(reportDir, stepName, fsApi = fs) {
   return readOptionalJson(path.join(reportDir, attempts[0].name), fsApi);
 }
 
+function assertResumeIdentity({ summary, options, manifests, sources, sequence, fsApi = fs }) {
+  if (!summary || summary.schema !== REPORT_SCHEMA) {
+    throw new ConvergenceError('resume requires a native convergence summary', 'RESUME_STATE_MISSING');
+  }
+  if (summary.mode !== 'apply' || summary.authorization !== options.authorization) {
+    throw new ConvergenceError('resume authorization or mode does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  if (summary.transactionId !== options.transactionId) {
+    throw new ConvergenceError('resume transaction id does not match the durable summary', 'SOURCE_BINDING_MISMATCH');
+  }
+  if (
+    summary.manifests?.core?.path !== options.coreManifest
+    || summary.manifests?.feishu?.path !== options.feishuManifest
+    || summary.manifests?.core?.sha256 !== manifests.core.sha256
+    || summary.manifests?.feishu?.sha256 !== manifests.feishu.sha256
+  ) {
+    throw new ConvergenceError('resume manifest identity does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  if (!sourceIdentityEqual(summary.sources?.core, sources?.core)
+    || !sourceIdentityEqual(summary.sources?.feishu, sources?.feishu)) {
+    throw new ConvergenceError('resume source directory or immutable commit does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  const expectedCommandIdentities = sequence.map(commandIdentity);
+  if (
+    summary.invocation?.coreDir !== options.coreDir
+    || summary.invocation?.feishuDir !== options.feishuDir
+    || !Array.isArray(summary.invocation?.commandIdentities)
+    || summary.invocation.commandIdentities.length !== expectedCommandIdentities.length
+    || summary.invocation.commandIdentities.some((identity, index) => !commandIdentityMatches(identity, sequence[index]))
+  ) {
+    throw new ConvergenceError('resume invocation command identity does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  const stepsByName = new Map(sequence.map(step => [step.name, step]));
+  for (const step of summary.steps || []) {
+    const currentStep = stepsByName.get(step.name);
+    if (!currentStep || !commandIdentityMatches(step.commandIdentity, currentStep)) {
+      throw new ConvergenceError(`resume command identity does not match ${step.name}`, 'SOURCE_BINDING_MISMATCH');
+    }
+  }
+  const receiptDir = path.join(options.reportDir, 'receipts');
+  if (fsApi.existsSync(receiptDir)) {
+    for (const entry of fsApi.readdirSync(receiptDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const receipt = readOptionalJson(path.join(receiptDir, entry.name), fsApi);
+      const currentStep = stepsByName.get(receipt?.step);
+      const receiptHashes = receipt?.manifestHashes ?? receipt?.manifestSha256;
+      if (!currentStep
+        || receipt.transactionId !== summary.transactionId
+        || JSON.stringify(receiptHashes) !== JSON.stringify(manifestHashIdentity(manifests))
+        || !sourceIdentityEqual(receipt.sources?.core, sources?.core)
+        || !sourceIdentityEqual(receipt.sources?.feishu, sources?.feishu)
+        || !commandIdentityMatches(receipt.commandIdentity, currentStep)) {
+        throw new ConvergenceError(`resume receipt identity does not match ${receipt?.step || entry.name}`, 'SOURCE_BINDING_MISMATCH');
+      }
+    }
+  }
+  if (summary.status === 'PASS') return { complete: true };
+  if (!['RUNNING', 'HOLD'].includes(summary.status)) {
+    throw new ConvergenceError('native convergence transaction has an invalid terminal state', 'RESUME_STATE_INVALID');
+  }
+  return { complete: false };
+}
+
+function recordStepSummary(summary, value) {
+  const index = summary.steps.findIndex(step => step.name === value.name);
+  if (index === -1) summary.steps.push(value);
+  else summary.steps[index] = value;
+}
+
 export function runNativeTaskConvergence({
   argv = process.argv.slice(2),
   env = process.env,
   fsApi = fs,
   spawn = spawnSync,
   stdout = process.stdout,
+  now = () => new Date().toISOString(),
 } = {}) {
   const options = parseArgs(argv);
   fsApi.mkdirSync(options.reportDir, { recursive: true });
   const summaryPath = path.join(options.reportDir, 'summary.json');
-  const manifestSha256 = {
-    core: sha256File(options.coreManifest, fsApi),
-    feishu: sha256File(options.feishuManifest, fsApi),
+  const manifests = {
+    core: { path: options.coreManifest, sha256: sha256File(options.coreManifest, fsApi) },
+    feishu: { path: options.feishuManifest, sha256: sha256File(options.feishuManifest, fsApi) },
   };
+  const manifestSha256 = manifestHashIdentity(manifests);
+  const sources = buildSourceIdentities(options, fsApi);
   const runtimeDir = path.resolve(env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'));
   const runtimeHostname = os.hostname();
   const existingSummary = readOptionalJson(summaryPath, fsApi);
-  const resumable = options.apply
+  const explicitResume = options.resume;
+  const existingSourcesMatch = !existingSummary
+    || (existingSummary.sources == null && sources == null)
+    || (sourceIdentityEqual(existingSummary.sources?.core, sources?.core)
+      && sourceIdentityEqual(existingSummary.sources?.feishu, sources?.feishu));
+  const existingTransactionMatch = !existingSummary
+    || options.transactionId === null
+    || existingSummary.transactionId === options.transactionId;
+  const resumable = !explicitResume
+    && options.apply
     && existingSummary?.schema === REPORT_SCHEMA
     && existingSummary?.mode === 'apply'
     && TRANSACTION_ID.test(String(existingSummary.transactionId ?? ''))
@@ -732,33 +1021,67 @@ export function runNativeTaskConvergence({
     && existingSummary.authorization === options.authorization
     && existingSummary.runtime?.zylosDir === runtimeDir
     && existingSummary.runtime?.hostname === runtimeHostname
-    && ['RUNNING', 'HOLD'].includes(existingSummary.status);
-  if (existingSummary && !resumable) {
+    && ['RUNNING', 'HOLD'].includes(existingSummary.status)
+    && existingSourcesMatch
+    && existingTransactionMatch;
+  if (explicitResume && !existingSummary) {
+    const hold = {
+      schema: REPORT_SCHEMA,
+      status: 'HOLD',
+      transactionId: options.transactionId,
+      code: 'RESUME_STATE_MISSING',
+      error: 'resume requires a native convergence summary',
+      reportDir: options.reportDir,
+    };
+    stdout.write(`${JSON.stringify(hold)}\n`);
+    return hold;
+  }
+  if (existingSummary && !explicitResume && !resumable) {
     throw new ConvergenceError(
       'report directory already contains evidence for a different or terminal transaction',
       'REPORT_IDENTITY_MISMATCH',
     );
   }
-  const transactionId = resumable ? existingSummary.transactionId : crypto.randomUUID();
-  const summary = {
+  const transactionId = explicitResume
+    ? options.transactionId
+    : resumable
+      ? existingSummary.transactionId
+      : options.transactionId ?? crypto.randomUUID();
+  const commands = buildNativeTaskConvergenceCommands({
+    coreDir: options.coreDir,
+    feishuDir: options.feishuDir,
+    coreManifest: options.coreManifest,
+    feishuManifest: options.feishuManifest,
+    apply: options.apply,
+    resume: options.resume,
+    transactionId,
+    coreSource: sources?.core,
+    feishuSource: sources?.feishu,
+  });
+  const sequence = options.apply ? [...commands.plans, ...commands.apply] : commands.plans;
+  let summary = explicitResume ? existingSummary : {
     schema: REPORT_SCHEMA,
     transactionId,
     status: 'RUNNING',
     mode: options.apply ? 'apply' : 'plan',
     authorization: options.apply ? options.authorization : null,
-    startedAt: resumable ? existingSummary.startedAt : new Date().toISOString(),
-    resumedAt: resumable ? new Date().toISOString() : null,
+    startedAt: resumable ? existingSummary.startedAt : now(),
+    resumedAt: resumable ? now() : null,
     attempt: resumable ? Number(existingSummary.attempt || 1) + 1 : 1,
+    resumeCount: resumable ? Number(existingSummary.resumeCount || 0) + 1 : 0,
     resumePolicy: options.apply ? 'READBACK_THEN_IDEMPOTENT_REPLAY' : null,
     runtime: { zylosDir: runtimeDir, hostname: runtimeHostname },
-    manifests: {
-      core: { path: options.coreManifest, sha256: manifestSha256.core },
-      feishu: { path: options.feishuManifest, sha256: manifestSha256.feishu },
+    manifests,
+    sources,
+    invocation: {
+      coreDir: options.coreDir,
+      feishuDir: options.feishuDir,
+      commandIdentities: sequence.map(commandIdentity),
     },
     steps: [],
   };
   let lockHandle = null;
-  if (options.apply) {
+  if (!explicitResume && options.apply) {
     lockHandle = acquireApplyLock({ zylosDir: runtimeDir, transactionId, fsApi });
   }
   const controlledRunner = Boolean(options.apply && spawn === spawnSync);
@@ -766,47 +1089,104 @@ export function runNativeTaskConvergence({
     Object.entries({ ...env, ZYLOS_DIR: runtimeDir })
       .filter(([key, value]) => typeof key === 'string' && typeof value === 'string'),
   );
-  atomicWriteJson(summaryPath, summary, fsApi);
   try {
+    if (explicitResume) {
+      let resumeState;
+      try {
+        resumeState = assertResumeIdentity({ summary, options, manifests, sources, sequence, fsApi });
+      } catch (error) {
+        const hold = {
+          ...summary,
+          status: 'HOLD',
+          code: error?.code ?? 'SOURCE_BINDING_MISMATCH',
+          error: error?.message ?? String(error),
+        };
+        stdout.write(`${JSON.stringify(hold)}\n`);
+        return hold;
+      }
+      if (resumeState.complete) {
+        stdout.write(`${JSON.stringify(summary)}\n`);
+        return summary;
+      }
+      summary.resumeCount = Number(summary.resumeCount || 0) + 1;
+      summary.resumedAt = now();
+      summary.status = 'RUNNING';
+      delete summary.finishedAt;
+      summary.steps = [];
+    } else if (resumable && existingSummary.sources) {
+      assertResumeIdentity({
+        summary: existingSummary,
+        options: { ...options, transactionId },
+        manifests,
+        sources,
+        sequence,
+        fsApi,
+      });
+    }
+
+    if (explicitResume && options.apply) {
+      lockHandle = acquireApplyLock({ zylosDir: runtimeDir, transactionId, fsApi });
+    }
+    atomicWriteJson(summaryPath, summary, fsApi);
+
     const pair = validateConvergenceManifestPair({
       coreManifest: readJson(options.coreManifest, 'Core manifest', fsApi),
       feishuManifest: readJson(options.feishuManifest, 'Feishu manifest', fsApi),
     });
     if (!pair.ok) throw new ConvergenceError(pair.error, 'MANIFEST_PAIR_MISMATCH');
     summary.target = pair;
-    const commands = buildNativeTaskConvergenceCommands({
+    summary.manifests = manifests;
+    summary.sources = sources;
+    summary.invocation = {
       coreDir: options.coreDir,
       feishuDir: options.feishuDir,
-      coreManifest: options.coreManifest,
-      feishuManifest: options.feishuManifest,
-      apply: options.apply,
-    });
-    const sequence = options.apply ? [...commands.plans, ...commands.apply] : commands.plans;
+      commandIdentities: sequence.map(commandIdentity),
+    };
+    atomicWriteJson(summaryPath, summary, fsApi);
+
     for (const step of sequence) {
       const currentReceiptPath = path.join(options.reportDir, `${step.name}.receipt.json`);
       const previousReceipt = previousStepReceipt(options.reportDir, step.name, fsApi);
       const attempt = Number.isInteger(previousReceipt?.attempt) ? previousReceipt.attempt + 1 : 1;
       const receiptPath = path.join(options.reportDir, `${step.name}.attempt-${attempt}.receipt.json`);
-      const startedAt = new Date().toISOString();
+      const startedAt = now();
       const receiptBase = {
         transactionId,
         manifestSha256,
         step,
         attempt,
         startedAt,
+        sources,
       };
       const writeReceipt = value => {
         atomicWriteJson(receiptPath, value, fsApi);
         atomicWriteJson(currentReceiptPath, value, fsApi);
       };
+      const writeCanonical = (state, details = {}) => {
+        if (options.apply) {
+          writeCanonicalStepReceipt({
+            reportDir: options.reportDir,
+            step,
+            state,
+            transactionId,
+            manifests,
+            sources,
+            fsApi,
+            details,
+            now,
+          });
+        }
+      };
       writeReceipt({
         ...commandReceipt({ ...receiptBase, status: 'ATTEMPTED' }),
         previousStatus: previousReceipt?.status ?? null,
       });
+      writeCanonical('attempted');
       writeReceipt({
         ...commandReceipt({ ...receiptBase, status: 'RUNNING' }),
         previousStatus: previousReceipt?.status ?? null,
       });
+      writeCanonical('running', { startedAt: now() });
       let result;
       try {
         result = controlledRunner
@@ -826,6 +1206,11 @@ export function runNativeTaskConvergence({
             maxBuffer: 8 * 1024 * 1024,
           });
       } catch (error) {
+        writeCanonical('unknown', {
+          error: error?.message ?? String(error),
+          signal: error?.signal ?? null,
+          finishedAt: now(),
+        });
         if (lockHandle && !controlledRunner) {
           try { markDirectAdapterTerminal(lockHandle, 'HOLD', fsApi); } catch {}
         }
@@ -840,42 +1225,57 @@ export function runNativeTaskConvergence({
         const reportPath = path.join(options.reportDir, `${step.name}.json`);
         atomicWriteJson(reportPath, report, fsApi);
         const reportSha256 = sha256File(reportPath, fsApi);
+        const details = {
+          exitCode: result.status,
+          signal: result.signal ?? null,
+          reportPath,
+          reportSha256,
+          finishedAt: now(),
+        };
         writeReceipt(commandReceipt({
           ...receiptBase,
           status: 'PASS',
-          finishedAt: new Date().toISOString(),
-          exitCode: result.status,
-          reportPath,
-          reportSha256,
+          ...details,
         }));
-        summary.steps.push({
+        writeCanonical('pass', details);
+        recordStepSummary(summary, {
           name: step.name,
           receiptPath,
           currentReceiptPath,
+          canonicalReceiptPath: canonicalReceiptPath(options.reportDir, step.name),
           reportPath,
           reportSha256,
+          commandIdentity: commandIdentity(step),
         });
         atomicWriteJson(summaryPath, summary, fsApi);
       } catch (error) {
-        const uncertain = Boolean(result.error) || result.status === null;
+        const uncertain = Boolean(result.error) || result.status === null || Boolean(result.signal);
+        const details = {
+          exitCode: result.status ?? null,
+          signal: result.signal ?? null,
+          error: error?.message ?? String(error),
+          finishedAt: now(),
+        };
         writeReceipt(commandReceipt({
           ...receiptBase,
           status: uncertain ? 'UNKNOWN' : 'HOLD',
-          finishedAt: new Date().toISOString(),
-          exitCode: result.status ?? null,
-          error: error?.message ?? String(error),
+          ...details,
         }));
+        writeCanonical(uncertain ? 'unknown' : 'hold', details);
         throw error;
       }
     }
     summary.status = 'PASS';
     summary.result = options.apply ? 'CONVERGENCE_APPLIED' : 'PLAN_COMPLETE';
   } catch (error) {
+    if (['LOCK_HELD', 'LOCK_FAILED', 'LOCK_RECOVERY_REQUIRED', 'LOCK_OWNERSHIP_LOST'].includes(error?.code)) {
+      throw error;
+    }
     summary.status = 'HOLD';
     summary.code = error?.code ?? 'CONVERGENCE_FAILED';
     summary.error = error?.message ?? String(error);
   }
-  summary.finishedAt = new Date().toISOString();
+  summary.finishedAt = now();
   atomicWriteJson(summaryPath, summary, fsApi);
   if (lockHandle) {
     try {

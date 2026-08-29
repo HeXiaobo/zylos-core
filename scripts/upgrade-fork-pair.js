@@ -320,24 +320,45 @@ export function buildNativeTaskConvergenceCommand({
   reportDir,
   apply = false,
   authorization,
+  resume = false,
+  transactionId,
+  coreSource,
+  feishuSource,
 }) {
+  const sourceArgs = (prefix, source) => source
+    ? [
+      `--${prefix}-source-repo`, source.repo,
+      `--${prefix}-source-commit`, source.commit,
+      `--${prefix}-source-version`, source.version,
+    ]
+    : [];
   return {
     command: nodePath,
     args: [
       path.join(coreDir, 'scripts', 'native-task-convergence.js'),
       apply ? '--apply' : '--plan',
+      ...(resume ? ['--resume'] : []),
       '--core-manifest', path.resolve(coreManifest),
       '--feishu-manifest', path.resolve(feishuManifest),
       '--core-dir', coreDir,
       '--feishu-dir', feishuDir,
       '--report-dir', reportDir,
-      ...(apply ? ['--authorization', authorization] : []),
+      ...(apply && authorization ? ['--authorization', authorization] : []),
+      ...(transactionId ? ['--transaction-id', transactionId] : []),
+      ...sourceArgs('core', coreSource),
+      ...sourceArgs('feishu', feishuSource),
     ],
   };
 }
 
 export function parseForkPairArgs(argv) {
-  const result = { execute: false, dryRun: false, repairOnly: false, agent: 'unknown' };
+  const result = {
+    execute: false,
+    dryRun: false,
+    repairOnly: false,
+    resume: false,
+    agent: 'unknown',
+  };
   const valueFlags = new Map([
     ['--core-sha', 'coreSha'],
     ['--feishu-sha', 'feishuSha'],
@@ -346,6 +367,7 @@ export function parseForkPairArgs(argv) {
     ['--staged-core', 'stagedCoreDir'],
     ['--agent', 'agent'],
     ['--report-root', 'reportRoot'],
+    ['--report-dir', 'reportDir'],
     ['--native-task-core-manifest', 'nativeTaskCoreManifest'],
     ['--native-task-feishu-manifest', 'nativeTaskFeishuManifest'],
     ['--native-task-repair-authorization', 'nativeTaskRepairAuthorization'],
@@ -363,6 +385,11 @@ export function parseForkPairArgs(argv) {
     }
     if (arg === '--repair-only') {
       result.repairOnly = true;
+      continue;
+    }
+    if (arg === '--resume') {
+      if (result.resume) throw new HoldError('duplicate option: --resume', 'INVALID_ARGS');
+      result.resume = true;
       continue;
     }
     const key = valueFlags.get(arg);
@@ -415,6 +442,15 @@ export function parseForkPairArgs(argv) {
       '--repair-only requires both native Task convergence manifests',
       'INVALID_ARGS',
     );
+  }
+  if (result.resume && !result.reportDir) {
+    throw new HoldError('--resume requires --report-dir so the same transaction can be reopened', 'INVALID_ARGS');
+  }
+  if (result.resume && result.dryRun) {
+    throw new HoldError('--resume is valid only for an apply or repair-only transaction', 'INVALID_ARGS');
+  }
+  if (result.reportDir && result.reportRoot) {
+    throw new HoldError('--report-dir cannot be combined with --report-root', 'INVALID_ARGS');
   }
   return result;
 }
@@ -491,6 +527,25 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+function commandIdentity(command) {
+  const value = { command: command.command, args: [...command.args] };
+  return { ...value, sha256: sha256(JSON.stringify(value)) };
+}
+
+function resumeNeutralCommandIdentity(command) {
+  return commandIdentity({
+    command: command.command,
+    args: command.args.filter(argument => argument !== '--resume'),
+  });
+}
+
+function commandIdentityMatches(identity, command) {
+  if (!identity || identity.command !== command.command || !Array.isArray(identity.args)) return false;
+  const expected = resumeNeutralCommandIdentity(command);
+  return identity.sha256 === expected.sha256
+    && identity.sha256 === sha256(JSON.stringify({ command: identity.command, args: identity.args }));
+}
+
 function signedDocument(payload) {
   return { ...payload, signature: sha256(JSON.stringify(payload)) };
 }
@@ -504,6 +559,56 @@ function hasValidSignature(document) {
 function hashFile(filePath) {
   if (!fileIsRegular(filePath)) return null;
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function sourceTreeSha256(root) {
+  const hash = crypto.createHash('sha256');
+  const visit = (current, relative = '') => {
+    const entries = fs.readdirSync(current, { withFileTypes: true })
+      .filter(entry => entry.name !== 'node_modules' && entry.name !== '.git')
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const child = path.join(current, entry.name);
+      const childRelative = path.join(relative, entry.name).split(path.sep).join('/');
+      const stat = fs.lstatSync(child);
+      if (stat.isSymbolicLink()) {
+        hash.update(`symlink\0${childRelative}\0${fs.readlinkSync(child)}\n`);
+      } else if (stat.isDirectory()) {
+        hash.update(`dir\0${childRelative}\0${stat.mode & 0o7777}\n`);
+        visit(child, childRelative);
+      } else if (stat.isFile()) {
+        hash.update(`file\0${childRelative}\0${stat.size}\0${stat.mode & 0o7777}\n`);
+        hash.update(fs.readFileSync(child));
+      }
+    }
+  };
+  visit(root);
+  return hash.digest('hex');
+}
+
+function buildSourceIdentity(root, { repo, sha, version }) {
+  const dir = path.resolve(root);
+  let realPath;
+  try {
+    realPath = fs.realpathSync(dir);
+  } catch (error) {
+    throw new HoldError(`source directory is not readable: ${dir}`, 'INVALID_SOURCE_IDENTITY');
+  }
+  return {
+    dir,
+    realPath,
+    repo,
+    commit: sha,
+    version,
+    packageSha256: hashFile(path.join(dir, 'package.json')),
+    treeSha256: sourceTreeSha256(dir),
+  };
+}
+
+function sourceIdentityMatches(expected, actual) {
+  return Boolean(expected && actual)
+    && ['dir', 'realPath', 'repo', 'commit', 'version', 'packageSha256', 'treeSha256']
+      .every(field => expected[field] === actual[field]);
 }
 
 function persistedEnvValue(filePath, name) {
@@ -1403,6 +1508,125 @@ function stageImmutableArchive(repo, sha, destination) {
   return archivePath;
 }
 
+function copyImmutableSource(source, destination) {
+  const sourceDir = path.resolve(source);
+  const destinationDir = path.resolve(destination);
+  if (sourceDir === destinationDir) return destinationDir;
+  if (fs.existsSync(destinationDir)) {
+    throw new HoldError(
+      `persistent staged source already exists at ${destinationDir}; resume the recorded transaction`,
+      'SOURCE_TRANSACTION_CONFLICT',
+    );
+  }
+  fs.cpSync(sourceDir, destinationDir, {
+    recursive: true,
+    force: false,
+    errorOnExist: true,
+    dereference: false,
+    filter(candidate) {
+      const base = path.basename(candidate);
+      return base !== 'node_modules' && base !== '.git';
+    },
+  });
+  return destinationDir;
+}
+
+function ensureFeishuRuntimeDependencies(stagedFeishuDir, liveNodeModules) {
+  const target = path.join(stagedFeishuDir, 'node_modules');
+  let liveRealPath;
+  try {
+    liveRealPath = fs.realpathSync(liveNodeModules);
+  } catch {
+    throw new HoldError(
+      `target Feishu preflight cannot reuse live runtime dependencies: ${liveNodeModules}`,
+      'INVALID_FEISHU_SOURCE',
+    );
+  }
+  if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false })) {
+    let targetRealPath;
+    try { targetRealPath = fs.realpathSync(target); } catch {
+      throw new HoldError(`staged Feishu node_modules is not readable: ${target}`, 'INVALID_FEISHU_SOURCE');
+    }
+    if (targetRealPath !== liveRealPath) {
+      throw new HoldError(
+        `staged Feishu node_modules is bound to ${targetRealPath}, expected ${liveRealPath}`,
+        'SOURCE_BINDING_MISMATCH',
+      );
+    }
+    return target;
+  }
+  fs.symlinkSync(liveNodeModules, target, 'dir');
+  return target;
+}
+
+export function preparePersistentStagedSources({
+  args,
+  reportDir,
+  summary,
+  zylosDir,
+  resume = false,
+  copySource = copyImmutableSource,
+  stageArchive = stageImmutableArchive,
+  persistProgress,
+}) {
+  const root = path.join(reportDir, 'staged-sources');
+  const coreDir = path.join(root, 'core');
+  const feishuDir = path.join(root, 'feishu');
+  const archivePath = path.join(root, 'feishu.tar.gz');
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+
+  if (resume) {
+    const persisted = summary?.stagedSources;
+    if (
+      !persisted
+      || path.resolve(persisted.root || '') !== path.resolve(root)
+      || path.resolve(persisted.coreDir || '') !== path.resolve(coreDir)
+      || path.resolve(persisted.feishuDir || '') !== path.resolve(feishuDir)
+      || path.resolve(persisted.archivePath || '') !== path.resolve(archivePath)
+    ) {
+      throw new HoldError('resume staged source paths do not match the transaction', 'SOURCE_BINDING_MISMATCH');
+    }
+    if (!fs.existsSync(coreDir) || !fs.existsSync(feishuDir)) {
+      throw new HoldError('resume requires the original staged source trees to remain present', 'SOURCE_BINDING_MISMATCH');
+    }
+    if (!fileIsRegular(archivePath)) {
+      throw new HoldError('resume requires the immutable Feishu source archive to remain present', 'SOURCE_BINDING_MISMATCH');
+    }
+  } else {
+    copySource(args.stagedCoreDir, coreDir);
+    persistProgress?.({ root, coreDir, feishuDir, archivePath: null, stage: 'core' });
+    stageArchive(FEISHU_REPO, args.feishuSha, feishuDir);
+    persistProgress?.({ root, coreDir, feishuDir, archivePath, stage: 'feishu' });
+  }
+
+  const liveFeishuDir = path.join(zylosDir, '.claude', 'skills', 'feishu');
+  ensureFeishuRuntimeDependencies(feishuDir, path.join(liveFeishuDir, 'node_modules'));
+  const core = buildSourceIdentity(coreDir, {
+    repo: CORE_REPO,
+    sha: args.coreSha,
+    version: args.coreVersion,
+  });
+  const feishu = buildSourceIdentity(feishuDir, {
+    repo: FEISHU_REPO,
+    sha: args.feishuSha,
+    version: args.feishuVersion,
+  });
+  if (resume && (
+    !sourceIdentityMatches(summary.sources?.core, core)
+    || !sourceIdentityMatches(summary.sources?.feishu, feishu)
+  )) {
+    throw new HoldError('resume staged source content or immutable commit does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  return {
+    root,
+    coreDir,
+    feishuDir,
+    archivePath,
+    core,
+    feishu,
+  };
+}
+
 function commandEvidence(result) {
   return {
     status: result.status,
@@ -1567,6 +1791,10 @@ function runNativeTaskConvergenceWorkflow({
   reportDir,
   apply,
   authorization,
+  resume = false,
+  transactionId,
+  coreSource,
+  feishuSource,
 }) {
   const command = buildNativeTaskConvergenceCommand({
     nodePath: process.execPath,
@@ -1577,6 +1805,10 @@ function runNativeTaskConvergenceWorkflow({
     reportDir,
     apply,
     authorization,
+    resume,
+    transactionId,
+    coreSource,
+    feishuSource,
   });
   const result = run(command.command, command.args, {
     cwd: coreDir,
@@ -1594,6 +1826,9 @@ function runNativeTaskConvergenceWorkflow({
     report.schema !== 'zylos.native-task-convergence-run/v1'
     || report.mode !== (apply ? 'apply' : 'plan')
     || (apply && report.authorization !== authorization)
+    || (transactionId && report.transactionId !== transactionId)
+    || (coreSource && !sourceIdentityMatches(report.sources?.core, coreSource))
+    || (feishuSource && !sourceIdentityMatches(report.sources?.feishu, feishuSource))
   ) {
     throw new HoldError(
       'native task convergence returned an invalid or mismatched PASS report',
@@ -1611,6 +1846,71 @@ function makeReportDir(zylosDir, explicitRoot) {
   const reportDir = path.join(root, `fork-pair-${timestamp}`);
   fs.mkdirSync(reportDir, { recursive: true });
   return reportDir;
+}
+
+function pairTransactionMode(args) {
+  return args.execute ? 'execute' : args.repairOnly ? 'repair-only' : 'dry-run';
+}
+
+function createPairTransactionSummary(args, reportDir) {
+  return {
+    schema: 'zylos.fork-pair-upgrade/v1',
+    status: 'RUNNING',
+    mode: pairTransactionMode(args),
+    agent: args.agent,
+    transactionId: crypto.randomUUID(),
+    startedAt: new Date().toISOString(),
+    target: {
+      core: { repo: CORE_REPO, sha: args.coreSha, version: args.coreVersion },
+      feishu: { repo: FEISHU_REPO, sha: args.feishuSha, version: args.feishuVersion },
+    },
+    reportDir,
+    coreUpgraded: false,
+    feishuUpgraded: false,
+  };
+}
+
+export function validatePairResumeSummary(summary, args, reportDir) {
+  if (!summary || summary.schema !== 'zylos.fork-pair-upgrade/v1') {
+    throw new HoldError('resume requires a fork-pair transaction summary', 'RESUME_STATE_MISSING');
+  }
+  if (!summary.transactionId || typeof summary.transactionId !== 'string') {
+    throw new HoldError('resume transaction has no durable transaction id', 'SOURCE_BINDING_MISMATCH');
+  }
+  if (path.resolve(summary.reportDir || '') !== path.resolve(reportDir)) {
+    throw new HoldError('resume report directory does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  if (summary.mode !== pairTransactionMode(args) || summary.agent !== args.agent) {
+    throw new HoldError('resume mode or Agent does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  if (
+    summary.target?.core?.repo !== CORE_REPO
+    || summary.target?.core?.sha !== args.coreSha
+    || summary.target?.core?.version !== args.coreVersion
+    || summary.target?.feishu?.repo !== FEISHU_REPO
+    || summary.target?.feishu?.sha !== args.feishuSha
+    || summary.target?.feishu?.version !== args.feishuVersion
+  ) {
+    throw new HoldError('resume immutable pair target does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  const hasNativeTaskInputs = Boolean(args.nativeTaskCoreManifest);
+  if (hasNativeTaskInputs !== Boolean(summary.nativeTaskInputs)
+    || (hasNativeTaskInputs && (
+      summary.nativeTaskInputs?.coreManifest !== path.resolve(args.nativeTaskCoreManifest)
+      || summary.nativeTaskInputs?.feishuManifest !== path.resolve(args.nativeTaskFeishuManifest)
+      || summary.nativeTaskInputs?.authorization !== args.nativeTaskRepairAuthorization
+      || summary.nativeTaskInputs?.transactionId !== summary.transactionId
+      || !summary.nativeTaskInputs?.coreDir
+      || !summary.nativeTaskInputs?.feishuDir
+      || !summary.nativeTaskInputs?.reportDir
+      || !summary.nativeTaskInputs?.commandIdentity?.sha256
+    ))) {
+    throw new HoldError('resume native Task inputs do not match the transaction', 'SOURCE_BINDING_MISMATCH');
+  }
+  if (!['RUNNING', 'HOLD'].includes(summary.status)) {
+    throw new HoldError('fork-pair transaction is already complete', 'TRANSACTION_COMPLETE');
+  }
+  return summary;
 }
 
 export function runForkPairUpgrade(argv = process.argv.slice(2)) {
@@ -1634,45 +1934,114 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
   }
 
   const zylosDir = path.resolve(process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'));
-  const reportDir = makeReportDir(zylosDir, args.reportRoot);
+  const reportDir = args.reportDir
+    ? path.resolve(args.reportDir)
+    : makeReportDir(zylosDir, args.reportRoot);
+  fs.mkdirSync(reportDir, { recursive: true, mode: 0o700 });
   const summaryPath = path.join(reportDir, 'summary.json');
+  let summary;
+  if (args.resume) {
+    try {
+      summary = validatePairResumeSummary(readJson(summaryPath), args, reportDir);
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify({
+        status: 'HOLD',
+        code: error.code || 'RESUME_STATE_MISSING',
+        error: error.message,
+        reportDir,
+      }, null, 2)}\n`);
+      return 1;
+    }
+    summary.resumeCount = Number(summary.resumeCount || 0) + 1;
+    summary.resumedAt = new Date().toISOString();
+    summary.status = 'RUNNING';
+    delete summary.finishedAt;
+    atomicWriteJson(summaryPath, summary);
+  } else {
+    if (fs.existsSync(summaryPath)) {
+      process.stdout.write(`${JSON.stringify({
+        status: 'HOLD',
+        code: 'REPORT_TRANSACTION_CONFLICT',
+        error: `report transaction already exists at ${reportDir}; use --resume`,
+        reportDir,
+      }, null, 2)}\n`);
+      return 1;
+    }
+    summary = createPairTransactionSummary(args, reportDir);
+    if (args.nativeTaskCoreManifest) {
+      summary.nativeTaskInputs = {
+        coreManifest: path.resolve(args.nativeTaskCoreManifest),
+        feishuManifest: path.resolve(args.nativeTaskFeishuManifest),
+        authorization: args.nativeTaskRepairAuthorization,
+        transactionId: summary.transactionId,
+      };
+    }
+    atomicWriteJson(summaryPath, summary);
+  }
   const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-fork-pair-upgrade-'));
-  const summary = {
-    schema: 'zylos.fork-pair-upgrade/v1',
-    status: 'RUNNING',
-    mode: args.execute ? 'execute' : args.repairOnly ? 'repair-only' : 'dry-run',
-    agent: args.agent,
-    startedAt: new Date().toISOString(),
-    target: {
-      core: { repo: CORE_REPO, sha: args.coreSha, version: args.coreVersion },
-      feishu: { repo: FEISHU_REPO, sha: args.feishuSha, version: args.feishuVersion },
-    },
-    reportDir,
-    coreUpgraded: false,
-    feishuUpgraded: false,
-  };
-  atomicWriteJson(summaryPath, summary);
 
   try {
-    const stagedCoreDir = path.resolve(args.stagedCoreDir);
+    const stagedSources = preparePersistentStagedSources({
+      args,
+      reportDir,
+      summary,
+      zylosDir,
+      resume: args.resume,
+      persistProgress: progress => {
+        summary.stagedSources = progress;
+        atomicWriteJson(summaryPath, summary);
+      },
+    });
+    const stagedCoreDir = stagedSources.coreDir;
+    const stagedFeishuDir = stagedSources.feishuDir;
     const coreSource = validateCoreSource(stagedCoreDir, args.coreVersion);
     if (!coreSource.ok) throw new HoldError(coreSource.error, 'INVALID_CORE_SOURCE');
 
-    const stagedFeishuDir = path.join(scratchDir, 'feishu');
-    stageImmutableArchive(FEISHU_REPO, args.feishuSha, stagedFeishuDir);
     const feishuSource = validateFeishuSource(stagedFeishuDir, args.feishuVersion);
     if (!feishuSource.ok) throw new HoldError(feishuSource.error, 'INVALID_FEISHU_SOURCE');
     const liveFeishuDir = path.join(zylosDir, '.claude', 'skills', 'feishu');
-    const liveFeishuNodeModules = path.join(liveFeishuDir, 'node_modules');
-    try {
-      if (!fs.statSync(liveFeishuNodeModules).isDirectory()) throw new Error('not a directory');
-      fs.symlinkSync(liveFeishuNodeModules, path.join(stagedFeishuDir, 'node_modules'), 'dir');
-    } catch (error) {
-      throw new HoldError(
-        `target Feishu preflight cannot reuse live runtime dependencies: ${error.message}`,
-        'INVALID_FEISHU_SOURCE',
-      );
+    summary.sources = { core: stagedSources.core, feishu: stagedSources.feishu };
+    summary.stagedSources = {
+      root: stagedSources.root,
+      coreDir: stagedSources.coreDir,
+      feishuDir: stagedSources.feishuDir,
+      archivePath: stagedSources.archivePath,
+    };
+    if (args.nativeTaskCoreManifest) {
+      const nativeTaskReportDir = path.join(reportDir, 'native-task-convergence');
+      const nativeTaskCommand = buildNativeTaskConvergenceCommand({
+        nodePath: process.execPath,
+        coreDir: stagedCoreDir,
+        feishuDir: stagedFeishuDir,
+        coreManifest: args.nativeTaskCoreManifest,
+        feishuManifest: args.nativeTaskFeishuManifest,
+        reportDir: nativeTaskReportDir,
+        apply: args.execute || args.repairOnly,
+        authorization: args.nativeTaskRepairAuthorization,
+        transactionId: summary.transactionId,
+        resume: args.resume,
+        coreSource: stagedSources.core,
+        feishuSource: stagedSources.feishu,
+      });
+      const nativeTaskInputs = {
+        ...(summary.nativeTaskInputs || {}),
+        coreManifest: path.resolve(args.nativeTaskCoreManifest),
+        feishuManifest: path.resolve(args.nativeTaskFeishuManifest),
+        authorization: args.nativeTaskRepairAuthorization,
+        coreDir: stagedCoreDir,
+        feishuDir: stagedFeishuDir,
+        reportDir: nativeTaskReportDir,
+        sources: { core: stagedSources.core, feishu: stagedSources.feishu },
+        commandIdentity: resumeNeutralCommandIdentity(nativeTaskCommand),
+      };
+      if (args.resume && summary.nativeTaskInputs?.commandIdentity) {
+        if (!commandIdentityMatches(summary.nativeTaskInputs.commandIdentity, nativeTaskCommand)) {
+          throw new HoldError('resume native Task command identity does not match the transaction', 'SOURCE_BINDING_MISMATCH');
+        }
+      }
+      summary.nativeTaskInputs = nativeTaskInputs;
     }
+    atomicWriteJson(summaryPath, summary);
 
     const envPath = path.join(zylosDir, '.env');
     const persistedCoreRepo = persistedEnvValue(envPath, 'ZYLOS_SELF_UPGRADE_REPO');
@@ -1761,6 +2130,10 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
         reportDir: path.join(reportDir, 'native-task-convergence'),
         apply: args.execute || args.repairOnly,
         authorization: args.nativeTaskRepairAuthorization,
+        resume: args.resume,
+        transactionId: summary.transactionId,
+        coreSource: stagedSources.core,
+        feishuSource: stagedSources.feishu,
       });
       atomicWriteJson(summaryPath, summary);
     } else {
