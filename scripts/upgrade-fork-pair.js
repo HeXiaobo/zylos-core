@@ -1469,6 +1469,30 @@ function loadNativeTaskDeploymentIdentity({ zylosDir, requestedAgent }) {
   return { configured, identity: identity.identity };
 }
 
+export function buildNativeTaskConservationEnv({
+  baseEnv = process.env,
+  zylosDir,
+  identity,
+  defaultAssigneeId,
+  agentAppIds,
+} = {}) {
+  const gateEnv = {
+    ...baseEnv,
+    ZYLOS_DIR: zylosDir,
+    ZYLOS_AGENT_ID: identity.agentId,
+    FEISHU_APP_ID: identity.appId,
+    ...(defaultAssigneeId
+      ? { C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: defaultAssigneeId }
+      : {}),
+  };
+  if (agentAppIds === undefined || agentAppIds === null || agentAppIds === '') {
+    delete gateEnv.FEISHU_TASK_V2_AGENT_APP_IDS;
+  } else {
+    gateEnv.FEISHU_TASK_V2_AGENT_APP_IDS = agentAppIds;
+  }
+  return gateEnv;
+}
+
 function runNativeTaskConservationGate({
   coreDir,
   feishuDir,
@@ -1485,16 +1509,12 @@ function runNativeTaskConservationGate({
     coreDir,
     feishuDir,
   });
-  const gateEnv = {
-    ...process.env,
-    ZYLOS_DIR: zylosDir,
-    ZYLOS_AGENT_ID: identity.agentId,
-    FEISHU_APP_ID: identity.appId,
-    FEISHU_TASK_V2_AGENT_APP_IDS: configured.agentAppIds,
-    ...(configured.defaultAssigneeId
-      ? { C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: configured.defaultAssigneeId }
-      : {}),
-  };
+  const gateEnv = buildNativeTaskConservationEnv({
+    zylosDir,
+    identity,
+    defaultAssigneeId: configured.defaultAssigneeId,
+    agentAppIds: configured.agentAppIds,
+  });
   const gateRun = run(command.command, command.args, {
     env: gateEnv,
     cwd: feishuDir,

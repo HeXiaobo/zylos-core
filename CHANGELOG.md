@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Omit `FEISHU_TASK_V2_AGENT_APP_IDS` from the native-task conservation
+  subprocess environment when no mapping is configured, while preserving
+  explicit mapping validation and preventing an inherited stale value from
+  being passed to the child process.
 - Let the immutable pair preflight derive one exact current Agent-to-App
   mapping when `FEISHU_TASK_V2_AGENT_APP_IDS` is absent, while preserving
   strict validation for every explicit multi-Agent mapping.
