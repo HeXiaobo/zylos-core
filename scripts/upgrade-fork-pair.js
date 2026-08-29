@@ -67,7 +67,9 @@ const CORE_ASSETS = Object.freeze([
   'skills/activity-monitor/scripts/assistant-turn-binding.js',
   'scripts/upgrade-fork-pair.js',
   'scripts/upgrade-fork-pair.sh',
+  'scripts/native-task-convergence.js',
   'cli/lib/native-task-conservation-inventory.js',
+  'skills/commitment-core/scripts/legacy-task-adoption.js',
 ]);
 
 const FEISHU_ASSETS = Object.freeze([
@@ -77,8 +79,12 @@ const FEISHU_ASSETS = Object.freeze([
   'scripts/native-task-closure-gate.js',
   'scripts/native-task-completion-gate.js',
   'scripts/native-task-conservation-gate.js',
+  'scripts/task-v2-legacy-adoption-bootstrap.js',
   'src/lib/native-task-conservation-gate.js',
   'src/lib/native-task-conservation-remote.js',
+  'src/lib/task-v2-legacy-adoption-bootstrap.js',
+  'src/lib/task-v2-deployment-identity.js',
+  'src/lib/task-v2-projection-worker.js',
   'src/lib/task-comment-worker.js',
   'src/lib/task-v2-projection.js',
 ]);
@@ -172,13 +178,18 @@ export function validateNativeTaskDeploymentIdentity({
     return { ok: false, error: 'FEISHU_APP_ID is required' };
   }
   let mappings;
-  try {
-    mappings = typeof agentAppIds === 'string' ? JSON.parse(agentAppIds) : agentAppIds;
-  } catch (error) {
-    return { ok: false, error: `FEISHU_TASK_V2_AGENT_APP_IDS is invalid JSON: ${error.message}` };
-  }
-  if (!mappings || typeof mappings !== 'object' || Array.isArray(mappings)) {
-    return { ok: false, error: 'FEISHU_TASK_V2_AGENT_APP_IDS must be an object' };
+  const mappingMissing = agentAppIds === undefined || agentAppIds === null || agentAppIds === '';
+  if (mappingMissing) {
+    mappings = { [deploymentAgentId]: normalizedAppId };
+  } else {
+    try {
+      mappings = typeof agentAppIds === 'string' ? JSON.parse(agentAppIds) : agentAppIds;
+    } catch (error) {
+      return { ok: false, error: `FEISHU_TASK_V2_AGENT_APP_IDS is invalid JSON: ${error.message}` };
+    }
+    if (!mappings || typeof mappings !== 'object' || Array.isArray(mappings)) {
+      return { ok: false, error: 'FEISHU_TASK_V2_AGENT_APP_IDS must be an object' };
+    }
   }
   if (String(mappings[deploymentAgentId] || '').trim() !== normalizedAppId) {
     return {
@@ -188,7 +199,11 @@ export function validateNativeTaskDeploymentIdentity({
   }
   return {
     ok: true,
-    identity: Object.freeze({ agentId: deploymentAgentId, appId: normalizedAppId }),
+    identity: Object.freeze({
+      agentId: deploymentAgentId,
+      appId: normalizedAppId,
+      mappingSource: mappingMissing ? 'derived-single-agent' : 'explicit',
+    }),
   };
 }
 
@@ -295,8 +310,33 @@ export function buildNativeTaskConservationCommand({
   };
 }
 
-function parseArgs(argv) {
-  const result = { execute: false, dryRun: false, agent: 'unknown' };
+export function buildNativeTaskConvergenceCommand({
+  nodePath,
+  coreDir,
+  feishuDir,
+  coreManifest,
+  feishuManifest,
+  reportDir,
+  apply = false,
+  authorization,
+}) {
+  return {
+    command: nodePath,
+    args: [
+      path.join(coreDir, 'scripts', 'native-task-convergence.js'),
+      apply ? '--apply' : '--plan',
+      '--core-manifest', path.resolve(coreManifest),
+      '--feishu-manifest', path.resolve(feishuManifest),
+      '--core-dir', coreDir,
+      '--feishu-dir', feishuDir,
+      '--report-dir', reportDir,
+      ...(apply ? ['--authorization', authorization] : []),
+    ],
+  };
+}
+
+export function parseForkPairArgs(argv) {
+  const result = { execute: false, dryRun: false, repairOnly: false, agent: 'unknown' };
   const valueFlags = new Map([
     ['--core-sha', 'coreSha'],
     ['--feishu-sha', 'feishuSha'],
@@ -305,6 +345,9 @@ function parseArgs(argv) {
     ['--staged-core', 'stagedCoreDir'],
     ['--agent', 'agent'],
     ['--report-root', 'reportRoot'],
+    ['--native-task-core-manifest', 'nativeTaskCoreManifest'],
+    ['--native-task-feishu-manifest', 'nativeTaskFeishuManifest'],
+    ['--native-task-repair-authorization', 'nativeTaskRepairAuthorization'],
   ]);
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -317,6 +360,10 @@ function parseArgs(argv) {
       result.dryRun = true;
       continue;
     }
+    if (arg === '--repair-only') {
+      result.repairOnly = true;
+      continue;
+    }
     const key = valueFlags.get(arg);
     if (!key) throw new HoldError(`unknown option: ${arg}`, 'INVALID_ARGS');
     const value = argv[index + 1];
@@ -327,11 +374,46 @@ function parseArgs(argv) {
     index += 1;
   }
 
-  if (result.execute === result.dryRun) {
-    throw new HoldError('choose exactly one of --execute or --dry-run', 'INVALID_ARGS');
+  if ([result.execute, result.dryRun, result.repairOnly].filter(Boolean).length !== 1) {
+    throw new HoldError(
+      'choose exactly one of --execute, --dry-run, or --repair-only',
+      'INVALID_ARGS',
+    );
   }
   if (!result.stagedCoreDir) {
     throw new HoldError('--staged-core is required; use the immutable bootstrap', 'INVALID_ARGS');
+  }
+  const hasCoreManifest = Boolean(result.nativeTaskCoreManifest);
+  const hasFeishuManifest = Boolean(result.nativeTaskFeishuManifest);
+  if (hasCoreManifest !== hasFeishuManifest) {
+    throw new HoldError(
+      '--native-task-core-manifest and --native-task-feishu-manifest must be provided together',
+      'INVALID_ARGS',
+    );
+  }
+  if (result.nativeTaskRepairAuthorization && !hasCoreManifest) {
+    throw new HoldError(
+      '--native-task-repair-authorization requires both convergence manifests',
+      'INVALID_ARGS',
+    );
+  }
+  if ((result.execute || result.repairOnly) && hasCoreManifest && !result.nativeTaskRepairAuthorization) {
+    throw new HoldError(
+      'native Task convergence during execute requires --native-task-repair-authorization',
+      'REPAIR_NOT_AUTHORIZED',
+    );
+  }
+  if (result.dryRun && result.nativeTaskRepairAuthorization) {
+    throw new HoldError(
+      '--native-task-repair-authorization is valid only with --execute',
+      'INVALID_ARGS',
+    );
+  }
+  if (result.repairOnly && !hasCoreManifest) {
+    throw new HoldError(
+      '--repair-only requires both native Task convergence manifests',
+      'INVALID_ARGS',
+    );
   }
   return result;
 }
@@ -1368,13 +1450,7 @@ function runCommunicationCanary(installedCoreDir, zylosDir) {
   return payload;
 }
 
-function runNativeTaskConservationGate({
-  coreDir,
-  feishuDir,
-  zylosDir,
-  requestedAgent,
-  reportPath,
-}) {
+function loadNativeTaskDeploymentIdentity({ zylosDir, requestedAgent }) {
   const envPath = path.join(zylosDir, '.env');
   const configured = {
     requestedAgent,
@@ -1390,6 +1466,20 @@ function runNativeTaskConservationGate({
       'NATIVE_TASK_CONSERVATION_FAILED',
     );
   }
+  return { configured, identity: identity.identity };
+}
+
+function runNativeTaskConservationGate({
+  coreDir,
+  feishuDir,
+  zylosDir,
+  requestedAgent,
+  reportPath,
+}) {
+  const { configured, identity } = loadNativeTaskDeploymentIdentity({
+    zylosDir,
+    requestedAgent,
+  });
   const command = buildNativeTaskConservationCommand({
     nodePath: process.execPath,
     coreDir,
@@ -1398,8 +1488,8 @@ function runNativeTaskConservationGate({
   const gateEnv = {
     ...process.env,
     ZYLOS_DIR: zylosDir,
-    ZYLOS_AGENT_ID: identity.identity.agentId,
-    FEISHU_APP_ID: identity.identity.appId,
+    ZYLOS_AGENT_ID: identity.agentId,
+    FEISHU_APP_ID: identity.appId,
     FEISHU_TASK_V2_AGENT_APP_IDS: configured.agentAppIds,
     ...(configured.defaultAssigneeId
       ? { C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: configured.defaultAssigneeId }
@@ -1431,17 +1521,62 @@ function runNativeTaskConservationGate({
   if (
     report.schema !== 'zylos.native-task-conservation-gate/v1'
     || report.passed !== true
-    || report.deployment?.agentId !== identity.identity.agentId
-    || report.deployment?.appId !== identity.identity.appId
+    || report.deployment?.agentId !== identity.agentId
+    || report.deployment?.appId !== identity.appId
     || report.inventory?.core?.schema !== 'zylos.native-task-core-inventory/v1'
     || report.inventory?.core?.snapshot?.stable !== true
-    || report.inventory?.core?.identity?.agentId !== identity.identity.agentId
+    || report.inventory?.core?.identity?.agentId !== identity.agentId
     || report.inventory?.remote?.identity?.kind !== 'app'
-    || report.inventory?.remote?.identity?.appId !== identity.identity.appId
+    || report.inventory?.remote?.identity?.appId !== identity.appId
   ) {
     throw new HoldError(
       'native task conservation returned an invalid or mismatched PASS report',
       'NATIVE_TASK_CONSERVATION_FAILED',
+    );
+  }
+  return report;
+}
+
+function runNativeTaskConvergenceWorkflow({
+  coreDir,
+  feishuDir,
+  zylosDir,
+  coreManifest,
+  feishuManifest,
+  reportDir,
+  apply,
+  authorization,
+}) {
+  const command = buildNativeTaskConvergenceCommand({
+    nodePath: process.execPath,
+    coreDir,
+    feishuDir,
+    coreManifest,
+    feishuManifest,
+    reportDir,
+    apply,
+    authorization,
+  });
+  const result = run(command.command, command.args, {
+    cwd: coreDir,
+    env: { ...process.env, ZYLOS_DIR: zylosDir },
+    timeout: 600_000,
+  });
+  const report = parseJsonOutput(result.stdout);
+  if (result.status !== 0 || result.error || report?.status !== 'PASS') {
+    throw new HoldError(
+      `native task convergence ${apply ? 'apply' : 'plan'} failed: ${report?.code ?? result.error ?? result.stderr.trim() ?? 'invalid report'}`,
+      'NATIVE_TASK_CONVERGENCE_FAILED',
+    );
+  }
+  if (
+    report.schema !== 'zylos.native-task-convergence-run/v1'
+    || report.mode !== (apply ? 'apply' : 'plan')
+    || (apply && report.authorization !== authorization)
+  ) {
+    throw new HoldError(
+      'native task convergence returned an invalid or mismatched PASS report',
+      'NATIVE_TASK_CONVERGENCE_FAILED',
     );
   }
   return report;
@@ -1460,7 +1595,7 @@ function makeReportDir(zylosDir, explicitRoot) {
 export function runForkPairUpgrade(argv = process.argv.slice(2)) {
   let args;
   try {
-    args = parseArgs(argv);
+    args = parseForkPairArgs(argv);
   } catch (error) {
     const output = { status: 'HOLD', code: error.code || 'INVALID_ARGS', error: error.message };
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
@@ -1484,7 +1619,7 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
   const summary = {
     schema: 'zylos.fork-pair-upgrade/v1',
     status: 'RUNNING',
-    mode: args.execute ? 'execute' : 'dry-run',
+    mode: args.execute ? 'execute' : args.repairOnly ? 'repair-only' : 'dry-run',
     agent: args.agent,
     startedAt: new Date().toISOString(),
     target: {
@@ -1588,6 +1723,32 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
       };
     }
 
+    if (args.nativeTaskCoreManifest) {
+      // Resolve the requested Agent/App before any convergence mutation. The
+      // workflow then performs both plans before its explicitly authorized
+      // remote-marker -> Core-link -> status-repair apply sequence.
+      loadNativeTaskDeploymentIdentity({
+        zylosDir,
+        requestedAgent: args.agent,
+      });
+      summary.nativeTaskConvergence = runNativeTaskConvergenceWorkflow({
+        coreDir: stagedCoreDir,
+        feishuDir: stagedFeishuDir,
+        zylosDir,
+        coreManifest: args.nativeTaskCoreManifest,
+        feishuManifest: args.nativeTaskFeishuManifest,
+        reportDir: path.join(reportDir, 'native-task-convergence'),
+        apply: args.execute || args.repairOnly,
+        authorization: args.nativeTaskRepairAuthorization,
+      });
+      atomicWriteJson(summaryPath, summary);
+    } else {
+      summary.nativeTaskConvergence = {
+        status: 'NOT_REQUESTED',
+        mode: args.execute || args.repairOnly ? 'apply' : 'plan',
+      };
+    }
+
     const nativeTaskConservation = runNativeTaskConservationGate({
       coreDir: stagedCoreDir,
       feishuDir: stagedFeishuDir,
@@ -1613,6 +1774,15 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
       nativeTaskConservation,
     };
     atomicWriteJson(summaryPath, summary);
+
+    if (args.repairOnly) {
+      summary.status = 'PASS';
+      summary.result = 'NATIVE_TASK_CONVERGENCE_COMPLETE';
+      summary.finishedAt = new Date().toISOString();
+      atomicWriteJson(summaryPath, summary);
+      process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+      return 0;
+    }
 
     if (args.dryRun) {
       summary.status = 'PASS';
