@@ -68,6 +68,7 @@ const CORE_ASSETS = Object.freeze([
   'scripts/upgrade-fork-pair.js',
   'scripts/upgrade-fork-pair.sh',
   'scripts/native-task-convergence.js',
+  'scripts/native-task-convergence-runner.js',
   'cli/lib/native-task-conservation-inventory.js',
   'skills/commitment-core/scripts/legacy-task-adoption.js',
 ]);

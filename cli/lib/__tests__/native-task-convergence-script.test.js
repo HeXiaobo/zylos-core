@@ -9,6 +9,7 @@ import {
   runNativeTaskConvergence,
   validateConvergenceManifestPair,
 } from '../../../scripts/native-task-convergence.js';
+import { captureProcessIdentity } from '../process-identity.js';
 
 function manifests() {
   return {
@@ -41,6 +42,11 @@ function reconciliationReport(consistent = false) {
     reminderDrifts: [],
     repairs: [],
   };
+}
+
+function writeScript(filePath, source) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, source);
 }
 
 test('manifest pair accepts only an exact GUID/Core id bijection', () => {
@@ -232,6 +238,68 @@ test('status repair must pass a fresh consistency readback', () => {
   }
 });
 
+test('apply runs every business step under the controlled runner and verifies terminal lock state', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-convergence-runner-'));
+  try {
+    const value = manifests();
+    const coreManifest = path.join(root, 'core.json');
+    const feishuManifest = path.join(root, 'feishu.json');
+    const reportDir = path.join(root, 'report');
+    const lockPath = path.join(root, '.zylos', 'locks', 'native-task-convergence.lock');
+    const markerPath = path.join(root, 'runner-seen.json');
+    fs.writeFileSync(coreManifest, JSON.stringify(value.core));
+    fs.writeFileSync(feishuManifest, JSON.stringify(value.feishu));
+    const stepSource = `
+      import fs from 'node:fs';
+      const lock = JSON.parse(fs.readFileSync(process.env.TEST_LOCK_PATH, 'utf8'));
+      fs.writeFileSync(process.env.TEST_RUNNER_SEEN_PATH, JSON.stringify({ phase: lock.phase, runner: lock.runner, child: lock.child }));
+      console.log(JSON.stringify({ failed: 0, status: 'PASS', consistent: true, missing: [], unexpected: [], stateMismatches: [], duplicateKeys: [], missingLinks: [], linkMismatches: [], reminderDrifts: [], repairs: [] }));
+    `;
+    writeScript(path.join(root, 'core', 'skills', 'commitment-core', 'scripts', 'legacy-task-adoption.js'), stepSource);
+    writeScript(path.join(root, 'feishu', 'scripts', 'task-v2-legacy-adoption-bootstrap.js'), stepSource);
+    writeScript(path.join(root, 'feishu', 'src', 'lib', 'task-v2-projection-worker.js'), stepSource);
+    const report = runNativeTaskConvergence({
+      argv: [
+        '--apply',
+        '--authorization', 'owner-issue-25',
+        '--core-manifest', coreManifest,
+        '--feishu-manifest', feishuManifest,
+        '--core-dir', path.join(root, 'core'),
+        '--feishu-dir', path.join(root, 'feishu'),
+        '--report-dir', reportDir,
+      ],
+      env: {
+        ...process.env,
+        ZYLOS_DIR: root,
+        TEST_LOCK_PATH: lockPath,
+        TEST_RUNNER_SEEN_PATH: markerPath,
+      },
+      stdout: { write() {} },
+    });
+    assert.equal(report.status, 'PASS');
+    assert.equal(fs.existsSync(lockPath), false);
+    assert.equal(fs.readdirSync(reportDir).some(name => name.endsWith('.runner-result.json')), true);
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    assert.equal(marker.phase, 'CHILD_RUNNING');
+    assert.ok(marker.runner?.pid > 0);
+    assert.ok(marker.runner?.startToken);
+    assert.equal(marker.runner.state, 'READY');
+    assert.ok(marker.child?.pid > 0);
+    assert.ok(marker.child?.startToken);
+    assert.equal(marker.child.state, 'RUNNING');
+    assert.equal(marker.child.groupAlive, true);
+    const terminal = JSON.parse(fs.readFileSync(
+      path.join(reportDir, '.core-plan.attempt-1.runner-result.json'),
+      'utf8',
+    ));
+    assert.equal(terminal.runner.state, 'EXITED');
+    assert.equal(terminal.child.state, 'EXITED');
+    assert.equal(terminal.child.groupAlive, false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a RUNNING step receipt resumes with readback plans and idempotent replay', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-convergence-resume-'));
   try {
@@ -321,8 +389,13 @@ test('a live repair transaction lock blocks concurrent apply', () => {
     fs.writeFileSync(path.join(lockDir, 'native-task-convergence.lock'), JSON.stringify({
       schema: 'zylos.native-task-convergence-lock/v1',
       transactionId: '11111111-1111-4111-8111-111111111111',
-      pid: process.pid,
       hostname: os.hostname(),
+      pid: process.pid,
+      parent: captureProcessIdentity(),
+      runnerToken: 'live-runner-token',
+      phase: 'PARENT_READY',
+      runner: null,
+      child: null,
       acquiredAt: new Date().toISOString(),
     }));
     assert.throws(
@@ -346,6 +419,113 @@ test('a live repair transaction lock blocks concurrent apply', () => {
   }
 });
 
+test('an active stale lock without a persisted child fails closed for safe recovery', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-convergence-recovery-lock-'));
+  try {
+    const value = manifests();
+    const coreManifest = path.join(root, 'core.json');
+    const feishuManifest = path.join(root, 'feishu.json');
+    const reportDir = path.join(root, 'report');
+    const lockDir = path.join(root, '.zylos', 'locks');
+    const staleTransactionId = '55555555-5555-4555-8555-555555555555';
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(coreManifest, JSON.stringify(value.core));
+    fs.writeFileSync(feishuManifest, JSON.stringify(value.feishu));
+    fs.writeFileSync(path.join(lockDir, 'native-task-convergence.lock'), JSON.stringify({
+      schema: 'zylos.native-task-convergence-lock/v1',
+      transactionId: staleTransactionId,
+      hostname: os.hostname(),
+      pid: 2_147_483_647,
+      parent: { pid: 2_147_483_647, startToken: 'dead-parent-token' },
+      runnerToken: 'stale-runner-token',
+      phase: 'CHILD_RUNNING',
+      runner: { pid: 2_147_483_646, startToken: 'dead-runner-token' },
+      child: null,
+      acquiredAt: new Date(0).toISOString(),
+    }));
+    assert.throws(
+      () => runNativeTaskConvergence({
+        argv: [
+          '--apply',
+          '--authorization', 'owner-issue-25',
+          '--core-manifest', coreManifest,
+          '--feishu-manifest', feishuManifest,
+          '--core-dir', path.join(root, 'core'),
+          '--feishu-dir', path.join(root, 'feishu'),
+          '--report-dir', reportDir,
+        ],
+        env: { ZYLOS_DIR: root },
+        stdout: { write() {} },
+      }),
+      error => error.code === 'LOCK_RECOVERY_REQUIRED',
+    );
+    assert.equal(fs.existsSync(path.join(lockDir, 'native-task-convergence.lock')), true);
+    assert.equal(fs.readdirSync(lockDir).some(name => name.includes('.stale.')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a terminal UNKNOWN lock is reclaimable only after runner, child, and group are proven dead', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-convergence-unknown-recovery-'));
+  try {
+    const value = manifests();
+    const coreManifest = path.join(root, 'core.json');
+    const feishuManifest = path.join(root, 'feishu.json');
+    const reportDir = path.join(root, 'report');
+    const lockDir = path.join(root, '.zylos', 'locks');
+    const staleTransactionId = '66666666-6666-4666-8666-666666666666';
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(coreManifest, JSON.stringify(value.core));
+    fs.writeFileSync(feishuManifest, JSON.stringify(value.feishu));
+    fs.writeFileSync(path.join(lockDir, 'native-task-convergence.lock'), JSON.stringify({
+      schema: 'zylos.native-task-convergence-lock/v1',
+      transactionId: staleTransactionId,
+      hostname: os.hostname(),
+      pid: 2_147_483_647,
+      parent: { pid: 2_147_483_647, startToken: 'dead-parent-token' },
+      runnerToken: 'stale-runner-token',
+      phase: 'CHILD_EXITED_UNKNOWN',
+      runner: { pid: 2_147_483_646, startToken: 'dead-runner-token', state: 'EXITED' },
+      child: {
+        pid: 2_147_483_645,
+        startToken: 'dead-child-token',
+        pgid: 2_147_483_645,
+        state: 'UNKNOWN',
+        groupAlive: null,
+      },
+      acquiredAt: new Date(0).toISOString(),
+    }));
+    const spawn = (_command, args) => {
+      const script = args[0];
+      if (script.endsWith('legacy-task-adoption.js')) return { status: 0, stdout: JSON.stringify({ failed: 0 }), stderr: '' };
+      if (script.endsWith('task-v2-legacy-adoption-bootstrap.js')) return { status: 0, stdout: JSON.stringify({ status: 'PASS' }), stderr: '' };
+      return { status: 0, stdout: JSON.stringify(reconciliationReport(true)), stderr: '' };
+    };
+    const report = runNativeTaskConvergence({
+      argv: [
+        '--apply',
+        '--authorization', 'owner-issue-25',
+        '--core-manifest', coreManifest,
+        '--feishu-manifest', feishuManifest,
+        '--core-dir', path.join(root, 'core'),
+        '--feishu-dir', path.join(root, 'feishu'),
+        '--report-dir', reportDir,
+      ],
+      env: { ZYLOS_DIR: root },
+      spawn,
+      stdout: { write() {} },
+    });
+    assert.equal(report.status, 'PASS');
+    assert.equal(fs.existsSync(path.join(lockDir, 'native-task-convergence.lock')), false);
+    assert.equal(fs.readdirSync(lockDir).some(name => (
+      name.startsWith(`native-task-convergence.lock.stale.${staleTransactionId}.`)
+    )), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a dead local lock is retained as stale evidence before safe resume', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-convergence-stale-lock-'));
   try {
@@ -361,8 +541,13 @@ test('a dead local lock is retained as stale evidence before safe resume', () =>
     fs.writeFileSync(path.join(lockDir, 'native-task-convergence.lock'), JSON.stringify({
       schema: 'zylos.native-task-convergence-lock/v1',
       transactionId: staleTransactionId,
-      pid: 2_147_483_647,
       hostname: os.hostname(),
+      pid: 2_147_483_647,
+      parent: { pid: 2_147_483_647, startToken: 'dead-parent-token' },
+      runnerToken: 'stale-runner-token',
+      phase: 'PARENT_READY',
+      runner: null,
+      child: null,
       acquiredAt: new Date(0).toISOString(),
     }));
     const spawn = (_command, args) => {

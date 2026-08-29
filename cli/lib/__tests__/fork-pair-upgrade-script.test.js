@@ -74,6 +74,7 @@ function writeCoreFixture(root) {
     'scripts/upgrade-fork-pair.js',
     'scripts/upgrade-fork-pair.sh',
     'scripts/native-task-convergence.js',
+    'scripts/native-task-convergence-runner.js',
     'cli/lib/native-task-conservation-inventory.js',
     'skills/commitment-core/scripts/legacy-task-adoption.js',
   ]) {
@@ -384,6 +385,21 @@ describe('fork-pair upgrade target contract', () => {
 
       assert.equal(result.ok, false);
       assert.match(result.error, /c4-receive\.js/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails source validation when an immutable Core archive lacks the convergence runner', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-'));
+    try {
+      writeCoreFixture(root);
+      fs.rmSync(path.join(root, 'scripts/native-task-convergence-runner.js'));
+
+      const result = validateCoreSource(root, '0.7.2-rc.5');
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, /native-task-convergence-runner\.js/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

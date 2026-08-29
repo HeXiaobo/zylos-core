@@ -7,13 +7,20 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import {
+  captureProcessIdentity,
+  inspectProcessIdentity,
+} from '../cli/lib/process-identity.js';
+
 const CORE_SCHEMA = 'zylos.legacy-task-adoption/v1';
 const FEISHU_SCHEMA = 'zylos.feishu-task-v2-legacy-adoption/v1';
 const REPORT_SCHEMA = 'zylos.native-task-convergence-run/v1';
 const STEP_RECEIPT_SCHEMA = 'zylos.native-task-convergence-step/v1';
 const LOCK_SCHEMA = 'zylos.native-task-convergence-lock/v1';
+const RUNNER_JOB_SCHEMA = 'zylos.native-task-convergence-runner-job/v1';
 const AUTHORIZATION = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{2,255}$/;
 const TRANSACTION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RUNNER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'native-task-convergence-runner.js');
 
 class ConvergenceError extends Error {
   constructor(message, code = 'CONVERGENCE_FAILED', cause) {
@@ -219,16 +226,6 @@ function validateStepReport(name, report) {
   }
 }
 
-function processIsAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
-  }
-}
-
 function readOptionalJson(filePath, fsApi = fs) {
   try {
     return JSON.parse(fsApi.readFileSync(filePath, 'utf8'));
@@ -238,15 +235,262 @@ function readOptionalJson(filePath, fsApi = fs) {
   }
 }
 
-function acquireApplyLock({ zylosDir, transactionId, fsApi = fs, hostname = os.hostname(), isAlive = processIsAlive }) {
+function processGroupStatus(pgid) {
+  if (!Number.isSafeInteger(pgid) || pgid <= 0) {
+    return { state: 'UNKNOWN', reason: 'invalid_process_group' };
+  }
+  if (process.platform === 'win32') {
+    return { state: 'UNKNOWN', reason: 'process_group_probe_unsupported' };
+  }
+  try {
+    process.kill(-pgid, 0);
+    return { state: 'ALIVE', reason: 'matching_process_group' };
+  } catch (error) {
+    if (error?.code === 'ESRCH') return { state: 'DEAD', reason: 'process_group_not_found' };
+    return { state: 'UNKNOWN', reason: error?.code || 'process_group_probe_failed' };
+  }
+}
+
+function isProcessIdentity(value) {
+  return Boolean(
+    value
+    && Number.isSafeInteger(value.pid)
+    && value.pid > 0
+    && typeof value.startToken === 'string'
+    && value.startToken.length > 0,
+  );
+}
+
+function sameProcessIdentity(left, right) {
+  return isProcessIdentity(left)
+    && isProcessIdentity(right)
+    && left.pid === right.pid
+    && left.startToken === right.startToken;
+}
+
+function requireLockIdentity(value, field) {
+  if (!isProcessIdentity(value)) {
+    throw new ConvergenceError(`${field} must contain a process pid and start token`, 'LOCK_FAILED');
+  }
+  return { pid: value.pid, startToken: value.startToken };
+}
+
+function requireLockOwner(lock) {
+  if (
+    !lock
+    || lock.schema !== LOCK_SCHEMA
+    || !TRANSACTION_ID.test(String(lock.transactionId ?? ''))
+    || typeof lock.hostname !== 'string'
+    || typeof lock.runnerToken !== 'string'
+    || lock.runnerToken.trim() === ''
+    || typeof lock.phase !== 'string'
+  ) {
+    throw new ConvergenceError('native Task convergence lock owner is invalid', 'LOCK_FAILED');
+  }
+  requireLockIdentity(lock.parent, 'native Task convergence lock parent');
+  if (lock.runner !== null && lock.runner !== undefined) {
+    requireLockIdentity(lock.runner, 'native Task convergence lock runner');
+  }
+  if (lock.child !== null && lock.child !== undefined) {
+    requireLockIdentity(lock.child, 'native Task convergence lock child');
+    if (process.platform !== 'win32' && (!Number.isSafeInteger(lock.child.pgid) || lock.child.pgid <= 0)) {
+      throw new ConvergenceError('native Task convergence lock child process group is invalid', 'LOCK_FAILED');
+    }
+    if (process.platform === 'win32' && lock.child.pgid !== null && (!Number.isSafeInteger(lock.child.pgid) || lock.child.pgid <= 0)) {
+      throw new ConvergenceError('native Task convergence lock child process group is invalid', 'LOCK_FAILED');
+    }
+  }
+  return lock;
+}
+
+function readLockFile(lockPath, fsApi = fs) {
+  let stat;
+  try {
+    stat = fsApi.lstatSync(lockPath);
+  } catch (cause) {
+    throw new ConvergenceError('cannot inspect native Task convergence lock', 'LOCK_FAILED', cause);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new ConvergenceError('native Task convergence lock is not a regular file', 'LOCK_FAILED');
+  }
+  let lock;
+  try {
+    lock = readOptionalJson(lockPath, fsApi);
+  } catch (error) {
+    throw new ConvergenceError('native Task convergence lock is unreadable', 'LOCK_FAILED', error);
+  }
+  if (!lock) throw new ConvergenceError('native Task convergence lock is unreadable', 'LOCK_FAILED');
+  return requireLockOwner(lock);
+}
+
+function inspectStoredIdentity(identity, field) {
+  const state = inspectProcessIdentity(identity);
+  if (state.state === 'UNKNOWN') {
+    throw new ConvergenceError(
+      `${field} process identity is UNKNOWN: ${state.reason}`,
+      'LOCK_RECOVERY_REQUIRED',
+    );
+  }
+  return state;
+}
+
+function rejectLiveOrUnknown(state, field) {
+  if (state.state === 'ALIVE') {
+    throw new ConvergenceError(`${field} is still alive`, 'LOCK_HELD');
+  }
+  if (state.state === 'UNKNOWN') {
+    throw new ConvergenceError(`${field} identity is UNKNOWN: ${state.reason}`, 'LOCK_RECOVERY_REQUIRED');
+  }
+}
+
+const ACTIVE_LOCK_PHASES = new Set(['RUNNER_STARTING', 'CHILD_STARTING', 'CHILD_RUNNING']);
+const TERMINAL_LOCK_PHASES = new Set([
+  'FINISHED',
+  'STEP_FAILED',
+  'RUNNER_FAILED',
+  'CHILD_EXITED_UNKNOWN',
+  'DIRECT_ADAPTER_FINISHED',
+  'DIRECT_ADAPTER_FAILED',
+]);
+
+function verifyStaleLockCanBeReclaimed(existing, processGroupProbe = processGroupStatus) {
+  const parentState = inspectStoredIdentity(existing.parent, 'native Task convergence lock parent');
+  rejectLiveOrUnknown(parentState, 'native Task convergence lock parent');
+
+  // A runner-starting lock is intentionally ambiguous: the runner may have
+  // been spawned but not had a chance to persist its own identity yet.
+  if (existing.phase === 'RUNNER_STARTING' && !existing.runner) {
+    throw new ConvergenceError(
+      'native Task convergence runner start is unverified; recovery is required',
+      'LOCK_RECOVERY_REQUIRED',
+    );
+  }
+  if (!TERMINAL_LOCK_PHASES.has(existing.phase) && existing.phase !== 'PARENT_READY' && !ACTIVE_LOCK_PHASES.has(existing.phase)) {
+    throw new ConvergenceError(
+      `native Task convergence lock phase ${existing.phase} is not recoverable`,
+      'LOCK_RECOVERY_REQUIRED',
+    );
+  }
+  if (ACTIVE_LOCK_PHASES.has(existing.phase) && !existing.runner) {
+    throw new ConvergenceError(
+      `native Task convergence lock phase ${existing.phase} has no runner identity`,
+      'LOCK_RECOVERY_REQUIRED',
+    );
+  }
+
+  if (existing.runner) {
+    const runnerState = inspectStoredIdentity(existing.runner, 'native Task convergence lock runner');
+    rejectLiveOrUnknown(runnerState, 'native Task convergence lock runner');
+  }
+
+  const child = existing.child;
+  if (ACTIVE_LOCK_PHASES.has(existing.phase) && existing.phase !== 'RUNNER_STARTING' && !child) {
+    throw new ConvergenceError(
+      `native Task convergence lock phase ${existing.phase} has no child identity`,
+      'LOCK_RECOVERY_REQUIRED',
+    );
+  }
+  if (child) {
+    const childState = inspectStoredIdentity(child, 'native Task convergence lock child');
+    rejectLiveOrUnknown(childState, 'native Task convergence lock child');
+    const groupState = processGroupProbe(child.pgid);
+    rejectLiveOrUnknown(groupState, 'native Task convergence child process group');
+  }
+}
+
+function updateApplyLock(handle, update, fsApi = fs) {
+  const current = readLockFile(handle.lockPath, fsApi);
+  if (
+    current.transactionId !== handle.transactionId
+    || !sameProcessIdentity(current.parent, handle.parent)
+    || current.runnerToken !== handle.runnerToken
+  ) {
+    throw new ConvergenceError('native Task convergence lock ownership was lost', 'LOCK_OWNERSHIP_LOST');
+  }
+  const next = requireLockOwner(update({ ...current }));
+  atomicWriteJson(handle.lockPath, next, fsApi);
+  return next;
+}
+
+function releaseApplyLock(handle, fsApi = fs) {
+  const existing = readLockFile(handle.lockPath, fsApi);
+  if (
+    existing.transactionId !== handle.transactionId
+    || !sameProcessIdentity(existing.parent, handle.parent)
+    || existing.runnerToken !== handle.runnerToken
+  ) {
+    throw new ConvergenceError('native Task convergence lock ownership was lost', 'LOCK_RELEASE_FAILED');
+  }
+  const ownerState = inspectStoredIdentity(existing.parent, 'native Task convergence lock parent');
+  if (ownerState.state !== 'ALIVE') {
+    throw new ConvergenceError('native Task convergence lock parent is not alive', 'LOCK_RELEASE_FAILED');
+  }
+
+  const noWorkStarted = existing.phase === 'PARENT_READY' && !existing.runner && !existing.child;
+  const directAdapterFinished = existing.phase === 'DIRECT_ADAPTER_FINISHED'
+    || existing.phase === 'DIRECT_ADAPTER_FAILED';
+  if (!noWorkStarted && !directAdapterFinished && !TERMINAL_LOCK_PHASES.has(existing.phase)) {
+    throw new ConvergenceError(
+      `native Task convergence lock is not terminal (${existing.phase})`,
+      'LOCK_RELEASE_FAILED',
+    );
+  }
+  if (existing.phase === 'CHILD_EXITED_UNKNOWN') {
+    throw new ConvergenceError(
+      'native Task convergence step outcome is UNKNOWN; retain lock for verified recovery',
+      'LOCK_RELEASE_FAILED',
+    );
+  }
+  if (existing.runner) {
+    const runnerState = inspectStoredIdentity(existing.runner, 'native Task convergence lock runner');
+    if (runnerState.state !== 'DEAD' || existing.runner.state !== 'EXITED') {
+      throw new ConvergenceError('native Task convergence runner has not exited cleanly', 'LOCK_RELEASE_FAILED');
+    }
+  }
+  if (existing.child) {
+    const childState = inspectStoredIdentity(existing.child, 'native Task convergence lock child');
+    if (childState.state !== 'DEAD' || existing.child.state !== 'EXITED') {
+      throw new ConvergenceError('native Task convergence child has not exited cleanly', 'LOCK_RELEASE_FAILED');
+    }
+    const groupState = processGroupStatus(existing.child.pgid);
+    if (groupState.state !== 'DEAD' || existing.child.groupAlive !== false) {
+      throw new ConvergenceError('native Task convergence child process group is not fully exited', 'LOCK_RELEASE_FAILED');
+    }
+  }
+
+  // Re-read immediately before unlinking so a replacement lock cannot be
+  // removed after a concurrent recovery attempt.
+  const current = readLockFile(handle.lockPath, fsApi);
+  if (
+    current.transactionId !== handle.transactionId
+    || !sameProcessIdentity(current.parent, handle.parent)
+    || current.runnerToken !== handle.runnerToken
+  ) {
+    throw new ConvergenceError('native Task convergence lock changed before release', 'LOCK_RELEASE_FAILED');
+  }
+  fsApi.unlinkSync(handle.lockPath);
+}
+
+function acquireApplyLock({ zylosDir, transactionId, fsApi = fs, hostname = os.hostname() }) {
   const lockDir = path.join(zylosDir, '.zylos', 'locks');
   const lockPath = path.join(lockDir, 'native-task-convergence.lock');
   fsApi.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  let parent;
+  try {
+    parent = captureProcessIdentity();
+  } catch (cause) {
+    throw new ConvergenceError('cannot establish parent process-start identity', 'LOCK_FAILED', cause);
+  }
   const owner = {
     schema: LOCK_SCHEMA,
     transactionId,
-    pid: process.pid,
     hostname,
+    pid: parent.pid,
+    parent,
+    runnerToken: crypto.randomUUID(),
+    phase: 'PARENT_READY',
+    runner: null,
+    child: null,
     acquiredAt: new Date().toISOString(),
   };
   const create = () => fsApi.writeFileSync(
@@ -260,41 +504,158 @@ function acquireApplyLock({ zylosDir, transactionId, fsApi = fs, hostname = os.h
     if (error?.code !== 'EEXIST') {
       throw new ConvergenceError('cannot acquire native Task convergence lock', 'LOCK_FAILED', error);
     }
-    let stat;
-    try {
-      stat = fsApi.lstatSync(lockPath);
-    } catch (cause) {
-      throw new ConvergenceError('cannot inspect native Task convergence lock', 'LOCK_FAILED', cause);
-    }
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new ConvergenceError('native Task convergence lock is not a regular file', 'LOCK_FAILED');
-    }
-    const existing = readOptionalJson(lockPath, fsApi);
-    if (
-      existing?.schema !== LOCK_SCHEMA
-      || !TRANSACTION_ID.test(String(existing.transactionId ?? ''))
-      || typeof existing.hostname !== 'string'
-      || !Number.isInteger(existing.pid)
-    ) {
-      throw new ConvergenceError('native Task convergence lock owner is invalid', 'LOCK_FAILED');
-    }
-    if (existing.hostname !== hostname || isAlive(existing.pid)) {
+    const existing = readLockFile(lockPath, fsApi);
+    if (existing.hostname !== hostname) {
       throw new ConvergenceError(
-        `native Task convergence is already running as ${existing.transactionId}`,
+        `native Task convergence lock belongs to host ${existing.hostname}`,
         'LOCK_HELD',
       );
     }
-    const stalePath = `${lockPath}.stale.${existing.transactionId}.${Date.now()}.${process.pid}`;
-    fsApi.renameSync(lockPath, stalePath);
-    create();
-  }
-  return () => {
-    const existing = readOptionalJson(lockPath, fsApi);
-    if (existing?.transactionId !== transactionId) {
-      throw new ConvergenceError('native Task convergence lock ownership was lost', 'LOCK_RELEASE_FAILED');
+    try {
+      verifyStaleLockCanBeReclaimed(existing);
+    } catch (error) {
+      if (error?.code === 'LOCK_HELD' || error?.code === 'LOCK_RECOVERY_REQUIRED') throw error;
+      throw new ConvergenceError('native Task convergence stale lock cannot be verified', 'LOCK_FAILED', error);
     }
-    fsApi.unlinkSync(lockPath);
+    const stalePath = `${lockPath}.stale.${existing.transactionId}.${Date.now()}.${process.pid}`;
+    try {
+      fsApi.renameSync(lockPath, stalePath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw new ConvergenceError('cannot retain stale native Task lock', 'LOCK_FAILED', error);
+    }
+    try {
+      create();
+    } catch (error) {
+      if (error?.code === 'EEXIST') {
+        throw new ConvergenceError(
+          'native Task convergence lock was acquired concurrently',
+          'LOCK_HELD',
+          error,
+        );
+      }
+      throw new ConvergenceError('cannot acquire native Task convergence lock', 'LOCK_FAILED', error);
+    }
+  }
+  return {
+    transactionId,
+    lockPath,
+    parent,
+    runnerToken: owner.runnerToken,
+    release() {
+      releaseApplyLock(this, fsApi);
+    },
   };
+}
+
+function markDirectAdapterTerminal(handle, status, fsApi = fs) {
+  updateApplyLock(handle, current => ({
+    ...current,
+    phase: status === 'PASS' ? 'DIRECT_ADAPTER_FINISHED' : 'DIRECT_ADAPTER_FAILED',
+    runner: null,
+    // Test adapters return synchronously and do not expose a child process.
+    // Keep the child slot empty so the production lock verifier never treats
+    // an adapter-only marker as an unverified process identity.
+    child: null,
+  }), fsApi);
+}
+
+function runnerResultAsSpawnResult(result, transactionId) {
+  if (
+    !result
+    || typeof result !== 'object'
+    || result.schema !== 'zylos.native-task-convergence-runner-result/v1'
+    || result.transactionId !== transactionId
+  ) {
+    return {
+      status: null,
+      stdout: '',
+      stderr: '',
+      error: new Error('controlled runner returned no result'),
+    };
+  }
+  if (result.status === 'PASS') {
+    return {
+      status: 0,
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+      error: null,
+    };
+  }
+  if (result.status === 'HOLD') {
+    return {
+      status: 1,
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+      // A non-zero business exit is deterministic HOLD, not an uncertain
+      // runner failure. The existing parser will preserve stderr/exit code.
+      error: null,
+    };
+  }
+  return {
+    status: null,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    error: new Error(result.error || 'controlled runner outcome is UNKNOWN'),
+  };
+}
+
+function runControlledStep({
+  step,
+  attempt,
+  reportDir,
+  runtimeDir,
+  environment,
+  lockHandle,
+  fsApi = fs,
+}) {
+  const jobPath = path.join(reportDir, `.${step.name}.attempt-${attempt}.runner-job.json`);
+  const resultPath = path.join(reportDir, `.${step.name}.attempt-${attempt}.runner-result.json`);
+  const job = {
+    schema: RUNNER_JOB_SCHEMA,
+    transactionId: lockHandle.transactionId,
+    lockPath: lockHandle.lockPath,
+    resultPath,
+    command: step.command,
+    args: step.args,
+    cwd: process.cwd(),
+    env: environment,
+    parent: lockHandle.parent,
+    runnerToken: lockHandle.runnerToken,
+    timeoutMs: 180_000,
+  };
+  if (fsApi.existsSync(jobPath) || fsApi.existsSync(resultPath)) {
+    throw new ConvergenceError(
+      `controlled runner evidence already exists for ${step.name} attempt ${attempt}`,
+      'RUNNER_EVIDENCE_COLLISION',
+    );
+  }
+  updateApplyLock(lockHandle, current => ({
+    ...current,
+    phase: 'RUNNER_STARTING',
+    step: { name: step.name, command: step.command, args: step.args, attempt },
+    runner: null,
+    child: null,
+  }), fsApi);
+  atomicWriteJson(jobPath, job, fsApi);
+  const invocation = spawnSync(process.execPath, [RUNNER_PATH, '--job', jobPath], {
+    cwd: process.cwd(),
+    env: { ...process.env, ...environment },
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const runnerResult = readOptionalJson(resultPath, fsApi);
+  if (!runnerResult) {
+    const details = invocation.error?.message
+      || invocation.stderr?.trim()
+      || `controlled runner exited with status ${invocation.status}`;
+    return {
+      status: null,
+      stdout: '',
+      stderr: invocation.stderr || '',
+      error: new Error(details),
+    };
+  }
+  return runnerResultAsSpawnResult(runnerResult, lockHandle.transactionId);
 }
 
 function commandReceipt({
@@ -393,10 +754,15 @@ export function runNativeTaskConvergence({
     },
     steps: [],
   };
-  let releaseLock = null;
+  let lockHandle = null;
   if (options.apply) {
-    releaseLock = acquireApplyLock({ zylosDir: runtimeDir, transactionId, fsApi });
+    lockHandle = acquireApplyLock({ zylosDir: runtimeDir, transactionId, fsApi });
   }
+  const controlledRunner = Boolean(options.apply && spawn === spawnSync);
+  const childEnvironment = Object.fromEntries(
+    Object.entries({ ...env, ZYLOS_DIR: runtimeDir })
+      .filter(([key, value]) => typeof key === 'string' && typeof value === 'string'),
+  );
   atomicWriteJson(summaryPath, summary, fsApi);
   try {
     const pair = validateConvergenceManifestPair({
@@ -438,12 +804,33 @@ export function runNativeTaskConvergence({
         ...commandReceipt({ ...receiptBase, status: 'RUNNING' }),
         previousStatus: previousReceipt?.status ?? null,
       });
-      const result = spawn(step.command, step.args, {
-        env: { ...env, ZYLOS_DIR: runtimeDir },
-        encoding: 'utf8',
-        timeout: 180_000,
-        maxBuffer: 8 * 1024 * 1024,
-      });
+      let result;
+      try {
+        result = controlledRunner
+          ? runControlledStep({
+            step,
+            attempt,
+            reportDir: options.reportDir,
+            runtimeDir,
+            environment: childEnvironment,
+            lockHandle,
+            fsApi,
+          })
+          : spawn(step.command, step.args, {
+            env: childEnvironment,
+            encoding: 'utf8',
+            timeout: 180_000,
+            maxBuffer: 8 * 1024 * 1024,
+          });
+      } catch (error) {
+        if (lockHandle && !controlledRunner) {
+          try { markDirectAdapterTerminal(lockHandle, 'HOLD', fsApi); } catch {}
+        }
+        throw error;
+      }
+      if (lockHandle && !controlledRunner) {
+        markDirectAdapterTerminal(lockHandle, result.status === 0 ? 'PASS' : 'HOLD', fsApi);
+      }
       try {
         const report = parseJsonOutput(result, step.name);
         validateStepReport(step.name, report);
@@ -487,9 +874,9 @@ export function runNativeTaskConvergence({
   }
   summary.finishedAt = new Date().toISOString();
   atomicWriteJson(summaryPath, summary, fsApi);
-  if (releaseLock) {
+  if (lockHandle) {
     try {
-      releaseLock();
+      lockHandle.release();
     } catch (error) {
       summary.status = 'HOLD';
       summary.code = 'LOCK_RELEASE_FAILED';
