@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     channel TEXT NOT NULL,          -- 'telegram' | 'lark' | 'scheduler' | 'system'
     endpoint_id TEXT,               -- chat_id, can be NULL (e.g., scheduler)
     content TEXT NOT NULL,          -- message content (large messages: preview + file path)
+    assistant_request_id TEXT,      -- durable response-stream identity, when applicable
     status TEXT DEFAULT 'pending',  -- 'pending' | 'delivered' | 'failed' (for direction='in' queue)
     delivery_action TEXT,           -- optional action outcome, e.g. 'queued' | 'delivered' | 'suppressed'
     priority INTEGER DEFAULT 3,     -- 1=urgent, 2=high, 3=normal
@@ -31,6 +32,9 @@ CREATE INDEX IF NOT EXISTS idx_conversations_timestamp ON conversations(timestam
 CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel);
 CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
 CREATE INDEX IF NOT EXISTS idx_conversations_priority ON conversations(priority);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_assistant_request_out
+  ON conversations(assistant_request_id)
+  WHERE direction = 'out' AND assistant_request_id IS NOT NULL;
 
 -- Control queue table (heartbeat/system control plane)
 CREATE TABLE IF NOT EXISTS control_queue (

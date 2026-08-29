@@ -283,7 +283,17 @@ async function main() {
 
   let outboundConversation = null;
   try {
-    outboundConversation = insertConversation('out', channel, endpoint, message);
+    outboundConversation = insertConversation(
+      'out',
+      channel,
+      endpoint,
+      message,
+      null,
+      3,
+      false,
+      null,
+      assistantRequestId,
+    );
   } catch (err) {
     console.error(`[C4] Warning: DB audit write failed: ${err.stack}`);
   } finally {

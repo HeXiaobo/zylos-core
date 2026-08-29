@@ -105,6 +105,14 @@ function ensureConversationsSchema(database) {
   if (!columnNames.has('delivery_action')) {
     database.exec('ALTER TABLE conversations ADD COLUMN delivery_action TEXT');
   }
+  if (!columnNames.has('assistant_request_id')) {
+    database.exec('ALTER TABLE conversations ADD COLUMN assistant_request_id TEXT');
+  }
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_assistant_request_out
+      ON conversations(assistant_request_id)
+      WHERE direction = 'out' AND assistant_request_id IS NOT NULL
+  `);
 }
 
 /**
@@ -685,9 +693,21 @@ export function openCommitmentIntakeQueue({
  * @param {string} status - 'pending' or 'delivered' (default: 'pending' for in, 'delivered' for out)
  * @param {number} priority - 1=urgent, 2=high, 3=normal (default: 3)
  * @param {boolean} requireIdle - whether to wait for Claude idle state (default: false)
+ * @param {string|null} deliveryAction - optional delivery/audit action label
+ * @param {string|null} assistantRequestId - durable assistant response identity, when applicable
  * @returns {object} - inserted record with id
  */
-export function insertConversation(direction, channel, endpointId, content, status = null, priority = 3, requireIdle = false, deliveryAction = null) {
+export function insertConversation(
+  direction,
+  channel,
+  endpointId,
+  content,
+  status = null,
+  priority = 3,
+  requireIdle = false,
+  deliveryAction = null,
+  assistantRequestId = null,
+) {
   const db = getDb();
 
   // Default status: 'pending' for incoming, 'delivered' for outgoing
@@ -696,11 +716,23 @@ export function insertConversation(direction, channel, endpointId, content, stat
   const requireIdleVal = requireIdle ? 1 : 0;
 
   const stmt = db.prepare(`
-    INSERT INTO conversations (direction, channel, endpoint_id, content, status, delivery_action, priority, require_idle)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO conversations (
+      direction, channel, endpoint_id, content, status, delivery_action,
+      priority, require_idle, assistant_request_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  const result = stmt.run(direction, channel, endpointId, content, finalStatus, deliveryAction, priority, requireIdleVal);
+  const result = stmt.run(
+    direction,
+    channel,
+    endpointId,
+    content,
+    finalStatus,
+    deliveryAction,
+    priority,
+    requireIdleVal,
+    assistantRequestId,
+  );
 
   return {
     id: result.lastInsertRowid,
@@ -710,6 +742,7 @@ export function insertConversation(direction, channel, endpointId, content, stat
     content,
     status: finalStatus,
     delivery_action: deliveryAction,
+    assistant_request_id: assistantRequestId,
     priority,
     require_idle: requireIdleVal,
     retry_count: 0
