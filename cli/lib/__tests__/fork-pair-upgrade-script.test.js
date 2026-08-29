@@ -11,6 +11,8 @@ import {
   buildNativeTaskConservationEnv,
   buildNativeTaskConvergenceCommand,
   executeCoreBackupRetention,
+  repairCoreBackupQuarantine,
+  repairCoreBackupRetention,
   preparePersistentStagedSources,
   validatePairResumeSummary,
   planCoreBackupRetention,
@@ -22,6 +24,7 @@ import {
   validateNativeTaskDeploymentIdentity,
   validatePm2Snapshot,
   validatePinnedTarget,
+  validateRetentionRepairAuthorization,
 } from '../../../scripts/upgrade-fork-pair.js';
 import {
   buildHxaProbeCommands,
@@ -213,6 +216,20 @@ describe('fork-pair upgrade target contract', () => {
       fsApi,
       retain,
     });
+  }
+
+  function retentionRepairAuthorization(quarantinePath) {
+    return {
+      schema: 'zylos.owner-authorization/v1',
+      status: 'PASS',
+      identity: 'user',
+      deploymentAuthorized: true,
+      retentionAuthorization: {
+        approvedDeletePaths: [quarantinePath],
+        mustMatchExactly: true,
+        authorizedBy: 'user',
+      },
+    };
   }
 
   it('accepts a complete pinned Core source fixture', () => {
@@ -1010,6 +1027,194 @@ describe('fork-pair upgrade target contract', () => {
     }
   });
 
+  it('unlinks only authorized npm .bin symlinks without touching their targets and writes an audit', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-retention-repair-'));
+    try {
+      const first = writeCoreBackup(root, 'zylos-core-backup-a', '0.7.2-rc.5', 1);
+      runVerifiedRetention(root, first, 1);
+      const second = writeCoreBackup(root, 'zylos-core-backup-b', '0.7.2-rc.9', 2);
+      runVerifiedRetention(root, second, 2);
+      const third = writeCoreBackup(root, 'zylos-core-backup-c', '0.7.2-rc.10', 3);
+      const pending = runVerifiedRetention(root, third, 3);
+      const quarantinePath = pending.generations[0].path;
+      const objectPath = pending.quarantined[0].quarantinePath;
+      const binPath = path.join(objectPath, 'core-package', 'node_modules', '.bin');
+      fs.mkdirSync(binPath, { recursive: true });
+      const outsideTarget = path.join(root, 'outside-target.js');
+      fs.writeFileSync(outsideTarget, 'must remain\n');
+      const linkPath = path.join(binPath, 'external-tool');
+      fs.symlinkSync(outsideTarget, linkPath);
+      const auditPath = path.join(root, 'retention-repair.json');
+
+      const result = repairCoreBackupRetention({
+        quarantinePath,
+        authorization: retentionRepairAuthorization(quarantinePath),
+        auditPath,
+        apply: true,
+        homeDir: path.join(root, 'home'),
+      });
+
+      assert.equal(result.status, 'PASS');
+      assert.equal(result.result, 'REPAIRED');
+      assert.equal(result.actions[0].status, 'UNLINKED');
+      assert.equal(fs.lstatSync(linkPath, { throwIfNoEntry: false }), undefined);
+      assert.equal(fs.readFileSync(outsideTarget, 'utf8'), 'must remain\n');
+      assert.equal(fs.lstatSync(quarantinePath).isDirectory(), true);
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.schema, 'zylos.core-backup-retention-repair/v1');
+      assert.equal(audit.status, 'PASS');
+      assert.equal(audit.result, 'REPAIRED');
+      assert.equal(audit.links[0].target, outsideTarget);
+      assert.equal(audit.authorization.approvedPath, quarantinePath);
+      assert.equal(audit.actions[0].status, 'UNLINKED');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed without mutation for an unknown symlink even with exact authorization', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-retention-repair-unknown-'));
+    try {
+      const first = writeCoreBackup(root, 'zylos-core-backup-a', '0.7.2-rc.5', 1);
+      runVerifiedRetention(root, first, 1);
+      const second = writeCoreBackup(root, 'zylos-core-backup-b', '0.7.2-rc.9', 2);
+      runVerifiedRetention(root, second, 2);
+      const third = writeCoreBackup(root, 'zylos-core-backup-c', '0.7.2-rc.10', 3);
+      const pending = runVerifiedRetention(root, third, 3);
+      const quarantinePath = pending.generations[0].path;
+      const objectPath = pending.quarantined[0].quarantinePath;
+      const outsideTarget = path.join(root, 'outside-target');
+      fs.writeFileSync(outsideTarget, 'must remain');
+      const unknownLink = path.join(objectPath, 'unexpected-link');
+      fs.symlinkSync(outsideTarget, unknownLink);
+      const auditPath = path.join(root, 'unknown-repair.json');
+
+      const result = repairCoreBackupQuarantine({
+        quarantinePath,
+        authorization: retentionRepairAuthorization(quarantinePath),
+        auditPath,
+        apply: true,
+        homeDir: path.join(root, 'home'),
+      });
+
+      assert.equal(result.status, 'HOLD');
+      assert.equal(result.code, 'RETENTION_REPAIR_UNKNOWN_SYMLINK');
+      assert.equal(fs.lstatSync(unknownLink).isSymbolicLink(), true);
+      assert.equal(fs.readFileSync(outsideTarget, 'utf8'), 'must remain');
+      assert.equal(JSON.parse(fs.readFileSync(auditPath, 'utf8')).status, 'HOLD');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed without mutation when a nested repair entry crosses devices', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-retention-repair-mount-'));
+    try {
+      const first = writeCoreBackup(root, 'zylos-core-backup-a', '0.7.2-rc.5', 1);
+      runVerifiedRetention(root, first, 1);
+      const second = writeCoreBackup(root, 'zylos-core-backup-b', '0.7.2-rc.9', 2);
+      runVerifiedRetention(root, second, 2);
+      const third = writeCoreBackup(root, 'zylos-core-backup-c', '0.7.2-rc.10', 3);
+      const pending = runVerifiedRetention(root, third, 3);
+      const quarantinePath = pending.generations[0].path;
+      const objectPath = pending.quarantined[0].quarantinePath;
+      const binPath = path.join(objectPath, 'core-package', 'node_modules', '.bin');
+      fs.mkdirSync(binPath, { recursive: true });
+      const outsideTarget = path.join(root, 'outside-target');
+      fs.writeFileSync(outsideTarget, 'must remain');
+      const linkPath = path.join(binPath, 'external-tool');
+      fs.symlinkSync(outsideTarget, linkPath);
+      const mountPath = path.join(objectPath, 'core-package', 'simulated-mount');
+      fs.mkdirSync(mountPath);
+      const fsApi = new Proxy(fs, {
+        get(target, property) {
+          if (property !== 'lstatSync') return Reflect.get(target, property);
+          return (targetPath, ...args) => {
+            const stat = fs.lstatSync(targetPath, ...args);
+            if (targetPath !== mountPath) return stat;
+            return new Proxy(stat, {
+              get(statTarget, statProperty) {
+                if (statProperty === 'dev') return statTarget.dev + 1;
+                return Reflect.get(statTarget, statProperty);
+              },
+            });
+          };
+        },
+      });
+      const auditPath = path.join(root, 'mount-repair.json');
+
+      const result = repairCoreBackupQuarantine({
+        quarantinePath,
+        authorization: retentionRepairAuthorization(quarantinePath),
+        auditPath,
+        apply: true,
+        fsApi,
+        homeDir: path.join(root, 'home'),
+      });
+
+      assert.equal(result.status, 'HOLD');
+      assert.equal(result.code, 'RETENTION_REPAIR_CROSS_DEVICE');
+      assert.equal(fs.lstatSync(linkPath).isSymbolicLink(), true);
+      assert.equal(fs.readFileSync(outsideTarget, 'utf8'), 'must remain');
+      assert.equal(JSON.parse(fs.readFileSync(auditPath, 'utf8')).status, 'HOLD');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed and records a race when a symlink is replaced during unlink', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-retention-repair-race-'));
+    try {
+      const first = writeCoreBackup(root, 'zylos-core-backup-a', '0.7.2-rc.5', 1);
+      runVerifiedRetention(root, first, 1);
+      const second = writeCoreBackup(root, 'zylos-core-backup-b', '0.7.2-rc.9', 2);
+      runVerifiedRetention(root, second, 2);
+      const third = writeCoreBackup(root, 'zylos-core-backup-c', '0.7.2-rc.10', 3);
+      const pending = runVerifiedRetention(root, third, 3);
+      const quarantinePath = pending.generations[0].path;
+      const objectPath = pending.quarantined[0].quarantinePath;
+      const binPath = path.join(objectPath, 'core-package', 'node_modules', '.bin');
+      fs.mkdirSync(binPath, { recursive: true });
+      const outsideTarget = path.join(root, 'outside-target');
+      fs.writeFileSync(outsideTarget, 'must remain');
+      const linkPath = path.join(binPath, 'external-tool');
+      fs.symlinkSync(outsideTarget, linkPath);
+      let raced = false;
+      const fsApi = new Proxy(fs, {
+        get(target, property) {
+          if (property !== 'unlinkSync') return Reflect.get(target, property);
+          return targetPath => {
+            fs.unlinkSync(targetPath);
+            if (!raced) {
+              raced = true;
+              fs.writeFileSync(targetPath, 'replacement');
+            }
+          };
+        },
+      });
+      const auditPath = path.join(root, 'race-repair.json');
+
+      const result = repairCoreBackupQuarantine({
+        quarantinePath,
+        authorization: retentionRepairAuthorization(quarantinePath),
+        auditPath,
+        apply: true,
+        fsApi,
+        homeDir: path.join(root, 'home'),
+      });
+
+      assert.equal(result.status, 'HOLD');
+      assert.equal(result.code, 'RETENTION_REPAIR_RACE');
+      assert.equal(fs.readFileSync(linkPath, 'utf8'), 'replacement');
+      assert.equal(fs.readFileSync(outsideTarget, 'utf8'), 'must remain');
+      const audit = JSON.parse(fs.readFileSync(auditPath, 'utf8'));
+      assert.equal(audit.status, 'HOLD');
+      assert.equal(audit.actions[0].status, 'RACE_DETECTED');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('reports residual GC after partial deletion without touching current or prior backups', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-core-retention-partial-gc-'));
     try {
@@ -1473,6 +1678,29 @@ describe('fork-pair upgrade target contract', () => {
       () => planCoreBackupRetention({ retain: 1 }),
       /between 2 and 10/,
     );
+  });
+
+  it('requires an exact normalized quarantine path in the retention authorization', () => {
+    const quarantinePath = path.join(os.tmpdir(), '.zylos-core-retention-quarantine-test');
+    const authorization = retentionRepairAuthorization(quarantinePath);
+    assert.deepEqual(
+      validateRetentionRepairAuthorization({ quarantinePath, authorization }),
+      { ok: true, approvedPath: quarantinePath, authorizedBy: 'user' },
+    );
+    assert.equal(validateRetentionRepairAuthorization({
+      quarantinePath: `${quarantinePath}/..`,
+      authorization,
+    }).ok, false);
+    assert.equal(validateRetentionRepairAuthorization({
+      quarantinePath,
+      authorization: {
+        ...authorization,
+        retentionAuthorization: {
+          ...authorization.retentionAuthorization,
+          mustMatchExactly: false,
+        },
+      },
+    }).ok, false);
   });
 });
 

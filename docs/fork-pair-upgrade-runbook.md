@@ -301,6 +301,26 @@ tmp 顶层，且 path/realpath/dev/ino/mtime、非 symlink 目录和 zylos packa
 回收。审计写入失败时零移动；任何 rename/GC 失败都保留现场并报告 `WARN`。执行前
 仍需按 Owner 授权核对精确候选路径，禁止把 retention 当成泛化清理授权。
 
+如果历史 quarantine 因 npm 安装留下了 `.bin` symlink，普通 GC 会按上述规则保持
+`HOLD`。此时只能使用 Core 提供的精确路径 repair 命令；它要求 Owner receipt 中的
+`retentionAuthorization.approvedDeletePaths` 与 `--quarantine-path` 完全一致，只会
+`unlink` quarantine 内、`node_modules/.bin/<name>` 这一层的 symlink，不会解析或跟随
+symlink target。命令会在首次变更前写入审计、在每个 unlink 前后更新审计，并对
+quarantine、父目录的 dev/ino 以及跨设备项重新核验；未知 symlink、mount、身份漂移、
+竞态或审计写入失败均保持 `HOLD`：
+
+```bash
+node scripts/repair-core-backup-retention.js \
+  --apply \
+  --quarantine-path '<exact-authorized-quarantine-path>' \
+  --authorization '<owner-authorization.json>' \
+  --audit-path '<outside-quarantine-repair-audit.json>'
+```
+
+先用 `--dry-run` 生成同一份预检审计，再使用相同路径和 receipt 执行 apply。repair
+完成后仍须重新执行完整 pair dry-run；该命令不改变 Core/Feishu 版本，也不删除
+symlink 指向的 target。
+
 本版本同时提供正式的 `zylos task set-reminder`。原生任务 reminder 漂移只能通过该
 public Core command 修复，必须带 owner/acceptor actor、正整数 expected version、
 非负 minutes-before-due 与稳定 idempotency key。禁止用 SQLite 直写伪造 receipt 或
