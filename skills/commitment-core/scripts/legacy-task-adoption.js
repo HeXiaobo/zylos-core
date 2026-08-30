@@ -177,6 +177,26 @@ function fingerprintFile(filePath) {
   };
 }
 
+function verifySnapshot(snapshotPath) {
+  let snapshot;
+  try {
+    snapshot = new Database(snapshotPath, { readonly: true, fileMustExist: true });
+    const quickCheck = snapshot.pragma('quick_check', { simple: true });
+    if (quickCheck !== 'ok') {
+      throw cliError(
+        `plan snapshot failed SQLite quick_check: ${quickCheck}`,
+        'PLAN_SNAPSHOT_INVALID',
+      );
+    }
+    return { quickCheck };
+  } catch (cause) {
+    if (cause?.code === 'PLAN_SNAPSHOT_INVALID') throw cause;
+    throw cliError('plan snapshot failed SQLite quick_check', 'PLAN_SNAPSHOT_INVALID', cause);
+  } finally {
+    snapshot?.close();
+  }
+}
+
 function absentPlanSource(sourcePath, status = 'absent') {
   return {
     dbPath: ':memory:',
@@ -189,7 +209,10 @@ function absentPlanSource(sourcePath, status = 'absent') {
   };
 }
 
-function createPlanSnapshot(sourcePath) {
+export function createPlanSnapshot(sourcePath, { afterSnapshot = () => {} } = {}) {
+  if (typeof afterSnapshot !== 'function') {
+    throw cliError('afterSnapshot must be a function', 'INVALID_ARGUMENT');
+  }
   if (sourcePath === ':memory:') return absentPlanSource(':memory:', 'memory');
 
   const resolvedPath = path.resolve(sourcePath);
@@ -213,27 +236,36 @@ function createPlanSnapshot(sourcePath) {
     source.pragma('busy_timeout = 5000');
     const dataVersionBefore = source.pragma('data_version', { simple: true });
     source.prepare('VACUUM INTO ?').run(snapshotPath);
+    afterSnapshot({ sourcePath: resolvedPath, snapshotPath });
     const dataVersionAfter = source.pragma('data_version', { simple: true });
     source.close();
     source = null;
 
-    const sourceAfter = fingerprintFile(resolvedPath);
-    if (dataVersionBefore !== dataVersionAfter
-      || sourceBefore.sha256 !== sourceAfter.sha256
-      || sourceBefore.bytes !== sourceAfter.bytes
-      || sourceBefore.mtimeMs !== sourceAfter.mtimeMs) {
+    const sourceAfterStat = lstatSync(resolvedPath);
+    if (!sourceAfterStat.isFile()
+      || sourceStat.dev !== sourceAfterStat.dev
+      || sourceStat.ino !== sourceAfterStat.ino) {
       throw cliError(
-        'plan source database changed while snapshotting',
-        'PLAN_SOURCE_CHANGED',
+        'plan source database was replaced while snapshotting',
+        'PLAN_SOURCE_REPLACED',
       );
     }
 
+    const sourceAfter = fingerprintFile(resolvedPath);
+    // VACUUM INTO reads one SQLite transaction snapshot. Later WAL commits
+    // advance the live source without invalidating that point-in-time copy.
+    const changedDuringSnapshot = dataVersionBefore !== dataVersionAfter
+      || sourceBefore.sha256 !== sourceAfter.sha256
+      || sourceBefore.bytes !== sourceAfter.bytes
+      || sourceBefore.mtimeMs !== sourceAfter.mtimeMs;
     const snapshot = fingerprintFile(snapshotPath);
+    const snapshotVerification = verifySnapshot(snapshotPath);
     return {
       dbPath: snapshotPath,
       sourceDb: {
         path: resolvedPath,
         status: 'snapshotted',
+        changedDuringSnapshot,
         fingerprint: {
           ...sourceBefore,
           dataVersionBefore,
@@ -242,6 +274,7 @@ function createPlanSnapshot(sourcePath) {
         snapshot: {
           bytes: snapshot.bytes,
           sha256: snapshot.sha256,
+          ...snapshotVerification,
         },
       },
       cleanup() {
@@ -251,15 +284,17 @@ function createPlanSnapshot(sourcePath) {
   } catch (cause) {
     if (source) source.close();
     rmSync(tempDir, { recursive: true, force: true });
-    if (cause?.code === 'PLAN_SOURCE_CHANGED') throw cause;
+    if (cause?.code === 'PLAN_SOURCE_REPLACED' || cause?.code === 'PLAN_SNAPSHOT_INVALID') {
+      throw cause;
+    }
     throw cliError('could not create read-only plan snapshot', 'PLAN_SNAPSHOT_FAILED', cause);
   }
 }
 
-function openForMode(options, openCore) {
+function openForMode(options, openCore, createSnapshot) {
   if (!options.commit) {
     const sourcePath = options.dbPath ?? defaultDbPath();
-    const prepared = createPlanSnapshot(sourcePath);
+    const prepared = createSnapshot(sourcePath);
     try {
       return {
         core: openCore({ dbPath: prepared.dbPath }),
@@ -295,12 +330,13 @@ function openForMode(options, openCore) {
 export function runLegacyTaskAdoptionCli({
   args = process.argv.slice(2),
   openCore = openCommitmentCore,
+  createSnapshot = createPlanSnapshot,
   readFile = readFileSync,
   stdout = process.stdout,
 } = {}) {
   const options = parseArgs(args);
   const manifest = parseManifestText(readManifest(options.manifest, readFile));
-  const prepared = openForMode(options, openCore);
+  const prepared = openForMode(options, openCore, createSnapshot);
   const { core } = prepared;
   const results = [];
   try {
