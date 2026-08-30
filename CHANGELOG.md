@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.21] - 2026-08-30
+
+### Fixed
+- Accept transaction-consistent SQLite planning snapshots while the live WAL
+  advances, while still failing closed on source replacement or snapshot
+  integrity failure.
+
 ## [0.7.2-rc.20] - 2026-08-30
 
 ### Fixed
