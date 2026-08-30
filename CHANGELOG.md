@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indefinitely active or leak rejected content.
 - Treat exact silent assistant responses as side-effect free terminals before
   adapter delivery.
+- Route manual self-upgrades, activity-monitor checks, the bundled installer,
+  and release-history lookup to the HeXiaobo fork by default while retaining an
+  explicit repository override.
 
 ## [0.7.2-rc.18] - 2026-08-29
 
