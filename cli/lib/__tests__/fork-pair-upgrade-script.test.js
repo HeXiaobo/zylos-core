@@ -11,6 +11,7 @@ import {
   buildNativeTaskConservationEnv,
   buildNativeTaskConvergenceCommand,
   executeCoreBackupRetention,
+  ensureCommitmentCoreRuntimeDependencies,
   repairCoreBackupQuarantine,
   repairCoreBackupRetention,
   preparePersistentStagedSources,
@@ -733,6 +734,107 @@ describe('fork-pair upgrade target contract', () => {
       });
       assert.equal(resumed.coreDir, result.coreDir);
       assert.equal(resumed.feishuDir, result.feishuDir);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('binds exact live Commitment Core dependencies when native Task convergence is requested', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-fork-pair-core-dependencies-'));
+    try {
+      const inputCore = path.join(root, 'input-core');
+      const reportDir = path.join(root, 'report');
+      const zylosDir = path.join(root, 'zylos');
+      const liveFeishuNodeModules = path.join(zylosDir, '.claude', 'skills', 'feishu', 'node_modules');
+      const liveCoreNodeModules = path.join(zylosDir, '.claude', 'skills', 'commitment-core', 'node_modules');
+      fs.mkdirSync(inputCore, { recursive: true });
+      writeCoreFixture(inputCore);
+      const coreSkillDir = path.join(inputCore, 'skills', 'commitment-core');
+      fs.writeFileSync(path.join(coreSkillDir, 'package.json'), JSON.stringify({
+        name: 'zylos-commitment-core',
+        version: '0.1.0',
+        dependencies: { 'better-sqlite3': '^12.6.2' },
+      }));
+      fs.writeFileSync(path.join(coreSkillDir, 'package-lock.json'), JSON.stringify({
+        name: 'zylos-commitment-core',
+        version: '0.1.0',
+        lockfileVersion: 3,
+        packages: {
+          '': {
+            name: 'zylos-commitment-core',
+            version: '0.1.0',
+            dependencies: { 'better-sqlite3': '^12.6.2' },
+          },
+          'node_modules/better-sqlite3': { version: '12.11.1' },
+        },
+      }));
+      fs.mkdirSync(liveFeishuNodeModules, { recursive: true });
+      fs.mkdirSync(path.join(liveCoreNodeModules, 'better-sqlite3'), { recursive: true });
+      fs.writeFileSync(
+        path.join(liveCoreNodeModules, 'better-sqlite3', 'package.json'),
+        JSON.stringify({ name: 'better-sqlite3', version: '12.11.1' }),
+      );
+      const args = {
+        stagedCoreDir: inputCore,
+        coreSha: CORE_SHA,
+        coreVersion: '0.7.2-rc.5',
+        feishuSha: FEISHU_SHA,
+        feishuVersion: '0.3.7-rc.5',
+        nativeTaskCoreManifest: '/evidence/core.json',
+      };
+      const result = preparePersistentStagedSources({
+        args,
+        reportDir,
+        zylosDir,
+        stageArchive(_repo, _sha, destination) {
+          fs.mkdirSync(destination, { recursive: true });
+          fs.writeFileSync(path.join(destination, 'package.json'), JSON.stringify({
+            name: 'zylos-feishu',
+            version: '0.3.7-rc.5',
+          }));
+          fs.writeFileSync(path.join(path.dirname(destination), 'feishu.tar.gz'), 'immutable archive');
+          return path.join(path.dirname(destination), 'feishu.tar.gz');
+        },
+      });
+
+      assert.equal(
+        fs.realpathSync(path.join(result.coreDir, 'skills', 'commitment-core', 'node_modules')),
+        fs.realpathSync(liveCoreNodeModules),
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('holds when live Commitment Core dependencies differ from the immutable target lockfile', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-fork-pair-core-dependency-mismatch-'));
+    try {
+      const stagedCoreDir = path.join(root, 'staged-core');
+      const packageDir = path.join(stagedCoreDir, 'skills', 'commitment-core');
+      const liveNodeModules = path.join(root, 'live-node-modules');
+      fs.mkdirSync(path.join(liveNodeModules, 'better-sqlite3'), { recursive: true });
+      fs.mkdirSync(packageDir, { recursive: true });
+      fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
+        name: 'zylos-commitment-core',
+        version: '0.1.0',
+        dependencies: { 'better-sqlite3': '^12.6.2' },
+      }));
+      fs.writeFileSync(path.join(packageDir, 'package-lock.json'), JSON.stringify({
+        packages: {
+          'node_modules/better-sqlite3': { version: '12.11.1' },
+        },
+      }));
+      fs.writeFileSync(
+        path.join(liveNodeModules, 'better-sqlite3', 'package.json'),
+        JSON.stringify({ name: 'better-sqlite3', version: '12.10.0' }),
+      );
+
+      assert.throws(
+        () => ensureCommitmentCoreRuntimeDependencies(stagedCoreDir, liveNodeModules),
+        error => error.code === 'SOURCE_BINDING_MISMATCH'
+          && /12\.10\.0.*12\.11\.1/.test(error.message),
+      );
+      assert.equal(fs.existsSync(path.join(packageDir, 'node_modules')), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
