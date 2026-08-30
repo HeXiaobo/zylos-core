@@ -175,6 +175,60 @@ test('unavailable runtime produces a durable failed terminal without a second ch
   }
 });
 
+test('updates a pre-created outbound audit row when the channel adapter fails', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-assistant-outbound-failure-'));
+  try {
+    const scripts = path.join(temp, '.claude', 'skills', 'feishu', 'scripts');
+    fs.mkdirSync(scripts, { recursive: true });
+    fs.writeFileSync(path.join(scripts, 'send.js'), 'process.exit(7);');
+    const env = { ...process.env, ZYLOS_DIR: temp };
+    const endpoint = 'oc_1|type:p2p|msg:om_outbound_failure';
+    const requestId = 'assistant.feishu.om_outbound_failure';
+    const receive = spawnSync('node', [
+      RECEIVE,
+      '--channel', 'feishu',
+      '--endpoint', endpoint,
+      '--assistant-request-id', requestId,
+      '--assistant-source-id', 'om_outbound_failure',
+      '--json',
+      '--content', 'hello',
+    ], { env, encoding: 'utf8' });
+    assert.equal(receive.status, 0, receive.stderr || receive.stdout);
+
+    const send = spawnSync('node', [SEND, 'feishu', endpoint, '--request-id', requestId], {
+      env,
+      input: '答案发送失败',
+      encoding: 'utf8',
+    });
+    assert.equal(send.status, 7, send.stderr || send.stdout);
+
+    const database = new Database(path.join(temp, 'comm-bridge', 'c4.db'));
+    const outbound = database.prepare(`
+      SELECT direction, channel, endpoint_id, content, status, delivery_action,
+             assistant_request_id
+      FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = ?
+    `).get(requestId);
+    const request = database.prepare(`
+      SELECT status FROM assistant_requests WHERE request_id = ?
+    `).get(requestId);
+    database.close();
+
+    assert.deepEqual(outbound, {
+      direction: 'out',
+      channel: 'feishu',
+      endpoint_id: endpoint,
+      content: '',
+      status: 'failed',
+      delivery_action: 'assistant-response-failed:CHANNEL_DELIVERY_FAILED',
+      assistant_request_id: requestId,
+    });
+    assert.deepEqual(request, { status: 'failed' });
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test('media delivery completes the stream without exposing its local transport path as answer text', () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-assistant-media-'));
   try {

@@ -549,7 +549,25 @@ export function openAssistantResponseStream({
       WHERE direction = 'out' AND assistant_request_id = ?
       LIMIT 1
     `).get(request.request_id);
-    if (existing) return existing;
+    if (existing) {
+      database.prepare(`
+        UPDATE conversations
+        SET content = ?, status = ?, delivery_action = ?
+        WHERE id = ? AND direction = 'out' AND assistant_request_id = ?
+      `).run(
+        content,
+        status,
+        deliveryAction,
+        existing.id,
+        request.request_id,
+      );
+      return database.prepare(`
+        SELECT id, direction, channel, endpoint_id, content, status,
+               delivery_action, assistant_request_id
+        FROM conversations
+        WHERE id = ?
+      `).get(existing.id);
+    }
 
     const inserted = database.prepare(`
       INSERT INTO conversations (
