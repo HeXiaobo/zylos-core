@@ -109,6 +109,20 @@ function isSilentAssistantOutput(message) {
   return /^\s*\[SKIP\]\s*$/i.test(message);
 }
 
+function failAssistantRequest(requestId, code, retryable) {
+  const responseStream = openAssistantResponseStream();
+  try {
+    responseStream.execute({
+      type: 'FailRun',
+      requestId,
+      code,
+      retryable,
+    });
+  } finally {
+    responseStream.close();
+  }
+}
+
 function readZylosEnvFlag(name) {
   if (process.env[name] !== undefined) return process.env[name] === '1';
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -208,20 +222,53 @@ async function main() {
     process.exit(1);
   }
 
+  const assistantRequestId = parsed.requestId;
+
+  if (assistantRequestId) {
+    try {
+      const responseStream = openAssistantResponseStream();
+      const stream = responseStream.query({ requestId: assistantRequestId });
+      responseStream.close();
+      if (!stream) throw new Error('assistant request does not exist');
+      if (stream.request.route.channel !== channel || stream.request.route.endpointId !== endpoint) {
+        throw new Error('assistant request does not match its channel route');
+      }
+    } catch (err) {
+      console.error(`[C4] Invalid assistant request: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
   if (channel !== 'void') {
     try {
       const policyDecision = enforceOutboundPolicy({ channel, endpoint, message });
       if (!policyDecision.allowed) {
+        let terminalWriteFailed = false;
+        if (assistantRequestId) {
+          try {
+            failAssistantRequest(assistantRequestId, 'OUTBOUND_POLICY_REJECTED', false);
+          } catch (err) {
+            terminalWriteFailed = true;
+            console.error(`[C4] Warning: failed to record assistant policy rejection: ${err.message}`);
+          }
+        }
         console.error(`[C4] Outbound policy rejected message (rule refs: ${policyDecision.ruleRefs.join(', ')})`);
-        process.exit(3);
+        process.exit(terminalWriteFailed ? 1 : 3);
       }
     } catch (err) {
+      let terminalWriteFailed = false;
+      if (assistantRequestId) {
+        try {
+          failAssistantRequest(assistantRequestId, 'OUTBOUND_POLICY_UNAVAILABLE', true);
+        } catch (terminalError) {
+          terminalWriteFailed = true;
+          console.error(`[C4] Warning: failed to record assistant policy failure: ${terminalError.message}`);
+        }
+      }
       console.error(`[C4] Outbound policy rejected message: ${err.message}`);
-      process.exit(3);
+      process.exit(terminalWriteFailed ? 1 : 3);
     }
   }
-
-  const assistantRequestId = parsed.requestId;
 
   // Virtual 'void' channel (#689): record-only, never dispatched.
   // No skill directory exists for it, so skip channel-path validation and
@@ -266,21 +313,6 @@ async function main() {
       validateEndpoint(endpoint);
     } catch (err) {
       console.error(`[C4] Invalid endpoint: ${err.stack}`);
-      process.exit(1);
-    }
-  }
-
-  if (assistantRequestId) {
-    try {
-      const responseStream = openAssistantResponseStream();
-      const stream = responseStream.query({ requestId: assistantRequestId });
-      responseStream.close();
-      if (!stream) throw new Error('assistant request does not exist');
-      if (stream.request.route.channel !== channel || stream.request.route.endpointId !== endpoint) {
-        throw new Error('assistant request does not match its channel route');
-      }
-    } catch (err) {
-      console.error(`[C4] Invalid assistant request: ${err.message}`);
       process.exit(1);
     }
   }
