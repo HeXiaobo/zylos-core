@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.22] - 2026-08-30
+
+### Fixed
+- Recover an unchanged started assistant request after the Codex runtime has
+  reported healthy sustained idle, with an atomic activity fence so abandoned
+  cross-channel requests cannot block later Feishu replies until stale expiry.
+
 ## [0.7.2-rc.21] - 2026-08-30
 
 ### Fixed
