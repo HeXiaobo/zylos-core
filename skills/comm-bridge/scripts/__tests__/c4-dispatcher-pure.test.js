@@ -510,7 +510,7 @@ describe('getDeliveryContent', () => {
       endpoint_id: 'oc_1|type:p2p|msg:om_1',
       assistant_request_id: 'assistant.feishu.om_1',
       content: 'hello',
-    });
+    }, 'claude');
 
     assert.match(result, /reply directly in this runtime turn/i);
     assert.match(result, /displayed assistant text is delivered automatically/i);
@@ -712,6 +712,54 @@ describe('assistant turn admission', () => {
 
     assert.equal(blocking.requestId, 'assistant.feishu.request-a');
     assert.deepEqual(calls, [{ excludingRequestId: 'assistant.feishu.request-b' }]);
+  });
+
+  it('recovers an unchanged Codex request after sustained healthy idle', () => {
+    const calls = [];
+    const responseStream = {
+      findStartedRequest(options) {
+        calls.push(['find', options]);
+        return {
+          requestId: 'assistant.hxa.request-a',
+          sourceId: 'hxa.dm.request-a',
+          status: 'started',
+          updatedAt: 100,
+        };
+      },
+      execute(command) {
+        calls.push(['execute', command]);
+        return {
+          recovered: true,
+          request: {
+            requestId: command.requestId,
+            status: 'failed',
+          },
+          events: [{ type: 'RunFailed' }],
+          replayed: false,
+        };
+      },
+    };
+
+    const result = mod.reconcileBlockingAssistantRun({
+      type: 'conversation',
+      assistant_request_id: 'assistant.feishu.request-b',
+    }, {
+      state: 'idle',
+      health: 'ok',
+      healthy: true,
+      idleSeconds: 30,
+    }, responseStream, 30, 130);
+
+    assert.equal(result.blockingRun, null);
+    assert.equal(result.recovered.request.requestId, 'assistant.hxa.request-a');
+    assert.deepEqual(calls, [
+      ['find', { excludingRequestId: 'assistant.feishu.request-b' }],
+      ['execute', {
+        type: 'RecoverIdleRun',
+        requestId: 'assistant.hxa.request-a',
+        staleBefore: 100,
+      }],
+    ]);
   });
 
   it('does not apply the conversation gate to control-plane items', () => {

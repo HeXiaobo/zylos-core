@@ -1457,6 +1457,31 @@ export function openAssistantResponseStream({
         };
       }
 
+      case 'RecoverIdleRun': {
+        const requestId = requireIdentifier(command.requestId, 'requestId');
+        const staleBefore = requireInteger(command.staleBefore, 'staleBefore');
+        const request = selectRequest.get(requestId);
+        if (
+          !request
+          || request.status !== 'started'
+          || request.updated_at > staleBefore
+        ) {
+          return {
+            recovered: false,
+            request: toRequest(request),
+            events: [],
+            replayed: false,
+          };
+        }
+        const failed = executeTransaction({
+          type: 'FailRun',
+          requestId,
+          code: 'RUN_ABANDONED_WHILE_RUNTIME_IDLE',
+          retryable: true,
+        });
+        return { ...failed, recovered: true };
+      }
+
       case 'ExpireStaleRuns': {
         const staleBefore = requireInteger(command.staleBefore, 'staleBefore');
         // A started runtime turn has an independent heartbeat. Do not let a
@@ -2126,6 +2151,10 @@ export function openAssistantResponseStream({
         FailRun: [
           ['type', 'requestId', 'runtimeSessionId', 'code', 'retryable'],
           ['type', 'code', 'retryable'],
+        ],
+        RecoverIdleRun: [
+          ['type', 'requestId', 'staleBefore'],
+          ['type', 'requestId', 'staleBefore'],
         ],
         ExpireStaleRuns: [['type', 'staleBefore'], ['type', 'staleBefore']],
       };

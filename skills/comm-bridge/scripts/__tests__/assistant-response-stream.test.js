@@ -1655,6 +1655,63 @@ test('leases deliveries with fencing and recovers stale requests as RunFailed', 
   stream.close();
 });
 
+test('recovers an unchanged started request after sustained runtime idle', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });
+  const accepted = accept(stream, {
+    requestId: 'assistant.hxa.idle-recovery',
+    sourceId: 'hxa.dm.idle-recovery',
+    route: { channel: 'hxa', endpointId: 'agent:mylos' },
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+
+  now = 130;
+  const recovered = stream.execute({
+    type: 'RecoverIdleRun',
+    requestId: accepted.request.requestId,
+    staleBefore: 100,
+  });
+
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.request.status, 'failed');
+  assert.deepEqual(recovered.events.map(event => event.type), ['RunFailed']);
+  assert.deepEqual(recovered.events[0].payload, {
+    code: 'RUN_ABANDONED_WHILE_RUNTIME_IDLE',
+    retryable: true,
+  });
+  stream.close();
+});
+
+test('idle recovery does not terminate a request that changed after observation', () => {
+  let now = 100;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });
+  const accepted = accept(stream, {
+    requestId: 'assistant.hxa.idle-recovery-race',
+    sourceId: 'hxa.dm.idle-recovery-race',
+    route: { channel: 'hxa', endpointId: 'agent:mylos' },
+  });
+  stream.execute({ type: 'StartRun', requestId: accepted.request.requestId });
+  now = 101;
+  stream.execute({
+    type: 'AppendOutputDelta',
+    requestId: accepted.request.requestId,
+    delta: 'still working',
+    idempotencyKey: 'idle-recovery-race-progress',
+  });
+
+  now = 130;
+  const recovery = stream.execute({
+    type: 'RecoverIdleRun',
+    requestId: accepted.request.requestId,
+    staleBefore: 100,
+  });
+
+  assert.equal(recovery.recovered, false);
+  assert.equal(recovery.request.status, 'started');
+  assert.deepEqual(recovery.events, []);
+  stream.close();
+});
+
 test('keeps a started request alive while its runtime admission sends a fresh heartbeat', () => {
   let now = 100;
   const stream = openAssistantResponseStream({
