@@ -38,10 +38,10 @@ describe('activity-monitor core repository routing', () => {
     assert.equal(repo, 'HeXiaobo/zylos-core');
   });
 
-  it('retains canonical routing when persisted configuration is absent', () => {
+  it('retains fork routing when persisted configuration is absent', () => {
     const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-monitor-default-'));
     assert.equal(resolveCoreRepository({
       env: { ZYLOS_DIR: zylosDir },
-    }), 'zylos-ai/zylos-core');
+    }), 'HeXiaobo/zylos-core');
   });
 });

@@ -3,10 +3,10 @@
 # Zylos One-Click Installer
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash
 #
 # Install from a specific branch:
-#   curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
+#   curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
 #
 # Full non-interactive deployment:
 #   curl -fsSL .../install.sh | bash -s -- -y --setup-token sk-ant-oat01-xxx --domain example.com --https
@@ -74,7 +74,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ── Configuration ─────────────────────────────────────────────
-ZYLOS_REPO_SLUG="${ZYLOS_SELF_UPGRADE_REPO:-zylos-ai/zylos-core}"
+ZYLOS_REPO_SLUG="${ZYLOS_SELF_UPGRADE_REPO:-HeXiaobo/zylos-core}"
 if [[ ! "$ZYLOS_REPO_SLUG" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "[zylos] Error: ZYLOS_SELF_UPGRADE_REPO must be an owner/repo slug" >&2
   exit 1

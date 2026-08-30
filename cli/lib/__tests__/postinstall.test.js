@@ -53,4 +53,17 @@ describe('self-upgrade bootstrap postinstall isolation', () => {
     assert.ok(installs.length > 0);
     assert.equal(installs.every((line) => line.includes('--ignore-scripts')), true);
   });
+
+  it('bootstraps fork installs from the fork release repository by default', () => {
+    const script = fs.readFileSync(INSTALL_SCRIPT, 'utf8');
+
+    assert.match(
+      script,
+      /ZYLOS_REPO_SLUG="\$\{ZYLOS_SELF_UPGRADE_REPO:-HeXiaobo\/zylos-core\}"/,
+    );
+    assert.doesNotMatch(
+      script,
+      /ZYLOS_REPO_SLUG="\$\{ZYLOS_SELF_UPGRADE_REPO:-zylos-ai\/zylos-core\}"/,
+    );
+  });
 });

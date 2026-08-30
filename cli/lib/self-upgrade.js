@@ -88,12 +88,11 @@ export function resolveSelfUpgradeFinalizerTimeoutMs(processEnv = process.env) {
   return Math.max(Math.trunc(parsed), MIN_FINALIZER_TIMEOUT_MS);
 }
 
-// Patch #6 (3AI fork layer): allow self-upgrade to target an alternate repo
-// (e.g. the 3AI fork) via the ZYLOS_SELF_UPGRADE_REPO env var. Value is an
-// `owner/repo` slug (e.g. `HeXiaobo/zylos-core`). Default stays canonical, so
-// normal upgrades on machines that do not set it are unaffected, and it makes
-// fork-based upgrades ratifiable without hand-editing installed code on every
-// machine.
+const DEFAULT_CORE_REPOSITORY = 'HeXiaobo/zylos-core';
+
+// The fork upgrades from its own release repository by default. Operators may
+// still select another immutable release source via ZYLOS_SELF_UPGRADE_REPO.
+// The value is an `owner/repo` slug (for example `HeXiaobo/zylos-core`).
 //   NOTE — deliberately NOT named ZYLOS_REPO: scripts/install.sh already uses
 //   ZYLOS_REPO with a DIFFERENT meaning (a full URL, for fresh installs). Same
 //   name + two meanings (URL vs slug) would silently mis-resolve here, so the
@@ -112,7 +111,7 @@ export function resolveCoreRepository({ processEnv = process.env, readEnv = read
     // An absent or unreadable persisted config must not make the CLI unusable.
   }
 
-  return 'zylos-ai/zylos-core';
+  return DEFAULT_CORE_REPOSITORY;
 }
 
 export const CORE_REPO = resolveCoreRepository();
