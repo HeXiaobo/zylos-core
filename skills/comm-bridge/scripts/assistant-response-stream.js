@@ -94,6 +94,10 @@ function outputHash(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+function isSilentAssistantOutput(value) {
+  return /^\s*\[SKIP\]\s*$/i.test(value);
+}
+
 function toEvent(row) {
   if (!row) return null;
   if (!EVENT_TYPE_SET.has(row.event_type)) {
@@ -1369,11 +1373,13 @@ export function openAssistantResponseStream({
           'consumed',
           'CANONICAL_RUN_COMPLETED',
         );
-        recordTerminalOutbound(request, {
-          content: output,
-          status: 'delivered',
-          deliveryAction: 'assistant-response',
-        });
+        if (!isSilentAssistantOutput(output)) {
+          recordTerminalOutbound(request, {
+            content: output,
+            status: 'delivered',
+            deliveryAction: 'assistant-response',
+          });
+        }
         return {
           request: toRequest(selectRequest.get(requestId)),
           events: emitted,

@@ -105,6 +105,10 @@ function publicAssistantOutput(message) {
   return /^\[MEDIA:(?:image|file)\].+/s.test(message) ? '' : message;
 }
 
+function isSilentAssistantOutput(message) {
+  return /^\s*\[SKIP\]\s*$/i.test(message);
+}
+
 function readZylosEnvFlag(name) {
   if (process.env[name] !== undefined) return process.env[name] === '1';
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -279,6 +283,22 @@ async function main() {
       console.error(`[C4] Invalid assistant request: ${err.message}`);
       process.exit(1);
     }
+  }
+
+  if (assistantRequestId && isSilentAssistantOutput(message)) {
+    try {
+      const responseStream = openAssistantResponseStream();
+      responseStream.execute({
+        type: 'CompleteRun',
+        requestId: assistantRequestId,
+        output: message.trim(),
+      });
+      responseStream.close();
+    } catch (err) {
+      console.error(`[C4] Warning: failed to record silent assistant terminal: ${err.message}`);
+      process.exit(1);
+    }
+    process.exit(0);
   }
 
   let outboundConversation = null;
