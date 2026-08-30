@@ -94,6 +94,10 @@ function outputHash(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+function isSilentAssistantOutput(value) {
+  return /^\s*\[SKIP\]\s*$/i.test(value);
+}
+
 function toEvent(row) {
   if (!row) return null;
   if (!EVENT_TYPE_SET.has(row.event_type)) {
@@ -549,7 +553,25 @@ export function openAssistantResponseStream({
       WHERE direction = 'out' AND assistant_request_id = ?
       LIMIT 1
     `).get(request.request_id);
-    if (existing) return existing;
+    if (existing) {
+      database.prepare(`
+        UPDATE conversations
+        SET content = ?, status = ?, delivery_action = ?
+        WHERE id = ? AND direction = 'out' AND assistant_request_id = ?
+      `).run(
+        content,
+        status,
+        deliveryAction,
+        existing.id,
+        request.request_id,
+      );
+      return database.prepare(`
+        SELECT id, direction, channel, endpoint_id, content, status,
+               delivery_action, assistant_request_id
+        FROM conversations
+        WHERE id = ?
+      `).get(existing.id);
+    }
 
     const inserted = database.prepare(`
       INSERT INTO conversations (
@@ -1351,11 +1373,13 @@ export function openAssistantResponseStream({
           'consumed',
           'CANONICAL_RUN_COMPLETED',
         );
-        recordTerminalOutbound(request, {
-          content: output,
-          status: 'delivered',
-          deliveryAction: 'assistant-response',
-        });
+        if (!isSilentAssistantOutput(output)) {
+          recordTerminalOutbound(request, {
+            content: output,
+            status: 'delivered',
+            deliveryAction: 'assistant-response',
+          });
+        }
         return {
           request: toRequest(selectRequest.get(requestId)),
           events: emitted,

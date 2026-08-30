@@ -175,6 +175,187 @@ test('unavailable runtime produces a durable failed terminal without a second ch
   }
 });
 
+test('updates a pre-created outbound audit row when the channel adapter fails', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-assistant-outbound-failure-'));
+  try {
+    const scripts = path.join(temp, '.claude', 'skills', 'feishu', 'scripts');
+    fs.mkdirSync(scripts, { recursive: true });
+    fs.writeFileSync(path.join(scripts, 'send.js'), 'process.exit(7);');
+    const env = { ...process.env, ZYLOS_DIR: temp };
+    const endpoint = 'oc_1|type:p2p|msg:om_outbound_failure';
+    const requestId = 'assistant.feishu.om_outbound_failure';
+    const receive = spawnSync('node', [
+      RECEIVE,
+      '--channel', 'feishu',
+      '--endpoint', endpoint,
+      '--assistant-request-id', requestId,
+      '--assistant-source-id', 'om_outbound_failure',
+      '--json',
+      '--content', 'hello',
+    ], { env, encoding: 'utf8' });
+    assert.equal(receive.status, 0, receive.stderr || receive.stdout);
+
+    const send = spawnSync('node', [SEND, 'feishu', endpoint, '--request-id', requestId], {
+      env,
+      input: '答案发送失败',
+      encoding: 'utf8',
+    });
+    assert.equal(send.status, 7, send.stderr || send.stdout);
+
+    const database = new Database(path.join(temp, 'comm-bridge', 'c4.db'));
+    const outbound = database.prepare(`
+      SELECT direction, channel, endpoint_id, content, status, delivery_action,
+             assistant_request_id
+      FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = ?
+    `).get(requestId);
+    const request = database.prepare(`
+      SELECT status FROM assistant_requests WHERE request_id = ?
+    `).get(requestId);
+    database.close();
+
+    assert.deepEqual(outbound, {
+      direction: 'out',
+      channel: 'feishu',
+      endpoint_id: endpoint,
+      content: '',
+      status: 'failed',
+      delivery_action: 'assistant-response-failed:CHANNEL_DELIVERY_FAILED',
+      assistant_request_id: requestId,
+    });
+    assert.deepEqual(request, { status: 'failed' });
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('silent assistant output completes without dispatch or an outbound audit row', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-assistant-silent-'));
+  try {
+    const scripts = path.join(temp, '.claude', 'skills', 'feishu', 'scripts');
+    fs.mkdirSync(scripts, { recursive: true });
+    fs.writeFileSync(path.join(scripts, 'send.js'), `
+import fs from 'node:fs';
+import path from 'node:path';
+fs.writeFileSync(path.join(process.env.ZYLOS_DIR, 'silent-send-marker'), 'sent');
+`);
+    const env = { ...process.env, ZYLOS_DIR: temp };
+    const requestId = 'assistant.feishu.om_silent';
+    const endpoint = 'oc_1|type:p2p|msg:om_silent';
+    const receive = spawnSync('node', [
+      RECEIVE,
+      '--channel', 'feishu',
+      '--endpoint', endpoint,
+      '--assistant-request-id', requestId,
+      '--assistant-source-id', 'om_silent',
+      '--json',
+      '--content', 'avoid a visible response',
+    ], { env, encoding: 'utf8' });
+    assert.equal(receive.status, 0, receive.stderr || receive.stdout);
+
+    const send = spawnSync('node', [
+      SEND,
+      'feishu',
+      endpoint,
+      '--request-id', requestId,
+    ], { env, input: '  [SKIP]  \n', encoding: 'utf8' });
+    assert.equal(send.status, 0, send.stderr || send.stdout);
+    assert.equal(fs.existsSync(path.join(temp, 'silent-send-marker')), false);
+    assert.doesNotMatch(send.stdout, /Message sent|Failed to send|Failed to complete/);
+    assert.doesNotMatch(send.stderr, /Message sent|Failed to send|Failed to complete/);
+
+    const database = new Database(path.join(temp, 'comm-bridge', 'c4.db'));
+    const request = database.prepare(`
+      SELECT status, output_text FROM assistant_requests WHERE request_id = ?
+    `).get(requestId);
+    const outboundCount = database.prepare(`
+      SELECT count(*) AS count FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = ?
+    `).get(requestId).count;
+    const events = database.prepare(`
+      SELECT event_type FROM assistant_response_events
+      WHERE request_id = ? ORDER BY sequence
+    `).all(requestId).map(row => row.event_type);
+    database.close();
+    assert.deepEqual(request, { status: 'completed', output_text: '[SKIP]' });
+    assert.equal(outboundCount, 0);
+    assert.deepEqual(events, [
+      'AssistantRequestAccepted',
+      'RunQueued',
+      'RunStarted',
+      'RunCompleted',
+    ]);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('outbound policy rejection fails the assistant request and records a safe terminal row', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-assistant-policy-rejection-'));
+  try {
+    const scripts = path.join(temp, '.claude', 'skills', 'feishu', 'scripts');
+    fs.mkdirSync(scripts, { recursive: true });
+    fs.writeFileSync(path.join(scripts, 'send.js'), `
+import fs from 'node:fs';
+import path from 'node:path';
+fs.writeFileSync(path.join(process.env.ZYLOS_DIR, 'policy-send-marker'), 'sent');
+`);
+    const policyDirectory = path.join(temp, '.zylos');
+    fs.mkdirSync(policyDirectory, { recursive: true });
+    fs.writeFileSync(path.join(policyDirectory, 'c4-outbound-policy.json'), JSON.stringify({
+      version: 1,
+      rules: [{ id: 'restricted-marker', contains: 'DO_NOT_SEND' }],
+    }));
+    const env = { ...process.env, ZYLOS_DIR: temp };
+    const requestId = 'assistant.feishu.om_policy_rejection';
+    const endpoint = 'oc_1|type:p2p|msg:om_policy_rejection';
+    const receive = spawnSync('node', [
+      RECEIVE,
+      '--channel', 'feishu',
+      '--endpoint', endpoint,
+      '--assistant-request-id', requestId,
+      '--assistant-source-id', 'om_policy_rejection',
+      '--json',
+      '--content', 'prepare a response',
+    ], { env, encoding: 'utf8' });
+    assert.equal(receive.status, 0, receive.stderr || receive.stdout);
+
+    const send = spawnSync('node', [
+      SEND,
+      'feishu',
+      endpoint,
+      '--request-id', requestId,
+    ], { env, input: 'before DO_NOT_SEND after', encoding: 'utf8' });
+    assert.equal(send.status, 3, send.stderr || send.stdout);
+    assert.equal(fs.existsSync(path.join(temp, 'policy-send-marker')), false);
+
+    const database = new Database(path.join(temp, 'comm-bridge', 'c4.db'));
+    const request = database.prepare(`
+      SELECT status, output_text FROM assistant_requests WHERE request_id = ?
+    `).get(requestId);
+    const outbound = database.prepare(`
+      SELECT direction, channel, endpoint_id, content, status, delivery_action,
+             assistant_request_id
+      FROM conversations
+      WHERE direction = 'out' AND assistant_request_id = ?
+    `).get(requestId);
+    database.close();
+
+    assert.deepEqual(request, { status: 'failed', output_text: '' });
+    assert.deepEqual(outbound, {
+      direction: 'out',
+      channel: 'feishu',
+      endpoint_id: endpoint,
+      content: '',
+      status: 'failed',
+      delivery_action: 'assistant-response-failed:OUTBOUND_POLICY_REJECTED',
+      assistant_request_id: requestId,
+    });
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test('media delivery completes the stream without exposing its local transport path as answer text', () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-assistant-media-'));
   try {
