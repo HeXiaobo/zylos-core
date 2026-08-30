@@ -651,6 +651,37 @@ export function findBlockingAssistantRun(item, responseStream) {
   });
 }
 
+export function reconcileBlockingAssistantRun(
+  item,
+  agentState,
+  responseStream,
+  minimumIdleSeconds = RUNTIME_TURN_RECOVERY_IDLE_SECONDS,
+  currentSeconds = nowSeconds(),
+) {
+  const blockingRun = findBlockingAssistantRun(item, responseStream);
+  if (!shouldRecoverRuntimeTurnAdmission(
+    blockingRun,
+    agentState,
+    minimumIdleSeconds,
+    currentSeconds,
+  )) {
+    return { blockingRun, recovered: null };
+  }
+
+  const recovered = responseStream.execute({
+    type: 'RecoverIdleRun',
+    requestId: blockingRun.requestId,
+    staleBefore: currentSeconds - minimumIdleSeconds,
+  });
+  if (!recovered.recovered) {
+    return {
+      blockingRun: findBlockingAssistantRun(item, responseStream),
+      recovered: null,
+    };
+  }
+  return { blockingRun: null, recovered };
+}
+
 export function shouldDeferConversationForRuntime(item, agentState) {
   return item?.type === 'conversation' && agentState?.state === 'busy';
 }
@@ -703,11 +734,11 @@ export function projectPendingAssistantTurnBindings(
   return { projected: projected.length, projections: projected };
 }
 
-function blockingAssistantRun(item) {
+function blockingAssistantRun(item, agentState) {
   if (item.type !== 'conversation') return null;
   const responseStream = openAssistantResponseStream();
   try {
-    return findBlockingAssistantRun(item, responseStream);
+    return reconcileBlockingAssistantRun(item, agentState, responseStream);
   } finally {
     responseStream.close();
   }
@@ -888,10 +919,16 @@ async function processNextMessage() {
     return { delivered: false, state: agentState.state };
   }
 
-  const blockingRun = blockingAssistantRun(item);
-  if (blockingRun) {
+  const assistantRunGate = blockingAssistantRun(item, agentState);
+  if (assistantRunGate?.recovered) {
+    log(
+      `Recovered assistant request ${assistantRunGate.recovered.request.requestId} `
+        + `after ${agentState.idleSeconds}s sustained idle`,
+    );
+  }
+  if (assistantRunGate?.blockingRun) {
     releaseItem(item);
-    logAssistantAdmissionBlock(item, blockingRun);
+    logAssistantAdmissionBlock(item, assistantRunGate.blockingRun);
     return { delivered: false, state: agentState.state };
   }
 
