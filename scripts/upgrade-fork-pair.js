@@ -2049,6 +2049,66 @@ function ensureFeishuRuntimeDependencies(stagedFeishuDir, liveNodeModules) {
   return target;
 }
 
+export function ensureCommitmentCoreRuntimeDependencies(stagedCoreDir, liveNodeModules) {
+  const packageDir = path.join(stagedCoreDir, 'skills', 'commitment-core');
+  const target = path.join(packageDir, 'node_modules');
+  let packageJson;
+  let packageLock;
+  let liveRealPath;
+  try {
+    packageJson = readJson(path.join(packageDir, 'package.json'));
+    packageLock = readJson(path.join(packageDir, 'package-lock.json'));
+    liveRealPath = fs.realpathSync(liveNodeModules);
+  } catch {
+    throw new HoldError(
+      `target Commitment Core convergence cannot reuse live runtime dependencies: ${liveNodeModules}`,
+      'INVALID_CORE_SOURCE',
+    );
+  }
+
+  const dependencies = Object.keys(packageJson.dependencies || {}).sort();
+  if (dependencies.length === 0) {
+    throw new HoldError(
+      'target Commitment Core convergence package has no declared runtime dependencies',
+      'INVALID_CORE_SOURCE',
+    );
+  }
+  for (const dependency of dependencies) {
+    const lockedVersion = packageLock.packages?.[`node_modules/${dependency}`]?.version;
+    let livePackage;
+    try {
+      livePackage = readJson(path.join(liveRealPath, ...dependency.split('/'), 'package.json'));
+    } catch {
+      throw new HoldError(
+        `live Commitment Core dependency is missing: ${dependency}`,
+        'SOURCE_BINDING_MISMATCH',
+      );
+    }
+    if (!lockedVersion || livePackage.version !== lockedVersion) {
+      throw new HoldError(
+        `live Commitment Core dependency ${dependency}@${livePackage.version || 'missing'} does not match target lockfile ${lockedVersion || 'missing'}`,
+        'SOURCE_BINDING_MISMATCH',
+      );
+    }
+  }
+
+  if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false })) {
+    let targetRealPath;
+    try { targetRealPath = fs.realpathSync(target); } catch {
+      throw new HoldError(`staged Commitment Core node_modules is not readable: ${target}`, 'INVALID_CORE_SOURCE');
+    }
+    if (targetRealPath !== liveRealPath) {
+      throw new HoldError(
+        `staged Commitment Core node_modules is bound to ${targetRealPath}, expected ${liveRealPath}`,
+        'SOURCE_BINDING_MISMATCH',
+      );
+    }
+    return target;
+  }
+  fs.symlinkSync(liveNodeModules, target, 'dir');
+  return target;
+}
+
 export function preparePersistentStagedSources({
   args,
   reportDir,
@@ -2091,6 +2151,13 @@ export function preparePersistentStagedSources({
 
   const liveFeishuDir = path.join(zylosDir, '.claude', 'skills', 'feishu');
   ensureFeishuRuntimeDependencies(feishuDir, path.join(liveFeishuDir, 'node_modules'));
+  if (args.nativeTaskCoreManifest) {
+    const liveCommitmentCoreDir = path.join(zylosDir, '.claude', 'skills', 'commitment-core');
+    ensureCommitmentCoreRuntimeDependencies(
+      coreDir,
+      path.join(liveCommitmentCoreDir, 'node_modules'),
+    );
+  }
   const core = buildSourceIdentity(coreDir, {
     repo: CORE_REPO,
     sha: args.coreSha,
