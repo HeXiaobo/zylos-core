@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.20] - 2026-08-30
+
+### Fixed
+- Bind staged Commitment Core runtime dependencies before native Task
+  convergence, and fail closed when live dependency versions differ from the
+  immutable candidate lockfile.
+
 ## [0.7.2-rc.19] - 2026-08-30
 
 ### Fixed
