@@ -236,7 +236,7 @@ User: `upgrade zylos`
 
 Run `zylos upgrade --self --check --json`. Then:
 
-1. **Analyze changes**: Read changelog + fetch commit history via `gh api repos/zylos-ai/zylos-core/compare/v<current>...v<latest> --jq '.commits[].commit.message'` (with proxy). Synthesize change summary.
+1. **Analyze changes**: Read changelog + fetch commit history via `gh api repos/HeXiaobo/zylos-core/compare/v<current>...v<latest> --jq '.commits[].commit.message'` (with proxy). Synthesize change summary.
 2. **Analyze templates**: Compare template changes with local files. Categorize as new / changed / unchanged.
 3. **Reply with ALL information**:
 

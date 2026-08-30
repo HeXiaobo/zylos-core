@@ -69,11 +69,11 @@ function emptyExactSkillsInventory(root = '/tmp/live-skills') {
 }
 
 describe('self-upgrade repository routing', () => {
-  it('defaults to the canonical repository', () => {
+  it('defaults fork builds to their own release repository', () => {
     assert.equal(resolveCoreRepository({
       processEnv: {},
       readEnv: () => new Map(),
-    }), 'zylos-ai/zylos-core');
+    }), 'HeXiaobo/zylos-core');
   });
 
   it('loads the fork repository from the configured Zylos directory', () => {
@@ -129,13 +129,13 @@ describe('self-upgrade repository routing', () => {
     assert.equal(result.stdout, 'HeXiaobo/zylos-core');
   });
 
-  it('retains canonical routing when persisted configuration is unreadable', () => {
+  it('retains fork routing when persisted configuration is unreadable', () => {
     assert.equal(resolveCoreRepository({
       processEnv: {},
       readEnv: () => {
         throw new Error('permission denied');
       },
-    }), 'zylos-ai/zylos-core');
+    }), 'HeXiaobo/zylos-core');
   });
 });
 
