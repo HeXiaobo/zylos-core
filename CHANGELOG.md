@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.19] - 2026-08-30
+
+### Fixed
+- Persist assistant outbound failures as safe terminal response records,
+  including policy rejections and transport failures, so requests cannot remain
+  indefinitely active or leak rejected content.
+- Treat exact silent assistant responses as side-effect free terminals before
+  adapter delivery.
+
 ## [0.7.2-rc.18] - 2026-08-29
 
 ### Fixed
