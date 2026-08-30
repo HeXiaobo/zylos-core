@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -10,8 +11,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import Database from 'better-sqlite3';
+
 import { openCommitmentCore } from '../core.js';
 import {
+  createPlanSnapshot,
   parseLegacyTaskAdoptionManifest,
   runLegacyTaskAdoptionCli,
 } from '../legacy-task-adoption.js';
@@ -161,6 +165,117 @@ test('plan snapshots an existing Core DB and detects conflicts without writing i
     } finally {
       core.close();
     }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('plan accepts a transaction-consistent snapshot when the live WAL advances afterward', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-adoption-cli-online-snapshot-'));
+  const dbPath = path.join(directory, 'commitments.db');
+  try {
+    const core = openCommitmentCore({ dbPath });
+    core.close();
+
+    const setup = new Database(dbPath);
+    setup.exec(`
+      CREATE TABLE snapshot_churn (
+        id INTEGER PRIMARY KEY,
+        counter INTEGER NOT NULL,
+        payload BLOB NOT NULL
+      );
+      INSERT INTO snapshot_churn (id, counter, payload)
+      VALUES (1, 0, zeroblob(1024));
+    `);
+    setup.close();
+
+    const manifestPath = writeManifest(directory, [entry()]);
+    let snapshotCounter = null;
+    const report = runLegacyTaskAdoptionCli({
+      args: ['--manifest', manifestPath, '--db-path', dbPath],
+      createSnapshot(sourcePath) {
+        return createPlanSnapshot(sourcePath, {
+          afterSnapshot() {
+            const writer = new Database(sourcePath);
+            writer.pragma('journal_mode = WAL');
+            writer.prepare(
+              'UPDATE snapshot_churn SET counter = counter + 1 WHERE id = 1',
+            ).run();
+            writer.close();
+          },
+        });
+      },
+      openCore(options) {
+        const snapshot = new Database(options.dbPath, { readonly: true });
+        snapshotCounter = snapshot.prepare(
+          'SELECT counter FROM snapshot_churn WHERE id = 1',
+        ).pluck().get();
+        snapshot.close();
+        return openCommitmentCore(options);
+      },
+      stdout: captureStdout(),
+    });
+
+    const verification = new Database(dbPath, { readonly: true });
+    const liveCounter = verification.prepare(
+      'SELECT counter FROM snapshot_churn WHERE id = 1',
+    ).pluck().get();
+    verification.close();
+
+    assert.equal(snapshotCounter, 0);
+    assert.equal(liveCounter, 1);
+    assert.equal(report.mode, 'plan');
+    assert.equal(report.storage, 'read-only-snapshot');
+    assert.equal(report.writes, false);
+    assert.equal(report.sourceDb.status, 'snapshotted');
+    assert.equal(report.sourceDb.changedDuringSnapshot, true);
+    assert.equal(report.sourceDb.snapshot.quickCheck, 'ok');
+    assert.equal(report.succeeded, 1);
+    assert.equal(report.failed, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('plan still rejects replacement of the source database path while snapshotting', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-adoption-cli-source-swap-'));
+  const dbPath = path.join(directory, 'commitments.db');
+  const movedPath = path.join(directory, 'commitments-original.db');
+  try {
+    const core = openCommitmentCore({ dbPath });
+    core.close();
+
+    assert.throws(
+      () => createPlanSnapshot(dbPath, {
+        afterSnapshot() {
+          renameSync(dbPath, movedPath);
+          const replacement = new Database(dbPath);
+          replacement.exec('CREATE TABLE replacement (id INTEGER PRIMARY KEY)');
+          replacement.close();
+        },
+      }),
+      error => error?.code === 'PLAN_SOURCE_REPLACED',
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('plan fails closed when the generated SQLite snapshot is corrupt', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-adoption-cli-corrupt-snapshot-'));
+  const dbPath = path.join(directory, 'commitments.db');
+  try {
+    const core = openCommitmentCore({ dbPath });
+    core.close();
+
+    assert.throws(
+      () => createPlanSnapshot(dbPath, {
+        afterSnapshot({ snapshotPath }) {
+          writeFileSync(snapshotPath, 'not a sqlite database');
+        },
+      }),
+      error => error?.code === 'PLAN_SNAPSHOT_INVALID',
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
