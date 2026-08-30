@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "product": "zylos-core",
-  "release": "0.7.2-rc.19",
+  "release": "0.7.2-rc.20",
   "protocols": {
     "c4.reply": 2,
     "c4.reply.argv-compat": 1,
