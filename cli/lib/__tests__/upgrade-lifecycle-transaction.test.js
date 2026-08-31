@@ -103,14 +103,17 @@ test('a failing post-upgrade hook rolls installed files back to the previous rel
   );
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.writeFileSync(path.join(fakeBin, 'pm2'), '#!/bin/sh\nprintf \'[]\'\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
-  const previousPath = process.env.PATH;
-  process.env.PATH = `${fakeBin}${path.delimiter}${previousPath}`;
-  try {
+  {
     const result = runUpgrade('demo-post', {
       tempDir: targetDir,
       newVersion: '2.0.0',
       jsonOutput: true,
+      // Explicitly trusted tools: the fixtures live under the system tempdir,
+      // whose world-writable ancestors (e.g. /tmp on Linux CI) are rejected
+      // by the strict validation that PATH-discovered tools must pass.
+      tools: { pm2: path.join(fakeBin, 'pm2'), npm: path.join(fakeBin, 'npm'), trusted: true },
     });
 
     assert.equal(result.success, false);
@@ -120,8 +123,6 @@ test('a failing post-upgrade hook rolls installed files back to the previous rel
     assert.equal(result.rollback.steps.some(step => step.action === 'restore_files' && step.success), true);
     assert.equal(fs.readFileSync(path.join(skillDir, 'payload.txt'), 'utf8'), 'old\n');
     assert.match(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8'), /version: 1\.0\.0/);
-  } finally {
-    process.env.PATH = previousPath;
   }
 });
 
@@ -151,14 +152,14 @@ test('post-upgrade rollback restores component data changed by the rejected hook
   fs.writeFileSync(envFile, 'KEEP_ME=old\n', 'utf8');
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.writeFileSync(path.join(fakeBin, 'pm2'), '#!/bin/sh\nprintf \'[]\'\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
-  const previousPath = process.env.PATH;
-  process.env.PATH = `${fakeBin}${path.delimiter}${previousPath}`;
-  try {
+  {
     const result = runUpgrade(component, {
       tempDir: targetDir,
       newVersion: '2.0.0',
       jsonOutput: true,
+      tools: { pm2: path.join(fakeBin, 'pm2'), npm: path.join(fakeBin, 'npm'), trusted: true },
     });
 
     assert.equal(result.success, false);
@@ -167,8 +168,6 @@ test('post-upgrade rollback restores component data changed by the rejected hook
     assert.equal(result.rollback.steps.some(step => step.action === 'restore_data' && step.success), true);
     assert.equal(fs.readFileSync(envFile, 'utf8'), 'KEEP_ME=old\n');
     assert.equal(result.rollback.steps.some(step => step.action === 'restore_environment' && step.success), true);
-  } finally {
-    process.env.PATH = previousPath;
   }
 });
 
@@ -195,14 +194,14 @@ test('post-upgrade rollback returns a previously online service to running state
     `#!/bin/sh\nprintf '%s\\n' "$*" >> "${pm2Log}"\nif [ "$1" = "jlist" ]; then\n  printf '[{"name":"zylos-demo-service","pm2_env":{"status":"online"}}]'\nfi\n`,
     { mode: 0o755 },
   );
+  fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
-  const previousPath = process.env.PATH;
-  process.env.PATH = `${fakeBin}${path.delimiter}${previousPath}`;
-  try {
+  {
     const result = runUpgrade(component, {
       tempDir: targetDir,
       newVersion: '2.0.0',
       jsonOutput: true,
+      tools: { pm2: path.join(fakeBin, 'pm2'), npm: path.join(fakeBin, 'npm'), trusted: true },
     });
 
     assert.equal(result.success, false);
@@ -212,8 +211,6 @@ test('post-upgrade rollback returns a previously online service to running state
     assert.equal(calls.includes('restart zylos-demo-service'), true);
     assert.equal(calls.includes('save'), true);
     assert.equal(calls.indexOf('stop zylos-demo-service') < calls.indexOf('restart zylos-demo-service'), true);
-  } finally {
-    process.env.PATH = previousPath;
   }
 });
 
