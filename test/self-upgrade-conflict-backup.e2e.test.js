@@ -75,7 +75,12 @@ afterEach(() => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-describe('self-upgrade durable conflict backups (#717)', () => {
+// Real self-upgrade pipeline: requires a globally installed Core package and
+// `pm2` on PATH. Hosted CI runners lack both, so the suite is opt-in via
+// ZYLOS_E2E_SELF_UPGRADE=1.
+const e2eDescribe = process.env.ZYLOS_E2E_SELF_UPGRADE === '1' ? describe : describe.skip;
+
+e2eDescribe('self-upgrade durable conflict backups (#717)', () => {
   test('old launcher prints every nested conflict path and success cleanup preserves durable backups', () => {
     prepareThreeWayConflictFixture();
 
