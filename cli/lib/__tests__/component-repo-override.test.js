@@ -10,6 +10,12 @@ import { validateUpgradeSource } from '../upgrade-metadata.js';
 
 const SHA = '0123456789abcdef0123456789abcdef01234567';
 const CLI = path.join(import.meta.dirname, '..', '..', 'zylos.js');
+// The upgrade child resolves npm/pm2 from PATH and then validates them with a
+// strict ownership check that rejects executables under world-writable
+// ancestors (e.g. /tmp on Linux CI). Fixture roots used by child-process
+// upgrades therefore live inside the checkout, whose ancestors are always
+// user-owned and non-world-writable.
+const FIXTURE_BASE = path.join(import.meta.dirname, '..', '..', '..', 'test', 'integration', 'runtime');
 
 test('accepts a GitHub owner/name override pinned to a full commit SHA', () => {
   assert.deepEqual(
@@ -483,7 +489,8 @@ test('exact-ref check and execute fail closed when the target version is unreada
 });
 
 test('execute commits override provenance consistently in marker and registry', () => {
-  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-component-repo-execute-'));
+  fs.mkdirSync(FIXTURE_BASE, { recursive: true });
+  const fixtureRoot = fs.mkdtempSync(path.join(FIXTURE_BASE, 'zylos-component-repo-execute-'));
   const zylosDir = path.join(fixtureRoot, 'zylos-home');
   const fakeBin = path.join(fixtureRoot, 'bin');
   const archiveRoot = path.join(fixtureRoot, 'component-fixture');

@@ -1678,8 +1678,15 @@ describe('fork-pair upgrade target contract', () => {
               const persisted = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
               if (persisted.backupRetention?.status === 'PLANNED') {
                 injected = true;
+                // Build the replacement under a temporary name while the old
+                // tree still exists, then swap by rename. Creating the
+                // replacement only after rmSync is not portable: ext4 can
+                // hand back the just-freed inode number, which would make
+                // the recreated backup indistinguishable by inode.
+                const replacementName = `${path.basename(old)}.replacement`;
+                writeCoreBackup(root, replacementName, '0.7.2-rc.5', plannedMtime);
                 fs.rmSync(old, { recursive: true });
-                writeCoreBackup(root, path.basename(old), '0.7.2-rc.5', plannedMtime);
+                fs.renameSync(path.join(root, replacementName), old);
               }
             }
           };
