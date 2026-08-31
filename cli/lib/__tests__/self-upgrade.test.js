@@ -514,7 +514,13 @@ describe('step10_ensureCodexConfig', () => {
   });
 });
 
-describe('self-upgrade backup and rollback', () => {
+// These cases require a globally installed Core package that the test resolves
+// from `npm ls -g` (or `ZYLOS_DIR`). Hosted CI runners have no such install,
+// so the suite is opt-in via ZYLOS_E2E_SELF_UPGRADE=1.
+const E2E_SELF_UPGRADE = process.env.ZYLOS_E2E_SELF_UPGRADE === '1';
+const e2eDescribe = E2E_SELF_UPGRADE ? describe : describe.skip;
+
+e2eDescribe('self-upgrade backup and rollback', () => {
   it('fails before live mutation when the transaction backup omits an existing top-level skill', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-upgrade-incomplete-skills-backup-'));
     const skillsDir = path.join(tmpDir, 'live-skills');
