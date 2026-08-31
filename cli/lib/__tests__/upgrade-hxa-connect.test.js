@@ -597,6 +597,10 @@ lifecycle:
 
     const tools = {
       pm2: path.join(fakeBin, 'pm2'),
+      // Execute mode runs an npm install inside the transaction; without an
+      // injected npm the script lazily resolves one from PATH through the
+      // strict validator, which rejects the hosted runner's toolcache.
+      npm: path.join(fakeBin, 'npm'),
       curl: path.join(fakeBin, 'curl'),
       ps: path.join(fakeBin, 'ps'),
       tar: '/usr/bin/tar',
@@ -606,6 +610,7 @@ lifecycle:
       // must pass.
       trusted: true,
     };
+    fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\nprintf "npm %s\\n" "$*" >> "$ZYLOS_TEST_CALLS"\nexit 0\n', { mode: 0o755 });
     const childEnvAdditions = {
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
       ZYLOS_TEST_TARBALL: tarball,
@@ -954,6 +959,10 @@ lifecycle:
 
     const tools = {
       pm2: path.join(fakeBin, 'pm2'),
+      // Execute mode runs an npm install inside the transaction; without an
+      // injected npm the script lazily resolves one from PATH through the
+      // strict validator, which rejects the hosted runner's toolcache.
+      npm: path.join(fakeBin, 'npm'),
       curl: path.join(fakeBin, 'curl'),
       ps: path.join(fakeBin, 'ps'),
       tar: '/usr/bin/tar',
