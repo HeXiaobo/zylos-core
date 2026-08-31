@@ -129,6 +129,11 @@ test('HXA fixed-SHA dry-run validates the target and does not mutate runtime sta
       curl: path.join(fakeBin, 'curl'),
       ps: path.join(fakeBin, 'ps'),
       tar: '/usr/bin/tar',
+      // Explicitly trusted injection: the fixtures live under the system
+      // tempdir, whose world-writable ancestors (e.g. /tmp on Linux CI) are
+      // rejected by the strict tool validation that PATH-discovered tools
+      // must pass.
+      trusted: true,
     };
     const childEnvAdditions = {
       ZYLOS_TEST_TARBALL: tarball,
@@ -595,6 +600,11 @@ lifecycle:
       curl: path.join(fakeBin, 'curl'),
       ps: path.join(fakeBin, 'ps'),
       tar: '/usr/bin/tar',
+      // Explicitly trusted injection: the fixtures live under the system
+      // tempdir, whose world-writable ancestors (e.g. /tmp on Linux CI) are
+      // rejected by the strict tool validation that PATH-discovered tools
+      // must pass.
+      trusted: true,
     };
     const childEnvAdditions = {
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
@@ -947,6 +957,11 @@ lifecycle:
       curl: path.join(fakeBin, 'curl'),
       ps: path.join(fakeBin, 'ps'),
       tar: '/usr/bin/tar',
+      // Explicitly trusted injection: the fixtures live under the system
+      // tempdir, whose world-writable ancestors (e.g. /tmp on Linux CI) are
+      // rejected by the strict tool validation that PATH-discovered tools
+      // must pass.
+      trusted: true,
     };
     const childEnvAdditions = {
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
