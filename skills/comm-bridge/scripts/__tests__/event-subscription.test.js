@@ -132,6 +132,32 @@ test('consumer ACK is independent, ordered and ignores legacy global delivery_st
   assert.equal(ledger.get(run.requestId).status, 'active');
 });
 
+test('event subscription public commands reject unknown v1 fields', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  ledger.accept(acceptMessage('strict-subscription-input'));
+  t.after(() => ledger.close());
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+  assert.throws(
+    () => subscriptions.subscribe({
+      consumerId: 'strict-consumer',
+      bootstrap: 'canonical_cutover',
+      attacker: true,
+    }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+  subscriptions.subscribe({ consumerId: 'strict-consumer', bootstrap: 'canonical_cutover' });
+  assert.throws(
+    () => subscriptions.claimNext({
+      consumerId: 'strict-consumer',
+      ownerId: 'worker',
+      attacker: true,
+    }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+});
+
 test('a leased or delayed stream does not block another request for the same consumer', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -204,6 +230,39 @@ test('a leased or delayed stream does not block another request for the same con
     ownerId: 'healthy-worker',
   });
   assert.equal(fairNext.event.requestId, requestB.requestId);
+});
+
+test('one degraded request stream does not block healthy requests for the same consumer', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  const poison = ledger.accept(acceptMessage('poison-stream')).request;
+  const healthy = ledger.accept(acceptMessage('healthy-stream')).request;
+  const buggyWriter = new Database(dbPath);
+  buggyWriter.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
+  buggyWriter.prepare(`
+    UPDATE assistant_response_events SET causation_id = 'attacker-cause'
+    WHERE request_id = ? AND sequence = 1
+  `).run(poison.requestId);
+  buggyWriter.close();
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+  subscriptions.subscribe({ consumerId: 'isolated-consumer', bootstrap: 'canonical_cutover' });
+  const poisonState = subscriptions.getStream({
+    consumerId: 'isolated-consumer',
+    requestId: poison.requestId,
+  });
+  assert.equal(poisonState.consumerId, 'isolated-consumer');
+  assert.equal(poisonState.requestId, poison.requestId);
+  assert.equal(poisonState.status, 'degraded');
+  assert.equal(poisonState.degradedReason, 'RUN_ACCEPTED_LEDGER_MISMATCH');
+  assert.equal(typeof poisonState.degradedEventRowId, 'number');
+  const claim = subscriptions.claimNext({
+    consumerId: 'isolated-consumer',
+    ownerId: 'healthy-worker',
+  });
+  assert.equal(claim.event.requestId, healthy.requestId);
+  assert.equal(claim.event.type, 'RunAccepted');
 });
 
 test('wrong and expired event leases cannot ACK, while restart recovery has one concurrent owner', async (t) => {
@@ -795,6 +854,7 @@ test('active RunCancelled cause must match its durable runtime confirmation', (t
     producer: 'runtime:shared',
   });
   const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
   mutate.prepare(`
     UPDATE assistant_response_events SET causation_id = 'BOGUS_CONFIRMATION_CAUSE'
     WHERE request_id = ? AND event_type = 'RunCancelled'
@@ -930,6 +990,50 @@ test('canonical event identity and body are immutable while legacy delivery_stat
     consumerId: 'immutable-consumer',
     ownerId: 'worker',
   }).event.type, 'RunAccepted');
+});
+
+test('post-cutover legacy rows cannot be promoted to canonical and remain observably degraded', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  const run = ledger.accept(acceptMessage('mixed-writer-promotion')).request;
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+  subscriptions.subscribe({ consumerId: 'mixed-writer-consumer', bootstrap: 'canonical_cutover' });
+  const mixedWriter = new Database(dbPath);
+  mixedWriter.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at
+    ) VALUES (?, 3, 'ProgressUpdated', '{"stage":"legacy"}', ?, 'pending', 102, 102)
+  `).run(run.requestId, `legacy:${run.requestId}:progress`);
+  assert.throws(
+    () => mixedWriter.prepare(`
+      UPDATE assistant_response_events
+      SET event_id = ?, turn_id = ?, generation = ?, trace_id = ?,
+          causation_id = ?, producer = 'runtime:shared',
+          idempotency_key = ?
+      WHERE request_id = ? AND sequence = 3
+    `).run(
+      `evt:${run.requestId}:3`,
+      run.turnId,
+      run.generation,
+      run.traceId,
+      `evt:${run.requestId}:2`,
+      `run:${run.requestId}:progress:1`,
+      run.requestId,
+    ),
+    /legacy assistant event cannot be promoted to canonical/,
+  );
+  mixedWriter.close();
+  assert.throws(
+    () => subscriptions.claimNext({
+      consumerId: 'mixed-writer-consumer',
+      ownerId: 'worker',
+    }),
+    error => error?.code === 'EVENT_SUBSCRIPTION_DEGRADED'
+      && error?.degradedReason === 'NONCANONICAL_EVENT_ID',
+  );
 });
 
 test('canonical ReplyOutcome rows are immutable', (t) => {

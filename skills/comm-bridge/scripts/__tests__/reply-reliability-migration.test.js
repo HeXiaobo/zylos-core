@@ -162,6 +162,7 @@ test('real issue-35 database migrates additively and preserves legacy answer and
     'assistant_delivery_settlements',
     'assistant_event_consumers',
     'assistant_event_deliveries',
+    'assistant_event_stream_health',
   ]) assert.ok(tables.has(table), table);
   assert.deepEqual(after.pragma('foreign_key_check'), []);
   after.close();
@@ -174,10 +175,17 @@ test('real issue-35 database migrates additively and preserves legacy answer and
   const degraded = subscriptions.getConsumer({ consumerId: 'new-consumer' });
   assert.equal(degraded.status, 'degraded');
   assert.equal(degraded.degradedReason, 'NONCANONICAL_EVENT_ID');
-  assert.throws(
-    () => subscriptions.claimNext({ consumerId: 'new-consumer', ownerId: 'worker' }),
-    error => error?.code === 'EVENT_SUBSCRIPTION_DEGRADED',
-  );
+  const degradedStream = subscriptions.getStream({
+    consumerId: 'new-consumer',
+    requestId: 'assistant.legacy.after-cutover',
+  });
+  assert.equal(degradedStream.status, 'degraded');
+  assert.equal(degradedStream.degradedReason, 'NONCANONICAL_EVENT_ID');
+  const healthyClaim = subscriptions.claimNext({
+    consumerId: 'new-consumer',
+    ownerId: 'worker',
+  });
+  assert.equal(healthyClaim.event.requestId, run.requestId);
 });
 
 test('previous run-ledger rows gain a conservative required reply policy and canonical route', (t) => {

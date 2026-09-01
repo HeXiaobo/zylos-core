@@ -28,6 +28,16 @@ function requireRecord(value, field) {
   return value;
 }
 
+function assertAllowedKeys(value, allowed, field) {
+  const unknown = Object.keys(value).filter(key => !allowed.includes(key));
+  if (unknown.length > 0) {
+    throw domainError(
+      'NONCANONICAL_V1_SHAPE',
+      `${field} contains unknown v1 fields: ${unknown.sort().join(', ')}`,
+    );
+  }
+}
+
 function requireText(value, field, maxLength = 100_000) {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new TypeError(`${field} must be a non-empty string`);
@@ -63,12 +73,14 @@ function normalizeContent(raw, field) {
   const content = requireRecord(raw, field);
   const format = requireText(content.format, `${field}.format`, 32);
   if (format === 'text') {
+    assertAllowedKeys(content, ['format', 'text'], field);
     if (typeof content.text !== 'string' || content.text.trim() === '') {
       throw domainError('MISSING_OUTPUT', `${field}.text must contain visible output`);
     }
     return { format: 'text', text: content.text };
   }
   if (format === 'media') {
+    assertAllowedKeys(content, ['format', 'ref'], field);
     if (typeof content.ref !== 'string' || content.ref.trim() === '') {
       throw domainError('MISSING_OUTPUT', `${field} media requires a durable content reference`);
     }
@@ -83,6 +95,10 @@ function normalizeContent(raw, field) {
 function normalizeOutcome(raw, { requestId, turnId, traceId }) {
   const input = requireRecord(raw, 'outcome');
   const kind = requireText(input.kind, 'outcome.kind', 32);
+  const variantFields = kind === 'answer' ? ['content']
+    : kind === 'silent' ? ['explicit', 'reason']
+      : kind === 'failure' ? ['code', 'retryable'] : [];
+  assertAllowedKeys(input, ['kind', 'outcomeId', ...variantFields], 'outcome');
   const common = {
     schemaVersion: 1,
     type: 'ReplyOutcome',
@@ -119,6 +135,7 @@ function normalizeOutcome(raw, { requestId, turnId, traceId }) {
 
 function normalizeRoute(raw, field = 'reply.route') {
   const route = requireRecord(raw, field);
+  assertAllowedKeys(route, ['adapterId', 'targetRef'], field);
   return {
     adapterId: requireText(route.adapterId, `${field}.adapterId`),
     targetRef: requireText(route.targetRef, `${field}.targetRef`),
@@ -133,6 +150,11 @@ function buildIntent({ requestId, traceId, cause, reply, outcome, replyPolicy })
     );
   }
   const decision = requireRecord(reply, 'reply');
+  assertAllowedKeys(
+    decision,
+    ['action', 'route', 'disposition', 'payload', 'intentId', 'idempotencyKey', 'contentHash'],
+    'reply',
+  );
   const action = requireText(decision.action, 'reply.action', 32);
   if (!['send', 'suppress'].includes(action)) {
     throw new TypeError('reply.action must be send or suppress');
@@ -173,6 +195,15 @@ function buildIntent({ requestId, traceId, cause, reply, outcome, replyPolicy })
   if (!payload) {
     throw domainError('MISSING_OUTPUT', 'failure_notice requires visible reply.payload');
   }
+  if (
+    outcome.kind === 'answer'
+    && canonicalJson(payload) !== canonicalJson(outcome.content)
+  ) {
+    throw domainError(
+      'REPLY_PAYLOAD_MISMATCH',
+      'answer ReplyIntent payload must equal the canonical ReplyOutcome content',
+    );
+  }
   const routeHash = sha256(canonicalJson(route));
   const intentId = `reply:${requestId}:${routeHash}`;
   const contentHash = `sha256:${sha256(canonicalJson(payload))}`;
@@ -202,9 +233,18 @@ function buildIntent({ requestId, traceId, cause, reply, outcome, replyPolicy })
 
 function buildTaskReceiptIntent(input) {
   const command = requireRecord(input, 'task receipt');
+  assertAllowedKeys(
+    command,
+    [
+      'requestId', 'traceId', 'cause', 'route', 'disposition', 'payload',
+      'intentId', 'idempotencyKey', 'contentHash',
+    ],
+    'task receipt',
+  );
   const requestId = requireText(command.requestId, 'requestId');
   const traceId = requireText(command.traceId, 'traceId');
   const cause = requireRecord(command.cause, 'cause');
+  assertAllowedKeys(cause, ['kind', 'eventId'], 'cause');
   if (cause.kind !== 'task_effect') {
     throw domainError('INVALID_REPLY_CAUSE', 'task_receipt requires a task_effect cause');
   }
@@ -450,6 +490,14 @@ export function openReplyOutcomeTransactions({
 
   const commitTransaction = database.transaction((input) => {
     const command = requireRecord(input, 'commitRunOutcome input');
+    assertAllowedKeys(
+      command,
+      [
+        'requestId', 'turnId', 'generation', 'traceId', 'causationId', 'producer',
+        'idempotencyKey', 'outcome', 'reply',
+      ],
+      'commitRunOutcome input',
+    );
     const requestId = requireText(command.requestId, 'requestId');
     const turnId = requireText(command.turnId, 'turnId');
     const generation = requireGeneration(command.generation);

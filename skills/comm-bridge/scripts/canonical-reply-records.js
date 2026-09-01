@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 
+import {
+  canonicalRunEventChainFailure,
+  canonicalRunPersistenceFailure,
+} from './canonical-run-event.js';
+
 const RECEIPT_OUTCOMES = new Set(['platform_accepted', 'unknown', 'reconciled', 'rejected']);
 const SETTLEMENT_BASES = new Set(['platform_accepted', 'reconciled', 'retry_exhausted']);
 
@@ -208,5 +213,67 @@ export function canonicalDeliverySettlementFailure(row, intentRow = null) {
       || row.trace_id !== intentRow.trace_id || row.adapter_id !== route.adapterId
     ) return 'SETTLEMENT_INTENT_LINK_MISMATCH';
   }
+  return null;
+}
+
+export function canonicalRunTerminalIntentCauseFailure({
+  intentRow,
+  terminal,
+  outcome,
+  run,
+  request,
+  admission,
+  events,
+}) {
+  const intentFailure = canonicalReplyIntentFailure(intentRow);
+  if (intentFailure) return intentFailure;
+  if (intentRow.cause_kind !== 'run_terminal') return null;
+  if (!terminal || !['RunCompleted', 'RunFailed'].includes(terminal.event_type)) {
+    return 'RUN_TERMINAL_CAUSE_NOT_FOUND';
+  }
+  if (
+    terminal.event_id !== intentRow.cause_event_id
+    || terminal.request_id !== intentRow.request_id
+    || terminal.trace_id !== intentRow.trace_id
+  ) return 'RUN_TERMINAL_CAUSE_IDENTITY_MISMATCH';
+  const chainFailure = canonicalRunEventChainFailure(events);
+  if (chainFailure) return chainFailure.reason;
+  if (events.at(-1)?.event_id !== terminal.event_id) return 'RUN_TERMINAL_NOT_CHAIN_HEAD';
+  const persistenceFailure = canonicalRunPersistenceFailure({
+    rows: events,
+    run,
+    request,
+    admission,
+  });
+  if (persistenceFailure) return persistenceFailure;
+  const outcomeFailure = canonicalReplyOutcomeFailure(outcome);
+  if (outcomeFailure) return outcomeFailure;
+  const terminalPayload = JSON.parse(terminal.payload_json);
+  if (
+    outcome.outcome_id !== terminalPayload.outcomeId
+    || outcome.request_id !== terminal.request_id
+    || outcome.turn_id !== terminal.turn_id
+    || outcome.generation !== terminal.generation
+    || outcome.trace_id !== terminal.trace_id
+    || (terminal.event_type === 'RunFailed' && outcome.kind !== 'failure')
+    || (terminal.event_type === 'RunCompleted' && outcome.kind === 'failure')
+  ) return 'RUN_TERMINAL_OUTCOME_LINK_MISMATCH';
+  const intent = JSON.parse(intentRow.envelope_json);
+  let durableRoute;
+  try {
+    durableRoute = JSON.parse(run.reply_route_json);
+  } catch {
+    return 'RUN_REPLY_ROUTE_INVALID';
+  }
+  if (canonicalJson(intent.route) !== canonicalJson(durableRoute)) {
+    return 'RUN_REPLY_ROUTE_MISMATCH';
+  }
+  if (
+    outcome.kind === 'silent'
+    || run.reply_mode === 'none'
+    || (outcome.kind === 'answer' && intent.disposition !== 'send')
+    || (outcome.kind === 'failure' && intent.disposition !== 'failure_notice')
+    || (outcome.kind === 'answer' && canonicalJson(intent.payload) !== canonicalJson(JSON.parse(outcome.envelope_json).content))
+  ) return 'RUN_TERMINAL_INTENT_POLICY_MISMATCH';
   return null;
 }

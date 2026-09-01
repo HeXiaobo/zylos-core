@@ -100,6 +100,47 @@ function getColumnNames(database, tableName) {
   return new Set(database.prepare(`PRAGMA table_info(${tableName})`).all().map((column) => column.name));
 }
 
+function replaceCanonicalEventImmutabilityTriggers(database) {
+  const replace = database.transaction(() => database.exec(`
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_id_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_no_delete;
+    DROP TRIGGER IF EXISTS assistant_response_events_no_legacy_promotion;
+
+    CREATE TRIGGER assistant_response_events_canonical_immutable
+    BEFORE UPDATE OF
+      id, request_id, sequence, event_type, payload_json, idempotency_key,
+      event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_canonical_id_immutable
+    BEFORE UPDATE OF id ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_canonical_no_delete
+    BEFORE DELETE ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_no_legacy_promotion
+    BEFORE UPDATE OF event_id ON assistant_response_events
+    WHEN OLD.event_id IS NULL AND NEW.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'legacy assistant event cannot be promoted to canonical');
+    END;
+  `));
+  replace.immediate();
+}
+
 function ensureConversationsSchema(database) {
   const columnNames = getColumnNames(database, 'conversations');
   if (!columnNames.has('delivery_action')) {
@@ -571,6 +612,7 @@ export function ensureAssistantRunLedgerSchema(database, options = {}) {
       database.exec(`ALTER TABLE runtime_turn_admissions ADD COLUMN ${column} ${definition}`);
     }
   }
+  replaceCanonicalEventImmutabilityTriggers(database);
 }
 
 /**
@@ -719,6 +761,23 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     CREATE INDEX IF NOT EXISTS idx_assistant_event_deliveries_stream
       ON assistant_event_deliveries(consumer_id, event_row_id, status);
 
+    CREATE TABLE IF NOT EXISTS assistant_event_stream_health (
+      consumer_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      health_status TEXT NOT NULL DEFAULT 'active'
+        CHECK (health_status IN ('active', 'degraded')),
+      degraded_reason TEXT,
+      degraded_event_row_id INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (consumer_id, request_id),
+      FOREIGN KEY (consumer_id) REFERENCES assistant_event_consumers(consumer_id) ON DELETE RESTRICT,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_event_stream_health_status
+      ON assistant_event_stream_health(consumer_id, health_status, request_id);
+
     CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_immutable
     BEFORE UPDATE OF
       id, request_id, sequence, event_type, payload_json, idempotency_key,
@@ -796,9 +855,6 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
   // IF NOT EXISTS. Older databases may already have a trigger with the same
   // name but a narrower protected-column set.
   const replaceCanonicalImmutabilityTriggers = database.transaction(() => database.exec(`
-    DROP TRIGGER IF EXISTS assistant_response_events_canonical_immutable;
-    DROP TRIGGER IF EXISTS assistant_response_events_canonical_id_immutable;
-    DROP TRIGGER IF EXISTS assistant_response_events_canonical_no_delete;
     DROP TRIGGER IF EXISTS assistant_reply_outcomes_immutable;
     DROP TRIGGER IF EXISTS assistant_reply_outcomes_no_delete;
     DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_immutable;
@@ -807,30 +863,6 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     DROP TRIGGER IF EXISTS assistant_delivery_receipts_no_delete;
     DROP TRIGGER IF EXISTS assistant_delivery_settlements_immutable;
     DROP TRIGGER IF EXISTS assistant_delivery_settlements_no_delete;
-
-    CREATE TRIGGER assistant_response_events_canonical_immutable
-    BEFORE UPDATE OF
-      id, request_id, sequence, event_type, payload_json, idempotency_key,
-      event_id, turn_id, generation, trace_id, causation_id, producer, created_at
-    ON assistant_response_events
-    WHEN OLD.event_id IS NOT NULL
-    BEGIN
-      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
-    END;
-
-    CREATE TRIGGER assistant_response_events_canonical_id_immutable
-    BEFORE UPDATE OF id ON assistant_response_events
-    WHEN OLD.event_id IS NOT NULL
-    BEGIN
-      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
-    END;
-
-    CREATE TRIGGER assistant_response_events_canonical_no_delete
-    BEFORE DELETE ON assistant_response_events
-    WHEN OLD.event_id IS NOT NULL
-    BEGIN
-      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
-    END;
 
     CREATE TRIGGER assistant_reply_outcomes_immutable
     BEFORE UPDATE ON assistant_reply_outcomes

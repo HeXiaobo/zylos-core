@@ -375,6 +375,7 @@ test('malformed RunStarted head cannot authorize a terminal write', (t) => {
   t.after(() => queue.close());
   const run = startRun(ledger, queue, 'malformed-started-head');
   const inject = new Database(dbPath);
+  inject.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
   inject.prepare(`
     UPDATE assistant_response_events
     SET payload_json = '{"runtimeLaneId":"runtime:shared"}'
@@ -705,6 +706,56 @@ test('empty answers, implicit silence and media without a durable content refere
   assert.equal(ledger.listEvents(run.requestId).length, 3);
 });
 
+test('commitRunOutcome rejects unknown v1 command, outcome, content, reply and route fields', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'strict-run-outcome');
+  const command = answerCommand(ledger, run, 'strict-run-outcome');
+  for (const mutation of [
+    { ...command, attacker: true },
+    { ...command, outcome: { ...command.outcome, attacker: true } },
+    { ...command, outcome: { ...command.outcome, content: { ...command.outcome.content, attacker: true } } },
+    { ...command, reply: { ...command.reply, attacker: true } },
+    { ...command, reply: { ...command.reply, route: { ...command.reply.route, attacker: true } } },
+  ]) {
+    assert.throws(
+      () => replies.commitRunOutcome(mutation),
+      error => error?.code === 'NONCANONICAL_V1_SHAPE',
+    );
+  }
+  assert.equal(ledger.get(run.requestId).status, 'active');
+});
+
+test('answer intent payload cannot diverge from its canonical ReplyOutcome content', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'answer-payload-link');
+  const command = answerCommand(ledger, run, 'answer-payload-link');
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      ...command,
+      reply: {
+        ...command.reply,
+        payload: { format: 'text', text: 'Different visible bytes.' },
+      },
+    }),
+    error => error?.code === 'REPLY_PAYLOAD_MISMATCH',
+  );
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.equal(ledger.listEvents(run.requestId).length, 3);
+});
+
 test('outcome, terminal and intent replay safely as one identity and conflict on any payload change', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -941,6 +992,44 @@ test('task_receipt durable replay fails closed when its stored intent is corrupt
   );
   replies.close();
   ledger.close();
+});
+
+test('commitTaskReceipt rejects unknown v1 command, cause, route and payload fields', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const run = ledger.accept(acceptMessage('strict-task-receipt')).request;
+  const command = {
+    requestId: run.requestId,
+    traceId: run.traceId,
+    cause: { kind: 'task_effect', eventId: 'task-effect-strict-001' },
+    route: { adapterId: 'feishu', targetRef: 'opaque:strict-task-receipt' },
+    disposition: 'task_receipt',
+    payload: { format: 'text', text: 'Task created.' },
+  };
+  const replies = openReplyOutcomeTransactions({
+    dbPath,
+    clock: () => 101,
+    taskEffectVerifier: () => ({
+      canonical: true,
+      applied: true,
+      eventId: command.cause.eventId,
+      requestId: command.requestId,
+      traceId: command.traceId,
+    }),
+  });
+  t.after(() => replies.close());
+  t.after(() => ledger.close());
+  for (const mutation of [
+    { ...command, attacker: true },
+    { ...command, cause: { ...command.cause, attacker: true } },
+    { ...command, route: { ...command.route, attacker: true } },
+    { ...command, payload: { ...command.payload, attacker: true } },
+  ]) {
+    assert.throws(
+      () => replies.commitTaskReceipt(mutation),
+      error => error?.code === 'NONCANONICAL_V1_SHAPE',
+    );
+  }
 });
 
 test('stale generation is fenced and RunCancelled never gains an Outcome or Intent', (t) => {

@@ -8,6 +8,7 @@ import {
   canonicalDeliveryReceiptFailure,
   canonicalDeliverySettlementFailure,
   canonicalReplyIntentFailure,
+  canonicalRunTerminalIntentCauseFailure,
 } from './canonical-reply-records.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
@@ -25,6 +26,16 @@ function requireRecord(value, field) {
     throw new TypeError(`${field} must be an object`);
   }
   return value;
+}
+
+function assertAllowedKeys(value, allowed, field) {
+  const unknown = Object.keys(value).filter(key => !allowed.includes(key));
+  if (unknown.length > 0) {
+    throw domainError(
+      'NONCANONICAL_V1_SHAPE',
+      `${field} contains unknown v1 fields: ${unknown.sort().join(', ')}`,
+    );
+  }
 }
 
 function requireText(value, field, maxLength = 100_000) {
@@ -105,6 +116,13 @@ function normalizeReceipt(raw) {
   if (!RECEIPT_OUTCOMES.has(outcome)) {
     throw new TypeError(`unsupported DeliveryReceipt outcome: ${outcome}`);
   }
+  const outcomeFields = outcome === 'unknown' ? ['nextAction']
+    : outcome === 'rejected' ? ['errorCode', 'retryable'] : [];
+  assertAllowedKeys(receipt, [
+    'schemaVersion', 'type', 'receiptId', 'intentId', 'deliveryId', 'requestId',
+    'attemptId', 'traceId', 'adapterId', 'outcome', 'externalRef', 'observedAt',
+    ...outcomeFields,
+  ], 'DeliveryReceipt');
   const normalized = {
     schemaVersion: 1,
     type: 'DeliveryReceipt',
@@ -210,6 +228,52 @@ export function openReplyIntentOutbox({
     SELECT * FROM assistant_delivery_settlements
     WHERE intent_id = ? ORDER BY created_at ASC, settlement_id ASC
   `);
+  const selectTerminalCause = database.prepare(`
+    SELECT request_id, sequence, event_type, payload_json, idempotency_key,
+           event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    FROM assistant_response_events WHERE event_id = ?
+  `);
+  const selectOutcomeForRequest = database.prepare(`
+    SELECT * FROM assistant_reply_outcomes WHERE request_id = ?
+  `);
+  const selectRunFacts = database.prepare(`SELECT * FROM assistant_run_ledger WHERE request_id = ?`);
+  const selectRequestFacts = database.prepare(`
+    SELECT request_id, status, runtime_session_id, next_sequence
+    FROM assistant_requests WHERE request_id = ?
+  `);
+  const selectRunEvents = database.prepare(`
+    SELECT request_id, sequence, event_type, payload_json, idempotency_key,
+           event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    FROM assistant_response_events WHERE request_id = ? ORDER BY sequence ASC
+  `);
+  const selectAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status
+    FROM runtime_turn_admissions
+    WHERE request_id = ? AND turn_id = ? AND generation = ?
+    ORDER BY id DESC LIMIT 1
+  `);
+
+  function requireCanonicalIntentCause(intent) {
+    if (intent.cause_kind !== 'run_terminal') return;
+    const run = selectRunFacts.get(intent.request_id);
+    const failure = canonicalRunTerminalIntentCauseFailure({
+      intentRow: intent,
+      terminal: selectTerminalCause.get(intent.cause_event_id),
+      outcome: selectOutcomeForRequest.get(intent.request_id),
+      run,
+      request: selectRequestFacts.get(intent.request_id),
+      admission: run
+        ? selectAdmissionFacts.get(intent.request_id, run.turn_id, run.generation)
+        : null,
+      events: selectRunEvents.all(intent.request_id),
+    });
+    if (failure) {
+      throw domainError(
+        'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+        `ReplyIntent terminal cause failed validation: ${failure}`,
+      );
+    }
+  }
 
   function requireCanonicalReceipt(row, intent) {
     const failure = canonicalDeliveryReceiptFailure(row, intent);
@@ -247,6 +311,7 @@ export function openReplyIntentOutbox({
 
   function validateDeliveryLedger(intent) {
     toIntent(intent);
+    requireCanonicalIntentCause(intent);
     const receipts = selectReceiptsForIntent.all(intent.intent_id);
     receipts.forEach(receipt => requireCanonicalReceipt(receipt, intent));
     const settlements = selectSettlementsForIntent.all(intent.intent_id);
@@ -644,10 +709,20 @@ export function openReplyIntentOutbox({
   });
 
   return Object.freeze({
-    claimNext({ ownerId, leaseSeconds = 30 } = {}) {
+    claimNext(input = {}) {
+      const command = requireRecord(input, 'claimNext input');
+      assertAllowedKeys(command, ['ownerId', 'leaseSeconds'], 'claimNext input');
+      const { ownerId, leaseSeconds = 30 } = command;
       return claimTransaction.immediate({ ownerId, leaseSeconds });
     },
-    recordReceipt({ action, claimEpoch, leaseToken, receipt } = {}) {
+    recordReceipt(input = {}) {
+      const command = requireRecord(input, 'recordReceipt input');
+      assertAllowedKeys(
+        command,
+        ['action', 'claimEpoch', 'leaseToken', 'receipt'],
+        'recordReceipt input',
+      );
+      const { action, claimEpoch, leaseToken, receipt } = command;
       return receiptTransaction.immediate({ action, claimEpoch, leaseToken, rawReceipt: receipt });
     },
     get(intentId) {
@@ -671,6 +746,8 @@ export function openReplyIntentOutbox({
       return settlements.map(row => JSON.parse(row.envelope_json));
     },
     redrive(input = {}) {
+      const command = requireRecord(input, 'redrive input');
+      assertAllowedKeys(command, ['intentId'], 'redrive input');
       return redriveTransaction.immediate(input);
     },
     close() {

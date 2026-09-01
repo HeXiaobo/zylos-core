@@ -212,3 +212,22 @@ test('the v1 ledger extends the existing issue-35 request and event tables in pl
     0,
   );
 });
+
+test('openRunLedger alone installs immutable canonical Run Event identity and body protection', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  const accepted = ledger.accept(acceptMessage('base-schema-immutable')).request;
+  const mutate = new Database(dbPath);
+  for (const statement of [
+    `UPDATE assistant_response_events SET payload_json = '{"attacker":true}' WHERE request_id = ? AND sequence = 1`,
+    `UPDATE assistant_response_events SET id = 99 WHERE request_id = ? AND sequence = 1`,
+    `DELETE FROM assistant_response_events WHERE request_id = ? AND sequence = 1`,
+  ]) {
+    assert.throws(
+      () => mutate.prepare(statement).run(accepted.requestId),
+      /canonical assistant event is immutable/,
+    );
+  }
+  mutate.close();
+});

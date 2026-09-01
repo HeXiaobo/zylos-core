@@ -133,6 +133,58 @@ test('tampered ReplyIntent canonical bytes fail closed before claim or settlemen
   );
 });
 
+test('orphan run_terminal ReplyIntent cannot be claimed without its canonical terminal cause', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { intent } = createAnswerIntent(t, dbPath, 'orphan-terminal-intent');
+  const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER assistant_response_events_canonical_no_delete');
+  mutate.prepare(`DELETE FROM assistant_response_events WHERE event_id = ?`).run(intent.cause.eventId);
+  mutate.close();
+  const outbox = openReplyIntentOutbox({ dbPath, clock: () => 100 });
+  t.after(() => outbox.close());
+  assert.throws(
+    () => outbox.claimNext({ ownerId: 'adapter-a' }),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+  );
+  assert.throws(
+    () => outbox.get(intent.intentId),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+  );
+});
+
+test('run_terminal ReplyIntent claim validates durable Outcome identity and intake route linkage', (t) => {
+  for (const scenario of ['outcome-trace', 'durable-route']) {
+    const dbPath = temporaryDatabase(t);
+    const { intent } = createAnswerIntent(t, dbPath, `intent-link-${scenario}`);
+    const mutate = new Database(dbPath);
+    if (scenario === 'outcome-trace') {
+      mutate.exec('DROP TRIGGER assistant_reply_outcomes_immutable');
+      const row = mutate.prepare(`SELECT envelope_json FROM assistant_reply_outcomes WHERE request_id = ?`)
+        .get(intent.requestId);
+      const envelope = { ...JSON.parse(row.envelope_json), traceId: 'trace:attacker' };
+      const envelopeJson = canonicalJson(envelope);
+      mutate.prepare(`
+        UPDATE assistant_reply_outcomes
+        SET trace_id = 'trace:attacker', envelope_json = ?, canonical_hash = ?
+        WHERE request_id = ?
+      `).run(envelopeJson, sha256(envelopeJson), intent.requestId);
+    } else {
+      mutate.prepare(`
+        UPDATE assistant_run_ledger
+        SET reply_route_json = '{"adapterId":"feishu","targetRef":"opaque:attacker"}'
+        WHERE request_id = ?
+      `).run(intent.requestId);
+    }
+    mutate.close();
+    const outbox = openReplyIntentOutbox({ dbPath, clock: () => 100 });
+    assert.throws(
+      () => outbox.claimNext({ ownerId: 'adapter-a' }),
+      error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+    );
+    outbox.close();
+  }
+});
+
 test('ReplyIntent identity/body and DeliveryReceipt/Settlement rows are immutable', (t) => {
   const dbPath = temporaryDatabase(t);
   const { run, intent } = createAnswerIntent(t, dbPath, 'immutable-delivery-ledger');
@@ -311,13 +363,13 @@ test('unknown delivery reconciles before retry and only reconciled settles accep
   const reconcileClaim = outbox.claimNext({ ownerId: 'adapter-b', leaseSeconds: 30 });
   assert.equal(reconcileClaim.action, 'reconcile');
   assert.equal(reconcileClaim.attemptId, sendClaim.attemptId);
+  const { nextAction: _unknownNextAction, ...receiptWithoutNextAction } = unknown;
   const reconciled = recordReceiptForClaim(outbox, reconcileClaim, {
-      ...unknown,
+      ...receiptWithoutNextAction,
       receiptId: `receipt:${sendClaim.attemptId}:reconciled`,
       outcome: 'reconciled',
       externalRef: 'opaque:platform-message-1',
       observedAt: '2026-09-01T00:02:00.000Z',
-      nextAction: undefined,
   });
   assert.equal(reconciled.delivery.state, 'accepted');
   assert.equal(reconciled.settlement.type, 'DeliverySettlement');
@@ -326,6 +378,52 @@ test('unknown delivery reconciles before retry and only reconciled settles accep
   assert.equal(reconciled.settlement.presented, true);
   assert.equal(ledger.get(run.requestId).status, 'completed');
   assert.equal(outbox.claimNext({ ownerId: 'adapter-c' }), null);
+});
+
+test('outbox public claims and DeliveryReceipt inputs reject unknown v1 fields', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { run, intent } = createAnswerIntent(t, dbPath, 'strict-delivery-receipt');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => 'strict-delivery-lease',
+  });
+  t.after(() => outbox.close());
+  assert.throws(
+    () => outbox.claimNext({ ownerId: 'adapter-a', attacker: true }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+  const claim = outbox.claimNext({ ownerId: 'adapter-a' });
+  const receipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:strict-delivery-receipt:accepted',
+    intentId: intent.intentId,
+    deliveryId: claim.deliveryId,
+    requestId: run.requestId,
+    attemptId: claim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'platform_accepted',
+    externalRef: 'opaque:accepted',
+    observedAt: '2026-09-01T00:05:00.000Z',
+  };
+  assert.throws(
+    () => outbox.recordReceipt({
+      action: claim.action,
+      claimEpoch: claim.claimEpoch,
+      leaseToken: claim.leaseToken,
+      receipt,
+      attacker: true,
+    }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+  assert.throws(
+    () => recordReceiptForClaim(outbox, claim, { ...receipt, attacker: true }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+  assert.equal(outbox.get(intent.intentId).delivery.state, 'sending');
+  assert.deepEqual(outbox.listReceipts(intent.intentId), []);
 });
 
 test('reconciliation claim epoch fences a stale owner when lease tokens are reused', (t) => {
