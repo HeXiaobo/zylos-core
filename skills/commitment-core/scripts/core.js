@@ -28,6 +28,27 @@ import {
   createTaskSubscriptionModule,
   initializeTaskSubscriptionSchema,
 } from './task-subscriptions.js';
+import {
+  createTaskApplicationModule,
+  initializeTaskApplicationSchema,
+} from './task-application.js';
+
+export { createTaskActorAssertionAuthority } from './task-application.js';
+
+const COMMITMENT_CORE_OPTION_FIELDS = new Set([
+  'dbPath',
+  'clock',
+  'idGenerator',
+  'eventIdGenerator',
+  'runIdGenerator',
+  'runEventIdGenerator',
+  'evidenceIdGenerator',
+  'externalLinkIdGenerator',
+  'conversationEventIdGenerator',
+  'taskEffectIdGenerator',
+  'taskActorAssertionVerifier',
+  'taskLegacyScopeResolver',
+]);
 
 function defaultDbPath() {
   const zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -621,17 +642,29 @@ function initializeLegacyTaskAdoptionSchema(database) {
  * migration, deduplication, events, leases, and persistence remain inside the
  * Module.
  */
-export function openCommitmentCore({
-  dbPath = defaultDbPath(),
-  clock = () => new Date().toISOString(),
-  idGenerator = () => `task-${randomUUID()}`,
-  eventIdGenerator = () => `event-${randomUUID()}`,
-  runIdGenerator = () => `run-${randomUUID()}`,
-  runEventIdGenerator = () => `run-event-${randomUUID()}`,
-  evidenceIdGenerator = () => `evidence-${randomUUID()}`,
-  externalLinkIdGenerator = () => `external-link-${randomUUID()}`,
-  conversationEventIdGenerator = () => `comment-event-${randomUUID()}`,
-} = {}) {
+export function openCommitmentCore(options = {}) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('Commitment Core options must be an object');
+  }
+  const unknownOption = Object.keys(options)
+    .find(option => !COMMITMENT_CORE_OPTION_FIELDS.has(option));
+  if (unknownOption) {
+    throw new TypeError(`unsupported Commitment Core option: ${unknownOption}`);
+  }
+  const {
+    dbPath = defaultDbPath(),
+    clock = () => new Date().toISOString(),
+    idGenerator = () => `task-${randomUUID()}`,
+    eventIdGenerator = () => `event-${randomUUID()}`,
+    runIdGenerator = () => `run-${randomUUID()}`,
+    runEventIdGenerator = () => `run-event-${randomUUID()}`,
+    evidenceIdGenerator = () => `evidence-${randomUUID()}`,
+    externalLinkIdGenerator = () => `external-link-${randomUUID()}`,
+    conversationEventIdGenerator = () => `comment-event-${randomUUID()}`,
+    taskEffectIdGenerator,
+    taskActorAssertionVerifier,
+    taskLegacyScopeResolver,
+  } = options;
   if (dbPath !== ':memory:') mkdirSync(path.dirname(dbPath), { recursive: true });
 
   const database = new Database(dbPath);
@@ -651,6 +684,7 @@ export function openCommitmentCore({
   initializeTaskConversationSchema(database);
   initializeTaskSubscriptionSchema(database);
   initializeTaskNotificationSchema(database);
+  initializeTaskApplicationSchema(database);
   const projectionOutboxModule = createProjectionOutboxModule({ database, clock });
   backfillCreationEvents(database, eventIdGenerator, projectionOutboxModule.append);
 
@@ -662,9 +696,15 @@ export function openCommitmentCore({
     WHERE id = ?
   `);
   const selectTaskForSource = database.prepare(`
-    SELECT task_id, request_fingerprint
+    SELECT task_id, sender_id, request_fingerprint
     FROM commitment_sources
     WHERE idempotency_key = ?
+  `);
+  const selectEventForTaskVersion = database.prepare(`
+    SELECT id, event_type, task_id, actor_id, from_state, to_state,
+           task_version, occurred_at
+    FROM commitment_events
+    WHERE task_id = ? AND task_version = ?
   `);
   const selectEvents = database.prepare(`
     SELECT id, event_type, task_id, actor_id, from_state, to_state,
@@ -842,7 +882,41 @@ export function openCommitmentCore({
     return { task: updatedTask, event };
   }
 
-  const ingestTransaction = database.transaction((rawEnvelope) => {
+  function loadTaskCreatedFact(taskId, sourceActorId, originalTask) {
+    const currentTask = toTaskView(selectTask.get(taskId));
+    const event = toEventView(selectEventForTaskVersion.get(taskId, 1));
+    if (
+      !currentTask
+      || !event
+      || event.type !== 'TaskCreated'
+      || event.actorId !== (sourceActorId ?? currentTask.ownerId)
+      || event.fromState !== null
+      || event.toState !== 'ready'
+      || event.version !== 1
+      || event.occurredAt !== currentTask.createdAt
+    ) {
+      throw domainError(
+        'IDEMPOTENCY_CONFLICT',
+        `existing source lacks a provable original TaskCreated fact: ${taskId}`,
+      );
+    }
+    return {
+      task: {
+        id: currentTask.id,
+        ...originalTask,
+        state: event.toState,
+        version: event.version,
+        createdAt: event.occurredAt,
+        updatedAt: event.occurredAt,
+      },
+      event,
+    };
+  }
+
+  function ingestWithinTransaction(
+    rawEnvelope,
+    { taskId: requestedTaskId = null, includeCreationFact = false } = {},
+  ) {
     const envelope = normalizeEnvelope(rawEnvelope);
     const fingerprint = fingerprintEnvelope(envelope);
     const existing = selectTaskForSource.get(envelope.idempotencyKey);
@@ -853,10 +927,23 @@ export function openCommitmentCore({
       ) {
         throw idempotencyConflict(envelope.idempotencyKey);
       }
-      return { created: false, task: toTaskView(selectTask.get(existing.task_id)) };
+      const task = toTaskView(selectTask.get(existing.task_id));
+      return {
+        created: false,
+        task,
+        ...(includeCreationFact ? {
+          creationFact: loadTaskCreatedFact(
+            existing.task_id,
+            existing.sender_id,
+            envelope.task,
+          ),
+        } : {}),
+      };
     }
 
-    const taskId = requireText(idGenerator(), 'generated task id');
+    const taskId = requestedTaskId === null
+      ? requireText(idGenerator(), 'generated task id')
+      : requireText(requestedTaskId, 'requested task id');
     const timestamp = requireText(clock(), 'clock result');
     const task = insertReadyTask({ taskId, task: envelope.task, timestamp });
     insertSource.run(
@@ -868,16 +955,21 @@ export function openCommitmentCore({
       taskId,
       timestamp,
     );
-    appendTaskCreatedEvent({
+    const event = appendTaskCreatedEvent({
       task,
       actorId: envelope.source.senderId ?? envelope.task.ownerId,
       timestamp,
     });
 
-    return { created: true, task };
-  });
+    return {
+      created: true,
+      task,
+      ...(includeCreationFact ? { creationFact: { task, event } } : {}),
+    };
+  }
+  const ingestTransaction = database.transaction(ingestWithinTransaction);
 
-  const commandTransaction = database.transaction((rawCommand, rawExpectedVersion) => {
+  function commandWithinTransaction(rawCommand, rawExpectedVersion) {
     const command = normalizeCommand(rawCommand);
     const expectedVersion = normalizeExpectedVersion(rawExpectedVersion);
     const fingerprint = fingerprintEnvelope({ command, expectedVersion });
@@ -950,7 +1042,8 @@ export function openCommitmentCore({
       timestamp,
     );
     return result;
-  });
+  }
+  const commandTransaction = database.transaction(commandWithinTransaction);
 
   const taskStore = {
     get(taskId) {
@@ -1069,6 +1162,16 @@ export function openCommitmentCore({
     database,
     clock,
   });
+  const taskApplicationModule = createTaskApplicationModule({
+    database,
+    clock,
+    idGenerator,
+    ingestWithinTransaction,
+    commandWithinTransaction,
+    effectIdGenerator: taskEffectIdGenerator,
+    verifyActorAssertion: taskActorAssertionVerifier,
+    resolveLegacyTaskScope: taskLegacyScopeResolver,
+  });
 
   return Object.freeze({
     ingest(envelope) {
@@ -1080,6 +1183,7 @@ export function openCommitmentCore({
     command(command, expectedVersion) {
       return commandTransaction.immediate(command, expectedVersion);
     },
+    taskCore: taskApplicationModule,
     runs: runModule.publicInterface,
     evidence: evidenceModule,
     externalLinks: externalLinkModule.publicInterface,

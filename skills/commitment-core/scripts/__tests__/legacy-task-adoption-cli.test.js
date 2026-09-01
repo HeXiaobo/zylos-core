@@ -14,6 +14,12 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { openCommitmentCore } from '../core.js';
+
+function removeAdoptionTestDirectory(directory) {
+  assert.equal(path.dirname(directory), os.tmpdir());
+  assert.equal(path.basename(directory).startsWith('zylos-adoption-cli-'), true);
+  rmSync(directory, { recursive: true, force: true });
+}
 import {
   createPlanSnapshot,
   parseLegacyTaskAdoptionManifest,
@@ -111,7 +117,7 @@ test('default plan validates through Core in memory and never creates the reques
     assert.equal(existsSync(dbPath), false);
     assert.deepEqual(stdout.read(), report);
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    removeAdoptionTestDirectory(directory);
   }
 });
 
@@ -166,7 +172,7 @@ test('plan snapshots an existing Core DB and detects conflicts without writing i
       core.close();
     }
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    removeAdoptionTestDirectory(directory);
   }
 });
 
@@ -211,7 +217,7 @@ test('plan accepts a transaction-consistent snapshot when the live WAL advances 
           'SELECT counter FROM snapshot_churn WHERE id = 1',
         ).pluck().get();
         snapshot.close();
-        return openCommitmentCore(options);
+        return openCommitmentCore({ ...options, dbPath: options.dbPath });
       },
       stdout: captureStdout(),
     });
@@ -233,7 +239,7 @@ test('plan accepts a transaction-consistent snapshot when the live WAL advances 
     assert.equal(report.succeeded, 1);
     assert.equal(report.failed, 0);
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    removeAdoptionTestDirectory(directory);
   }
 });
 
@@ -257,7 +263,7 @@ test('plan still rejects replacement of the source database path while snapshott
       error => error?.code === 'PLAN_SOURCE_REPLACED',
     );
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    removeAdoptionTestDirectory(directory);
   }
 });
 
@@ -277,7 +283,7 @@ test('plan fails closed when the generated SQLite snapshot is corrupt', () => {
       error => error?.code === 'PLAN_SNAPSHOT_INVALID',
     );
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    removeAdoptionTestDirectory(directory);
   }
 });
 
@@ -308,7 +314,7 @@ test('explicit commit is per-entry idempotent and persists exactly one adoption'
       core.close();
     }
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    removeAdoptionTestDirectory(directory);
   }
 });
 
@@ -367,6 +373,6 @@ test('one item conflict is reported without preventing later entries or partial 
       core.close();
     }
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    removeAdoptionTestDirectory(directory);
   }
 });

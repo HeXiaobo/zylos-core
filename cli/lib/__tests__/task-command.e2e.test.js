@@ -58,6 +58,14 @@ function installTaskCore(zylosDir) {
     path.join(SOURCE_TASK_CORE, 'scripts', 'task-subscriptions.js'),
     path.join(destination, 'scripts', 'task-subscriptions.js'),
   );
+  copyFileSync(
+    path.join(SOURCE_TASK_CORE, 'scripts', 'task-application.js'),
+    path.join(destination, 'scripts', 'task-application.js'),
+  );
+  copyFileSync(
+    path.join(SOURCE_TASK_CORE, 'scripts', 'task-effect-relay.js'),
+    path.join(destination, 'scripts', 'task-effect-relay.js'),
+  );
   symlinkSync(
     path.join(SOURCE_TASK_CORE, 'node_modules'),
     path.join(destination, 'node_modules'),
