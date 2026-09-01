@@ -221,8 +221,8 @@ function fetchRawFileOnce(repo, filePath, branch) {
 // ── Shared tag parsing ───────────────────────────────────────────
 
 export function compareSemverDesc(a, b) {
-  const [aBase, aPre] = a.split(/-(.+)/);
-  const [bBase, bPre] = b.split(/-(.+)/);
+  const [aBase, aPre] = a.split('+')[0].split(/-(.+)/);
+  const [bBase, bPre] = b.split('+')[0].split(/-(.+)/);
 
   const aParts = aBase.split('.').map(Number);
   const bParts = bBase.split('.').map(Number);
@@ -250,21 +250,42 @@ export function compareSemverDesc(a, b) {
   return 0;
 }
 
+const RELEASE_TAG_RE = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/;
+
 function parseTagsResponse(jsonStr, { includePrerelease = false } = {}) {
   const tags = JSON.parse(jsonStr);
-  if (!Array.isArray(tags) || tags.length === 0) return null;
-
-  let versions = tags
-    .map(t => t.name)
-    .filter(name => /^v?\d+\.\d+\.\d+/.test(name))
-    .map(name => name.replace(/^v/, ''));
-
-  if (!includePrerelease) {
-    versions = versions.filter(v => !v.includes('-'));
+  if (!Array.isArray(tags)
+      || tags.some(entry => !entry || typeof entry !== 'object' || typeof entry.name !== 'string')) {
+    throw new TypeError('Invalid GitHub tags response: expected an array of tag objects');
   }
+  const repositoryTags = tags;
+  const releaseTags = repositoryTags.flatMap((entry) => {
+    const tag = typeof entry?.name === 'string' ? entry.name : '';
+    const match = tag.match(RELEASE_TAG_RE);
+    if (!match) return [];
+    const version = match[1];
+    return [{
+      version,
+      tag,
+      ref: `refs/tags/${tag}`,
+      prerelease: version.split('+')[0].includes('-'),
+    }];
+  });
+  const prereleaseTags = releaseTags.filter(tag => tag.prerelease);
+  const candidates = includePrerelease
+    ? releaseTags
+    : releaseTags.filter(tag => !tag.prerelease);
 
-  versions.sort(compareSemverDesc);
-  return versions[0] || null;
+  candidates.sort((a, b) => compareSemverDesc(a.version, b.version));
+  prereleaseTags.sort((a, b) => compareSemverDesc(a.version, b.version));
+
+  return {
+    selected: candidates[0] || null,
+    latestPrerelease: prereleaseTags[0] || null,
+    tagCount: repositoryTags.length,
+    releaseTagCount: releaseTags.length,
+    prereleaseTagCount: prereleaseTags.length,
+  };
 }
 
 function fetchTagsJsonSync(repo) {
@@ -332,9 +353,22 @@ async function fetchTagsJsonAsync(repo) {
  * @throws {Error} On network/API failures (callers should catch and handle)
  */
 export function fetchLatestTag(repo, { includePrerelease = false } = {}) {
+  return fetchLatestTagSelection(repo, { includePrerelease }).selected?.version || null;
+}
+
+/**
+ * Fetch a tag selection with the exact tag/ref and policy-filter statistics.
+ * This lets callers distinguish an empty repository from tags excluded by a
+ * stable-only policy without performing a second network request.
+ */
+export function fetchLatestTagSelection(repo, { includePrerelease = false } = {}) {
   try {
     const json = withRateLimitRetrySync(() => fetchTagsJsonSync(repo), `${repo} tags`);
-    return parseTagsResponse(json, { includePrerelease });
+    return {
+      repo,
+      policy: includePrerelease ? 'include-prerelease' : 'stable-only',
+      ...parseTagsResponse(json, { includePrerelease }),
+    };
   } catch (err) {
     const msg = err.stderr?.toString().trim() || err.message || 'unknown error';
     throw new Error(`Failed to fetch tags for ${repo}: ${sanitizeError(msg)}`);
@@ -355,7 +389,7 @@ export function fetchLatestTag(repo, { includePrerelease = false } = {}) {
 export async function fetchLatestTagAsync(repo, { includePrerelease = false } = {}) {
   try {
     const json = await withRateLimitRetryAsync(() => fetchTagsJsonAsync(repo), `${repo} tags`);
-    return parseTagsResponse(json, { includePrerelease });
+    return parseTagsResponse(json, { includePrerelease }).selected?.version || null;
   } catch (err) {
     const msg = err.stderr?.toString().trim() || err.message || 'unknown error';
     throw new Error(`Failed to fetch tags for ${repo}: ${sanitizeError(msg)}`);
