@@ -146,6 +146,48 @@ function bindV2PreflightReceipt(manifest, mode, fileName = `${mode}-preflight.js
   return manifest;
 }
 
+function writeRuntimeIdentityFixture({
+  hostname = 'test-host',
+  agent = 'test-agent',
+  profileId = 'test-profile',
+  deploymentOrgLabel = 'zylos',
+} = {}) {
+  const registryPath = path.join(tempRoot, 'employee-runtime-registry.json');
+  writeJson(tempRoot, 'employee-runtime-registry.json', {
+    schema: 'zylos.employee-runtime-registry/v1',
+    updatedAt: new Date().toISOString(),
+    employees: {
+      [agent]: {
+        host: hostname,
+        identity: {
+          profileId,
+          profileName: agent,
+          deploymentProfileId: profileId,
+          deploymentOrgLabel,
+        },
+      },
+    },
+  });
+  const probePath = path.join(tempRoot, 'profile-verify.mjs');
+  writeFile(tempRoot, 'profile-verify.mjs', `
+const args = process.argv.slice(2);
+const value = (flag) => args[args.indexOf(flag) + 1];
+const org = value('--org');
+const profileId = value('--profile-id');
+const hostname = value('--hostname');
+const profileName = ${JSON.stringify(agent)};
+const observedAt = new Date().toISOString();
+console.log(JSON.stringify({
+  schema: 'zylos.hxa-org-profile-verification/v1',
+  status: 'PASS',
+  org,
+  expected: { orgId: 'org-test', profileId, profileName, hostname },
+  observed: { orgId: 'org-test', profileId, profileName, hostname, observedAt },
+}));
+`);
+  return { registryPath, probePath, hostname, agent, profileId, deploymentOrgLabel };
+}
+
 function makeGlobalV2Manifest(fixture, {
   status = 'HOLD',
   deploymentAllowed = false,
@@ -215,6 +257,7 @@ function makeGlobalV2Manifest(fixture, {
       },
       pairReport: { status: 'PASS' },
       canary: 'PASS',
+      hxa: { status: 'PASS' },
       hxaProvenance: 'PASS',
     },
   };
@@ -335,7 +378,7 @@ describe('external release manifest gate', () => {
     });
   });
 
-  test('keeps the deploy gate identity requirement for a global v2 manifest', () => {
+  test('uses the typed deploy receipt identity instead of a per-agent v2 manifest target', () => {
     const fixture = makeFixture();
     const manifestPath = path.join(tempRoot, 'global-v2-deploy-manifest.json');
     writeJson(tempRoot, 'global-v2-deploy-manifest.json', makeGlobalV2Manifest(fixture, {
@@ -352,7 +395,30 @@ describe('external release manifest gate', () => {
     });
 
     expect(result.ok).toBe(false);
-    expect(result.errors.join('\n')).toMatch(/target\.agent|required|identity probe/);
+    expect(result.errors.join('\n')).not.toMatch(/target\.(agent|profileId|hostname) is required/);
+    expect(result.errors.join('\n')).toMatch(/employee runtime registry|profile verification|runtimeTarget/);
+  });
+
+  test('accepts a global v2 deploy receipt only after registry and HXA verification agree', () => {
+    const fixture = makeFixture();
+    const identity = writeRuntimeIdentityFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-deploy-verified.json');
+    writeJson(tempRoot, 'global-v2-deploy-verified.json', makeGlobalV2Manifest(fixture, {
+      status: 'READY',
+      deploymentAllowed: true,
+      publicationAllowed: false,
+    }));
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'deploy',
+      manifestPath,
+      identityProbePath: identity.probePath,
+      localHostname: identity.hostname,
+      env: { ZYLOS_EMPLOYEE_RUNTIME_REGISTRY: identity.registryPath },
+    });
+
+    expect(result.ok).toBe(true);
   });
 
   test('uses only candidate.core for v2 and rejects stable or top-level fallbacks', () => {
@@ -610,6 +676,28 @@ describe('external release manifest gate', () => {
     expect(result.errors.join('\n')).toMatch(/workspacePublish\.report\.dispositions/);
   });
 
+  test('requires publication deploymentStage to be present and exactly null', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-publish-stage.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    const receiptPath = manifest.evidence.workspacePublish.report;
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    delete receipt.deploymentStage;
+    writeJson(tempRoot, path.basename(receiptPath), receipt);
+    manifest.evidence.workspacePublish.reportSha256 = sha256File(receiptPath);
+    writeJson(tempRoot, 'global-v2-publish-stage.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/workspacePublish\.report\.deploymentStage.*null/);
+  });
+
   test('binds the publication receipt to the root release status and exact envelope shape', () => {
     const fixture = makeFixture();
     const manifestPath = path.join(tempRoot, 'global-v2-publish-receipt-binding.json');
@@ -657,6 +745,35 @@ describe('external release manifest gate', () => {
     });
 
     expect(result.join('\n')).toMatch(/globalPreflight\.report\.runtimeTarget\.identityObservedAt/);
+  });
+
+  test('rejects a fresh-looking deploy identity that disagrees with trusted registry and HXA verification', () => {
+    const fixture = makeFixture();
+    const identity = writeRuntimeIdentityFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-deploy-forged-identity.json');
+    const manifest = makeGlobalV2Manifest(fixture, {
+      status: 'READY',
+      deploymentAllowed: true,
+      publicationAllowed: false,
+    });
+    const receiptPath = manifest.evidence.globalPreflight.report;
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    receipt.runtimeTarget.agent = 'forged-agent';
+    writeJson(tempRoot, path.basename(receiptPath), receipt);
+    manifest.evidence.globalPreflight.reportSha256 = sha256File(receiptPath);
+    writeJson(tempRoot, 'global-v2-deploy-forged-identity.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'deploy',
+      manifestPath,
+      identityProbePath: identity.probePath,
+      localHostname: identity.hostname,
+      env: { ZYLOS_EMPLOYEE_RUNTIME_REGISTRY: identity.registryPath },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/runtimeTarget\.agent.*registry|registry.*runtimeTarget\.agent/);
   });
 
   test('requires immutable main source policy and strict candidate identity fields', () => {
@@ -720,7 +837,24 @@ describe('external release manifest gate', () => {
     });
 
     expect(result.ok).toBe(false);
-    expect(result.errors.join('\n')).toMatch(/origin .*does not identify GitHub repository HeXiaobo\/zylos-core/);
+    expect(result.errors.join('\n')).toMatch(/origin.*GitHub repository HeXiaobo\/zylos-core/);
+  });
+
+  test('requires every origin URL to identify exactly the Core fork', () => {
+    const fixture = makeFixture();
+    git(fixture.root, ['config', '--add', 'remote.origin.url', 'https://evil.example/HeXiaobo/zylos-core.git']);
+    const manifestPath = path.join(tempRoot, 'global-v2-mixed-origin.json');
+    writeJson(tempRoot, 'global-v2-mixed-origin.json', makeGlobalV2Manifest(fixture));
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/origin.*all|origin.*exact|does not identify GitHub repository/);
   });
 
   test('requires the candidate SHA to be an ancestor of origin/main', () => {
@@ -803,6 +937,42 @@ describe('external release manifest gate', () => {
     expect(result.errors.join('\n')).toMatch(/repo.*does not exactly match HeXiaobo\/zylos-core|GitHub/);
   });
 
+  test('rejects SSH candidate repository URLs carrying credentials', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-credentialed-repo.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.candidate.core.repo = 'ssh://git:password@github.com/HeXiaobo/zylos-core.git';
+    writeJson(tempRoot, 'global-v2-credentialed-repo.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/candidate\.core\.repo.*repository|GitHub/);
+  });
+
+  test('rejects a manifest whose lexical path is inside the repository even when its symlink resolves outside', () => {
+    const fixture = makeFixture();
+    const outsideManifest = path.join(tempRoot, 'global-v2-symlink-target.json');
+    writeJson(tempRoot, 'global-v2-symlink-target.json', makeGlobalV2Manifest(fixture));
+    const linkPath = path.join(fixture.root, 'manifest-link.json');
+    fs.symlinkSync(outsideManifest, linkPath);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath: linkPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/outside the repository|self-reference|lexical path/);
+  });
+
   test('rejects a v2 manifest when the repository origin is a non-GitHub lookalike', () => {
     const fixture = makeFixture();
     git(fixture.root, ['remote', 'set-url', 'origin', 'https://evil.example/Acme/demo-core.git']);
@@ -817,7 +987,7 @@ describe('external release manifest gate', () => {
     });
 
     expect(result.ok).toBe(false);
-    expect(result.errors.join('\n')).toMatch(/origin.*does not identify(?: a valid)? GitHub repository/);
+    expect(result.errors.join('\n')).toMatch(/origin.*GitHub repository/);
   });
 
   test('does not probe HXA identity for a malformed v2 release target', () => {
@@ -1020,6 +1190,9 @@ describe('external release manifest gate', () => {
 
   test('accepts the v2 structured pair report for deploy readiness', () => {
     const fixture = makeFixture();
+    const identity = writeRuntimeIdentityFixture({
+      hostname: os.hostname(),
+    });
     const manifest = makeGlobalV2Manifest(fixture, {
       status: 'READY',
       deploymentAllowed: true,
@@ -1029,6 +1202,23 @@ describe('external release manifest gate', () => {
     manifest.evidence.canary = 'PASS';
     manifest.evidence.hxa = { status: 'PASS' };
     bindV2PreflightReceipt(manifest, 'deploy');
-    expect(validateDeploymentReadiness(manifest)).toEqual([]);
+    const receiptPath = manifest.evidence.globalPreflight.report;
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    receipt.runtimeTarget = {
+      agent: identity.agent,
+      profileId: identity.profileId,
+      hostname: identity.hostname,
+      deploymentOrgLabel: identity.deploymentOrgLabel,
+      deploymentProfileId: identity.profileId,
+      identityObservedAt: new Date().toISOString(),
+    };
+    writeJson(tempRoot, path.basename(receiptPath), receipt);
+    manifest.evidence.globalPreflight.reportSha256 = sha256File(receiptPath);
+    expect(validateDeploymentReadiness(manifest, {
+      root: fixture.root,
+      identityProbePath: identity.probePath,
+      localHostname: identity.hostname,
+      env: { ZYLOS_EMPLOYEE_RUNTIME_REGISTRY: identity.registryPath },
+    })).toEqual([]);
   });
 });

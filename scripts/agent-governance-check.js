@@ -26,6 +26,8 @@ const RELEASE_MANIFEST_V1 = 'zylos.release-manifest/v1';
 const RELEASE_MANIFEST_V2 = 'zylos.release-manifest/v2';
 const V2_REPOSITORY = 'HeXiaobo/zylos-core';
 const PREFLIGHT_SCHEMA = 'zylos.agent-preflight/v1';
+const EMPLOYEE_RUNTIME_REGISTRY_SCHEMA = 'zylos.employee-runtime-registry/v1';
+const HXA_PROFILE_VERIFICATION_SCHEMA = 'zylos.hxa-org-profile-verification/v1';
 const PUBLICATION_AUTHORIZATION_SCHEMA = 'zylos.release-publication-authorization/v1';
 const DEPLOYMENT_AUTHORIZATION_SCHEMA = 'zylos.release-deployment-authorization/v1';
 const PUBLICATION_SCOPE = 'RELEASE_GLOBAL_BUNDLE';
@@ -621,7 +623,8 @@ function normalizeGitHubRepository(value) {
     return null;
   }
   if (parsed.search || parsed.hash) return null;
-  if (parsed.protocol === 'https:' && (parsed.username || parsed.password)) return null;
+  if (parsed.password) return null;
+  if (parsed.protocol === 'https:' && parsed.username) return null;
   if (parsed.protocol === 'ssh:' && parsed.username && parsed.username !== 'git') return null;
   const parts = parsed.pathname.split('/').filter(Boolean);
   if (parts.length !== 2) return null;
@@ -633,6 +636,11 @@ function isExactGitHubOrigin(value, expectedRepository) {
   const text = value.trim().replace(/^git\+/, '');
   const hasGitHubHost = /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)/i.test(text);
   return hasGitHubHost && normalizeGitHubRepository(text) === expectedRepository;
+}
+
+function originUrls(root) {
+  const output = git(root, ['remote', 'get-url', '--all', 'origin'], { allowFailure: true }) || '';
+  return output.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
 }
 
 function repoSlug(value) {
@@ -784,8 +792,8 @@ function validateGlobalV2PreflightReceipt(manifest, errors, { mode }) {
     if (receipt.deploymentStage !== 'final') errors.push(`${label}.report.deploymentStage must be final`);
     if (receipt.deploymentAllowed !== true) errors.push(`${label}.report.deploymentAllowed must be true`);
   } else {
-    if (receipt.deploymentStage !== null && receipt.deploymentStage !== undefined) {
-      errors.push(`${label}.report.deploymentStage must be null for publication`);
+    if (!Object.prototype.hasOwnProperty.call(receipt, 'deploymentStage') || receipt.deploymentStage !== null) {
+      errors.push(`${label}.report.deploymentStage must be present and null for publication`);
     }
     if (receipt.publicationAllowed !== true) errors.push(`${label}.report.publicationAllowed must be true`);
     if (typeof receipt.deploymentAllowed !== 'boolean') errors.push(`${label}.report.deploymentAllowed must be boolean`);
@@ -806,7 +814,7 @@ function validateGlobalV2PreflightReceipt(manifest, errors, { mode }) {
     errors.push(`${label}.report.generatedAt must be a fresh canonical ISO timestamp`);
   }
 
-  if (!isDeploy) return;
+  if (!isDeploy) return receipt;
   const runtimeTarget = receipt.runtimeTarget;
   if (!isObject(runtimeTarget)) {
     errors.push(`${label}.report.runtimeTarget is required`);
@@ -818,6 +826,7 @@ function validateGlobalV2PreflightReceipt(manifest, errors, { mode }) {
   if (!canonicalIsoTimestamp(runtimeTarget.identityObservedAt) || !freshIsoTimestamp(runtimeTarget.identityObservedAt)) {
     errors.push(`${label}.report.runtimeTarget.identityObservedAt must be a fresh canonical ISO timestamp`);
   }
+  return receipt;
 }
 
 function validateGlobalV2CandidateComponent(manifest, componentName, versionKey, errors, { expectedBranch = null } = {}) {
@@ -980,6 +989,156 @@ export function probeLocalIdentity({ probePath, exec = execFileSync } = {}) {
   }
 }
 
+function runtimeRegistryPath(root, explicitPath, env = process.env) {
+  if (explicitPath || env.ZYLOS_EMPLOYEE_RUNTIME_REGISTRY) {
+    return path.resolve(explicitPath || env.ZYLOS_EMPLOYEE_RUNTIME_REGISTRY);
+  }
+  return path.resolve(root, '..', '..', 'governance', 'employee-runtime-registry.json');
+}
+
+function probeLocalDeploymentIdentity({ probePath, org, profileId, hostname, env = process.env, exec = execFileSync } = {}) {
+  const cliPath = probePath || env.ZYLOS_HXA_PROFILE_CLI
+    || path.join(os.homedir(), 'zylos', '.claude', 'skills', 'hxa-connect', 'scripts', 'cli.js');
+  if (!fs.existsSync(cliPath)) {
+    return { ok: false, error: `HXA org-scoped identity probe is missing: ${cliPath}`, path: cliPath };
+  }
+  try {
+    const output = exec(process.execPath, [
+      cliPath,
+      'profile-verify',
+      '--org', org,
+      '--profile-id', profileId,
+      '--hostname', hostname,
+    ], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const report = JSON.parse(output);
+    return { ok: isObject(report), report, path: cliPath };
+  } catch (error) {
+    if (typeof error.stdout === 'string' && error.stdout.trim()) {
+      try {
+        const report = JSON.parse(error.stdout);
+        return { ok: false, report, error: `HXA org-scoped identity probe returned a non-PASS report`, path: cliPath };
+      } catch {
+        // Fall through to the process error when stdout is not a JSON report.
+      }
+    }
+    return { ok: false, error: `HXA org-scoped identity probe failed: ${error.message}`, path: cliPath };
+  }
+}
+
+function validateGlobalV2RuntimeIdentity({ root, receipt, errors, identityProbePath, localHostname, env, runtimeRegistryPath: explicitRegistryPath }) {
+  const label = 'Release manifest evidence.globalPreflight.report.runtimeTarget';
+  const runtimeTarget = receipt?.runtimeTarget;
+  if (!isObject(runtimeTarget)) return;
+
+  const registryPath = runtimeRegistryPath(root, explicitRegistryPath, env);
+  const lexicalRepoRoot = path.resolve(root);
+  const realRepoRoot = fs.existsSync(root) ? fs.realpathSync(root) : lexicalRepoRoot;
+  if (isPathInside(lexicalRepoRoot, registryPath)) {
+    errors.push(`${label} trusted employee runtime registry must be outside the repository`);
+    return;
+  }
+  let realRegistryPath = registryPath;
+  try {
+    realRegistryPath = fs.realpathSync(registryPath);
+  } catch {
+    // The readable-file error below carries the useful path and cause.
+  }
+  if (isPathInside(realRepoRoot, realRegistryPath)) {
+    errors.push(`${label} trusted employee runtime registry must resolve outside the repository`);
+    return;
+  }
+  let registry;
+  try {
+    registry = JSON.parse(readText(registryPath));
+  } catch (error) {
+    errors.push(`${label} requires a readable trusted employee runtime registry: ${registryPath} (${error.message})`);
+    return;
+  }
+  if (!isObject(registry) || registry.schema !== EMPLOYEE_RUNTIME_REGISTRY_SCHEMA) {
+    errors.push(`${label} trusted employee runtime registry schema must be ${EMPLOYEE_RUNTIME_REGISTRY_SCHEMA}`);
+    return;
+  }
+  const employees = registry.employees;
+  if (!isObject(employees)) {
+    errors.push(`${label} trusted employee runtime registry employees must be an object`);
+    return;
+  }
+  const matches = [];
+  for (const [employeeName, employee] of Object.entries(employees)) {
+    if (!isObject(employee) || !asNonEmptyString(employee.host)) {
+      errors.push(`${label} trusted registry employee ${employeeName}.host is required`);
+      continue;
+    }
+    if (employee.host === localHostname) matches.push({ employeeName, employee });
+  }
+  if (matches.length !== 1) {
+    errors.push(`${label} trusted employee runtime registry must contain exactly one employee for hostname ${localHostname} (found ${matches.length})`);
+    return;
+  }
+
+  const { employeeName, employee } = matches[0];
+  const identity = employee.identity;
+  if (!isObject(identity)) {
+    errors.push(`${label} trusted registry identity ${employeeName}.identity is required`);
+    return;
+  }
+  const expected = {
+    agent: asNonEmptyString(identity.profileName),
+    profileId: asNonEmptyString(identity.deploymentProfileId),
+    hostname: employee.host,
+    deploymentOrgLabel: asNonEmptyString(identity.deploymentOrgLabel),
+    deploymentProfileId: asNonEmptyString(identity.deploymentProfileId),
+  };
+  for (const [field, expectedValue] of Object.entries(expected)) {
+    if (!expectedValue) errors.push(`${label} trusted registry ${field} is required`);
+    else if (runtimeTarget[field] !== expectedValue) {
+      errors.push(`${label}.${field} does not match trusted registry ${expectedValue}`);
+    }
+  }
+  if (runtimeTarget.hostname !== localHostname) {
+    errors.push(`${label}.hostname must match the current hostname ${localHostname}`);
+  }
+  if (Object.values(expected).some((value) => !value)) return;
+
+  const probe = probeLocalDeploymentIdentity({
+    probePath: identityProbePath,
+    org: expected.deploymentOrgLabel,
+    profileId: expected.deploymentProfileId,
+    hostname: expected.hostname,
+    env,
+  });
+  if (!probe.ok || !isObject(probe.report)) {
+    errors.push(`${label} fresh HXA profile verification failed: ${probe.error || 'invalid report'}`);
+    return;
+  }
+  const report = probe.report;
+  if (report.schema !== HXA_PROFILE_VERIFICATION_SCHEMA) {
+    errors.push(`${label} HXA profile verification schema must be ${HXA_PROFILE_VERIFICATION_SCHEMA}`);
+  }
+  if (report.status !== 'PASS') errors.push(`${label} HXA profile verification status must be PASS`);
+  if (report.org !== expected.deploymentOrgLabel) errors.push(`${label} HXA profile verification org does not match trusted registry`);
+  if (report.expected?.profileId !== expected.deploymentProfileId) errors.push(`${label} HXA expected profileId does not match trusted registry`);
+  if (report.expected?.profileName !== expected.agent) errors.push(`${label} HXA expected profileName does not match trusted registry`);
+  if (report.expected?.hostname !== expected.hostname) errors.push(`${label} HXA expected hostname does not match trusted registry`);
+  if (!asNonEmptyString(report.expected?.orgId)) errors.push(`${label} HXA expected orgId is required`);
+  if (!asNonEmptyString(report.observed?.orgId)) errors.push(`${label} HXA observed orgId is required`);
+  if (report.expected?.orgId !== report.observed?.orgId) errors.push(`${label} HXA expected/observed orgId mismatch`);
+  if (report.observed?.profileId !== expected.deploymentProfileId) errors.push(`${label} HXA observed profileId does not match trusted registry`);
+  if (report.observed?.profileName !== expected.agent) errors.push(`${label} HXA observed profileName does not match trusted registry`);
+  if (report.observed?.hostname !== localHostname) errors.push(`${label} HXA observed hostname does not match current hostname`);
+  const hxaObservedAt = report.observed?.observedAt || report.observedAt;
+  if (!freshIsoTimestamp(hxaObservedAt)) errors.push(`${label} HXA profile verification observedAt must be fresh and canonical`);
+  if (freshIsoTimestamp(runtimeTarget.identityObservedAt) && freshIsoTimestamp(hxaObservedAt)) {
+    const observationDrift = Math.abs(Date.parse(runtimeTarget.identityObservedAt) - Date.parse(hxaObservedAt));
+    if (observationDrift > PREFLIGHT_MAX_AGE_MS) {
+      errors.push(`${label}.identityObservedAt must be bound to the fresh HXA profile verification`);
+    }
+  }
+}
+
 /** Validate and pin an external release/deployment manifest. */
 export function validateReleaseManifest({
   root = SCRIPT_ROOT,
@@ -992,6 +1151,8 @@ export function validateReleaseManifest({
   localIdentity,
   identityProbePath,
   localHostname = os.hostname(),
+  env = process.env,
+  runtimeRegistryPath: explicitRegistryPath = null,
   mode = 'release',
 } = {}) {
   const repoRoot = path.resolve(root);
@@ -1005,7 +1166,11 @@ export function validateReleaseManifest({
   } catch {
     errors.push(`Release manifest does not exist: ${requestedPath}`);
   }
+  const lexicalRepoRoot = path.resolve(repoRoot);
   const realRepoRoot = fs.existsSync(repoRoot) ? fs.realpathSync(repoRoot) : repoRoot;
+  if (isPathInside(lexicalRepoRoot, requestedPath)) {
+    errors.push('Release manifest lexical path must be outside the repository; do not self-reference the current commit in a tracked manifest');
+  }
   if (isPathInside(realRepoRoot, resolvedManifestPath)) {
     errors.push('Release manifest must be outside the repository; do not self-reference the current commit in a tracked manifest');
   }
@@ -1099,9 +1264,9 @@ export function validateReleaseManifest({
     errors.push(`Release manifest repo ${manifestRepo} does not target ${expectedSlug}`);
   }
   if (isV2Manifest) {
-    const origin = git(repoRoot, ['remote', 'get-url', 'origin'], { allowFailure: true });
-    if (!isExactGitHubOrigin(origin, V2_REPOSITORY)) {
-      errors.push(`Release manifest origin ${origin || '(missing)'} does not identify GitHub repository ${V2_REPOSITORY}`);
+    const origins = originUrls(repoRoot);
+    if (origins.length === 0 || origins.some((origin) => !isExactGitHubOrigin(origin, V2_REPOSITORY))) {
+      errors.push(`Release manifest origin URLs ${origins.length ? origins.join(', ') : '(missing)'} must all identify exactly GitHub repository ${V2_REPOSITORY}`);
     }
     if (normalizedManifestRepo && normalizedManifestRepo !== V2_REPOSITORY) {
       errors.push(`Release manifest repo ${manifestRepo} must exactly identify GitHub repository ${V2_REPOSITORY}`);
@@ -1164,7 +1329,7 @@ export function validateReleaseManifest({
   const targetAgent = asNonEmptyString(targetIdentity?.agent);
   const targetProfileId = asNonEmptyString(targetIdentity?.profileId);
   const targetHostname = asNonEmptyString(targetIdentity?.hostname);
-  const identityRequired = mode === 'deploy' || !isV2Manifest;
+  const identityRequired = !isV2Manifest;
   if (identityRequired) {
     if (!targetAgent) errors.push('Release manifest target.agent is required');
     if (!targetProfileId) errors.push('Release manifest target.profileId is required');
@@ -1205,7 +1370,13 @@ export function validateReleaseManifest({
 }
 
 /** Validate evidence that is required only when the operation will deploy. */
-export function validateDeploymentReadiness(manifest) {
+export function validateDeploymentReadiness(manifest, {
+  root = SCRIPT_ROOT,
+  identityProbePath = null,
+  localHostname = os.hostname(),
+  env = process.env,
+  runtimeRegistryPath: explicitRegistryPath = null,
+} = {}) {
   const errors = [];
   if (manifest?.schema === RELEASE_MANIFEST_V2) {
     if (!isObject(manifest?.evidence?.pairReport)) {
@@ -1223,7 +1394,18 @@ export function validateDeploymentReadiness(manifest) {
     if (!isObject(manifest?.evidence?.hxa) || manifest.evidence.hxa.status !== 'PASS') {
       errors.push(`Deploy mode requires evidence.hxa.status=PASS (found ${manifest?.evidence?.hxa?.status ?? '(missing)'})`);
     }
-    validateGlobalV2PreflightReceipt(manifest, errors, { mode: 'deploy' });
+    const receipt = validateGlobalV2PreflightReceipt(manifest, errors, { mode: 'deploy' });
+    if (receipt) {
+      validateGlobalV2RuntimeIdentity({
+        root: path.resolve(root),
+        receipt,
+        errors,
+        identityProbePath,
+        localHostname,
+        env,
+        runtimeRegistryPath: explicitRegistryPath,
+      });
+    }
   } else if (manifest?.evidence?.hxaProvenance !== 'PASS') {
     errors.push(`Deploy mode requires evidence.hxaProvenance=PASS (found ${manifest?.evidence?.hxaProvenance ?? '(missing)'})`);
   }
@@ -1281,6 +1463,8 @@ export function runGovernance({
   branch = null,
   manifestPath = null,
   identityProbePath = null,
+  localHostname = os.hostname(),
+  runtimeRegistryPath = null,
   env = process.env,
 } = {}) {
   const repoRoot = path.resolve(root);
@@ -1344,12 +1528,21 @@ export function runGovernance({
       packageName: metadata.packageName,
       repository: metadata.repository,
       identityProbePath,
+      localHostname,
+      env,
+      runtimeRegistryPath,
       mode,
     });
     errors.push(...manifest.errors);
     if (mode === 'deploy' && manifest.path && fs.existsSync(manifest.path)) {
       const deployManifest = readJson(manifest.path, 'Release manifest', errors);
-      if (deployManifest) errors.push(...validateDeploymentReadiness(deployManifest));
+      if (deployManifest) errors.push(...validateDeploymentReadiness(deployManifest, {
+        root: repoRoot,
+        identityProbePath,
+        localHostname,
+        env,
+        runtimeRegistryPath,
+      }));
     }
   }
 
