@@ -30,6 +30,13 @@ function requireGeneration(value, field = 'generation') {
   return value;
 }
 
+function requireAdmissionId(value) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError('admissionId must be a positive safe integer');
+  }
+  return value;
+}
+
 function requireClock(clock) {
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
   const current = clock();
@@ -126,10 +133,17 @@ export function openRuntimePendingQueue({
     LIMIT 1
   `);
   const selectAdmissionById = database.prepare(`${admissionProjection} WHERE id = ?`);
-  const selectAdmissionForFence = database.prepare(`
+  const selectAdmissionForIdentity = database.prepare(`
     ${admissionProjection}
+    WHERE id = ? AND request_id = ? AND turn_id = ? AND generation = ?
+    LIMIT 1
+  `);
+  const selectStartedEventForFence = database.prepare(`
+    SELECT payload_json
+    FROM assistant_response_events
     WHERE request_id = ? AND turn_id = ? AND generation = ?
-    ORDER BY id DESC
+      AND event_type = 'RunStarted'
+    ORDER BY sequence ASC
     LIMIT 1
   `);
   const selectCandidate = database.prepare(`
@@ -237,11 +251,13 @@ export function openRuntimePendingQueue({
   });
 
   const confirmStartedTransaction = database.transaction(({
+    admissionId,
     requestId,
     turnId,
     generation,
     runtimeSessionId,
   }) => {
+    const safeAdmissionId = requireAdmissionId(admissionId);
     const safeRequestId = requireText(requestId, 'requestId');
     const safeTurnId = requireText(turnId, 'turnId');
     const safeGeneration = requireGeneration(generation);
@@ -251,7 +267,8 @@ export function openRuntimePendingQueue({
       turnId: safeTurnId,
       generation: safeGeneration,
     });
-    const admission = selectAdmissionForFence.get(
+    const admission = selectAdmissionForIdentity.get(
+      safeAdmissionId,
       safeRequestId,
       safeTurnId,
       safeGeneration,
@@ -259,12 +276,29 @@ export function openRuntimePendingQueue({
     if (!admission) {
       throw domainError('RUNTIME_ADMISSION_NOT_FOUND', 'no runtime admission matches the run fence');
     }
-    if (admission.status === 'started') {
+    if (admission.status === 'started' || admission.status === 'completed') {
       if (admission.runtime_session_id !== safeRuntimeSessionId) {
         throw domainError(
           'RUNTIME_SESSION_CONFLICT',
           'runtime admission is already bound to another runtime session',
         );
+      }
+      if (admission.status === 'completed') {
+        const startedEvent = selectStartedEventForFence.get(
+          safeRequestId,
+          safeTurnId,
+          safeGeneration,
+        );
+        const startedPayload = startedEvent ? JSON.parse(startedEvent.payload_json) : null;
+        if (
+          admission.started_at === null
+          || startedPayload?.runtimeSessionId !== safeRuntimeSessionId
+        ) {
+          throw domainError(
+            'INVALID_RUNTIME_ADMISSION_STATE',
+            'completed admission has no matching confirmed start fact',
+          );
+        }
       }
       return {
         started: true,
@@ -361,11 +395,13 @@ export function openRuntimePendingQueue({
   });
 
   const releaseSubmittedTransaction = database.transaction(({
+    admissionId,
     requestId,
     turnId,
     generation,
     reason,
   }) => {
+    const safeAdmissionId = requireAdmissionId(admissionId);
     const safeRequestId = requireText(requestId, 'requestId');
     const safeTurnId = requireText(turnId, 'turnId');
     const safeGeneration = requireGeneration(generation);
@@ -375,7 +411,8 @@ export function openRuntimePendingQueue({
       turnId: safeTurnId,
       generation: safeGeneration,
     });
-    const admission = selectAdmissionForFence.get(
+    const admission = selectAdmissionForIdentity.get(
+      safeAdmissionId,
       safeRequestId,
       safeTurnId,
       safeGeneration,
@@ -398,12 +435,24 @@ export function openRuntimePendingQueue({
       );
     }
     const current = safeClock();
-    database.prepare(`
+    const releaseUpdate = database.prepare(`
       UPDATE runtime_turn_admissions
       SET status = 'released', terminal_at = ?, updated_at = ?,
           binding_mode = 'closed', terminal_reason = ?
-      WHERE id = ? AND status = 'submitted'
-    `).run(current, current, safeReason, admission.id);
+      WHERE id = ? AND request_id = ? AND turn_id = ? AND generation = ?
+        AND status = 'submitted'
+    `).run(
+      current,
+      current,
+      safeReason,
+      safeAdmissionId,
+      safeRequestId,
+      safeTurnId,
+      safeGeneration,
+    );
+    if (releaseUpdate.changes !== 1) {
+      throw domainError('RUNTIME_RELEASE_CONFLICT', 'runtime release lost its admission fence');
+    }
     return {
       released: true,
       replayed: false,

@@ -70,6 +70,7 @@ function claimAndStart(queue, options = {}) {
   const claim = queue.claimNext(options);
   assert.equal(claim.claimed, true);
   return queue.confirmStarted({
+    admissionId: claim.admission.id,
     requestId: claim.request.requestId,
     turnId: claim.request.turnId,
     generation: claim.request.generation,
@@ -116,6 +117,7 @@ test('claim reserves submitted capacity and only confirmed runtime binding start
   });
 
   const started = queue.confirmStarted({
+    admissionId: claim.admission.id,
     requestId: accepted.requestId,
     turnId: accepted.turnId,
     generation: accepted.generation,
@@ -133,6 +135,7 @@ test('claim reserves submitted capacity and only confirmed runtime binding start
   ]);
 
   const replay = queue.confirmStarted({
+    admissionId: claim.admission.id,
     requestId: accepted.requestId,
     turnId: accepted.turnId,
     generation: accepted.generation,
@@ -143,6 +146,7 @@ test('claim reserves submitted capacity and only confirmed runtime binding start
   assert.equal(ledger.listEvents(accepted.requestId).length, 3);
   assert.throws(
     () => queue.confirmStarted({
+      admissionId: claim.admission.id,
       requestId: accepted.requestId,
       turnId: accepted.turnId,
       generation: accepted.generation,
@@ -152,6 +156,7 @@ test('claim reserves submitted capacity and only confirmed runtime binding start
   );
   assert.throws(
     () => queue.confirmStarted({
+      admissionId: claim.admission.id,
       requestId: accepted.requestId,
       turnId: `${accepted.turnId}:stale`,
       generation: accepted.generation,
@@ -161,12 +166,23 @@ test('claim reserves submitted capacity and only confirmed runtime binding start
   );
   assert.throws(
     () => queue.confirmStarted({
+      admissionId: claim.admission.id,
       requestId: accepted.requestId,
       turnId: accepted.turnId,
       generation: accepted.generation + 1,
       runtimeSessionId: 'runtime-session-two-phase',
     }),
     error => error?.code === 'RUN_EVENT_FENCED',
+  );
+  assert.throws(
+    () => queue.confirmStarted({
+      admissionId: claim.admission.id + 1,
+      requestId: accepted.requestId,
+      turnId: accepted.turnId,
+      generation: accepted.generation,
+      runtimeSessionId: 'runtime-session-two-phase',
+    }),
+    error => error?.code === 'RUNTIME_ADMISSION_NOT_FOUND',
   );
 });
 
@@ -179,8 +195,10 @@ test('failed submit releases its reservation and stale unconfirmed submit advanc
   t.after(() => queue.close());
 
   const accepted = ledger.accept(command('31', 'lane:release')).request;
-  assert.equal(queue.claimNext().claimed, true);
+  const firstClaim = queue.claimNext();
+  assert.equal(firstClaim.claimed, true);
   const releaseInput = {
+    admissionId: firstClaim.admission.id,
     requestId: accepted.requestId,
     turnId: accepted.turnId,
     generation: accepted.generation,
@@ -218,6 +236,7 @@ test('failed submit releases its reservation and stale unconfirmed submit advanc
   ]);
   assert.throws(
     () => queue.confirmStarted({
+      admissionId: crashClaim.admission.id,
       requestId: accepted.requestId,
       turnId: accepted.turnId,
       generation: accepted.generation,
@@ -226,6 +245,73 @@ test('failed submit releases its reservation and stale unconfirmed submit advanc
     error => error?.code === 'RUN_EVENT_FENCED',
   );
   assert.equal(queue.claimNext().claimed, true);
+});
+
+test('released admission attempts cannot start or release a later claim with the same run fence', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+
+  const accepted = ledger.accept(command('33', 'lane:attempt-fence')).request;
+  const first = queue.claimNext();
+  const firstRelease = {
+    admissionId: first.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    reason: 'first_submit_failed',
+  };
+  assert.equal(queue.releaseSubmitted(firstRelease).replayed, false);
+
+  const second = queue.claimNext();
+  assert.equal(second.claimed, true);
+  assert.notEqual(second.admission.id, first.admission.id);
+  const lateFirstConfirm = {
+    admissionId: first.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: 'runtime-session:first-attempt',
+  };
+  assert.throws(
+    () => queue.confirmStarted(lateFirstConfirm),
+    error => error?.code === 'INVALID_RUNTIME_ADMISSION_STATE',
+  );
+  assert.equal(queue.getActive().id, second.admission.id);
+  assert.equal(queue.getActive().status, 'submitted');
+
+  const lateReleaseReplay = queue.releaseSubmitted(firstRelease);
+  assert.equal(lateReleaseReplay.released, true);
+  assert.equal(lateReleaseReplay.replayed, true);
+  assert.equal(lateReleaseReplay.admission.id, first.admission.id);
+  assert.equal(lateReleaseReplay.admission.status, 'released');
+  assert.equal(queue.getActive().id, second.admission.id);
+  assert.equal(queue.getActive().status, 'submitted');
+
+  const secondConfirm = {
+    admissionId: second.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: 'runtime-session:second-attempt',
+  };
+  const started = queue.confirmStarted(secondConfirm);
+  assert.equal(started.started, true);
+  assert.equal(started.replayed, false);
+  assert.equal(started.admission.id, second.admission.id);
+  complete(ledger, started.request);
+
+  const terminalReplay = queue.confirmStarted(secondConfirm);
+  assert.equal(terminalReplay.started, true);
+  assert.equal(terminalReplay.replayed, true);
+  assert.equal(terminalReplay.admission.id, second.admission.id);
+  assert.equal(terminalReplay.admission.status, 'completed');
+  assert.equal(terminalReplay.request.status, 'completed');
+  assert.equal(ledger.listEvents(accepted.requestId).filter(
+    event => event.type === 'RunStarted',
+  ).length, 1);
 });
 
 test('legacy submitted and started admissions occupy capacity and remain owned by the legacy recovery path', (t) => {

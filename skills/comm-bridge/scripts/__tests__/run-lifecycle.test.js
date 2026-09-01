@@ -98,6 +98,7 @@ function claimAndStart(queue, options = {}) {
   const claim = queue.claimNext(options);
   assert.equal(claim.claimed, true);
   return queue.confirmStarted({
+    admissionId: claim.admission.id,
     requestId: claim.request.requestId,
     turnId: claim.request.turnId,
     generation: claim.request.generation,
