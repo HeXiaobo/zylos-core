@@ -9,9 +9,14 @@ import path from 'node:path';
 import os from 'node:os';
 import { execSync, spawnSync } from 'node:child_process';
 import { SKILLS_DIR, ZYLOS_DIR, getZylosConfig } from './config.js';
-import { downloadArchive, downloadBranch } from './download.js';
+import { downloadBranch, downloadTag } from './download.js';
 import { generateManifest, saveMergeBaseline } from './manifest.js';
-import { fetchRawFile, fetchLatestTag, compareSemverDesc, sanitizeError } from './github.js';
+import {
+  fetchRawFile,
+  fetchLatestTagSelection,
+  compareSemverDesc,
+  sanitizeError,
+} from './github.js';
 import { copyTree, syncTree } from './fs-utils.js';
 import { getCommandHooks, hookScriptKey } from './hook-utils.js';
 import { isCoreManaged } from './sync-settings-hooks.js';
@@ -146,24 +151,85 @@ export function getCurrentVersion() {
 function getLatestVersion({ branch, beta = false } = {}) {
   // When --branch is specified, read package.json from that branch
   if (branch) {
+    const source = {
+      repo: REPO,
+      policy: 'explicit-ref',
+      tag: null,
+      ref: branch,
+    };
     try {
       const content = fetchRawFile(REPO, 'package.json', branch);
       const pkg = JSON.parse(content);
-      return { success: true, version: pkg.version };
+      return { success: true, version: pkg.version, source };
     } catch (err) {
-      return { success: false, error: `Cannot fetch latest version: ${sanitizeError(err.message)}` };
+      return {
+        success: false,
+        error: 'remote_version_failed',
+        message: `Cannot fetch latest version from ${REPO} at ${branch}: ${sanitizeError(err.message)}`,
+        source,
+      };
     }
   }
 
   // Default: tag-based detection (unified with component upgrades)
+  const source = {
+    repo: REPO,
+    policy: beta ? 'include-prerelease' : 'stable-only',
+    tag: null,
+    ref: null,
+  };
   try {
-    const tagVersion = fetchLatestTag(REPO, { includePrerelease: beta });
-    if (tagVersion) {
-      return { success: true, version: tagVersion };
+    const selection = fetchLatestTagSelection(REPO, { includePrerelease: beta });
+    if (selection.selected) {
+      return {
+        success: true,
+        version: selection.selected.version,
+        source: {
+          ...source,
+          tag: selection.selected.tag,
+          ref: selection.selected.ref,
+        },
+      };
     }
-    return { success: false, error: 'No release tags found' };
+    if (selection.tagCount === 0) {
+      return {
+        success: false,
+        error: 'no_repository_tags',
+        message: `No tags found in ${REPO}`,
+        source,
+      };
+    }
+    if (selection.releaseTagCount === 0) {
+      return {
+        success: false,
+        error: 'no_semver_release_tags',
+        message: `No semantic release tags found in ${REPO} (${selection.tagCount} repository tag(s) inspected)`,
+        source,
+      };
+    }
+    if (!beta && selection.latestPrerelease) {
+      const { version, tag, ref } = selection.latestPrerelease;
+      return {
+        success: false,
+        error: 'prerelease_tags_excluded',
+        message: `No stable release tags found in ${REPO}; prerelease tag ${tag} (${ref}) was excluded by the stable-only policy. Re-run with --beta to include prerelease tags.`,
+        source,
+        availablePrerelease: { version, tag, ref },
+      };
+    }
+    return {
+      success: false,
+      error: 'no_matching_release_tags',
+      message: `No release tags match the ${source.policy} policy in ${REPO}`,
+      source,
+    };
   } catch (err) {
-    return { success: false, error: `Cannot fetch latest version: ${sanitizeError(err.message)}` };
+    return {
+      success: false,
+      error: 'remote_version_failed',
+      message: `Cannot fetch latest version from ${REPO}: ${sanitizeError(err.message)}`,
+      source,
+    };
   }
 }
 
@@ -187,7 +253,7 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
 
   const latest = getLatestVersion({ branch, beta });
   if (!latest.success) {
-    return { success: false, error: 'remote_version_failed', message: latest.error };
+    return latest;
   }
 
   // Use semver comparison (not string inequality) to avoid suggesting downgrades.
@@ -199,6 +265,7 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
     hasUpdate,
     current: current.version,
     latest: latest.version,
+    source: latest.source,
   };
 }
 
@@ -210,7 +277,9 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
  * Download a zylos-core version to temp directory.
  *
  * @param {string} version
- * @returns {{ success: boolean, tempDir?: string, error?: string }}
+ * @param {string|null} branch
+ * @param {{ repo: string, policy: string, tag: string|null, ref: string, version?: string }} source
+ * @returns {{ success: boolean, tempDir?: string, error?: string, source?: object }}
  */
 function getWritableTmpBase(prefix = 'zylos-self-upgrade-probe-') {
   let base = os.tmpdir();
@@ -225,30 +294,39 @@ function getWritableTmpBase(prefix = 'zylos-self-upgrade-probe-') {
   return base;
 }
 
-export function downloadCoreToTemp(version, branch) {
+export function downloadCoreToTemp(version, branch, source) {
   const base = getWritableTmpBase('zylos-self-upgrade-probe-');
   const tempDir = fs.mkdtempSync(path.join(base, 'zylos-self-upgrade-'));
 
   if (branch) {
+    if (source?.repo !== REPO || source?.ref !== branch || source?.tag !== null) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return { success: false, error: `Invalid self-upgrade source for ${REPO}@${branch}`, source };
+    }
     const branchResult = downloadBranch(REPO, branch, tempDir);
     if (!branchResult.success) {
       fs.rmSync(tempDir, { recursive: true, force: true });
-      return { success: false, error: branchResult.error };
+      return { success: false, error: branchResult.error, source };
     }
-    return { success: true, tempDir };
+    return { success: true, tempDir, source };
   }
 
-  const result = downloadArchive(REPO, version, tempDir);
+  if (source?.repo !== REPO
+      || typeof source?.tag !== 'string'
+      || source.ref !== `refs/tags/${source.tag}`
+      || source.tag.replace(/^v/, '') !== version
+      || (source.version != null && source.version !== version)) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    return { success: false, error: `Invalid self-upgrade tag source for ${REPO}@${version}`, source };
+  }
+
+  const result = downloadTag(REPO, source.tag, tempDir);
   if (!result.success) {
-    // Fallback: try downloading main branch (for pre-release versions without tags)
-    const branchResult = downloadBranch(REPO, 'main', tempDir);
-    if (!branchResult.success) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-      return { success: false, error: result.error };
-    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    return { success: false, error: result.error, source };
   }
 
-  return { success: true, tempDir };
+  return { success: true, tempDir, source };
 }
 
 // ---------------------------------------------------------------------------

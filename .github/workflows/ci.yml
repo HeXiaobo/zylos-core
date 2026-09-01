@@ -1,0 +1,46 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # Do not execute package lifecycle scripts from an untrusted PR. The
+      # test suites only need the declared root dependencies; skill-level
+      # native modules (better-sqlite3) are installed explicitly below.
+      - name: Install root dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install skill-level test dependencies
+        run: node scripts/install-skill-deps.js
+
+      - name: Run jest and node test suites
+        # ZYLOS_E2E_SELF_UPGRADE is intentionally left unset: the
+        # real-pipeline self-upgrade e2e cases require a globally installed
+        # Core package and `pm2` on PATH, neither of which is provided on
+        # the hosted runner. Set ZYLOS_E2E_SELF_UPGRADE=1 on a self-hosted
+        # runner to exercise them.
+        run: npm test

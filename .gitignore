@@ -8,6 +8,7 @@ node_modules/
 .zylos/runtime-env.manifest
 test/integration/runtime/*.local.env
 test/integration/runtime/*.local.json
+test/integration/runtime/zylos-*
 
 # Agent worktrees (runtime artifact)
 .claude/worktrees/

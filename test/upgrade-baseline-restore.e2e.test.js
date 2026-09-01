@@ -92,7 +92,12 @@ afterAll(() => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-describe('runUpgrade owns the final baseline commit (#715)', () => {
+// Real self-upgrade pipeline: requires a globally installed Core package and
+// `pm2` on PATH. Hosted CI runners lack both, so the suite is opt-in via
+// ZYLOS_E2E_SELF_UPGRADE=1.
+const e2eDescribe = process.env.ZYLOS_E2E_SELF_UPGRADE === '1' ? describe : describe.skip;
+
+e2eDescribe('runUpgrade owns the final baseline commit (#715)', () => {
   test('component upgrade does not report an identical file missing from the saved manifest as conflict', () => {
     const name = 'identical-untracked-collision';
     const dest = installV1(name);

@@ -91,6 +91,15 @@ function curlDownloadOnce(repo, ref, refType, tarballPath) {
  */
 export function downloadArchive(repo, version, destDir) {
   const tag = version.startsWith('v') ? version : `v${version}`;
+  return downloadTag(repo, tag, destDir);
+}
+
+/**
+ * Download an exact GitHub tag without normalizing or inventing a prefix.
+ * Callers that obtained a tag from GitHub must use this interface so the
+ * selected immutable ref and the acquired archive cannot drift apart.
+ */
+export function downloadTag(repo, tag, destDir) {
   let tmpDir;
   try {
     tmpDir = createDownloadTmpDir();

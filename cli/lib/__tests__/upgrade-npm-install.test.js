@@ -55,16 +55,6 @@ function readNpmInvocations(logPath) {
   return invocations;
 }
 
-function withFakeBin(binDir, callback) {
-  const previousPath = process.env.PATH;
-  process.env.PATH = `${binDir}${path.delimiter}${previousPath}`;
-  try {
-    return callback();
-  } finally {
-    process.env.PATH = previousPath;
-  }
-}
-
 test('forward component install passes --omit=dev and --ignore-scripts to npm', () => {
   const component = 'demo-npm-forward';
   const skillDir = path.join(process.env.ZYLOS_DIR, '.claude', 'skills', component);
@@ -75,11 +65,15 @@ test('forward component install passes --omit=dev and --ignore-scripts to npm', 
   const binDir = createFakeBin(logPath);
 
   try {
-    const result = withFakeBin(binDir, () => runUpgrade(component, {
+    const result = runUpgrade(component, {
       tempDir: targetDir,
       newVersion: '2.0.0',
       jsonOutput: true,
-    }));
+      // Explicitly trusted tools: the fixtures live under the system tempdir,
+      // whose world-writable ancestors (e.g. /tmp on Linux CI) are rejected
+      // by the strict validation that PATH-discovered tools must pass.
+      tools: { pm2: path.join(binDir, 'pm2'), npm: path.join(binDir, 'npm'), trusted: true },
+    });
 
     assert.equal(result.success, true);
     assert.deepEqual(readNpmInvocations(logPath), [
@@ -106,11 +100,12 @@ test('rollback dependency reinstall also passes --omit=dev and --ignore-scripts'
   const binDir = createFakeBin(logPath);
 
   try {
-    const result = withFakeBin(binDir, () => runUpgrade(component, {
+    const result = runUpgrade(component, {
       tempDir: targetDir,
       newVersion: '2.0.0',
       jsonOutput: true,
-    }));
+      tools: { pm2: path.join(binDir, 'pm2'), npm: path.join(binDir, 'npm'), trusted: true },
+    });
 
     assert.equal(result.success, false);
     assert.equal(result.failedStep, 8);
