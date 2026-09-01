@@ -7,6 +7,8 @@ import { describe, it } from 'node:test';
 
 import {
   buildUpgradeCommands,
+  buildComponentReifyPlan,
+  buildSkillSetReifyPlan,
   buildNativeTaskConservationCommand,
   buildNativeTaskConservationEnv,
   buildNativeTaskConvergenceCommand,
@@ -27,6 +29,7 @@ import {
   validatePinnedTarget,
   validateRetentionRepairAuthorization,
 } from '../../../scripts/upgrade-fork-pair.js';
+import { generateManifest, saveManifest } from '../manifest.js';
 import {
   buildHxaProbeCommands,
   pathsReferToSameFile as hxaPathsReferToSameFile,
@@ -142,6 +145,116 @@ function writeFeishuFixture(root) {
 }
 
 describe('fork-pair upgrade target contract', () => {
+  it('reports exact smart-merge changes without pretending hook-final state is exact', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-pair-reify-plan-'));
+    try {
+      const source = path.join(root, 'source');
+      const destination = path.join(root, 'destination');
+      fs.mkdirSync(source);
+      fs.mkdirSync(destination);
+      fs.writeFileSync(path.join(destination, 'stable.js'), 'stable');
+      fs.mkdirSync(path.join(destination, 'references'));
+      fs.writeFileSync(path.join(destination, 'references', 'generated.md'), 'generated');
+      saveManifest(destination, generateManifest(destination));
+      fs.writeFileSync(path.join(destination, 'local.md'), 'local');
+      fs.writeFileSync(path.join(source, 'stable.js'), 'stable');
+
+      const componentPlan = buildComponentReifyPlan({
+        sourceDir: source,
+        destinationDir: destination,
+        postUpgradeHookPresent: true,
+      });
+
+      assert.equal(componentPlan.smartMerge.certainty, 'exact');
+      assert.deepEqual(componentPlan.smartMerge.changes.delete, [{
+        file: 'references/generated.md',
+        certainty: 'exact',
+        reason: 'tracked_upstream_removed_local_unmodified',
+        outcome: 'deleted',
+      }]);
+      assert.equal(componentPlan.finalState.certainty, 'conservative');
+      assert.match(componentPlan.finalState.reason, /post-upgrade hook/);
+      assert.equal(componentPlan.finalState.changes, null);
+      assert.equal(fs.existsSync(path.join(destination, 'references', 'generated.md')), true);
+
+      const sourceSkills = path.join(root, 'source-skills');
+      const destinationSkills = path.join(root, 'destination-skills');
+      fs.mkdirSync(path.join(sourceSkills, 'demo'), { recursive: true });
+      fs.mkdirSync(path.join(destinationSkills, 'demo'), { recursive: true });
+      fs.writeFileSync(path.join(sourceSkills, 'demo', 'new.js'), 'new');
+      const skillSetPlan = buildSkillSetReifyPlan({ sourceSkillsDir: sourceSkills, destinationSkillsDir: destinationSkills });
+      assert.deepEqual(skillSetPlan.smartMerge.changes.create.map(({ file }) => file), ['demo/new.js']);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects symlink roots in component and aggregate skill reify plans', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-pair-reify-symlink-root-'));
+    try {
+      const source = path.join(root, 'source');
+      const realDestination = path.join(root, 'real-destination');
+      const destinationLink = path.join(root, 'destination-link');
+      fs.mkdirSync(source);
+      fs.mkdirSync(realDestination);
+      fs.writeFileSync(path.join(source, 'new.js'), 'new');
+      fs.symlinkSync(realDestination, destinationLink);
+
+      const componentPlan = buildComponentReifyPlan({
+        sourceDir: source,
+        destinationDir: destinationLink,
+      });
+      assert.equal(componentPlan.smartMerge.certainty, 'unavailable');
+      assert.deepEqual(componentPlan.smartMerge.errors, [
+        `destination root is a symlink: ${destinationLink}`,
+      ]);
+
+      const sourceSkills = path.join(root, 'source-skills');
+      const realDestinationSkills = path.join(root, 'real-destination-skills');
+      const destinationSkillsLink = path.join(root, 'destination-skills-link');
+      fs.mkdirSync(path.join(sourceSkills, 'demo'), { recursive: true });
+      fs.mkdirSync(realDestinationSkills);
+      fs.writeFileSync(path.join(sourceSkills, 'demo', 'new.js'), 'new');
+      fs.symlinkSync(realDestinationSkills, destinationSkillsLink);
+
+      const skillSetPlan = buildSkillSetReifyPlan({
+        sourceSkillsDir: sourceSkills,
+        destinationSkillsDir: destinationSkillsLink,
+      });
+      assert.equal(skillSetPlan.smartMerge.certainty, 'unavailable');
+      assert.deepEqual(skillSetPlan.smartMerge.errors, [
+        `destination skills root is a symlink: ${destinationSkillsLink}`,
+      ]);
+      assert.equal(fs.existsSync(path.join(realDestinationSkills, 'demo')), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not silently omit a symlinked source skill from the aggregate plan', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-pair-reify-source-skill-link-'));
+    try {
+      const sourceSkills = path.join(root, 'source-skills');
+      const destinationSkills = path.join(root, 'destination-skills');
+      const externalSkill = path.join(root, 'external-skill');
+      fs.mkdirSync(sourceSkills);
+      fs.mkdirSync(destinationSkills);
+      fs.mkdirSync(externalSkill);
+      fs.writeFileSync(path.join(externalSkill, 'SKILL.md'), 'external');
+      fs.symlinkSync(externalSkill, path.join(sourceSkills, 'linked-skill'));
+
+      const plan = buildSkillSetReifyPlan({ sourceSkillsDir: sourceSkills, destinationSkillsDir: destinationSkills });
+
+      assert.equal(plan.smartMerge.certainty, 'unavailable');
+      assert.deepEqual(plan.smartMerge.errors, [
+        'linked-skill: source skill entry is a symlink',
+      ]);
+      assert.equal(fs.existsSync(path.join(destinationSkills, 'linked-skill')), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('recognizes a bootstrap entrypoint reached through a filesystem path alias', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-main-module-alias-'));
     try {

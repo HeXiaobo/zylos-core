@@ -68,20 +68,11 @@ function isBinaryFile(filePath) {
  * @returns {MergeResult}
  */
 export function smartSync(srcDir, destDir, opts = {}) {
-  const { backupDir, mode = 'merge' } = opts;
-
-  /** @type {MergeResult} */
-  const result = {
-    overwritten: [],
-    kept: [],
-    merged: [],
-    conflicts: [],
-    added: [],
-    deleted: [],
-    preserved: [],
-    errors: [],
-    nextManifest: null,
-  };
+  const safetyErrors = [
+    ...sourceTreeErrors(path.resolve(srcDir)),
+    ...destinationTreeErrors(path.resolve(destDir)),
+  ];
+  if (safetyErrors.length > 0) return emptyMergeResult(safetyErrors);
 
   // Repair any interrupted baseline transaction BEFORE reading the manifest
   // or originals — a half-committed baseline read here would misclassify
@@ -91,14 +82,231 @@ export function smartSync(srcDir, destDir, opts = {}) {
   } catch (err) {
     // Baseline is untrustworthy and was deliberately left untouched —
     // merging against it could corrupt user files. Abort the sync.
-    result.errors.push(`baseline recovery failed: ${err.message}`);
-    return result;
+    return emptyMergeResult([`baseline recovery failed: ${err.message}`]);
+  }
+
+  const plan = planSmartSync(srcDir, destDir, opts);
+  if (plan.errors.length > 0) return emptyMergeResult(plan.errors);
+  return reifySmartSyncPlan(plan);
+}
+
+function emptyMergeResult(errors = []) {
+  return {
+    overwritten: [],
+    kept: [],
+    merged: [],
+    conflicts: [],
+    added: [],
+    deleted: [],
+    preserved: [],
+    errors: [...errors],
+    nextManifest: null,
+  };
+}
+
+function isSafeRelativePath(relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0 || path.isAbsolute(relPath)) return false;
+  const normalized = path.normalize(relPath);
+  return normalized !== '..'
+    && !normalized.startsWith(`..${path.sep}`)
+    && normalized === relPath;
+}
+
+function lstatIfPresent(filePath) {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+const SMART_SYNC_TREE_EXCLUDES = new Set(['.git', 'node_modules', '.backup']);
+
+function treeSymlinkErrors(rootDir, role) {
+  const errors = [];
+
+  function visit(dir) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name);
+      const relPath = path.relative(rootDir, entryPath);
+      const stat = fs.lstatSync(entryPath);
+      if (stat.isSymbolicLink()) {
+        errors.push(`${relPath}: ${role} path is a symlink`);
+      } else if (SMART_SYNC_TREE_EXCLUDES.has(entry.name)) {
+        continue;
+      } else if (stat.isDirectory()) {
+        visit(entryPath);
+      }
+    }
+  }
+
+  visit(rootDir);
+  return errors;
+}
+
+function sourceTreeErrors(rootDir) {
+  const rootStat = lstatIfPresent(rootDir);
+  if (rootStat === null) return [`source root does not exist: ${rootDir}`];
+  if (rootStat.isSymbolicLink()) return [`source root is a symlink: ${rootDir}`];
+  if (!rootStat.isDirectory()) return [`source root is not a directory: ${rootDir}`];
+  return treeSymlinkErrors(rootDir, 'source');
+}
+
+function destinationRootErrors(rootDir) {
+  const rootStat = lstatIfPresent(rootDir);
+  if (rootStat === null) return [];
+  if (rootStat.isSymbolicLink()) return [`destination root is a symlink: ${rootDir}`];
+  if (!rootStat.isDirectory()) return [`destination root is not a directory: ${rootDir}`];
+  return [];
+}
+
+function destinationTreeErrors(rootDir) {
+  const rootErrors = destinationRootErrors(rootDir);
+  if (rootErrors.length > 0 || lstatIfPresent(rootDir) === null) return rootErrors;
+  return treeSymlinkErrors(rootDir, 'destination');
+}
+
+function destinationParentError(rootDir, targetPath) {
+  const relative = path.relative(rootDir, targetPath);
+  if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+    return 'destination path escapes its root';
+  }
+  const parts = relative.split(path.sep);
+  let current = rootDir;
+  for (const part of parts.slice(0, -1)) {
+    current = path.join(current, part);
+    const stat = lstatIfPresent(current);
+    if (stat === null) break;
+    if (stat.isSymbolicLink()) return 'destination path crosses a nested symlink';
+    if (!stat.isDirectory()) return 'destination path crosses a non-directory parent';
+  }
+  return null;
+}
+
+function publicChange(operation) {
+  const change = {
+    file: operation.file,
+    certainty: 'exact',
+    reason: operation.reason,
+  };
+  if (operation.outcome) change.outcome = operation.outcome;
+  if (operation.backupPath !== undefined) change.backupPath = operation.backupPath;
+  return change;
+}
+
+function addOperation(plan, operation) {
+  plan.operations.push(operation);
+  plan.changes[operation.action].push(publicChange(operation));
+}
+
+function operationDestinationError(plan, operation) {
+  if (!isSafeRelativePath(operation.file)) {
+    return `${operation.file}: unsafe operation path`;
+  }
+  const expectedPath = path.join(plan.destinationDir, operation.file);
+  if (path.resolve(operation.destFile) !== expectedPath) {
+    return `${operation.file}: destination operation path does not match its root`;
+  }
+  const parentError = destinationParentError(plan.destinationDir, expectedPath);
+  if (parentError) return `${operation.file}: ${parentError}`;
+
+  const stat = lstatIfPresent(expectedPath);
+  if (operation.action === 'create') {
+    return stat === null
+      ? null
+      : `${operation.file}: destination changed after planning: expected an absent path`;
+  }
+  if (stat === null || !stat.isFile() || stat.isSymbolicLink()) {
+    return `${operation.file}: destination changed after planning: expected a regular non-symlink file`;
+  }
+  return null;
+}
+
+function reifyPlanErrors(plan) {
+  if (!plan || plan.schema !== 'zylos.smart-sync-plan/v1') {
+    return ['invalid smart-sync plan'];
+  }
+  if (plan.errors.length > 0) return [...plan.errors];
+
+  const errors = [
+    ...sourceTreeErrors(plan.sourceDir),
+    ...destinationTreeErrors(plan.destinationDir),
+  ];
+  if (errors.length > 0) return errors;
+
+  const currentSourceManifest = generateManifest(plan.sourceDir);
+  if (!plan.nextManifest
+      || JSON.stringify(currentSourceManifest.files) !== JSON.stringify(plan.nextManifest.files)) {
+    return ['source tree changed after planning'];
+  }
+
+  for (const operation of plan.operations) {
+    const error = operationDestinationError(plan, operation);
+    if (error) errors.push(error);
+  }
+  return errors;
+}
+
+function recoveryResidue(destDir) {
+  const metadataDir = path.join(destDir, '.zylos');
+  return [
+    'manifest.json.tmp',
+    'originals.new',
+    'originals.bak',
+  ].filter((name) => fs.existsSync(path.join(metadataDir, name)));
+}
+
+/**
+ * Build the exact file-operation plan consumed by smartSync without changing
+ * the source, destination, manifest, originals, or conflict-backup trees.
+ * Interrupted baseline state is reported instead of repaired: recovery is a
+ * mutating transaction owned by smartSync, not by a dry-run caller.
+ *
+ * @param {string} srcDir
+ * @param {string} destDir
+ * @param {object} [opts]
+ * @param {string} [opts.backupDir]
+ * @param {string} [opts.mode]
+ * @returns {{schema: string, mode: string, sourceDir: string, destinationDir: string, changes: object, operations: object[], errors: string[], nextManifest: object|null}}
+ */
+export function planSmartSync(srcDir, destDir, opts = {}) {
+  const { backupDir = null, mode = 'merge' } = opts;
+  srcDir = path.resolve(srcDir);
+  destDir = path.resolve(destDir);
+  const plan = {
+    schema: 'zylos.smart-sync-plan/v1',
+    mode,
+    sourceDir: path.resolve(srcDir),
+    destinationDir: path.resolve(destDir),
+    changes: { create: [], update: [], delete: [], preserve: [], conflict: [] },
+    operations: [],
+    errors: [],
+    nextManifest: null,
+  };
+
+  if (mode !== 'merge' && mode !== 'overwrite') {
+    plan.errors.push(`unsupported smart sync mode: ${mode}`);
+    return plan;
+  }
+
+  plan.errors.push(...sourceTreeErrors(srcDir));
+  plan.errors.push(...destinationTreeErrors(destDir));
+  if (plan.errors.length > 0) return plan;
+
+  const residue = recoveryResidue(destDir);
+  if (residue.length > 0) {
+    plan.errors.push(`baseline recovery required before exact planning: ${residue.join(', ')}`);
+    return plan;
   }
 
   const savedManifest = loadManifest(destDir);
   const newManifest = generateManifest(srcDir);
   const diff3Available = isDiff3Available();
   const originalsExist = hasOriginals(destDir);
+  plan.nextManifest = newManifest;
 
   // Generate current manifest for comparison (if we have a saved one)
   let currentManifest;
@@ -107,40 +315,50 @@ export function smartSync(srcDir, destDir, opts = {}) {
   }
 
   for (const [relPath, newHash] of Object.entries(newManifest.files)) {
+    if (!isSafeRelativePath(relPath)) {
+      plan.errors.push(`${relPath}: unsafe source path`);
+      continue;
+    }
     const srcFile = path.join(srcDir, relPath);
     const destFile = path.join(destDir, relPath);
 
+    const parentError = destinationParentError(destDir, destFile);
+    if (parentError) {
+      plan.errors.push(`${relPath}: ${parentError}`);
+      continue;
+    }
+
+    const destStat = lstatIfPresent(destFile);
+
     // New file — just add it
-    if (!fs.existsSync(destFile)) {
-      try {
-        fs.mkdirSync(path.dirname(destFile), { recursive: true });
-        fs.copyFileSync(srcFile, destFile);
-        result.added.push(relPath);
-      } catch (err) {
-        result.errors.push(`${relPath}: add failed: ${err.message}`);
-      }
+    if (destStat === null) {
+      addOperation(plan, {
+        action: 'create', outcome: 'added', file: relPath, srcFile, destFile,
+        reason: 'destination_missing',
+      });
+      continue;
+    }
+
+    if (!destStat.isFile() || destStat.isSymbolicLink()) {
+      plan.errors.push(`${relPath}: destination is not a regular non-symlink file`);
       continue;
     }
 
     // Overwrite mode — skip merge logic, always overwrite
     if (mode === 'overwrite') {
-      try {
-        fs.copyFileSync(srcFile, destFile);
-        result.overwritten.push(relPath);
-      } catch (err) {
-        result.errors.push(`${relPath}: overwrite failed: ${err.message}`);
-      }
+      addOperation(plan, {
+        action: 'update', outcome: 'overwritten', file: relPath, srcFile, destFile,
+        reason: 'overwrite_mode',
+      });
       continue;
     }
 
     // No manifest — can't tell if user modified; treat as overwrite
     if (!savedManifest) {
-      try {
-        fs.copyFileSync(srcFile, destFile);
-        result.overwritten.push(relPath);
-      } catch (err) {
-        result.errors.push(`${relPath}: overwrite failed: ${err.message}`);
-      }
+      addOperation(plan, {
+        action: 'update', outcome: 'overwritten', file: relPath, srcFile, destFile,
+        reason: 'baseline_manifest_missing',
+      });
       continue;
     }
 
@@ -158,19 +376,11 @@ export function smartSync(srcDir, destDir, opts = {}) {
         continue;
       }
 
-      try {
-        if (backupDir) {
-          const backupPath = path.join(backupDir, relPath);
-          fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-          fs.copyFileSync(destFile, backupPath);
-          result.conflicts.push({ file: relPath, backupPath });
-        } else {
-          result.conflicts.push({ file: relPath, backupPath: null });
-        }
-        fs.copyFileSync(srcFile, destFile);
-      } catch (err) {
-        result.errors.push(`${relPath}: conflict handling failed: ${err.message}`);
-      }
+      addOperation(plan, {
+        action: 'conflict', outcome: 'conflict', file: relPath, srcFile, destFile,
+        backupPath: backupDir ? path.join(backupDir, relPath) : null,
+        reason: 'incoming_collides_with_untracked_local_file',
+      });
       continue;
     }
 
@@ -180,12 +390,10 @@ export function smartSync(srcDir, destDir, opts = {}) {
     if (!localModified) {
       // Local unmodified — safe to overwrite
       if (newChanged) {
-        try {
-          fs.copyFileSync(srcFile, destFile);
-          result.overwritten.push(relPath);
-        } catch (err) {
-          result.errors.push(`${relPath}: overwrite failed: ${err.message}`);
-        }
+        addOperation(plan, {
+          action: 'update', outcome: 'overwritten', file: relPath, srcFile, destFile,
+          reason: 'upstream_changed_local_unmodified',
+        });
       }
       // else: neither changed, nothing to do
       continue;
@@ -193,26 +401,21 @@ export function smartSync(srcDir, destDir, opts = {}) {
 
     if (!newChanged) {
       // Only local modified, new version unchanged — keep local
-      result.kept.push(relPath);
+      addOperation(plan, {
+        action: 'preserve', outcome: 'kept', file: relPath, destFile,
+        reason: 'local_changed_upstream_unchanged',
+      });
       continue;
     }
 
     // Both sides changed — attempt three-way merge
     // Skip text merge for binary files to avoid corruption
     if (isBinaryFile(destFile) || isBinaryFile(srcFile)) {
-      try {
-        if (backupDir) {
-          const backupPath = path.join(backupDir, relPath);
-          fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-          fs.copyFileSync(destFile, backupPath);
-          result.conflicts.push({ file: relPath, backupPath });
-        } else {
-          result.conflicts.push({ file: relPath, backupPath: null });
-        }
-        fs.copyFileSync(srcFile, destFile);
-      } catch (err) {
-        result.errors.push(`${relPath}: binary conflict handling failed: ${err.message}`);
-      }
+      addOperation(plan, {
+        action: 'conflict', outcome: 'conflict', file: relPath, srcFile, destFile,
+        backupPath: backupDir ? path.join(backupDir, relPath) : null,
+        reason: 'binary_changed_on_both_sides',
+      });
       continue;
     }
 
@@ -228,9 +431,11 @@ export function smartSync(srcDir, destDir, opts = {}) {
       try {
         const mergeResult = merge3(baseContent, localContent, newContent);
         if (mergeResult.clean) {
-          // Clean merge — write result
-          fs.writeFileSync(destFile, mergeResult.content);
-          result.merged.push(relPath);
+          addOperation(plan, {
+            action: 'update', outcome: 'merged', file: relPath, destFile,
+            content: mergeResult.content,
+            reason: 'clean_three_way_merge',
+          });
           continue;
         }
       } catch {
@@ -239,19 +444,13 @@ export function smartSync(srcDir, destDir, opts = {}) {
     }
 
     // Cannot merge (no originals, no diff3, or conflict) — overwrite + backup local
-    try {
-      if (backupDir) {
-        const backupPath = path.join(backupDir, relPath);
-        fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-        fs.copyFileSync(destFile, backupPath);
-        result.conflicts.push({ file: relPath, backupPath });
-      } else {
-        result.conflicts.push({ file: relPath, backupPath: null });
-      }
-      fs.copyFileSync(srcFile, destFile);
-    } catch (err) {
-      result.errors.push(`${relPath}: conflict handling failed: ${err.message}`);
-    }
+    addOperation(plan, {
+      action: 'conflict', outcome: 'conflict', file: relPath, srcFile, destFile,
+      backupPath: backupDir ? path.join(backupDir, relPath) : null,
+      reason: baseContent === null
+        ? 'merge_base_missing'
+        : diff3Available ? 'three_way_merge_conflict' : 'diff3_unavailable',
+    });
   }
 
   // Delete files that were in the old version but removed in the new version.
@@ -263,36 +462,96 @@ export function smartSync(srcDir, destDir, opts = {}) {
   if (savedManifest) {
     const newFiles = new Set(Object.keys(newManifest.files));
     for (const file of Object.keys(savedManifest.files)) {
+      if (!isSafeRelativePath(file)) {
+        plan.errors.push(`${file}: unsafe path in saved manifest`);
+        continue;
+      }
       if (!newFiles.has(file)) {
         const destFile = path.join(destDir, file);
-        try {
-          if (mode !== 'overwrite' && fs.existsSync(destFile) && hashFile(destFile) !== savedManifest.files[file]) {
-            // Upstream removed the file but the local copy was modified —
-            // preserve the local data instead of deleting it.
-            if (backupDir) {
-              const backupPath = path.join(backupDir, file);
-              fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-              fs.copyFileSync(destFile, backupPath);
-            }
-            result.preserved.push(file);
-            continue;
-          }
-          fs.unlinkSync(destFile);
-          result.deleted.push(file);
-          // Clean up empty parent directories
-          let dir = path.dirname(destFile);
-          while (dir !== destDir) {
-            const entries = fs.readdirSync(dir);
-            if (entries.length > 0) break;
-            fs.rmdirSync(dir);
-            dir = path.dirname(dir);
-          }
-        } catch (err) {
-          if (err.code !== 'ENOENT') {
-            result.errors.push(`${file}: delete failed: ${err.message}`);
-          }
+        const parentError = destinationParentError(destDir, destFile);
+        if (parentError) {
+          plan.errors.push(`${file}: tracked ${parentError}`);
+          continue;
+        }
+        const destStat = lstatIfPresent(destFile);
+        if (destStat === null) continue;
+        if (!destStat.isFile() || destStat.isSymbolicLink()) {
+          plan.errors.push(`${file}: tracked destination is not a regular non-symlink file`);
+          continue;
+        }
+        if (mode !== 'overwrite' && hashFile(destFile) !== savedManifest.files[file]) {
+          addOperation(plan, {
+            action: 'preserve', outcome: 'preserved', file, destFile,
+            backupPath: backupDir ? path.join(backupDir, file) : null,
+            reason: 'upstream_removed_local_modified',
+          });
+          continue;
+        }
+        addOperation(plan, {
+          action: 'delete', outcome: 'deleted', file, destFile,
+          reason: mode === 'overwrite'
+            ? 'overwrite_mode_upstream_removed'
+            : 'tracked_upstream_removed_local_unmodified',
+        });
+      }
+    }
+  }
+
+  if (plan.errors.length > 0) plan.nextManifest = null;
+  return plan;
+}
+
+export function reifySmartSyncPlan(plan) {
+  const validationErrors = reifyPlanErrors(plan);
+  if (validationErrors.length > 0) return emptyMergeResult(validationErrors);
+
+  const result = emptyMergeResult();
+
+  for (const operation of plan.operations) {
+    try {
+      const destinationError = operationDestinationError(plan, operation);
+      if (destinationError) {
+        result.errors.push(destinationError);
+        break;
+      }
+      if (operation.action === 'create') {
+        fs.mkdirSync(path.dirname(operation.destFile), { recursive: true });
+        fs.copyFileSync(operation.srcFile, operation.destFile);
+        result.added.push(operation.file);
+      } else if (operation.action === 'update' && operation.outcome === 'merged') {
+        fs.writeFileSync(operation.destFile, operation.content);
+        result.merged.push(operation.file);
+      } else if (operation.action === 'update') {
+        fs.copyFileSync(operation.srcFile, operation.destFile);
+        result.overwritten.push(operation.file);
+      } else if (operation.action === 'conflict') {
+        if (operation.backupPath) {
+          fs.mkdirSync(path.dirname(operation.backupPath), { recursive: true });
+          fs.copyFileSync(operation.destFile, operation.backupPath);
+        }
+        fs.copyFileSync(operation.srcFile, operation.destFile);
+        result.conflicts.push({ file: operation.file, backupPath: operation.backupPath });
+      } else if (operation.action === 'preserve' && operation.outcome === 'kept') {
+        result.kept.push(operation.file);
+      } else if (operation.action === 'preserve') {
+        if (operation.backupPath) {
+          fs.mkdirSync(path.dirname(operation.backupPath), { recursive: true });
+          fs.copyFileSync(operation.destFile, operation.backupPath);
+        }
+        result.preserved.push(operation.file);
+      } else if (operation.action === 'delete') {
+        fs.unlinkSync(operation.destFile);
+        result.deleted.push(operation.file);
+        let dir = path.dirname(operation.destFile);
+        while (dir !== plan.destinationDir) {
+          const entries = fs.readdirSync(dir);
+          if (entries.length > 0) break;
+          fs.rmdirSync(dir);
+          dir = path.dirname(dir);
         }
       }
+    } catch (err) {
+      result.errors.push(`${operation.file}: ${operation.action} failed: ${err.message}`);
     }
   }
 
@@ -306,7 +565,7 @@ export function smartSync(srcDir, destDir, opts = {}) {
   // baseline. On success, the caller commits this source-generated manifest
   // together with source originals at its own final success boundary.
   if (result.errors.length === 0) {
-    result.nextManifest = newManifest;
+    result.nextManifest = plan.nextManifest;
   }
 
   return result;
