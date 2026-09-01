@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { planSmartSync } from '../cli/lib/smart-merge.js';
 
 const CORE_REPO = 'HeXiaobo/zylos-core';
 const FEISHU_REPO = 'HeXiaobo/zylos-feishu';
@@ -291,6 +292,112 @@ export function buildUpgradeCommands({
         '--yes', '--skip-eval', '--json',
       ],
     },
+  };
+}
+
+function clonePlanChanges(changes, prefix = '') {
+  return Object.fromEntries(Object.entries(changes).map(([action, entries]) => [
+    action,
+    entries.map((entry) => ({ ...entry, file: `${prefix}${entry.file}` })),
+  ]));
+}
+
+/**
+ * Produce the structured, zero-write file plan for one component reify step.
+ * The smart-merge scope is exact because execute consumes the same planner.
+ * A later lifecycle hook makes the transaction-final tree conservative: an
+ * arbitrary hook can recreate, remove, or rewrite files after smart merge.
+ */
+export function buildComponentReifyPlan({
+  sourceDir,
+  destinationDir,
+  mode = 'merge',
+  postUpgradeHookPresent = false,
+} = {}) {
+  const plan = planSmartSync(sourceDir, destinationDir, { mode });
+  const changes = clonePlanChanges(plan.changes);
+  const smartMerge = {
+    scope: 'smart_merge',
+    mode,
+    certainty: plan.errors.length === 0 ? 'exact' : 'unavailable',
+    reason: plan.errors.length === 0
+      ? 'execute reifies this shared smart-sync plan'
+      : 'an exact smart-sync plan could not be produced',
+    changes,
+    errors: [...plan.errors],
+  };
+  const finalState = postUpgradeHookPresent
+    ? {
+      certainty: 'conservative',
+      reason: 'a post-upgrade hook runs after smart merge and may recreate, remove, or rewrite files',
+      changes: null,
+    }
+    : {
+      certainty: smartMerge.certainty,
+      reason: smartMerge.reason,
+      changes: smartMerge.certainty === 'exact' ? changes : null,
+    };
+
+  return {
+    schema: 'zylos.component-reify-plan/v1',
+    sourceDir: path.resolve(sourceDir),
+    destinationDir: path.resolve(destinationDir),
+    smartMerge,
+    finalState,
+  };
+}
+
+/** Aggregate Core's per-skill reify plans without creating missing skill dirs. */
+export function buildSkillSetReifyPlan({
+  sourceSkillsDir,
+  destinationSkillsDir,
+  mode = 'merge',
+} = {}) {
+  const changes = { create: [], update: [], delete: [], preserve: [], conflict: [] };
+  const errors = [];
+  const skills = [];
+  const sourceStat = fs.lstatSync(sourceSkillsDir, { throwIfNoEntry: false });
+  const destinationStat = fs.lstatSync(destinationSkillsDir, { throwIfNoEntry: false });
+
+  if (!sourceStat) {
+    errors.push(`source skills directory does not exist: ${sourceSkillsDir}`);
+  } else if (sourceStat.isSymbolicLink()) {
+    errors.push(`source skills root is a symlink: ${sourceSkillsDir}`);
+  } else if (!sourceStat.isDirectory()) {
+    errors.push(`source skills root is not a directory: ${sourceSkillsDir}`);
+  } else if (destinationStat?.isSymbolicLink()) {
+    errors.push(`destination skills root is a symlink: ${destinationSkillsDir}`);
+  } else if (destinationStat && !destinationStat.isDirectory()) {
+    errors.push(`destination skills root is not a directory: ${destinationSkillsDir}`);
+  } else {
+    const sourceEntries = fs.readdirSync(sourceSkillsDir, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of sourceEntries.filter((candidate) => candidate.isSymbolicLink())) {
+      errors.push(`${entry.name}: source skill entry is a symlink`);
+    }
+    const entries = sourceEntries.filter((entry) => entry.isDirectory());
+    for (const entry of entries) {
+      const skillPlan = planSmartSync(
+        path.join(sourceSkillsDir, entry.name),
+        path.join(destinationSkillsDir, entry.name),
+        { mode },
+      );
+      const prefixed = clonePlanChanges(skillPlan.changes, `${entry.name}/`);
+      for (const action of Object.keys(changes)) changes[action].push(...prefixed[action]);
+      errors.push(...skillPlan.errors.map((error) => `${entry.name}: ${error}`));
+      skills.push({ name: entry.name, errors: [...skillPlan.errors] });
+    }
+  }
+
+  const certainty = errors.length === 0 ? 'exact' : 'unavailable';
+  const reason = certainty === 'exact'
+    ? 'execute reifies each Core skill with the shared smart-sync plan'
+    : 'one or more Core skill plans could not be produced exactly';
+  return {
+    schema: 'zylos.skill-set-reify-plan/v1',
+    smartMerge: { scope: 'smart_merge', mode, certainty, reason, changes, errors },
+    finalState: { certainty, reason, changes: certainty === 'exact' ? changes : null },
+    skills,
   };
 }
 
@@ -2597,6 +2704,31 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
         }
       }
       summary.nativeTaskInputs = nativeTaskInputs;
+    }
+
+    const liveSkillsDir = path.join(zylosDir, '.claude', 'skills');
+    summary.reifyPlans = {
+      coreSkills: buildSkillSetReifyPlan({
+        sourceSkillsDir: path.join(stagedCoreDir, 'skills'),
+        destinationSkillsDir: liveSkillsDir,
+        mode: 'merge',
+      }),
+      feishu: buildComponentReifyPlan({
+        sourceDir: stagedFeishuDir,
+        destinationDir: liveFeishuDir,
+        mode: 'merge',
+        postUpgradeHookPresent: fileIsRegular(path.join(stagedFeishuDir, 'hooks', 'post-upgrade.js')),
+      }),
+    };
+    const reifyPlanErrors = [
+      ...summary.reifyPlans.coreSkills.smartMerge.errors,
+      ...summary.reifyPlans.feishu.smartMerge.errors.map((error) => `feishu: ${error}`),
+    ];
+    if (reifyPlanErrors.length > 0) {
+      throw new HoldError(
+        `exact reify plan unavailable: ${reifyPlanErrors.join('; ')}`,
+        'REIFY_PLAN_UNAVAILABLE',
+      );
     }
     atomicWriteJson(summaryPath, summary);
 
