@@ -186,6 +186,30 @@ describe('local component source resolution', () => {
     });
   });
 
+  it('normalizes an exact --branch SHA to an immutable commit source identity', async () => {
+    const sha = '0123456789abcdef0123456789abcdef01234567';
+
+    const resolved = await resolveTarget('example/zylos-demo', { branch: sha });
+
+    assert.deepEqual(resolved.source, {
+      type: 'github-release',
+      repo: 'example/zylos-demo',
+      ref: sha,
+      refType: 'commit',
+    });
+  });
+
+  it('keeps a named --branch source mutable', async () => {
+    const resolved = await resolveTarget('example/zylos-demo', { branch: 'release/candidate' });
+
+    assert.deepEqual(resolved.source, {
+      type: 'github-release',
+      repo: 'example/zylos-demo',
+      ref: 'release/candidate',
+      refType: 'branch',
+    });
+  });
+
   it('allows future acquire resolvers to be registered without changing add', () => {
     const root = makeTmpDir();
     const dest = path.join(root, 'dest');

@@ -10,6 +10,7 @@ import os from 'node:os';
 import { getGitHubToken, sanitizeError, withRateLimitRetrySync } from './github.js';
 import { copyTree } from './fs-utils.js';
 import { parseSkillMd } from './skill.js';
+import { FULL_COMMIT_SHA, isValidGitHubRepository } from './component-repo-override.js';
 
 function getWritableTmpBase() {
   let base = os.tmpdir();
@@ -226,6 +227,10 @@ const SOURCE_RESOLVERS = new Map();
 
 registerSourceResolver('github-release', {
   acquire(source, destDir) {
+    validateGitHubReleaseSource(source);
+    if (source.refType === 'commit') {
+      return downloadCommit(source.repo, source.ref, destDir);
+    }
     if (source.refType === 'branch') {
       return downloadBranch(source.repo, source.ref, destDir);
     }
@@ -255,6 +260,26 @@ registerSourceResolver('local-tarball', {
  * @returns {{ success: boolean, extractedDir: string, error?: string }}
  */
 export function downloadBranch(repo, branch, destDir) {
+  const refType = FULL_COMMIT_SHA.test(branch) ? 'commit' : 'branch';
+  return downloadGitHubRef(repo, branch, refType, destDir);
+}
+
+/**
+ * Download an immutable GitHub commit archive. The caller must already have
+ * normalized its identity to a full commit SHA.
+ */
+export function downloadCommit(repo, sha, destDir) {
+  if (!FULL_COMMIT_SHA.test(sha)) {
+    return {
+      success: false,
+      extractedDir: null,
+      error: 'Commit source ref must be a full 40-hex SHA',
+    };
+  }
+  return downloadGitHubRef(repo, sha, 'commit', destDir);
+}
+
+function downloadGitHubRef(repo, ref, refType, destDir) {
   let tmpDir;
   try {
     tmpDir = createDownloadTmpDir();
@@ -269,8 +294,7 @@ export function downloadBranch(repo, branch, destDir) {
 
   try {
     fs.mkdirSync(destDir, { recursive: true });
-    const refType = /^[0-9a-f]{40}$/i.test(branch) ? 'commit' : 'branch';
-    curlDownload(repo, branch, refType, tarballPath);
+    curlDownload(repo, ref, refType, tarballPath);
     const result = extractTarball(tarballPath, destDir);
     fs.rmSync(tmpDir, { recursive: true, force: true });
     return result;
@@ -279,8 +303,26 @@ export function downloadBranch(repo, branch, destDir) {
     return {
       success: false,
       extractedDir: null,
-      error: `Failed to download ${repo}@${branch}: ${sanitizeError(err.message)}`,
+      error: `Failed to download ${repo}@${ref}: ${sanitizeError(err.message)}`,
     };
+  }
+}
+
+function validateGitHubReleaseSource(source) {
+  if (!isValidGitHubRepository(source.repo)) {
+    throw new Error('github-release source repo must be owner/name');
+  }
+  if (typeof source.ref !== 'string' || source.ref.length === 0) {
+    throw new Error('github-release source ref is required');
+  }
+  if (!['commit', 'branch', 'tag'].includes(source.refType)) {
+    throw new Error('github-release source refType must be commit, branch, or tag');
+  }
+  if (source.refType === 'commit' && !FULL_COMMIT_SHA.test(source.ref)) {
+    throw new Error('commit source ref must be a full 40-hex SHA');
+  }
+  if (source.refType !== 'commit' && FULL_COMMIT_SHA.test(source.ref)) {
+    throw new Error('a full commit SHA must use refType commit');
   }
 }
 
