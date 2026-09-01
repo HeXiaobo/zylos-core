@@ -20,6 +20,8 @@ import { fileURLToPath } from 'node:url';
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const RELEASE_MANIFEST_V1 = 'zylos.release-manifest/v1';
+const RELEASE_MANIFEST_V2 = 'zylos.release-manifest/v2';
 const VERSION_KEYS = ['version', 'release', 'releaseVersion', 'packageVersion'];
 const TASK_BRANCH_PREFIXES = [
   'codex', 'feat', 'feature', 'fix', 'chore', 'docs', 'refactor', 'test',
@@ -617,6 +619,7 @@ export function validateReleaseManifest({
   localIdentity,
   identityProbePath,
   localHostname = os.hostname(),
+  mode = 'release',
 } = {}) {
   const repoRoot = path.resolve(root);
   const errors = [];
@@ -655,8 +658,13 @@ export function validateReleaseManifest({
   const manifestSha = manifestValue(manifest, target, ['sha', 'commit', 'commitSha', 'headSha']);
   const manifestVersion = manifestValue(manifest, target, ['version', 'release', 'packageVersion']);
 
-  if (manifest.schema !== undefined && manifest.schema !== 'zylos.release-manifest/v1') {
+  const manifestSchema = manifest.schema === undefined ? RELEASE_MANIFEST_V1 : manifest.schema;
+  const isGlobalV2Manifest = manifestSchema === RELEASE_MANIFEST_V2 && manifest.target === undefined;
+  if (![RELEASE_MANIFEST_V1, RELEASE_MANIFEST_V2].includes(manifestSchema)) {
     errors.push(`Release manifest schema is unsupported: ${manifest.schema}`);
+  }
+  if (manifestSchema === RELEASE_MANIFEST_V2 && manifest.target !== undefined) {
+    errors.push('Global v2 release manifest must not contain a per-agent target');
   }
   if (!releaseId) errors.push('Release manifest must declare releaseId');
   if (status !== 'READY') errors.push(`Release manifest status must be READY (found ${status ?? '(missing)'})`);
@@ -694,11 +702,14 @@ export function validateReleaseManifest({
   const targetAgent = asNonEmptyString(targetIdentity?.agent);
   const targetProfileId = asNonEmptyString(targetIdentity?.profileId);
   const targetHostname = asNonEmptyString(targetIdentity?.hostname);
-  if (!targetAgent) errors.push('Release manifest target.agent is required');
-  if (!targetProfileId) errors.push('Release manifest target.profileId is required');
-  if (!targetHostname) errors.push('Release manifest target.hostname is required');
+  const identityRequired = mode === 'deploy' || !isGlobalV2Manifest;
+  if (identityRequired) {
+    if (!targetAgent) errors.push('Release manifest target.agent is required');
+    if (!targetProfileId) errors.push('Release manifest target.profileId is required');
+    if (!targetHostname) errors.push('Release manifest target.hostname is required');
+  }
   let identityResult = null;
-  if (targetAgent && targetProfileId && targetHostname) {
+  if (identityRequired && targetAgent && targetProfileId && targetHostname) {
     identityResult = localIdentity
       ? { ok: true, identity: localIdentity, path: null }
       : probeLocalIdentity({ probePath: identityProbePath });
@@ -725,6 +736,7 @@ export function validateReleaseManifest({
     branch: manifestBranch,
     sha: manifestSha,
     version: manifestVersion,
+    schema: manifestSchema,
     target: { agent: targetAgent, profileId: targetProfileId, hostname: targetHostname },
     identity: identityResult?.identity || null,
   };
@@ -841,6 +853,7 @@ export function runGovernance({
       packageName: metadata.packageName,
       repository: metadata.repository,
       identityProbePath,
+      mode,
     });
     errors.push(...manifest.errors);
     if (mode === 'deploy' && manifest.path && fs.existsSync(manifest.path)) {

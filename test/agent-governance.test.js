@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import {
   classifyBranch,
   probeLocalIdentity,
+  runGovernance,
   validateNoVersionMetadataChanges,
   validateDeploymentReadiness,
   validateReleaseManifest,
@@ -151,6 +152,70 @@ describe('feature branch version gate', () => {
 });
 
 describe('external release manifest gate', () => {
+  test('accepts a global v2 release manifest without probing a per-agent identity', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-release-manifest.json');
+    writeJson(tempRoot, 'global-v2-release-manifest.json', {
+      schema: 'zylos.release-manifest/v2',
+      releaseId: 'demo-global-1.2.3-01',
+      status: 'READY',
+      deploymentAllowed: true,
+      candidate: {
+        core: {
+          repo: 'Acme/demo-core',
+          branch: 'main',
+          version: '1.2.3',
+          sha: fixture.baseSha,
+        },
+      },
+      deploymentContract: { targetMode: 'global' },
+    });
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.manifest).toMatchObject({
+      releaseId: 'demo-global-1.2.3-01',
+      status: 'READY',
+      deploymentAllowed: true,
+    });
+  });
+
+  test('keeps the deploy gate identity requirement for a global v2 manifest', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-deploy-manifest.json');
+    writeJson(tempRoot, 'global-v2-deploy-manifest.json', {
+      schema: 'zylos.release-manifest/v2',
+      releaseId: 'demo-global-1.2.3-02',
+      status: 'READY',
+      deploymentAllowed: true,
+      candidate: {
+        core: {
+          repo: 'Acme/demo-core',
+          branch: 'main',
+          version: '1.2.3',
+          sha: fixture.baseSha,
+        },
+      },
+      deploymentContract: { targetMode: 'global' },
+    });
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'deploy',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'deploy-probe-missing.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/target\.agent|required|identity probe/);
+  });
+
   test('uses a fresh HXA profile probe instead of trusting a command-line agent label', () => {
     const probePath = path.join(tempRoot, 'profile-cli.mjs');
     writeFile(tempRoot, 'profile-cli.mjs', `if (process.argv[2] !== 'profile') process.exit(2); console.log(${JSON.stringify(JSON.stringify({ name: 'ss', id: 'profile-ss' }))});\n`);
