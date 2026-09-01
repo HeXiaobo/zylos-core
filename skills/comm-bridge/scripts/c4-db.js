@@ -538,6 +538,134 @@ export function ensureAssistantRunLedgerSchema(database, options = {}) {
   }
 }
 
+/**
+ * Additive Core-owned storage for canonical reply outcomes and delivery facts.
+ * Adapter-local network attempts remain outside this database; these tables
+ * only hold the durable intent, adapter observations, and Core settlement.
+ */
+export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
+  ensureAssistantRunLedgerSchema(database, options);
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS assistant_reply_outcomes (
+      outcome_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL UNIQUE,
+      turn_id TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK (generation >= 1),
+      trace_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('answer', 'silent', 'failure')),
+      envelope_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS assistant_reply_intents (
+      intent_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      cause_kind TEXT NOT NULL CHECK (cause_kind IN ('run_terminal', 'task_effect')),
+      cause_event_id TEXT NOT NULL,
+      route_json TEXT NOT NULL,
+      route_hash TEXT NOT NULL,
+      disposition TEXT NOT NULL
+        CHECK (disposition IN ('send', 'failure_notice', 'task_receipt')),
+      payload_json TEXT NOT NULL,
+      envelope_json TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      canonical_hash TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (delivery_state IN (
+          'pending', 'sending', 'reconcile_required', 'retrying',
+          'accepted', 'unpresentable'
+        )),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      current_attempt_id TEXT,
+      lease_owner TEXT,
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      available_at INTEGER NOT NULL,
+      redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_reply_intents_ready
+      ON assistant_reply_intents(delivery_state, available_at, created_at, intent_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_reply_intents_request
+      ON assistant_reply_intents(request_id, created_at, intent_id);
+
+    CREATE TABLE IF NOT EXISTS assistant_delivery_receipts (
+      receipt_id TEXT PRIMARY KEY,
+      intent_id TEXT NOT NULL,
+      delivery_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      adapter_id TEXT NOT NULL,
+      outcome TEXT NOT NULL
+        CHECK (outcome IN ('platform_accepted', 'unknown', 'reconciled', 'rejected')),
+      envelope_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (intent_id) REFERENCES assistant_reply_intents(intent_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_delivery_receipts_intent
+      ON assistant_delivery_receipts(intent_id, created_at, receipt_id);
+
+    CREATE TABLE IF NOT EXISTS assistant_delivery_settlements (
+      settlement_id TEXT PRIMARY KEY,
+      intent_id TEXT NOT NULL,
+      delivery_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      adapter_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('accepted', 'unpresentable')),
+      basis TEXT NOT NULL CHECK (basis IN ('platform_accepted', 'reconciled', 'retry_exhausted')),
+      presented INTEGER NOT NULL CHECK (presented IN (0, 1)),
+      envelope_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (intent_id) REFERENCES assistant_reply_intents(intent_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_delivery_settlements_intent
+      ON assistant_delivery_settlements(intent_id, created_at, settlement_id);
+
+    CREATE TABLE IF NOT EXISTS assistant_event_consumers (
+      consumer_id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS assistant_event_deliveries (
+      consumer_id TEXT NOT NULL,
+      event_row_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'acknowledged')),
+      retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      available_at INTEGER NOT NULL,
+      lease_owner TEXT,
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      acknowledged_at INTEGER,
+      PRIMARY KEY (consumer_id, event_row_id),
+      FOREIGN KEY (consumer_id) REFERENCES assistant_event_consumers(consumer_id) ON DELETE RESTRICT,
+      FOREIGN KEY (event_row_id) REFERENCES assistant_response_events(id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_event_deliveries_ready
+      ON assistant_event_deliveries(consumer_id, status, available_at, event_row_id);
+  `);
+}
+
 function toCommitmentIntakeView(row) {
   if (!row) return null;
   return {
