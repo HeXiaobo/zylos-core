@@ -11,6 +11,7 @@ import {
 import {
   canonicalReplyIntentFailure,
   canonicalReplyOutcomeFailure,
+  canonicalVerifiedTaskEffectFailure,
 } from './canonical-reply-records.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
@@ -281,6 +282,47 @@ function buildTaskReceiptIntent(input) {
   };
 }
 
+function normalizeVerifiedTaskEffect(raw, intent) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw domainError('TASK_EFFECT_NOT_VERIFIED', 'task effect verifier returned no durable fact');
+  }
+  const verification = requireRecord(raw, 'task effect verification');
+  assertAllowedKeys(verification, [
+    'canonical', 'applied', 'eventId', 'effectId', 'taskId', 'requestId', 'traceId',
+    'route', 'disposition', 'payload',
+  ], 'task effect verification');
+  const route = normalizeRoute(verification.route, 'task effect route');
+  const payload = normalizeContent(verification.payload, 'task effect payload');
+  const fact = {
+    eventId: requireText(verification.eventId, 'task effect eventId'),
+    effectId: requireText(verification.effectId, 'task effect effectId'),
+    taskId: requireText(verification.taskId, 'task effect taskId'),
+    requestId: requireText(verification.requestId, 'task effect requestId'),
+    traceId: requireText(verification.traceId, 'task effect traceId'),
+    status: verification.applied === true ? 'applied' : 'not_applied',
+    route,
+    disposition: verification.disposition,
+    payload,
+  };
+  if (
+    verification.canonical !== true
+    || fact.status !== 'applied'
+    || fact.eventId !== intent.cause.eventId
+    || fact.effectId !== fact.eventId
+    || fact.requestId !== intent.requestId
+    || fact.traceId !== intent.traceId
+    || fact.disposition !== intent.disposition
+    || canonicalJson(fact.route) !== canonicalJson(intent.route)
+    || canonicalJson(fact.payload) !== canonicalJson(intent.payload)
+  ) {
+    throw domainError(
+      'TASK_EFFECT_NOT_VERIFIED',
+      'task effect must be canonical, applied, and fully linked to its ReplyIntent',
+    );
+  }
+  return fact;
+}
+
 function toEvent(row) {
   return row && {
     schemaVersion: 1,
@@ -366,15 +408,24 @@ export function openReplyOutcomeTransactions({
   const selectIntentById = database.prepare(`
     SELECT * FROM assistant_reply_intents WHERE intent_id = ?
   `);
+  const selectTaskEffectFact = database.prepare(`
+    SELECT * FROM assistant_verified_task_effects WHERE event_id = ?
+  `);
   const selectRequestFacts = database.prepare(`
     SELECT request_id, status, runtime_session_id, next_sequence
     FROM assistant_requests WHERE request_id = ?
   `);
   const selectAdmissionFacts = database.prepare(`
-    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
     FROM runtime_turn_admissions
     WHERE request_id = ? AND turn_id = ? AND generation = ?
     ORDER BY id DESC LIMIT 1
+  `);
+  const selectAllAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
+    FROM runtime_turn_admissions WHERE request_id = ? ORDER BY id ASC
   `);
 
   function requireCanonicalOutcome(row) {
@@ -393,6 +444,19 @@ export function openReplyOutcomeTransactions({
       throw domainError('CANONICAL_REPLY_INTENT_CORRUPT', `ReplyIntent failed validation: ${failure}`);
     }
     return JSON.parse(row.envelope_json);
+  }
+
+  function requireCanonicalTaskEffect(intentRow) {
+    const failure = canonicalVerifiedTaskEffectFailure(
+      selectTaskEffectFact.get(intentRow.cause_event_id),
+      intentRow,
+    );
+    if (failure) {
+      throw domainError(
+        'CANONICAL_TASK_EFFECT_CORRUPT',
+        `verified TaskEffect fact failed validation: ${failure}`,
+      );
+    }
   }
 
   function resultFor(requestId, replayed) {
@@ -460,6 +524,7 @@ export function openReplyOutcomeTransactions({
       run: selectRun.get(requestId),
       request: selectRequestFacts.get(requestId),
       admission: selectAdmissionFacts.get(requestId, turnId, generation),
+      admissions: selectAllAdmissionFacts.all(requestId),
     });
     if (persistenceFailure) {
       throw domainError(
@@ -701,6 +766,7 @@ export function openReplyOutcomeTransactions({
     const existing = selectIntentById.get(intent.intentId);
     if (existing) {
       requireCanonicalIntent(existing);
+      requireCanonicalTaskEffect(existing);
       if (existing.canonical_hash !== canonicalHash) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'ReplyIntent identity has another payload');
       }
@@ -724,24 +790,23 @@ export function openReplyOutcomeTransactions({
     if (verification && typeof verification.then === 'function') {
       throw new TypeError('taskEffectVerifier must be synchronous');
     }
-    if (
-      !verification
-      || verification.canonical !== true
-      || verification.applied !== true
-      || verification.eventId !== intent.cause.eventId
-      || verification.requestId !== intent.requestId
-      || verification.traceId !== intent.traceId
-    ) {
-      throw domainError(
-        'TASK_EFFECT_NOT_VERIFIED',
-        'task effect must be canonical, applied, and match requestId/traceId',
-      );
-    }
+    const taskEffect = normalizeVerifiedTaskEffect(verification, intent);
     const current = clock();
     if (!Number.isSafeInteger(current) || current < 0) {
       throw new TypeError('clock must return a non-negative safe integer');
     }
     const routeHash = intent.intentId.split(':').at(-1);
+    const factJson = canonicalJson(taskEffect);
+    database.prepare(`
+      INSERT INTO assistant_verified_task_effects (
+        event_id, effect_id, task_id, request_id, trace_id, route_json,
+        disposition, payload_json, fact_json, canonical_hash, applied_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      taskEffect.eventId, taskEffect.effectId, taskEffect.taskId, taskEffect.requestId,
+      taskEffect.traceId, canonicalJson(taskEffect.route), taskEffect.disposition,
+      canonicalJson(taskEffect.payload), factJson, sha256(factJson), current,
+    );
     database.prepare(`
       INSERT INTO assistant_reply_intents (
         intent_id, request_id, trace_id, cause_kind, cause_event_id,

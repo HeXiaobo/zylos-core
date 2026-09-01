@@ -104,7 +104,9 @@ function replaceCanonicalEventImmutabilityTriggers(database) {
   const replace = database.transaction(() => database.exec(`
     DROP TRIGGER IF EXISTS assistant_response_events_canonical_immutable;
     DROP TRIGGER IF EXISTS assistant_response_events_canonical_id_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_rowid_immutable;
     DROP TRIGGER IF EXISTS assistant_response_events_canonical_no_delete;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_no_replace;
     DROP TRIGGER IF EXISTS assistant_response_events_no_legacy_promotion;
 
     CREATE TRIGGER assistant_response_events_canonical_immutable
@@ -124,9 +126,31 @@ function replaceCanonicalEventImmutabilityTriggers(database) {
       SELECT RAISE(ABORT, 'canonical assistant event is immutable');
     END;
 
+    CREATE TRIGGER assistant_response_events_canonical_rowid_immutable
+    BEFORE UPDATE OF rowid ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
     CREATE TRIGGER assistant_response_events_canonical_no_delete
     BEFORE DELETE ON assistant_response_events
     WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+
+    CREATE TRIGGER assistant_response_events_canonical_no_replace
+    BEFORE INSERT ON assistant_response_events
+    WHEN NEW.event_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM assistant_response_events AS existing
+      WHERE existing.event_id = NEW.event_id
+         OR (existing.request_id = NEW.request_id AND existing.sequence = NEW.sequence)
+         OR (NEW.idempotency_key IS NOT NULL
+             AND existing.request_id = NEW.request_id
+             AND existing.idempotency_key = NEW.idempotency_key)
+    )
     BEGIN
       SELECT RAISE(ABORT, 'canonical assistant event is immutable');
     END;
@@ -139,6 +163,66 @@ function replaceCanonicalEventImmutabilityTriggers(database) {
     END;
   `));
   replace.immediate();
+}
+
+function ensureAssistantRequestsCancelledStatus(database) {
+  const definition = database.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'assistant_requests'
+  `).get()?.sql;
+  if (!definition || definition.includes("'cancelled'")) return;
+  const foreignKeysEnabled = database.pragma('foreign_keys', { simple: true }) === 1;
+  database.pragma('foreign_keys = OFF');
+  try {
+    const migrate = database.transaction(() => database.exec(`
+      CREATE TABLE assistant_requests_v2 (
+        request_id TEXT PRIMARY KEY,
+        conversation_id INTEGER UNIQUE,
+        route_channel TEXT NOT NULL,
+        route_endpoint TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        status TEXT NOT NULL
+          CHECK (status IN ('queued', 'started', 'completed', 'failed', 'cancelled')),
+        runtime_session_id TEXT,
+        next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
+        output_text TEXT NOT NULL DEFAULT '',
+        accepted_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        terminal_at INTEGER,
+        FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+      );
+
+      INSERT INTO assistant_requests_v2 (
+        request_id, conversation_id, route_channel, route_endpoint, source_id,
+        status, runtime_session_id, next_sequence, output_text,
+        accepted_at, updated_at, terminal_at
+      )
+      SELECT
+        request_id, conversation_id, route_channel, route_endpoint, source_id,
+        CASE
+          WHEN status = 'failed' AND EXISTS (
+            SELECT 1 FROM assistant_response_events AS event
+            WHERE event.request_id = assistant_requests.request_id
+              AND event.event_type = 'RunCancelled'
+          ) THEN 'cancelled'
+          ELSE status
+        END,
+        runtime_session_id, next_sequence, output_text,
+        accepted_at, updated_at, terminal_at
+      FROM assistant_requests;
+
+      DROP TABLE assistant_requests;
+      ALTER TABLE assistant_requests_v2 RENAME TO assistant_requests;
+      CREATE INDEX idx_assistant_requests_status_time
+        ON assistant_requests(status, accepted_at, request_id);
+      CREATE INDEX idx_assistant_requests_runtime
+        ON assistant_requests(runtime_session_id, status, updated_at);
+      CREATE INDEX idx_assistant_requests_route
+        ON assistant_requests(route_channel, route_endpoint, status, updated_at);
+    `));
+    migrate.immediate();
+  } finally {
+    if (foreignKeysEnabled) database.pragma('foreign_keys = ON');
+  }
 }
 
 function ensureConversationsSchema(database) {
@@ -239,7 +323,7 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       route_endpoint TEXT NOT NULL,
       source_id TEXT NOT NULL,
       status TEXT NOT NULL
-        CHECK (status IN ('queued', 'started', 'completed', 'failed')),
+        CHECK (status IN ('queued', 'started', 'completed', 'failed', 'cancelled')),
       runtime_session_id TEXT,
       next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
       output_text TEXT NOT NULL DEFAULT '',
@@ -352,6 +436,8 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
     CREATE INDEX IF NOT EXISTS idx_assistant_final_output_request
       ON assistant_final_output_candidates(request_id, id);
   `);
+
+  ensureAssistantRequestsCancelledStatus(database);
 
   const eventColumns = getColumnNames(database, 'assistant_response_events');
   if (!eventColumns.has('redrive_count')) {
@@ -678,6 +764,21 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       ON assistant_reply_intents(cause_event_id)
       WHERE cause_kind = 'run_terminal';
 
+    CREATE TABLE IF NOT EXISTS assistant_verified_task_effects (
+      event_id TEXT PRIMARY KEY,
+      effect_id TEXT NOT NULL UNIQUE,
+      task_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      route_json TEXT NOT NULL,
+      disposition TEXT NOT NULL CHECK (disposition = 'task_receipt'),
+      payload_json TEXT NOT NULL,
+      fact_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      applied_at INTEGER NOT NULL,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
     CREATE TABLE IF NOT EXISTS assistant_delivery_receipts (
       receipt_id TEXT PRIMARY KEY,
       intent_id TEXT NOT NULL,
@@ -719,6 +820,8 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
 
     CREATE INDEX IF NOT EXISTS idx_assistant_delivery_settlements_intent
       ON assistant_delivery_settlements(intent_id, created_at, settlement_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_delivery_settlements_one_terminal
+      ON assistant_delivery_settlements(intent_id);
 
     CREATE TABLE IF NOT EXISTS assistant_event_consumers (
       consumer_id TEXT PRIMARY KEY,
@@ -859,10 +962,18 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     DROP TRIGGER IF EXISTS assistant_reply_outcomes_no_delete;
     DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_immutable;
     DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_no_delete;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_rowid_immutable;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_no_replace;
+    DROP TRIGGER IF EXISTS assistant_verified_task_effects_immutable;
+    DROP TRIGGER IF EXISTS assistant_verified_task_effects_no_delete;
     DROP TRIGGER IF EXISTS assistant_delivery_receipts_immutable;
     DROP TRIGGER IF EXISTS assistant_delivery_receipts_no_delete;
     DROP TRIGGER IF EXISTS assistant_delivery_settlements_immutable;
     DROP TRIGGER IF EXISTS assistant_delivery_settlements_no_delete;
+    DROP TRIGGER IF EXISTS assistant_reply_outcomes_no_replace;
+    DROP TRIGGER IF EXISTS assistant_verified_task_effects_no_replace;
+    DROP TRIGGER IF EXISTS assistant_delivery_receipts_no_replace;
+    DROP TRIGGER IF EXISTS assistant_delivery_settlements_no_replace;
 
     CREATE TRIGGER assistant_reply_outcomes_immutable
     BEFORE UPDATE ON assistant_reply_outcomes
@@ -872,6 +983,16 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
 
     CREATE TRIGGER assistant_reply_outcomes_no_delete
     BEFORE DELETE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_outcomes_no_replace
+    BEFORE INSERT ON assistant_reply_outcomes
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_reply_outcomes
+      WHERE outcome_id = NEW.outcome_id OR request_id = NEW.request_id
+    )
     BEGIN
       SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
     END;
@@ -892,6 +1013,46 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
     END;
 
+    CREATE TRIGGER assistant_reply_intents_canonical_rowid_immutable
+    BEFORE UPDATE OF rowid ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_intents_canonical_no_replace
+    BEFORE INSERT ON assistant_reply_intents
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_reply_intents
+      WHERE intent_id = NEW.intent_id OR idempotency_key = NEW.idempotency_key
+        OR (NEW.cause_kind = 'run_terminal' AND cause_kind = 'run_terminal'
+            AND cause_event_id = NEW.cause_event_id)
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_verified_task_effects_immutable
+    BEFORE UPDATE ON assistant_verified_task_effects
+    BEGIN
+      SELECT RAISE(ABORT, 'verified TaskEffect fact is immutable');
+    END;
+
+    CREATE TRIGGER assistant_verified_task_effects_no_delete
+    BEFORE DELETE ON assistant_verified_task_effects
+    BEGIN
+      SELECT RAISE(ABORT, 'verified TaskEffect fact is immutable');
+    END;
+
+    CREATE TRIGGER assistant_verified_task_effects_no_replace
+    BEFORE INSERT ON assistant_verified_task_effects
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_verified_task_effects
+      WHERE event_id = NEW.event_id OR effect_id = NEW.effect_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'verified TaskEffect fact is immutable');
+    END;
+
     CREATE TRIGGER assistant_delivery_receipts_immutable
     BEFORE UPDATE ON assistant_delivery_receipts
     BEGIN
@@ -904,6 +1065,15 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
     END;
 
+    CREATE TRIGGER assistant_delivery_receipts_no_replace
+    BEFORE INSERT ON assistant_delivery_receipts
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_delivery_receipts WHERE receipt_id = NEW.receipt_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+    END;
+
     CREATE TRIGGER assistant_delivery_settlements_immutable
     BEFORE UPDATE ON assistant_delivery_settlements
     BEGIN
@@ -912,6 +1082,16 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
 
     CREATE TRIGGER assistant_delivery_settlements_no_delete
     BEFORE DELETE ON assistant_delivery_settlements
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_settlements_no_replace
+    BEFORE INSERT ON assistant_delivery_settlements
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_delivery_settlements
+      WHERE settlement_id = NEW.settlement_id OR intent_id = NEW.intent_id
+    )
     BEGIN
       SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');
     END;

@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 
 import { openAssistantResponseStream } from '../assistant-response-stream.js';
 import { openRunLedger } from '../run-ledger.js';
+import { openRuntimePendingQueue } from '../runtime-pending-queue.js';
 
 function temporaryDatabase(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-run-ledger-'));
@@ -136,6 +137,99 @@ test('accept fails closed when an idempotency or logical identity is reused with
   );
 });
 
+test('Core v1 intake, appendEvent and cancel reject unknown fields and wrong head causation', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  const command = acceptMessage({
+    idempotencyKey: 'strict:v1:accept',
+    commandId: 'command:strict-v1',
+    traceId: 'trace:strict-v1',
+    causationId: 'event:strict-v1',
+    source: { eventId: 'event:strict-v1', messageId: 'message:strict-v1' },
+  });
+  for (const mutation of [
+    { ...command, attacker: true },
+    { ...command, source: { ...command.source, attacker: true } },
+    { ...command, actor: { ...command.actor, attacker: true } },
+    { ...command, content: { ...command.content, attacker: true } },
+    { ...command, contextHints: { ...command.contextHints, attacker: true } },
+    { ...command, reply: { ...command.reply, attacker: true } },
+    { ...command, policy: { ...command.policy, attacker: true } },
+  ]) {
+    assert.throws(
+      () => ledger.accept(mutation),
+      error => error?.code === 'NONCANONICAL_V1_SHAPE',
+    );
+  }
+  const run = ledger.accept(command).request;
+  const claim = queue.claimNext();
+  const active = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    runtimeSessionId: 'runtime:strict-v1',
+  }).request;
+  const progress = {
+    type: 'ProgressUpdated',
+    requestId: active.requestId,
+    turnId: active.turnId,
+    generation: active.generation,
+    traceId: active.traceId,
+    causationId: ledger.listEvents(active.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${active.requestId}:progress:1`,
+    payload: { stage: 'working' },
+  };
+  assert.throws(
+    () => ledger.appendEvent({ ...progress, attacker: true }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+  assert.throws(
+    () => ledger.appendEvent({ ...progress, payload: { ...progress.payload, attacker: true } }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+  assert.throws(
+    () => ledger.appendEvent({ ...progress, causationId: 'evt:wrong:999' }),
+    error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN',
+  );
+  assert.equal(ledger.listEvents(active.requestId).length, 3);
+
+  const cancel = {
+    schemaVersion: 1,
+    type: 'CancelRequest',
+    commandId: 'cancel:strict-v1',
+    idempotencyKey: `cancel:${active.requestId}:g${active.generation}`,
+    requestId: active.requestId,
+    turnId: active.turnId,
+    generation: active.generation,
+    traceId: active.traceId,
+    causationId: 'cancel-event:strict-v1',
+    issuedAt: '2026-09-01T00:00:10.000Z',
+    source: {
+      adapterId: 'feishu', accountRef: 'account-1', eventType: 'message',
+      eventId: 'cancel-event:strict-v1', messageId: 'cancel-message:strict-v1',
+    },
+    actor: {
+      provider: 'feishu', tenantRef: 'tenant-1', externalId: 'user-1',
+      provenance: 'verified_channel_actor',
+    },
+    mode: 'cooperative',
+    reason: 'user_requested',
+  };
+  assert.throws(
+    () => ledger.cancel({ ...cancel, attacker: true }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+  assert.throws(
+    () => ledger.cancel({ ...cancel, source: { ...cancel.source, attacker: true } }),
+    error => error?.code === 'NONCANONICAL_V1_SHAPE',
+  );
+});
+
 test('different conversation lanes complete durable acceptance independently', async (t) => {
   const dbPath = temporaryDatabase(t);
   const firstLedger = openRunLedger({ dbPath });
@@ -217,11 +311,12 @@ test('openRunLedger alone installs immutable canonical Run Event identity and bo
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
   t.after(() => ledger.close());
-  const accepted = ledger.accept(acceptMessage('base-schema-immutable')).request;
+  const accepted = ledger.accept(acceptMessage()).request;
   const mutate = new Database(dbPath);
   for (const statement of [
     `UPDATE assistant_response_events SET payload_json = '{"attacker":true}' WHERE request_id = ? AND sequence = 1`,
     `UPDATE assistant_response_events SET id = 99 WHERE request_id = ? AND sequence = 1`,
+    `UPDATE assistant_response_events SET rowid = 99 WHERE request_id = ? AND sequence = 1`,
     `DELETE FROM assistant_response_events WHERE request_id = ? AND sequence = 1`,
   ]) {
     assert.throws(
@@ -229,5 +324,12 @@ test('openRunLedger alone installs immutable canonical Run Event identity and bo
       /canonical assistant event is immutable/,
     );
   }
+  assert.throws(
+    () => mutate.prepare(`
+      INSERT OR REPLACE INTO assistant_response_events
+      SELECT * FROM assistant_response_events WHERE request_id = ? AND sequence = 1
+    `).run(accepted.requestId),
+    /canonical assistant event is immutable/,
+  );
   mutate.close();
 });

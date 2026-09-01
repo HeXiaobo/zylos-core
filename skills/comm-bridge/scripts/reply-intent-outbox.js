@@ -9,6 +9,7 @@ import {
   canonicalDeliverySettlementFailure,
   canonicalReplyIntentFailure,
   canonicalRunTerminalIntentCauseFailure,
+  canonicalVerifiedTaskEffectFailure,
 } from './canonical-reply-records.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
@@ -247,14 +248,35 @@ export function openReplyIntentOutbox({
     FROM assistant_response_events WHERE request_id = ? ORDER BY sequence ASC
   `);
   const selectAdmissionFacts = database.prepare(`
-    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
     FROM runtime_turn_admissions
     WHERE request_id = ? AND turn_id = ? AND generation = ?
     ORDER BY id DESC LIMIT 1
   `);
+  const selectAllAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
+    FROM runtime_turn_admissions WHERE request_id = ? ORDER BY id ASC
+  `);
+  const selectTaskEffectFact = database.prepare(`
+    SELECT * FROM assistant_verified_task_effects WHERE event_id = ?
+  `);
 
   function requireCanonicalIntentCause(intent) {
-    if (intent.cause_kind !== 'run_terminal') return;
+    if (intent.cause_kind === 'task_effect') {
+      const failure = canonicalVerifiedTaskEffectFailure(
+        selectTaskEffectFact.get(intent.cause_event_id),
+        intent,
+      );
+      if (failure) {
+        throw domainError(
+          'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+          `ReplyIntent task effect cause failed validation: ${failure}`,
+        );
+      }
+      return;
+    }
     const run = selectRunFacts.get(intent.request_id);
     const failure = canonicalRunTerminalIntentCauseFailure({
       intentRow: intent,
@@ -265,6 +287,7 @@ export function openReplyIntentOutbox({
       admission: run
         ? selectAdmissionFacts.get(intent.request_id, run.turn_id, run.generation)
         : null,
+      admissions: selectAllAdmissionFacts.all(intent.request_id),
       events: selectRunEvents.all(intent.request_id),
     });
     if (failure) {
@@ -316,6 +339,12 @@ export function openReplyIntentOutbox({
     receipts.forEach(receipt => requireCanonicalReceipt(receipt, intent));
     const settlements = selectSettlementsForIntent.all(intent.intent_id);
     settlements.forEach(settlement => requireCanonicalSettlement(settlement, intent, receipts));
+    if (settlements.length > 1) {
+      throw domainError(
+        'CANONICAL_DELIVERY_LEDGER_CORRUPT',
+        'ReplyIntent has conflicting terminal DeliverySettlements',
+      );
+    }
     if (intent.delivery_state === 'accepted' && !settlements.some(row => row.state === 'accepted')) {
       throw domainError('CANONICAL_DELIVERY_LEDGER_CORRUPT', 'accepted delivery has no accepted Settlement');
     }

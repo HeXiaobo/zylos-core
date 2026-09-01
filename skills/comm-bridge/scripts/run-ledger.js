@@ -4,6 +4,11 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import {
+  canonicalRunEventFailure,
+  canonicalRunEventLinkFailure,
+  canonicalRunPersistenceFailure,
+} from './canonical-run-event.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantRunLedgerSchema } from './c4-db.js';
 
@@ -36,6 +41,16 @@ function requireRecord(value, field) {
     throw new TypeError(`${field} must be an object`);
   }
   return value;
+}
+
+function assertAllowedKeys(value, allowed, field) {
+  const unknown = Object.keys(value).filter(key => !allowed.includes(key));
+  if (unknown.length > 0) {
+    throw domainError(
+      'NONCANONICAL_V1_SHAPE',
+      `${field} contains unknown v1 fields: ${unknown.sort().join(', ')}`,
+    );
+  }
 }
 
 function requireText(value, field, maxLength = 8_192) {
@@ -81,6 +96,10 @@ function canonicalJson(value) {
 
 function normalizeEvent(raw) {
   const event = requireRecord(raw, 'run event');
+  assertAllowedKeys(event, [
+    'type', 'requestId', 'turnId', 'generation', 'traceId', 'causationId',
+    'producer', 'idempotencyKey', 'payload',
+  ], 'run event');
   const type = requireText(event.type, 'event.type');
   if (!RUN_EVENT_TYPES.has(type)) throw new TypeError(`unsupported run event type: ${type}`);
   const generation = event.generation;
@@ -88,6 +107,22 @@ function normalizeEvent(raw) {
     throw new TypeError('event.generation must be a positive integer');
   }
   const payload = requireRecord(event.payload ?? {}, 'event.payload');
+  const payloadKeys = {
+    RunAccepted: [],
+    RunQueued: event.producer === 'core:runtime-recovery'
+      ? ['runtimeLaneId', 'recoveredFromTurnId', 'recoveredAdmissionStatus']
+      : ['runtimeLaneId'],
+    RunStarted: ['runtimeLaneId', 'runtimeSessionId', 'contextSnapshotId', 'contextSnapshotHash'],
+    ProgressUpdated: ['stage'],
+    OutputDelta: ['deltaIndex', 'text'],
+    RunCompleted: ['outcomeId'],
+    RunFailed: ['outcomeId', 'code', 'retryable'],
+    RunCancelled: ['mode'],
+  }[type];
+  const allowedPayloadKeys = type === 'RunStarted'
+    ? payloadKeys.filter(key => Object.hasOwn(payload, key) || !key.startsWith('contextSnapshot'))
+    : payloadKeys;
+  assertAllowedKeys(payload, allowedPayloadKeys, `${type}.payload`);
   if (type === 'RunCompleted' || type === 'RunFailed') {
     requireText(payload.outcomeId, 'event.payload.outcomeId');
     for (const visibleField of ['text', 'content', 'output', 'outputText']) {
@@ -121,11 +156,34 @@ function normalizeEvent(raw) {
 
 function normalizeCancelRequest(raw) {
   const command = requireRecord(raw, 'CancelRequest');
+  assertAllowedKeys(command, [
+    'schemaVersion', 'type', 'commandId', 'idempotencyKey', 'requestId', 'turnId',
+    'generation', 'traceId', 'causationId', 'issuedAt', 'source', 'actor', 'mode', 'reason',
+  ], 'CancelRequest');
   if (command.schemaVersion !== 1 || command.type !== 'CancelRequest') {
     throw new TypeError('RunLedger.cancel requires a CancelRequest v1 command');
   }
   if (command.mode !== 'cooperative') {
     throw new TypeError('CancelRequest.mode must be cooperative');
+  }
+  requireText(command.issuedAt, 'CancelRequest.issuedAt');
+  const source = requireRecord(command.source, 'CancelRequest.source');
+  assertAllowedKeys(
+    source,
+    ['adapterId', 'accountRef', 'eventType', 'eventId', 'messageId'],
+    'CancelRequest.source',
+  );
+  for (const field of ['adapterId', 'accountRef', 'eventType', 'eventId', 'messageId']) {
+    requireText(source[field], `CancelRequest.source.${field}`);
+  }
+  const actor = requireRecord(command.actor, 'CancelRequest.actor');
+  assertAllowedKeys(
+    actor,
+    ['provider', 'tenantRef', 'externalId', 'provenance'],
+    'CancelRequest.actor',
+  );
+  for (const field of ['provider', 'tenantRef', 'externalId', 'provenance']) {
+    requireText(actor[field], `CancelRequest.actor.${field}`);
   }
   const generation = command.generation;
   if (!Number.isInteger(generation) || generation < 1) {
@@ -149,6 +207,9 @@ function normalizeCancelRequest(raw) {
 
 function normalizeCancellationConfirmation(raw) {
   const confirmation = requireRecord(raw, 'cancellation confirmation');
+  assertAllowedKeys(confirmation, [
+    'requestId', 'turnId', 'generation', 'traceId', 'causationId', 'producer',
+  ], 'cancellation confirmation');
   const generation = confirmation.generation;
   if (!Number.isInteger(generation) || generation < 1) {
     throw new TypeError('cancellation confirmation generation must be a positive integer');
@@ -165,6 +226,11 @@ function normalizeCancellationConfirmation(raw) {
 
 function normalizeAcceptMessage(raw) {
   const command = requireRecord(raw, 'AcceptMessage');
+  assertAllowedKeys(command, [
+    'schemaVersion', 'type', 'commandId', 'idempotencyKey', 'traceId', 'causationId',
+    'issuedAt', 'source', 'actor', 'content', 'contextHints', 'reply', 'policy',
+    'requestClass', 'conversationLaneKey',
+  ], 'AcceptMessage');
   if (command.schemaVersion !== 1 || command.type !== 'AcceptMessage') {
     throw new TypeError('RunLedger.accept requires an AcceptMessage v1 command');
   }
@@ -172,6 +238,26 @@ function normalizeAcceptMessage(raw) {
   const policy = requireRecord(command.policy, 'policy');
   const reply = requireRecord(command.reply, 'reply');
   const content = requireRecord(command.content, 'content');
+  const actor = requireRecord(command.actor, 'actor');
+  const contextHints = requireRecord(command.contextHints, 'contextHints');
+  assertAllowedKeys(source, [
+    'adapterId', 'accountRef', 'targetRef', 'conversationKey', 'messageId',
+    'eventId', 'eventType', 'payloadHash',
+  ], 'source');
+  assertAllowedKeys(actor, ['provider', 'tenantRef', 'externalId'], 'actor');
+  assertAllowedKeys(content, ['kind', 'text'], 'content');
+  assertAllowedKeys(contextHints, [
+    'threadRef', 'rootRef', 'parentRef', 'quoteRefs', 'mentionRefs', 'attachmentRefs',
+  ], 'contextHints');
+  assertAllowedKeys(reply, ['mode', 'targetRef'], 'reply');
+  assertAllowedKeys(policy, ['priority', 'requireIdle'], 'policy');
+  requireText(command.commandId, 'commandId');
+  requireText(command.issuedAt, 'issuedAt');
+  for (const field of ['provider', 'tenantRef', 'externalId']) requireText(actor[field], `actor.${field}`);
+  if (content.kind !== 'text') throw new TypeError('content.kind must be text');
+  for (const field of ['quoteRefs', 'mentionRefs', 'attachmentRefs']) {
+    if (!Array.isArray(contextHints[field])) throw new TypeError(`contextHints.${field} must be an array`);
+  }
   const requestClass = command.requestClass ?? 'ordinary';
   if (!REQUEST_CLASSES.has(requestClass)) {
     throw new TypeError('requestClass must be ordinary, maintenance, or control');
@@ -206,9 +292,7 @@ function normalizeAcceptMessage(raw) {
   }
   const targetRef = requireText(reply.targetRef ?? source.targetRef, 'reply.targetRef');
   const replyRoute = { adapterId, targetRef };
-  const renderedContent = content.kind === 'text'
-    ? requireText(content.text, 'content.text', 100_000)
-    : JSON.stringify(content);
+  const renderedContent = requireText(content.text, 'content.text', 100_000);
   return {
     idempotencyKey: requireText(command.idempotencyKey, 'idempotencyKey'),
     transportKey: identityKey([adapterId, accountRef, eventType, eventId]),
@@ -353,6 +437,41 @@ export function openRunLedger({
     ORDER BY sequence ASC
     LIMIT 1
   `);
+  const selectRequestFacts = database.prepare(`
+    SELECT request_id, status, runtime_session_id, next_sequence
+    FROM assistant_requests WHERE request_id = ?
+  `);
+  const selectAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
+    FROM runtime_turn_admissions
+    WHERE request_id = ? AND turn_id = ? AND generation = ?
+    ORDER BY id DESC LIMIT 1
+  `);
+  const selectAllAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
+    FROM runtime_turn_admissions WHERE request_id = ? ORDER BY id ASC
+  `);
+
+  function loadCanonicalRun(requestId) {
+    const run = selectRun.get(requestId);
+    if (!run) return null;
+    const failure = canonicalRunPersistenceFailure({
+      rows: selectEvents.all(requestId),
+      run,
+      request: selectRequestFacts.get(requestId),
+      admission: selectAdmissionFacts.get(requestId, run.turn_id, run.generation),
+      admissions: selectAllAdmissionFacts.all(requestId),
+    });
+    if (failure) {
+      throw domainError(
+        'CANONICAL_RUN_LEDGER_CORRUPT',
+        `RunLedger failed canonical persistence validation: ${failure}`,
+      );
+    }
+    return toRun(run);
+  }
 
   function acceptedResult(requestId, replayed) {
     const row = selectRun.get(requestId);
@@ -563,6 +682,35 @@ export function openRunLedger({
       SELECT next_sequence FROM assistant_requests WHERE request_id = ?
     `).get(event.requestId).next_sequence;
     const eventId = `evt:${event.requestId}:${sequence}`;
+    const canonicalEvent = {
+      request_id: event.requestId,
+      sequence,
+      event_type: event.type,
+      payload_json: event.payloadJson,
+      idempotency_key: event.idempotencyKey,
+      event_id: eventId,
+      turn_id: event.turnId,
+      generation: event.generation,
+      trace_id: event.traceId,
+      causation_id: event.causationId,
+      producer: event.producer,
+      created_at: current,
+    };
+    const structuralFailure = canonicalRunEventFailure(canonicalEvent);
+    if (structuralFailure) {
+      throw domainError(
+        'NONCANONICAL_RUN_EVENT',
+        `${event.type} failed canonical validation: ${structuralFailure}`,
+      );
+    }
+    const predecessor = selectEvents.all(event.requestId).at(-1);
+    const linkFailure = canonicalRunEventLinkFailure(canonicalEvent, predecessor);
+    if (linkFailure) {
+      throw domainError(
+        'NONCANONICAL_RUN_EVENT_CHAIN',
+        `${event.type} cannot extend the canonical head: ${linkFailure}`,
+      );
+    }
     insertEvent.run(
       event.requestId,
       sequence,
@@ -588,7 +736,6 @@ export function openRunLedger({
       const nextStatus = event.type === 'RunCompleted'
         ? 'completed'
         : event.type === 'RunFailed' ? 'failed' : 'cancelled';
-      const legacyStatus = nextStatus === 'cancelled' ? 'failed' : nextStatus;
       database.prepare(`
         UPDATE assistant_run_ledger
         SET status = ?, updated_at = ?, terminal_at = ?
@@ -598,7 +745,7 @@ export function openRunLedger({
         UPDATE assistant_requests
         SET status = ?, updated_at = ?, terminal_at = ?
         WHERE request_id = ?
-      `).run(legacyStatus, current, current, event.requestId);
+      `).run(nextStatus, current, current, event.requestId);
       database.prepare(`
         UPDATE runtime_turn_admissions
         SET status = 'completed', terminal_at = ?, updated_at = ?,
@@ -778,7 +925,7 @@ export function openRunLedger({
       return acceptTransaction.immediate(command);
     },
     get(requestId) {
-      return toRun(selectRun.get(requireText(requestId, 'requestId')));
+      return loadCanonicalRun(requireText(requestId, 'requestId'));
     },
     listEvents(requestId) {
       return selectEvents.all(requireText(requestId, 'requestId')).map(toEvent);

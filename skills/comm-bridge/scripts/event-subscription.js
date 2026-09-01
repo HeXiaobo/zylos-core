@@ -236,10 +236,16 @@ export function openEventSubscriptions({
     FROM assistant_requests WHERE request_id = ?
   `);
   const selectAdmissionFacts = database.prepare(`
-    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
     FROM runtime_turn_admissions
     WHERE request_id = ? AND turn_id = ? AND generation = ?
     ORDER BY id DESC LIMIT 1
+  `);
+  const selectAllAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status,
+           terminal_reason
+    FROM runtime_turn_admissions WHERE request_id = ? ORDER BY id ASC
   `);
   const selectRunChain = database.prepare(`${eventProjection} WHERE request_id = ? ORDER BY sequence ASC`);
   const selectConfirmedCancellation = database.prepare(`
@@ -415,6 +421,7 @@ export function openEventSubscriptions({
             admission: run
               ? selectAdmissionFacts.get(event.request_id, run.turn_id, run.generation)
               : null,
+            admissions: selectAllAdmissionFacts.all(event.request_id),
           });
           if (persistenceFailure) {
             degrade(consumerId, event.request_id, persistenceFailure, event.id, current);
@@ -736,6 +743,15 @@ export function openEventSubscriptions({
     );
   });
 
+  const getStateTransaction = database.transaction(({ consumerId, eventId }) => {
+    const safeConsumerId = requireText(consumerId, 'consumerId');
+    const safeEventId = requireText(eventId, 'eventId');
+    requireActiveConsumer(safeConsumerId, currentTime(clock));
+    const row = selectState.get(safeConsumerId, safeEventId);
+    if (row) requireActiveStream(safeConsumerId, row.request_id);
+    return toState(row);
+  });
+
   return Object.freeze({
     subscribe(input = {}) {
       const command = requireRecord(input, 'subscribe input');
@@ -770,11 +786,7 @@ export function openEventSubscriptions({
     getState(input = {}) {
       const command = requireRecord(input, 'getState input');
       assertAllowedKeys(command, ['consumerId', 'eventId'], 'getState input');
-      const { consumerId, eventId } = command;
-      return toState(selectState.get(
-        requireText(consumerId, 'consumerId'),
-        requireText(eventId, 'eventId'),
-      ));
+      return getStateTransaction.immediate(command);
     },
     getConsumer(input = {}) {
       const command = requireRecord(input, 'getConsumer input');

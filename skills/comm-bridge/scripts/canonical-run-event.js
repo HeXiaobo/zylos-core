@@ -275,6 +275,21 @@ export function canonicalRunEventLinkFailure(event, predecessor) {
   ) {
     return 'NONCANONICAL_EVENT_TRANSITION';
   }
+  if (event.event_type === 'RunQueued') {
+    const payload = JSON.parse(event.payload_json);
+    if (event.producer === 'core:runtime-recovery') {
+      if (
+        event.generation !== predecessor.generation + 1
+        || event.turn_id !== `turn:${event.request_id}:${event.generation}`
+        || payload.recoveredFromTurnId !== predecessor.turn_id
+      ) return 'NONCANONICAL_RECOVERY_FENCE_CHAIN';
+    } else if (
+      event.generation !== predecessor.generation
+      || event.turn_id !== predecessor.turn_id
+    ) {
+      return 'NONCANONICAL_RUN_FENCE_CHAIN';
+    }
+  }
   if (
     event.event_type === 'RunQueued'
     && event.producer === 'core:runtime-recovery'
@@ -309,7 +324,7 @@ export function canonicalRunEventChainFailure(rows) {
   return null;
 }
 
-export function canonicalRunPersistenceFailure({ rows, run, request, admission }) {
+export function canonicalRunPersistenceFailure({ rows, run, request, admission, admissions = [] }) {
   if (!run || !request) return 'RUN_LEDGER_FACTS_MISSING';
   if (!Array.isArray(rows) || rows.length === 0) return 'RUN_EVENT_CHAIN_MISSING';
   const chainFailure = canonicalRunEventChainFailure(rows);
@@ -333,13 +348,43 @@ export function canonicalRunPersistenceFailure({ rows, run, request, admission }
     || head.generation !== run.generation
     || head.trace_id !== run.trace_id
   ) return 'RUN_HEAD_LEDGER_FENCE_MISMATCH';
+  const terminalStatus = {
+    RunCompleted: 'completed',
+    RunFailed: 'failed',
+    RunCancelled: 'cancelled',
+  }[head.event_type];
+  if (terminalStatus && run.status !== terminalStatus) {
+    return 'RUN_TERMINAL_LEDGER_STATUS_MISMATCH';
+  }
+  if (!terminalStatus && ['completed', 'failed', 'cancelled'].includes(run.status)) {
+    return 'RUN_LEDGER_TERMINAL_WITHOUT_EVENT';
+  }
   const expectedRequestStatus = {
-    queued: 'queued', active: 'started', completed: 'completed', failed: 'failed', cancelled: 'failed',
+    queued: 'queued', active: 'started', completed: 'completed', failed: 'failed', cancelled: 'cancelled',
   }[run.status];
   if (expectedRequestStatus && request.status !== expectedRequestStatus) {
     return 'RUN_REQUEST_STATUS_MISMATCH';
   }
   const started = [...rows].reverse().find(event => event.event_type === 'RunStarted');
+  for (const recovered of rows.filter(event => (
+    event.event_type === 'RunQueued' && event.producer === 'core:runtime-recovery'
+  ))) {
+    const payload = JSON.parse(recovered.payload_json);
+    const priorAdmission = admissions.find(candidate => (
+      candidate.request_id === run.request_id
+      && candidate.turn_id === payload.recoveredFromTurnId
+      && candidate.generation === recovered.generation - 1
+    ));
+    const expectedReason = payload.recoveredAdmissionStatus === 'submitted'
+      ? 'stale_unconfirmed_submission_generation_fence'
+      : 'stale_started_generation_fence';
+    if (
+      !priorAdmission
+      || priorAdmission.status !== 'released'
+      || priorAdmission.runtime_lane_id !== 'runtime:shared'
+      || priorAdmission.terminal_reason !== expectedReason
+    ) return 'RUN_RECOVERY_ADMISSION_MISMATCH';
+  }
   if (started) {
     const payload = JSON.parse(started.payload_json);
     if (

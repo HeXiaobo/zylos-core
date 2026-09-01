@@ -50,6 +50,13 @@ function command(id, lane = `lane:${id}`, priority = 2) {
 }
 
 function eventFor(run, type, causationId, payload, overrides = {}) {
+  const suffix = {
+    ProgressUpdated: 'progress:1',
+    OutputDelta: 'delta:1',
+    RunCompleted: 'completed',
+    RunFailed: 'failed',
+    RunCancelled: `cancelled:g${run.generation}`,
+  }[type] ?? `${type}:${run.generation}`;
   return {
     type,
     requestId: run.requestId,
@@ -58,7 +65,7 @@ function eventFor(run, type, causationId, payload, overrides = {}) {
     traceId: run.traceId,
     causationId,
     producer: RUNTIME_LANE_ID,
-    idempotencyKey: `run:${run.requestId}:${type}:${run.generation}`,
+    idempotencyKey: `run:${run.requestId}:${suffix}`,
     payload,
     ...overrides,
   };
@@ -165,7 +172,7 @@ test('events preserve complete fenced identity, monotonic sequence, and exactly 
       started.eventId,
       { outcomeId: 'outcome:invalid', text: 'must not be embedded' },
     )),
-    error => error?.code === 'INVALID_TERMINAL_PAYLOAD',
+    error => ['INVALID_TERMINAL_PAYLOAD', 'NONCANONICAL_V1_SHAPE'].includes(error?.code),
   );
 
   const events = ledger.listEvents(run.requestId);

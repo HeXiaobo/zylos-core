@@ -62,6 +62,31 @@ function acceptMessage(id) {
   };
 }
 
+function cancelRequest(run, id) {
+  return {
+    schemaVersion: 1,
+    type: 'CancelRequest',
+    commandId: `cancel:${id}`,
+    idempotencyKey: `cancel:${run.requestId}:g${run.generation}`,
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: `cancel-requested:${id}`,
+    issuedAt: '2026-09-01T00:00:10.000Z',
+    source: {
+      adapterId: 'feishu', accountRef: 'account-1', eventType: 'message',
+      eventId: `cancel-event:${id}`, messageId: `cancel-message:${id}`,
+    },
+    actor: {
+      provider: 'feishu', tenantRef: 'tenant-1', externalId: 'user-1',
+      provenance: 'verified_channel_actor',
+    },
+    mode: 'cooperative',
+    reason: 'user_requested',
+  };
+}
+
 function createProgressEvents(t, dbPath) {
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
   const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
@@ -688,6 +713,58 @@ test('canonical-looking terminals require a durable matching ReplyOutcome', (t) 
   }
 });
 
+test('getState revalidates terminal event, RunLedger and request status integrity', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 100 });
+  const accepted = ledger.accept(acceptMessage('get-state-terminal-split')).request;
+  const admission = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: admission.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: 'runtime:get-state-terminal-split',
+  }).request;
+  replies.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Stable.' } },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: 'opaque:get-state-terminal-split' },
+      disposition: 'send',
+    },
+  });
+  const terminal = ledger.listEvents(run.requestId).at(-1);
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  subscriptions.subscribe({ consumerId: 'state-integrity', bootstrap: 'canonical_cutover' });
+  const claim = subscriptions.claimNext({ consumerId: 'state-integrity', ownerId: 'worker' });
+  assert.ok(claim);
+
+  const mutate = new Database(dbPath);
+  mutate.prepare(`UPDATE assistant_run_ledger SET status = 'failed' WHERE request_id = ?`)
+    .run(run.requestId);
+  mutate.prepare(`UPDATE assistant_requests SET status = 'failed' WHERE request_id = ?`)
+    .run(run.requestId);
+  mutate.close();
+
+  assert.throws(
+    () => subscriptions.getState({ consumerId: 'state-integrity', eventId: terminal.eventId }),
+    error => ['EVENT_STREAM_DEGRADED', 'EVENT_SUBSCRIPTION_DEGRADED'].includes(error?.code),
+  );
+  subscriptions.close();
+  replies.close();
+  queue.close();
+  ledger.close();
+});
+
 test('RunCompleted cannot jump directly from RunQueued even with a matching Outcome', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -832,19 +909,7 @@ test('RunCancelled rejects noncanonical idempotency and payload', (t) => {
 test('active RunCancelled cause must match its durable runtime confirmation', (t) => {
   const dbPath = temporaryDatabase(t);
   const { ledger, run } = createProgressEvents(t, dbPath);
-  ledger.cancel({
-    schemaVersion: 1,
-    type: 'CancelRequest',
-    commandId: 'cancel:bad-active-cause',
-    idempotencyKey: `cancel:${run.requestId}:g${run.generation}`,
-    requestId: run.requestId,
-    turnId: run.turnId,
-    generation: run.generation,
-    traceId: run.traceId,
-    causationId: 'cancel-requested:bad-active-cause',
-    mode: 'cooperative',
-    reason: 'user_requested',
-  });
+  ledger.cancel(cancelRequest(run, 'bad-active-cause'));
   ledger.confirmCancellation({
     requestId: run.requestId,
     turnId: run.turnId,
@@ -922,19 +987,7 @@ test('a canonical event after a terminal degrades the stream', (t) => {
 test('cooperative runtime cancellation remains a canonical terminal stream', (t) => {
   const dbPath = temporaryDatabase(t);
   const { ledger, run } = createProgressEvents(t, dbPath);
-  ledger.cancel({
-    schemaVersion: 1,
-    type: 'CancelRequest',
-    commandId: 'cancel:runtime-terminal',
-    idempotencyKey: `cancel:${run.requestId}:g${run.generation}`,
-    requestId: run.requestId,
-    turnId: run.turnId,
-    generation: run.generation,
-    traceId: run.traceId,
-    causationId: 'cancel-requested:runtime-terminal',
-    mode: 'cooperative',
-    reason: 'user_requested',
-  });
+  ledger.cancel(cancelRequest(run, 'runtime-terminal'));
   ledger.confirmCancellation({
     requestId: run.requestId,
     turnId: run.turnId,

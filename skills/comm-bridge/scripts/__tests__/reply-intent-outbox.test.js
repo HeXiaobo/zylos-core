@@ -86,6 +86,41 @@ function createAnswerIntent(t, dbPath, id, clock = () => 100) {
   return { ledger, run, intent: committed.intent };
 }
 
+function createFailureIntent(t, dbPath, id, clock = () => 100) {
+  const ledger = openRunLedger({ dbPath, clock });
+  const queue = openRuntimePendingQueue({ dbPath, clock });
+  const outcomes = openReplyOutcomeTransactions({ dbPath, clock });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => outcomes.close());
+  const accepted = ledger.accept(acceptMessage(id)).request;
+  const claim = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: `runtime:${id}`,
+  }).request;
+  const committed = outcomes.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:failed`,
+    outcome: { kind: 'failure', code: 'RUNTIME_FAILED', retryable: true },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: `opaque:${id}` },
+      disposition: 'failure_notice',
+      payload: { format: 'text', text: 'Unable to complete.' },
+    },
+  });
+  return { ledger, run, intent: committed.intent };
+}
+
 function recordReceiptForClaim(outbox, claim, receipt, overrides = {}) {
   return outbox.recordReceipt({
     action: claim.action,
@@ -185,6 +220,113 @@ test('run_terminal ReplyIntent claim validates durable Outcome identity and inta
   }
 });
 
+test('run_terminal ReplyIntent cannot outlive a terminal event/ledger/request status split', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { intent, ledger } = createAnswerIntent(t, dbPath, 'terminal-status-split');
+  const mutate = new Database(dbPath);
+  mutate.prepare(`UPDATE assistant_run_ledger SET status = 'failed' WHERE request_id = ?`)
+    .run(intent.requestId);
+  mutate.prepare(`UPDATE assistant_requests SET status = 'failed' WHERE request_id = ?`)
+    .run(intent.requestId);
+  mutate.close();
+
+  assert.throws(
+    () => ledger.get(intent.requestId),
+    error => error?.code === 'CANONICAL_RUN_LEDGER_CORRUPT',
+  );
+
+  const outbox = openReplyIntentOutbox({ dbPath, clock: () => 100 });
+  t.after(() => outbox.close());
+  assert.throws(
+    () => outbox.claimNext({ ownerId: 'adapter-a' }),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+  );
+  assert.throws(
+    () => outbox.get(intent.intentId),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+  );
+});
+
+test('RunFailed terminal payload must equal its canonical failure Outcome', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { intent } = createFailureIntent(t, dbPath, 'failure-payload-link');
+  const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER assistant_reply_outcomes_immutable');
+  const row = mutate.prepare(`SELECT envelope_json FROM assistant_reply_outcomes WHERE request_id = ?`)
+    .get(intent.requestId);
+  const envelope = { ...JSON.parse(row.envelope_json), code: 'DIFFERENT_FAILURE' };
+  const envelopeJson = canonicalJson(envelope);
+  mutate.prepare(`
+    UPDATE assistant_reply_outcomes
+    SET envelope_json = ?, canonical_hash = ?
+    WHERE request_id = ?
+  `).run(envelopeJson, sha256(envelopeJson), intent.requestId);
+  mutate.close();
+
+  const outbox = openReplyIntentOutbox({ dbPath, clock: () => 100 });
+  t.after(() => outbox.close());
+  assert.throws(
+    () => outbox.claimNext({ ownerId: 'adapter-a' }),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+  );
+});
+
+test('task_effect ReplyIntent cannot be claimed after its durable TaskEffect fact is orphaned', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const run = ledger.accept(acceptMessage('orphan-task-effect')).request;
+  const command = {
+    requestId: run.requestId,
+    traceId: run.traceId,
+    cause: { kind: 'task_effect', eventId: 'task-effect:orphan:applied' },
+    route: { adapterId: 'feishu', targetRef: 'opaque:orphan-task-effect' },
+    disposition: 'task_receipt',
+    payload: { format: 'text', text: 'Task created.' },
+  };
+  const replies = openReplyOutcomeTransactions({
+    dbPath,
+    clock: () => 101,
+    taskEffectVerifier: () => ({
+      canonical: true,
+      applied: true,
+      eventId: command.cause.eventId,
+      effectId: command.cause.eventId,
+      taskId: 'task:orphan',
+      requestId: command.requestId,
+      traceId: command.traceId,
+      route: command.route,
+      disposition: command.disposition,
+      payload: command.payload,
+    }),
+  });
+  const committed = replies.commitTaskReceipt(command);
+  replies.close();
+  ledger.close();
+
+  const mutate = new Database(dbPath);
+  const exists = mutate.prepare(`
+    SELECT 1 FROM sqlite_master
+    WHERE type = 'table' AND name = 'assistant_verified_task_effects'
+  `).get();
+  if (exists) {
+    mutate.exec('DROP TRIGGER assistant_verified_task_effects_no_delete');
+    mutate.prepare(`DELETE FROM assistant_verified_task_effects WHERE event_id = ?`)
+      .run(command.cause.eventId);
+  }
+  mutate.close();
+
+  const outbox = openReplyIntentOutbox({ dbPath, clock: () => 102 });
+  t.after(() => outbox.close());
+  assert.throws(
+    () => outbox.claimNext({ ownerId: 'adapter-a' }),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+  );
+  assert.throws(
+    () => outbox.get(committed.intent.intentId),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CAUSE_INVALID',
+  );
+});
+
 test('ReplyIntent identity/body and DeliveryReceipt/Settlement rows are immutable', (t) => {
   const dbPath = temporaryDatabase(t);
   const { run, intent } = createAnswerIntent(t, dbPath, 'immutable-delivery-ledger');
@@ -234,6 +376,26 @@ test('ReplyIntent identity/body and DeliveryReceipt/Settlement rows are immutabl
   );
   assert.throws(
     () => mutate.prepare(`DELETE FROM assistant_delivery_settlements WHERE intent_id = ?`).run(intent.intentId),
+    /immutable/,
+  );
+  assert.throws(
+    () => mutate.prepare(`
+      INSERT INTO assistant_delivery_settlements (
+        settlement_id, intent_id, delivery_id, request_id, trace_id, adapter_id,
+        state, basis, presented, envelope_json, canonical_hash, created_at
+      )
+      SELECT
+        'settlement:attacker', intent_id, delivery_id, request_id, trace_id, adapter_id,
+        state, basis, presented, envelope_json, canonical_hash, created_at
+      FROM assistant_delivery_settlements WHERE intent_id = ?
+    `).run(intent.intentId),
+    /immutable|UNIQUE/,
+  );
+  assert.throws(
+    () => mutate.prepare(`
+      INSERT OR REPLACE INTO assistant_delivery_settlements
+      SELECT * FROM assistant_delivery_settlements WHERE intent_id = ?
+    `).run(intent.intentId),
     /immutable/,
   );
   mutate.close();

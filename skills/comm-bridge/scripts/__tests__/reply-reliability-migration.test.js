@@ -231,7 +231,20 @@ test('previous run-ledger rows gain a conservative required reply policy and can
 
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
   t.after(() => ledger.close());
-  assert.deepEqual(ledger.get('assistant.previous-run-ledger').replyPolicy, {
+  assert.throws(
+    () => ledger.get('assistant.previous-run-ledger'),
+    error => error?.code === 'CANONICAL_RUN_LEDGER_CORRUPT',
+  );
+  const inspect = new Database(dbPath, { readonly: true });
+  const migrated = inspect.prepare(`
+    SELECT reply_mode, reply_route_json
+    FROM assistant_run_ledger WHERE request_id = ?
+  `).get('assistant.previous-run-ledger');
+  inspect.close();
+  assert.deepEqual({
+    mode: migrated.reply_mode,
+    route: JSON.parse(migrated.reply_route_json),
+  }, {
     mode: 'required',
     route: {
       adapterId: 'feishu',

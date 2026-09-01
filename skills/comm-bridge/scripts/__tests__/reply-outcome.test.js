@@ -80,6 +80,22 @@ function answerCommand(ledger, run, id, text = 'Stable answer.') {
   };
 }
 
+function verifiedTaskEffect(command, overrides = {}) {
+  return {
+    canonical: true,
+    applied: true,
+    eventId: command.cause.eventId,
+    effectId: command.cause.eventId,
+    taskId: `task:${command.cause.eventId}`,
+    requestId: command.requestId,
+    traceId: command.traceId,
+    route: command.route,
+    disposition: command.disposition,
+    payload: command.payload,
+    ...overrides,
+  };
+}
+
 test('answer commits one canonical outcome, terminal and pending intent atomically', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -227,14 +243,16 @@ test('terminal write atomically fences request.next_sequence against the canonic
       () => replies.commitRunOutcome(answerCommand(ledger, run, id)),
       error => error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
     );
-    assert.equal(ledger.get(run.requestId).status, 'active');
     const inspect = new Database(dbPath, { readonly: true });
     assert.deepEqual(inspect.prepare(`
       SELECT
+        (SELECT status FROM assistant_run_ledger WHERE request_id = ?) AS status,
         (SELECT COUNT(*) FROM assistant_reply_outcomes WHERE request_id = ?) AS outcomes,
         (SELECT COUNT(*) FROM assistant_reply_intents WHERE request_id = ?) AS intents,
         (SELECT COUNT(*) FROM assistant_response_events WHERE request_id = ? AND event_type = 'RunCompleted') AS terminals
-    `).get(run.requestId, run.requestId, run.requestId), { outcomes: 0, intents: 0, terminals: 0 });
+    `).get(run.requestId, run.requestId, run.requestId, run.requestId), {
+      status: 'active', outcomes: 0, intents: 0, terminals: 0,
+    });
     inspect.close();
     // Release the global WT01 admission so the second adversarial run can start.
     if (id === 'sequence-gap') {
@@ -266,7 +284,10 @@ test('terminal write binds RunAccepted and RunStarted to ledger and admission fa
       () => replies.commitRunOutcome(answerCommand(ledger, run, `ledger-link-${scenario}`)),
       error => error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
     );
-    assert.equal(ledger.get(run.requestId).status, 'active');
+    const inspect = new Database(dbPath, { readonly: true });
+    assert.equal(inspect.prepare(`SELECT status FROM assistant_run_ledger WHERE request_id = ?`)
+      .get(run.requestId).status, 'active');
+    inspect.close();
     replies.close();
     queue.close();
     ledger.close();
@@ -351,15 +372,16 @@ test('malformed canonical-looking ProgressUpdated head cannot authorize a termin
     error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN',
   );
 
-  assert.equal(ledger.get(run.requestId).status, 'active');
   const inspect = new Database(dbPath, { readonly: true });
   assert.deepEqual(inspect.prepare(`
     SELECT
+      (SELECT status FROM assistant_run_ledger WHERE request_id = ?) AS status,
       (SELECT COUNT(*) FROM assistant_reply_outcomes WHERE request_id = ?) AS outcomes,
       (SELECT COUNT(*) FROM assistant_reply_intents WHERE request_id = ?) AS intents,
       (SELECT COUNT(*) FROM assistant_response_events
        WHERE request_id = ? AND event_type IN ('RunCompleted', 'RunFailed')) AS terminals
-  `).get(run.requestId, run.requestId, run.requestId), {
+  `).get(run.requestId, run.requestId, run.requestId, run.requestId), {
+    status: 'active',
     outcomes: 0,
     intents: 0,
     terminals: 0,
@@ -399,7 +421,14 @@ test('malformed RunStarted head cannot authorize a terminal write', (t) => {
     }),
     error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN',
   );
-  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.throws(
+    () => ledger.get(run.requestId),
+    error => error?.code === 'CANONICAL_RUN_LEDGER_CORRUPT',
+  );
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.equal(inspect.prepare(`SELECT status FROM assistant_run_ledger WHERE request_id = ?`)
+    .get(run.requestId).status, 'active');
+  inspect.close();
   assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
     'RunAccepted',
     'RunQueued',
@@ -501,6 +530,52 @@ test('canonical runtime recovery generation can start and complete', (t) => {
     'RunStarted',
     'RunCompleted',
   ]);
+});
+
+test('forged recovery generation lineage cannot authorize completion', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  const ledger = openRunLedger({ dbPath, clock: () => now });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => now });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => now });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  ledger.accept(acceptMessage('forged-recovery'));
+  queue.claimNext();
+  now = 200;
+  const recovered = queue.recoverStale({ staleBefore: 150 }).request;
+  const claim = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: recovered.requestId,
+    turnId: recovered.turnId,
+    generation: recovered.generation,
+    runtimeSessionId: 'runtime:forged-recovery:g2',
+  }).request;
+  const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
+  mutate.prepare(`
+    UPDATE assistant_response_events
+    SET payload_json = json_set(payload_json, '$.recoveredFromTurnId', 'turn:attacker:99')
+    WHERE request_id = ? AND event_type = 'RunQueued' AND producer = 'core:runtime-recovery'
+  `).run(run.requestId);
+  mutate.close();
+
+  assert.throws(
+    () => replies.commitRunOutcome(answerCommand(ledger, run, 'forged-recovery')),
+    error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN'
+      || error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
+  );
+  assert.throws(
+    () => ledger.get(run.requestId),
+    error => error?.code === 'CANONICAL_RUN_LEDGER_CORRUPT',
+  );
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.equal(inspect.prepare(`
+    SELECT status FROM assistant_run_ledger WHERE request_id = ?
+  `).get(run.requestId).status, 'active');
+  inspect.close();
 });
 
 test('explicit silent completes execution without creating a ReplyIntent', (t) => {
@@ -895,33 +970,39 @@ test('task_receipt accepts only a task_effect cause and replays by canonical ide
     () => replies.commitTaskReceipt(command),
     error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
   );
-  taskEffect = {
-    canonical: true,
-    applied: false,
-    eventId: command.cause.eventId,
-    requestId: command.requestId,
-    traceId: command.traceId,
-  };
+  taskEffect = verifiedTaskEffect(command, { applied: false });
   assert.throws(
     () => replies.commitTaskReceipt(command),
     error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
   );
-  taskEffect = { ...taskEffect, applied: true, requestId: 'request:wrong' };
+  taskEffect = verifiedTaskEffect(command, { requestId: 'request:wrong' });
   assert.throws(
     () => replies.commitTaskReceipt(command),
     error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
   );
-  taskEffect = { ...taskEffect, requestId: command.requestId, traceId: 'trace:wrong' };
+  taskEffect = verifiedTaskEffect(command, { traceId: 'trace:wrong' });
   assert.throws(
     () => replies.commitTaskReceipt(command),
     error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
   );
-  taskEffect = { ...taskEffect, traceId: command.traceId, canonical: false };
+  for (const mismatch of [
+    { effectId: 'effect:wrong' },
+    { route: { adapterId: 'feishu', targetRef: 'opaque:wrong' } },
+    { disposition: 'send' },
+    { payload: { format: 'text', text: 'Wrong durable effect payload.' } },
+  ]) {
+    taskEffect = verifiedTaskEffect(command, mismatch);
+    assert.throws(
+      () => replies.commitTaskReceipt(command),
+      error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
+    );
+  }
+  taskEffect = verifiedTaskEffect(command, { canonical: false });
   assert.throws(
     () => replies.commitTaskReceipt(command),
     error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
   );
-  taskEffect = { ...taskEffect, canonical: true };
+  taskEffect = verifiedTaskEffect(command);
   const first = replies.commitTaskReceipt(command);
   taskEffect = null;
   const replay = replies.commitTaskReceipt(command);
@@ -972,13 +1053,7 @@ test('task_receipt durable replay fails closed when its stored intent is corrupt
   const replies = openReplyOutcomeTransactions({
     dbPath,
     clock: () => 101,
-    taskEffectVerifier: () => ({
-      canonical: true,
-      applied: true,
-      eventId: command.cause.eventId,
-      requestId: command.requestId,
-      traceId: command.traceId,
-    }),
+    taskEffectVerifier: () => verifiedTaskEffect(command),
   });
   const first = replies.commitTaskReceipt(command);
   const mutate = new Database(dbPath);
@@ -1009,13 +1084,7 @@ test('commitTaskReceipt rejects unknown v1 command, cause, route and payload fie
   const replies = openReplyOutcomeTransactions({
     dbPath,
     clock: () => 101,
-    taskEffectVerifier: () => ({
-      canonical: true,
-      applied: true,
-      eventId: command.cause.eventId,
-      requestId: command.requestId,
-      traceId: command.traceId,
-    }),
+    taskEffectVerifier: () => verifiedTaskEffect(command),
   });
   t.after(() => replies.close());
   t.after(() => ledger.close());

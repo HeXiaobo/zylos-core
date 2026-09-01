@@ -127,6 +127,52 @@ export function canonicalReplyIntentFailure(row) {
   return null;
 }
 
+export function canonicalVerifiedTaskEffectFailure(row, intentRow = null) {
+  if (!row || typeof row.fact_json !== 'string') return 'TASK_EFFECT_FACT_NOT_FOUND';
+  if (sha256(row.fact_json) !== row.canonical_hash) return 'TASK_EFFECT_CANONICAL_HASH_MISMATCH';
+  let fact;
+  try {
+    fact = JSON.parse(row.fact_json);
+  } catch {
+    return 'TASK_EFFECT_FACT_INVALID';
+  }
+  if (
+    canonicalJson(fact) !== row.fact_json
+    || !exactKeys(fact, [
+      'eventId', 'effectId', 'taskId', 'requestId', 'traceId', 'status',
+      'route', 'disposition', 'payload',
+    ])
+    || !isText(fact.eventId) || !isText(fact.effectId) || !isText(fact.taskId)
+    || !isText(fact.requestId) || !isText(fact.traceId)
+    || fact.status !== 'applied' || fact.disposition !== 'task_receipt'
+    || !exactKeys(fact.route ?? {}, ['adapterId', 'targetRef'])
+    || !isText(fact.route.adapterId) || !isText(fact.route.targetRef)
+    || !exactKeys(fact.payload ?? {}, ['format', 'text'])
+    || fact.payload.format !== 'text' || !isText(fact.payload.text)
+  ) return 'TASK_EFFECT_FACT_INVALID';
+  if (
+    row.event_id !== fact.eventId || row.effect_id !== fact.effectId
+    || row.task_id !== fact.taskId || row.request_id !== fact.requestId
+    || row.trace_id !== fact.traceId || row.route_json !== canonicalJson(fact.route)
+    || row.disposition !== fact.disposition || row.payload_json !== canonicalJson(fact.payload)
+  ) return 'TASK_EFFECT_FACT_IDENTITY_MISMATCH';
+  if (intentRow) {
+    const intentFailure = canonicalReplyIntentFailure(intentRow);
+    if (intentFailure) return intentFailure;
+    const intent = JSON.parse(intentRow.envelope_json);
+    if (
+      intent.cause.kind !== 'task_effect'
+      || intent.cause.eventId !== fact.eventId
+      || intent.requestId !== fact.requestId
+      || intent.traceId !== fact.traceId
+      || canonicalJson(intent.route) !== canonicalJson(fact.route)
+      || intent.disposition !== fact.disposition
+      || canonicalJson(intent.payload) !== canonicalJson(fact.payload)
+    ) return 'TASK_EFFECT_INTENT_LINK_MISMATCH';
+  }
+  return null;
+}
+
 export function canonicalDeliveryReceiptFailure(row, intentRow = null) {
   const parsed = parsedCanonical(row, 'RECEIPT');
   if (parsed.failure) return parsed.failure;
@@ -223,6 +269,7 @@ export function canonicalRunTerminalIntentCauseFailure({
   run,
   request,
   admission,
+  admissions,
   events,
 }) {
   const intentFailure = canonicalReplyIntentFailure(intentRow);
@@ -244,11 +291,13 @@ export function canonicalRunTerminalIntentCauseFailure({
     run,
     request,
     admission,
+    admissions,
   });
   if (persistenceFailure) return persistenceFailure;
   const outcomeFailure = canonicalReplyOutcomeFailure(outcome);
   if (outcomeFailure) return outcomeFailure;
   const terminalPayload = JSON.parse(terminal.payload_json);
+  const outcomeEnvelope = JSON.parse(outcome.envelope_json);
   if (
     outcome.outcome_id !== terminalPayload.outcomeId
     || outcome.request_id !== terminal.request_id
@@ -258,6 +307,13 @@ export function canonicalRunTerminalIntentCauseFailure({
     || (terminal.event_type === 'RunFailed' && outcome.kind !== 'failure')
     || (terminal.event_type === 'RunCompleted' && outcome.kind === 'failure')
   ) return 'RUN_TERMINAL_OUTCOME_LINK_MISMATCH';
+  if (
+    terminal.event_type === 'RunFailed'
+    && (
+      terminalPayload.code !== outcomeEnvelope.code
+      || terminalPayload.retryable !== outcomeEnvelope.retryable
+    )
+  ) return 'RUN_FAILED_OUTCOME_PAYLOAD_MISMATCH';
   const intent = JSON.parse(intentRow.envelope_json);
   let durableRoute;
   try {
@@ -273,7 +329,7 @@ export function canonicalRunTerminalIntentCauseFailure({
     || run.reply_mode === 'none'
     || (outcome.kind === 'answer' && intent.disposition !== 'send')
     || (outcome.kind === 'failure' && intent.disposition !== 'failure_notice')
-    || (outcome.kind === 'answer' && canonicalJson(intent.payload) !== canonicalJson(JSON.parse(outcome.envelope_json).content))
+    || (outcome.kind === 'answer' && canonicalJson(intent.payload) !== canonicalJson(outcomeEnvelope.content))
   ) return 'RUN_TERMINAL_INTENT_POLICY_MISMATCH';
   return null;
 }
