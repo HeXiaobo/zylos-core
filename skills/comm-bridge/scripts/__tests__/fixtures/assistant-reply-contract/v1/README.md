@@ -1,7 +1,11 @@
 # Assistant Reply contract v1 fixtures
 
-This directory freezes the Gate 0 cross-repository vocabulary. The fixture is
-the target contract, not a claim that the current Core fork implements it.
+This directory freezes the Gate 0 cross-repository vocabulary. The canonical
+fixture is `common-contract-vectors.json`, copied byte-for-byte from the parent
+contract source. `contract-vectors.json` remains an identical compatibility copy
+for the original Core test path; both copies are checked against the same fixed
+SHA-256. The fixture is the target contract, not a claim that the current Core
+fork implements it.
 `assistant-reply-contract.test.js` validates the target invariants, while
 `assistant-reply-characterization.test.js` records current support and leaves
 unimplemented target behavior as `test.todo`.
@@ -21,6 +25,13 @@ The official control establishes the unified C4 SQLite entry, priority/FIFO,
 one dispatcher over the shared Runtime, opt-in `requireIdle`, and explicit
 `c4-send`. Assistant Request lifecycle, automatic final-output candidates and
 event-row delivery leases are fork-only extensions.
+
+The common v1 contract keeps the official shared-runtime boundary while making
+the fork's additional lifecycle explicit: source-derived deduplication keys are
+not sent across the Core boundary; RunCompleted/RunFailed reference an
+independent outcome; RunCancelled is execution-only; ReplyIntent and
+DeliveryReceipt are separate from DeliverySettlement; and `runtimeLaneId` is
+the only public runtime lane field.
 
 ## Current fork
 
