@@ -22,6 +22,7 @@ const RUN_EVENT_TYPES = new Set([
   'RunCancelled',
 ]);
 const REQUEST_CLASSES = new Set(['ordinary', 'maintenance', 'control']);
+const REPLY_MODES = new Set(['required', 'optional', 'none']);
 const PAYLOAD_HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 function domainError(code, message) {
@@ -199,7 +200,12 @@ function normalizeAcceptMessage(raw) {
     command.conversationLaneKey ?? source.conversationKey,
     'source.conversationKey',
   );
+  const replyMode = requireText(reply.mode, 'reply.mode', 32);
+  if (!REPLY_MODES.has(replyMode)) {
+    throw new TypeError('reply.mode must be required, optional, or none');
+  }
   const targetRef = requireText(reply.targetRef ?? source.targetRef, 'reply.targetRef');
+  const replyRoute = { adapterId, targetRef };
   const renderedContent = content.kind === 'text'
     ? requireText(content.text, 'content.text', 100_000)
     : JSON.stringify(content);
@@ -210,6 +216,8 @@ function normalizeAcceptMessage(raw) {
     payloadHash,
     adapterId,
     targetRef,
+    replyMode,
+    replyRouteJson: canonicalJson(replyRoute),
     sourceId: messageId,
     conversationLaneKey,
     renderedContent,
@@ -248,6 +256,10 @@ function toRun(row) {
     requestClass: row.request_class,
     priority: row.priority,
     requireIdle: row.require_idle === 1,
+    replyPolicy: {
+      mode: row.reply_mode,
+      route: JSON.parse(row.reply_route_json),
+    },
     runtimeLaneId: row.runtime_lane_id,
     turnId: row.turn_id,
     generation: row.generation,
@@ -376,6 +388,16 @@ export function openRunLedger({
     }
     if (requestIds.size === 1) {
       const [requestId] = requestIds;
+      const existingRun = selectRun.get(requestId);
+      if (
+        existingRun.reply_mode !== command.replyMode
+        || canonicalJson(JSON.parse(existingRun.reply_route_json)) !== command.replyRouteJson
+      ) {
+        throw domainError(
+          'IDEMPOTENCY_CONFLICT',
+          'source identity replay changes the durable reply policy',
+        );
+      }
       const current = safeClock();
       for (const [kind, key] of identities) {
         if (!selectReceipt.get(kind, key)) {
@@ -425,9 +447,9 @@ export function openRunLedger({
       INSERT INTO assistant_run_ledger (
         request_id, conversation_lane_key, lane_sequence, payload_hash,
         trace_id, causation_id, request_class, priority, require_idle,
-        runtime_lane_id, turn_id, generation, status,
+        reply_mode, reply_route_json, runtime_lane_id, turn_id, generation, status,
         accepted_at, updated_at, terminal_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'queued', ?, ?, NULL)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'queued', ?, ?, NULL)
     `).run(
       requestId,
       command.conversationLaneKey,
@@ -438,6 +460,8 @@ export function openRunLedger({
       command.requestClass,
       command.priority,
       command.requireIdle ? 1 : 0,
+      command.replyMode,
+      command.replyRouteJson,
       RUNTIME_LANE_ID,
       turnId,
       current,

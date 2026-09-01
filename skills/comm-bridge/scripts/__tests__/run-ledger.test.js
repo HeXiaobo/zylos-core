@@ -84,6 +84,10 @@ test('accept safely replays transport and logical duplicates before allocating a
   assert.equal(transportReplay.accepted.requestId, first.accepted.requestId);
   assert.equal(logicalReplay.accepted.requestId, first.accepted.requestId);
   assert.equal(first.accepted.laneSequence, 1);
+  assert.deepEqual(first.request.replyPolicy, {
+    mode: 'required',
+    route: { adapterId: 'feishu', targetRef: 'opaque:chat-1:message-1' },
+  });
   assert.equal(second.accepted.laneSequence, 2);
   assert.deepEqual(
     ledger.listEvents(first.accepted.requestId).map(event => [event.type, event.sequence]),
@@ -114,6 +118,20 @@ test('accept fails closed when an idempotency or logical identity is reused with
         payloadHash: `sha256:${'3'.repeat(64)}`,
       },
     })),
+    error => error?.code === 'IDEMPOTENCY_CONFLICT',
+  );
+  assert.throws(
+    () => ledger.accept({
+      ...command,
+      reply: { ...command.reply, mode: 'none' },
+    }),
+    error => error?.code === 'IDEMPOTENCY_CONFLICT',
+  );
+  assert.throws(
+    () => ledger.accept({
+      ...command,
+      reply: { ...command.reply, targetRef: 'opaque:changed-route' },
+    }),
     error => error?.code === 'IDEMPOTENCY_CONFLICT',
   );
 });

@@ -446,6 +446,9 @@ export function ensureAssistantRunLedgerSchema(database, options = {}) {
         CHECK (request_class IN ('ordinary', 'maintenance', 'control')),
       priority INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 3),
       require_idle INTEGER NOT NULL DEFAULT 0 CHECK (require_idle IN (0, 1)),
+      reply_mode TEXT NOT NULL DEFAULT 'required'
+        CHECK (reply_mode IN ('required', 'optional', 'none')),
+      reply_route_json TEXT NOT NULL,
       runtime_lane_id TEXT NOT NULL DEFAULT 'runtime:shared'
         CHECK (runtime_lane_id = 'runtime:shared'),
       turn_id TEXT NOT NULL,
@@ -504,6 +507,32 @@ export function ensureAssistantRunLedgerSchema(database, options = {}) {
   if (!cancelColumns.has('command_id')) {
     database.exec('ALTER TABLE assistant_cancel_requests ADD COLUMN command_id TEXT');
   }
+
+  const runLedgerColumns = getColumnNames(database, 'assistant_run_ledger');
+  if (!runLedgerColumns.has('reply_mode')) {
+    database.exec(`
+      ALTER TABLE assistant_run_ledger
+      ADD COLUMN reply_mode TEXT NOT NULL DEFAULT 'required'
+        CHECK (reply_mode IN ('required', 'optional', 'none'))
+    `);
+  }
+  if (!runLedgerColumns.has('reply_route_json')) {
+    database.exec('ALTER TABLE assistant_run_ledger ADD COLUMN reply_route_json TEXT');
+  }
+  database.prepare(`
+    UPDATE assistant_run_ledger
+    SET reply_route_json = json_object(
+      'adapterId', (
+        SELECT route_channel FROM assistant_requests
+        WHERE assistant_requests.request_id = assistant_run_ledger.request_id
+      ),
+      'targetRef', (
+        SELECT route_endpoint FROM assistant_requests
+        WHERE assistant_requests.request_id = assistant_run_ledger.request_id
+      )
+    )
+    WHERE reply_route_json IS NULL
+  `).run();
 
   const eventColumns = getColumnNames(database, 'assistant_response_events');
   const eventColumnDefinitions = {
@@ -596,6 +625,9 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       ON assistant_reply_intents(delivery_state, available_at, created_at, intent_id);
     CREATE INDEX IF NOT EXISTS idx_assistant_reply_intents_request
       ON assistant_reply_intents(request_id, created_at, intent_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_reply_intents_run_terminal
+      ON assistant_reply_intents(cause_event_id)
+      WHERE cause_kind = 'run_terminal';
 
     CREATE TABLE IF NOT EXISTS assistant_delivery_receipts (
       receipt_id TEXT PRIMARY KEY,
@@ -638,6 +670,15 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
 
     CREATE TABLE IF NOT EXISTS assistant_event_consumers (
       consumer_id TEXT PRIMARY KEY,
+      bootstrap_mode TEXT NOT NULL DEFAULT 'canonical_cutover'
+        CHECK (bootstrap_mode = 'canonical_cutover'),
+      start_event_row_id INTEGER NOT NULL DEFAULT 1 CHECK (start_event_row_id >= 1),
+      cutover_event_row_id INTEGER NOT NULL DEFAULT 0 CHECK (cutover_event_row_id >= 0),
+      legacy_skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (legacy_skipped_count >= 0),
+      health_status TEXT NOT NULL DEFAULT 'active'
+        CHECK (health_status IN ('active', 'degraded')),
+      degraded_reason TEXT,
+      degraded_event_row_id INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -648,6 +689,7 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'processing', 'acknowledged')),
       retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0),
       available_at INTEGER NOT NULL,
       lease_owner TEXT,
       lease_token TEXT,
@@ -656,6 +698,7 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       acknowledged_at INTEGER,
+      event_fingerprint TEXT NOT NULL,
       PRIMARY KEY (consumer_id, event_row_id),
       FOREIGN KEY (consumer_id) REFERENCES assistant_event_consumers(consumer_id) ON DELETE RESTRICT,
       FOREIGN KEY (event_row_id) REFERENCES assistant_response_events(id) ON DELETE RESTRICT
@@ -663,7 +706,54 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
 
     CREATE INDEX IF NOT EXISTS idx_assistant_event_deliveries_ready
       ON assistant_event_deliveries(consumer_id, status, available_at, event_row_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_event_deliveries_stream
+      ON assistant_event_deliveries(consumer_id, event_row_id, status);
+
+    CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_immutable
+    BEFORE UPDATE OF
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
   `);
+
+  const consumerColumns = getColumnNames(database, 'assistant_event_consumers');
+  const migratedUnprovenConsumers = !consumerColumns.has('bootstrap_mode');
+  const consumerColumnDefinitions = {
+    bootstrap_mode: "TEXT NOT NULL DEFAULT 'canonical_cutover' CHECK (bootstrap_mode = 'canonical_cutover')",
+    start_event_row_id: 'INTEGER NOT NULL DEFAULT 1 CHECK (start_event_row_id >= 1)',
+    cutover_event_row_id: 'INTEGER NOT NULL DEFAULT 0 CHECK (cutover_event_row_id >= 0)',
+    legacy_skipped_count: 'INTEGER NOT NULL DEFAULT 0 CHECK (legacy_skipped_count >= 0)',
+    health_status: "TEXT NOT NULL DEFAULT 'active' CHECK (health_status IN ('active', 'degraded'))",
+    degraded_reason: 'TEXT',
+    degraded_event_row_id: 'INTEGER',
+  };
+  for (const [column, definition] of Object.entries(consumerColumnDefinitions)) {
+    if (!consumerColumns.has(column)) {
+      database.exec(`ALTER TABLE assistant_event_consumers ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  if (migratedUnprovenConsumers) {
+    database.prepare(`
+      UPDATE assistant_event_consumers
+      SET health_status = 'degraded',
+          degraded_reason = 'LEGACY_SUBSCRIPTION_STATE_UNPROVEN'
+    `).run();
+  }
+
+  const deliveryColumns = getColumnNames(database, 'assistant_event_deliveries');
+  if (!deliveryColumns.has('claim_epoch')) {
+    database.exec(`
+      ALTER TABLE assistant_event_deliveries
+      ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0)
+    `);
+  }
+  if (!deliveryColumns.has('event_fingerprint')) {
+    database.exec('ALTER TABLE assistant_event_deliveries ADD COLUMN event_fingerprint TEXT');
+  }
 }
 
 function toCommitmentIntakeView(row) {

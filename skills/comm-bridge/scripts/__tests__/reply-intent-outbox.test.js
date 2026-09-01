@@ -75,6 +75,7 @@ function createAnswerIntent(t, dbPath, id, clock = () => 100) {
     idempotencyKey: `run:${run.requestId}:completed`,
     outcome: { kind: 'answer', content: { format: 'text', text: `answer ${id}` } },
     reply: {
+      action: 'send',
       route: { adapterId: 'feishu', targetRef: `opaque:${id}` },
       disposition: 'send',
     },

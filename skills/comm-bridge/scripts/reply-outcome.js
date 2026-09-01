@@ -109,21 +109,49 @@ function normalizeOutcome(raw, { requestId, turnId, traceId }) {
   throw new TypeError('outcome.kind must be answer, silent, or failure');
 }
 
-function normalizeRoute(raw) {
-  const route = requireRecord(raw, 'reply.route');
+function normalizeRoute(raw, field = 'reply.route') {
+  const route = requireRecord(raw, field);
   return {
-    adapterId: requireText(route.adapterId, 'reply.route.adapterId'),
-    targetRef: requireText(route.targetRef, 'reply.route.targetRef'),
+    adapterId: requireText(route.adapterId, `${field}.adapterId`),
+    targetRef: requireText(route.targetRef, `${field}.targetRef`),
   };
 }
 
-function buildIntent({ requestId, traceId, cause, reply, outcome }) {
-  if (!reply) return null;
-  if (outcome.kind === 'silent') {
-    throw domainError('SILENT_INTENT_FORBIDDEN', 'explicit silent must not create a ReplyIntent');
+function buildIntent({ requestId, traceId, cause, reply, outcome, replyPolicy }) {
+  if (!reply) {
+    throw domainError(
+      'REPLY_DECISION_REQUIRED',
+      `${replyPolicy.mode} reply policy requires an explicit send or suppress decision`,
+    );
   }
-  const route = normalizeRoute(reply.route);
-  const disposition = requireText(reply.disposition, 'reply.disposition', 32);
+  const decision = requireRecord(reply, 'reply');
+  const action = requireText(decision.action, 'reply.action', 32);
+  if (!['send', 'suppress'].includes(action)) {
+    throw new TypeError('reply.action must be send or suppress');
+  }
+  const route = normalizeRoute(replyPolicy.route, 'stored reply route');
+  if (
+    decision.route !== undefined
+    && canonicalJson(normalizeRoute(decision.route)) !== canonicalJson(route)
+  ) {
+    throw domainError('REPLY_ROUTE_MISMATCH', 'reply route differs from the durable intake route');
+  }
+  if (outcome.kind === 'silent') {
+    if (action !== 'suppress') {
+      throw domainError('SILENT_INTENT_FORBIDDEN', 'explicit silent requires reply.action=suppress');
+    }
+    return null;
+  }
+  if (action !== 'send') {
+    throw domainError(
+      'REPLY_POLICY_VIOLATION',
+      'only an explicit silent outcome may suppress a ReplyIntent',
+    );
+  }
+  if (replyPolicy.mode === 'none') {
+    throw domainError('REPLY_POLICY_VIOLATION', 'reply.mode=none only permits explicit silent');
+  }
+  const disposition = requireText(decision.disposition, 'reply.disposition', 32);
   const expectedDisposition = outcome.kind === 'answer' ? 'send' : 'failure_notice';
   if (disposition !== expectedDisposition) {
     throw domainError(
@@ -131,8 +159,8 @@ function buildIntent({ requestId, traceId, cause, reply, outcome }) {
       `${outcome.kind} requires disposition=${expectedDisposition}`,
     );
   }
-  const payload = reply.payload
-    ? normalizeContent(reply.payload, 'reply.payload')
+  const payload = decision.payload
+    ? normalizeContent(decision.payload, 'reply.payload')
     : outcome.kind === 'answer' ? outcome.content : null;
   if (!payload) {
     throw domainError('MISSING_OUTPUT', 'failure_notice requires visible reply.payload');
@@ -236,9 +264,13 @@ function toDelivery(row) {
 export function openReplyOutcomeTransactions({
   dbPath = DB_PATH,
   clock = () => Math.floor(Date.now() / 1_000),
+  taskEffectVerifier = null,
 } = {}) {
   const normalizedPath = requireText(dbPath, 'dbPath');
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+  if (taskEffectVerifier !== null && typeof taskEffectVerifier !== 'function') {
+    throw new TypeError('taskEffectVerifier must be a function or null');
+  }
   if (normalizedPath !== ':memory:') fs.mkdirSync(path.dirname(normalizedPath), { recursive: true });
   const database = new Database(normalizedPath);
   database.pragma('journal_mode = WAL');
@@ -289,6 +321,27 @@ export function openReplyOutcomeTransactions({
     };
   }
 
+  function replyPolicyFor(run) {
+    return {
+      mode: run.reply_mode,
+      route: JSON.parse(run.reply_route_json),
+    };
+  }
+
+  function terminalIdentityMatches(row, expected) {
+    return row.event_type === expected.type
+      && row.event_id === expected.eventId
+      && row.idempotency_key === expected.idempotencyKey
+      && row.request_id === expected.requestId
+      && row.turn_id === expected.turnId
+      && row.generation === expected.generation
+      && row.sequence === expected.sequence
+      && row.trace_id === expected.traceId
+      && row.causation_id === expected.causationId
+      && row.producer === expected.producer
+      && canonicalJson(JSON.parse(row.payload_json)) === canonicalJson(expected.payload);
+  }
+
   const commitTransaction = database.transaction((input) => {
     const command = requireRecord(input, 'commitRunOutcome input');
     const requestId = requireText(command.requestId, 'requestId');
@@ -304,6 +357,7 @@ export function openReplyOutcomeTransactions({
       throw domainError('RUN_EVENT_FENCED', 'outcome targets a stale request/turn/generation');
     }
     const outcome = normalizeOutcome(command.outcome, { requestId, turnId, traceId });
+    const replyPolicy = replyPolicyFor(run);
     const outcomeJson = canonicalJson(outcome);
     const outcomeHash = sha256(outcomeJson);
     const existingOutcome = selectOutcome.get(requestId);
@@ -312,8 +366,31 @@ export function openReplyOutcomeTransactions({
         throw domainError('IDEMPOTENCY_CONFLICT', 'canonical ReplyOutcome already has another payload');
       }
       const existingTerminal = selectTerminal.get(requestId);
-      if (!existingTerminal || existingTerminal.idempotency_key !== idempotencyKey) {
+      if (!existingTerminal) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'outcome replay does not match its terminal');
+      }
+      const terminalType = outcome.kind === 'failure' ? 'RunFailed' : 'RunCompleted';
+      const terminalPayload = outcome.kind === 'failure'
+        ? { outcomeId: outcome.outcomeId, code: outcome.code, retryable: outcome.retryable }
+        : { outcomeId: outcome.outcomeId };
+      const expectedTerminal = {
+        type: terminalType,
+        eventId: `evt:${requestId}:${existingTerminal.sequence}`,
+        idempotencyKey,
+        requestId,
+        turnId,
+        generation,
+        sequence: existingTerminal.sequence,
+        traceId,
+        causationId,
+        producer,
+        payload: terminalPayload,
+      };
+      if (!terminalIdentityMatches(existingTerminal, expectedTerminal)) {
+        throw domainError(
+          'IDEMPOTENCY_CONFLICT',
+          'outcome replay changes the canonical terminal envelope',
+        );
       }
       const expectedIntent = buildIntent({
         requestId,
@@ -321,6 +398,7 @@ export function openReplyOutcomeTransactions({
         cause: { kind: 'run_terminal', eventId: existingTerminal.event_id },
         reply: command.reply,
         outcome,
+        replyPolicy,
       });
       const storedIntent = selectIntentByCause.get('run_terminal', existingTerminal.event_id);
       if ((expectedIntent === null) !== (storedIntent === undefined)) {
@@ -371,6 +449,7 @@ export function openReplyOutcomeTransactions({
       cause: { kind: 'run_terminal', eventId },
       reply: command.reply,
       outcome,
+      replyPolicy,
     });
 
     database.prepare(`
@@ -441,6 +520,33 @@ export function openReplyOutcomeTransactions({
     if (!run) throw domainError('RUN_NOT_FOUND', `unknown Assistant Request: ${intent.requestId}`);
     if (run.trace_id !== intent.traceId) {
       throw domainError('TRACE_ID_MISMATCH', 'task receipt traceId does not match its request');
+    }
+    if (!taskEffectVerifier) {
+      throw domainError(
+        'TASK_EFFECT_VERIFICATION_REQUIRED',
+        'task_receipt requires an injected canonical task-effect verifier',
+      );
+    }
+    const verification = taskEffectVerifier({
+      eventId: intent.cause.eventId,
+      requestId: intent.requestId,
+      traceId: intent.traceId,
+    });
+    if (verification && typeof verification.then === 'function') {
+      throw new TypeError('taskEffectVerifier must be synchronous');
+    }
+    if (
+      !verification
+      || verification.canonical !== true
+      || verification.applied !== true
+      || verification.eventId !== intent.cause.eventId
+      || verification.requestId !== intent.requestId
+      || verification.traceId !== intent.traceId
+    ) {
+      throw domainError(
+        'TASK_EFFECT_NOT_VERIFIED',
+        'task effect must be canonical, applied, and match requestId/traceId',
+      );
     }
     const canonicalHash = sha256(canonicalJson(intent));
     const existing = selectIntentById.get(intent.intentId);

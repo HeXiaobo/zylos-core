@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -7,9 +7,12 @@ import Database from 'better-sqlite3';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
 
-function domainError(code, message) {
+const BOOTSTRAP_MODE = 'canonical_cutover';
+
+function domainError(code, message, details = {}) {
   const error = new Error(message);
   error.code = code;
+  Object.assign(error, details);
   return error;
 }
 
@@ -29,6 +32,75 @@ function currentTime(clock) {
     throw new TypeError('clock must return a non-negative safe integer');
   }
   return current;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function canonicalEventFailure(row) {
+  for (const field of [
+    'event_id',
+    'request_id',
+    'event_type',
+    'idempotency_key',
+    'turn_id',
+    'trace_id',
+    'causation_id',
+    'producer',
+  ]) {
+    if (typeof row[field] !== 'string' || row[field].trim() === '') {
+      return `NONCANONICAL_${field.toUpperCase()}`;
+    }
+  }
+  if (!Number.isSafeInteger(row.sequence) || row.sequence < 1) {
+    return 'NONCANONICAL_SEQUENCE';
+  }
+  if (!Number.isSafeInteger(row.generation) || row.generation < 1) {
+    return 'NONCANONICAL_GENERATION';
+  }
+  if (!Number.isSafeInteger(row.created_at) || row.created_at < 0) {
+    return 'NONCANONICAL_CREATED_AT';
+  }
+  if (row.event_id !== `evt:${row.request_id}:${row.sequence}`) {
+    return 'NONCANONICAL_EVENT_ID';
+  }
+  try {
+    const payload = JSON.parse(row.payload_json);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return 'NONCANONICAL_PAYLOAD';
+    }
+  } catch {
+    return 'NONCANONICAL_PAYLOAD';
+  }
+  return null;
+}
+
+function eventFingerprint(row) {
+  return sha256(canonicalJson({
+    eventId: row.event_id,
+    requestId: row.request_id,
+    sequence: row.sequence,
+    type: row.event_type,
+    payload: JSON.parse(row.payload_json),
+    idempotencyKey: row.idempotency_key,
+    turnId: row.turn_id,
+    generation: row.generation,
+    traceId: row.trace_id,
+    causationId: row.causation_id,
+    producer: row.producer,
+    createdAt: row.created_at,
+  }));
 }
 
 function toEvent(row) {
@@ -64,15 +136,32 @@ function toState(row) {
   };
 }
 
+function toConsumer(row) {
+  return row && {
+    consumerId: row.consumer_id,
+    bootstrap: row.bootstrap_mode,
+    startEventRowId: row.start_event_row_id,
+    cutoverEventRowId: row.cutover_event_row_id,
+    legacySkippedCount: row.legacy_skipped_count,
+    status: row.health_status,
+    degradedReason: row.degraded_reason,
+    degradedEventRowId: row.degraded_event_row_id,
+  };
+}
+
 export function openEventSubscriptions({
   dbPath = DB_PATH,
   clock = () => Math.floor(Date.now() / 1_000),
   leaseTokenFactory = () => `event-lease:${randomUUID()}`,
+  maxInFlightPerConsumer = 4,
 } = {}) {
   const normalizedPath = requireText(dbPath, 'dbPath');
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
   if (typeof leaseTokenFactory !== 'function') {
     throw new TypeError('leaseTokenFactory must be a function');
+  }
+  if (!Number.isSafeInteger(maxInFlightPerConsumer) || maxInFlightPerConsumer < 1) {
+    throw new TypeError('maxInFlightPerConsumer must be a positive safe integer');
   }
   if (normalizedPath !== ':memory:') fs.mkdirSync(path.dirname(normalizedPath), { recursive: true });
   const database = new Database(normalizedPath);
@@ -81,41 +170,163 @@ export function openEventSubscriptions({
   database.pragma('foreign_keys = ON');
   ensureAssistantReplyReliabilitySchema(database);
 
-  const projection = `
+  const eventProjection = `
+    SELECT id, event_id, request_id, sequence, event_type, payload_json,
+           idempotency_key, turn_id, generation, trace_id, causation_id,
+           producer, created_at
+    FROM assistant_response_events
+  `;
+  const deliveryProjection = `
     SELECT d.*, e.event_id, e.request_id, e.sequence, e.event_type,
            e.payload_json, e.idempotency_key, e.turn_id, e.generation,
            e.trace_id, e.causation_id, e.producer, e.created_at AS event_created_at
     FROM assistant_event_deliveries AS d
     JOIN assistant_response_events AS e ON e.id = d.event_row_id
   `;
+  const selectConsumer = database.prepare(`
+    SELECT * FROM assistant_event_consumers WHERE consumer_id = ?
+  `);
   const selectState = database.prepare(`
-    ${projection} WHERE d.consumer_id = ? AND e.event_id = ?
+    ${deliveryProjection} WHERE d.consumer_id = ? AND e.event_id = ?
   `);
   const selectByRow = database.prepare(`
-    ${projection} WHERE d.consumer_id = ? AND d.event_row_id = ?
+    ${deliveryProjection} WHERE d.consumer_id = ? AND d.event_row_id = ?
+  `);
+  const selectEventBySequence = database.prepare(`
+    ${eventProjection} WHERE request_id = ? AND sequence = ?
+  `);
+  const selectDeliveryFingerprint = database.prepare(`
+    SELECT event_fingerprint
+    FROM assistant_event_deliveries
+    WHERE consumer_id = ? AND event_row_id = ?
+  `);
+  const insertDelivery = database.prepare(`
+    INSERT INTO assistant_event_deliveries (
+      consumer_id, event_row_id, status, retry_count, available_at,
+      created_at, updated_at, event_fingerprint
+    ) VALUES (?, ?, 'pending', 0, ?, ?, ?, ?)
   `);
 
-  function materialize(consumerId, current) {
+  function degrade(consumerId, reason, eventRowId, current) {
     database.prepare(`
-      INSERT OR IGNORE INTO assistant_event_deliveries (
-        consumer_id, event_row_id, status, retry_count, available_at,
-        created_at, updated_at
-      )
-      SELECT ?, id, 'pending', 0, ?, ?, ?
-      FROM assistant_response_events
-      WHERE event_id IS NOT NULL
-    `).run(consumerId, current, current, current);
+      UPDATE assistant_event_consumers
+      SET health_status = 'degraded', degraded_reason = ?,
+          degraded_event_row_id = ?, updated_at = ?
+      WHERE consumer_id = ? AND health_status = 'active'
+    `).run(reason, eventRowId ?? null, current, consumerId);
   }
 
-  const subscribeTransaction = database.transaction(({ consumerId }) => {
+  function materializeAndValidate(consumerId, current) {
+    let consumer = selectConsumer.get(consumerId);
+    if (!consumer) {
+      throw domainError('CONSUMER_NOT_FOUND', `unknown event consumer: ${consumerId}`);
+    }
+    if (consumer.health_status === 'degraded') return consumer;
+
+    const postCutoverRows = database.prepare(`
+      ${eventProjection}
+      WHERE id > ?
+      ORDER BY id ASC
+    `).all(consumer.cutover_event_row_id);
+    for (const event of postCutoverRows) {
+      const failure = canonicalEventFailure(event);
+      if (failure) {
+        degrade(consumerId, failure, event.id, current);
+        return selectConsumer.get(consumerId);
+      }
+    }
+
+    const canonicalRows = database.prepare(`
+      ${eventProjection}
+      WHERE id >= ? AND event_id IS NOT NULL
+      ORDER BY id ASC
+    `).all(consumer.start_event_row_id);
+    for (const event of canonicalRows) {
+      const failure = canonicalEventFailure(event);
+      if (failure) {
+        degrade(consumerId, failure, event.id, current);
+        return selectConsumer.get(consumerId);
+      }
+      if (event.sequence > 1) {
+        const predecessor = selectEventBySequence.get(event.request_id, event.sequence - 1);
+        if (!predecessor) {
+          degrade(consumerId, 'CANONICAL_SEQUENCE_GAP', event.id, current);
+          return selectConsumer.get(consumerId);
+        }
+        const predecessorFailure = canonicalEventFailure(predecessor);
+        if (predecessorFailure) {
+          degrade(consumerId, 'NONCANONICAL_SEQUENCE_PREDECESSOR', predecessor.id, current);
+          return selectConsumer.get(consumerId);
+        }
+      }
+      const fingerprint = eventFingerprint(event);
+      const delivery = selectDeliveryFingerprint.get(consumerId, event.id);
+      if (!delivery) {
+        insertDelivery.run(consumerId, event.id, current, current, current, fingerprint);
+      } else if (!delivery.event_fingerprint) {
+        degrade(consumerId, 'EVENT_FINGERPRINT_MISSING', event.id, current);
+        return selectConsumer.get(consumerId);
+      } else if (delivery.event_fingerprint !== fingerprint) {
+        degrade(consumerId, 'CANONICAL_EVENT_MUTATED', event.id, current);
+        return selectConsumer.get(consumerId);
+      }
+    }
+    consumer = selectConsumer.get(consumerId);
+    return consumer;
+  }
+
+  function requireActiveConsumer(consumerId, current) {
+    const consumer = materializeAndValidate(consumerId, current);
+    if (consumer.health_status !== 'active') {
+      throw domainError(
+        'EVENT_SUBSCRIPTION_DEGRADED',
+        `event subscription is degraded: ${consumer.degraded_reason}`,
+        {
+          degradedReason: consumer.degraded_reason,
+          degradedEventRowId: consumer.degraded_event_row_id,
+        },
+      );
+    }
+    return consumer;
+  }
+
+  const subscribeTransaction = database.transaction(({ consumerId, bootstrap }) => {
     const safeConsumerId = requireText(consumerId, 'consumerId');
+    if (bootstrap !== BOOTSTRAP_MODE) {
+      throw new TypeError(`bootstrap must be ${BOOTSTRAP_MODE}`);
+    }
     const current = currentTime(clock);
-    const inserted = database.prepare(`
-      INSERT OR IGNORE INTO assistant_event_consumers (consumer_id, created_at, updated_at)
-      VALUES (?, ?, ?)
-    `).run(safeConsumerId, current, current);
-    materialize(safeConsumerId, current);
-    return { consumerId: safeConsumerId, replayed: inserted.changes === 0 };
+    let consumer = selectConsumer.get(safeConsumerId);
+    if (consumer) {
+      if (consumer.bootstrap_mode !== bootstrap) {
+        throw domainError('IDEMPOTENCY_CONFLICT', 'consumer replay changes bootstrap mode');
+      }
+      consumer = materializeAndValidate(safeConsumerId, current);
+      return { ...toConsumer(consumer), replayed: true };
+    }
+    const cutoverEventRowId = database.prepare(`
+      SELECT COALESCE(MAX(id), 0) AS value FROM assistant_response_events
+    `).get().value;
+    const legacySkippedCount = database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM assistant_response_events
+      WHERE id <= ? AND event_id IS NULL
+    `).get(cutoverEventRowId).count;
+    database.prepare(`
+      INSERT INTO assistant_event_consumers (
+        consumer_id, bootstrap_mode, start_event_row_id, cutover_event_row_id,
+        legacy_skipped_count, health_status, created_at, updated_at
+      ) VALUES (?, ?, 1, ?, ?, 'active', ?, ?)
+    `).run(
+      safeConsumerId,
+      bootstrap,
+      cutoverEventRowId,
+      legacySkippedCount,
+      current,
+      current,
+    );
+    consumer = materializeAndValidate(safeConsumerId, current);
+    return { ...toConsumer(consumer), replayed: false };
   });
 
   const claimTransaction = database.transaction(({ consumerId, ownerId, leaseSeconds }) => {
@@ -125,28 +336,7 @@ export function openEventSubscriptions({
       throw new TypeError('leaseSeconds must be a positive safe integer');
     }
     const current = currentTime(clock);
-    if (!database.prepare(`
-      SELECT 1 FROM assistant_event_consumers WHERE consumer_id = ?
-    `).get(safeConsumerId)) {
-      throw domainError('CONSUMER_NOT_FOUND', `unknown event consumer: ${safeConsumerId}`);
-    }
-    materialize(safeConsumerId, current);
-    const active = database.prepare(`
-      ${projection}
-      WHERE d.consumer_id = ? AND d.status = 'processing'
-        AND d.lease_expires_at > ?
-      ORDER BY d.event_row_id ASC LIMIT 1
-    `).get(safeConsumerId, current);
-    if (active && active.lease_owner === safeOwnerId) {
-      return {
-        replayed: true,
-        event: toEvent(active),
-        leaseOwner: active.lease_owner,
-        leaseToken: active.lease_token,
-        leaseExpiresAt: active.lease_expires_at,
-      };
-    }
-    if (active) return null;
+    requireActiveConsumer(safeConsumerId, current);
     database.prepare(`
       UPDATE assistant_event_deliveries
       SET status = 'pending', lease_owner = NULL, lease_token = NULL,
@@ -155,26 +345,51 @@ export function openEventSubscriptions({
       WHERE consumer_id = ? AND status = 'processing'
         AND lease_expires_at <= ?
     `).run(current, safeConsumerId, current);
+    const activeCount = database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM assistant_event_deliveries
+      WHERE consumer_id = ? AND status = 'processing' AND lease_expires_at > ?
+    `).get(safeConsumerId, current).count;
+    if (activeCount >= maxInFlightPerConsumer) return null;
+
     const candidate = database.prepare(`
-      ${projection}
+      ${deliveryProjection}
       WHERE d.consumer_id = ? AND d.status = 'pending' AND d.available_at <= ?
         AND NOT EXISTS (
-          SELECT 1 FROM assistant_event_deliveries AS predecessor
+          SELECT 1
+          FROM assistant_event_deliveries AS predecessor
+          JOIN assistant_response_events AS predecessor_event
+            ON predecessor_event.id = predecessor.event_row_id
           WHERE predecessor.consumer_id = d.consumer_id
-            AND predecessor.event_row_id < d.event_row_id
+            AND predecessor_event.request_id = e.request_id
+            AND predecessor_event.sequence < e.sequence
             AND predecessor.status != 'acknowledged'
         )
-      ORDER BY d.event_row_id ASC LIMIT 1
+      ORDER BY (
+        SELECT COALESCE(MAX(stream_delivery.claim_epoch), 0)
+        FROM assistant_event_deliveries AS stream_delivery
+        JOIN assistant_response_events AS stream_event
+          ON stream_event.id = stream_delivery.event_row_id
+        WHERE stream_delivery.consumer_id = d.consumer_id
+          AND stream_event.request_id = e.request_id
+      ) ASC, d.available_at ASC, d.event_row_id ASC
+      LIMIT 1
     `).get(safeConsumerId, current);
     if (!candidate) return null;
+    const claimEpoch = database.prepare(`
+      SELECT COALESCE(MAX(claim_epoch), 0) + 1 AS value
+      FROM assistant_event_deliveries
+      WHERE consumer_id = ?
+    `).get(safeConsumerId).value;
     const leaseToken = requireText(leaseTokenFactory(candidate), 'generated leaseToken');
     const leaseExpiresAt = current + leaseSeconds;
     const updated = database.prepare(`
       UPDATE assistant_event_deliveries
-      SET status = 'processing', lease_owner = ?, lease_token = ?,
+      SET status = 'processing', claim_epoch = ?, lease_owner = ?, lease_token = ?,
           lease_expires_at = ?, updated_at = ?
       WHERE consumer_id = ? AND event_row_id = ? AND status = 'pending'
     `).run(
+      claimEpoch,
       safeOwnerId,
       leaseToken,
       leaseExpiresAt,
@@ -199,6 +414,8 @@ export function openEventSubscriptions({
     const safeConsumerId = requireText(consumerId, 'consumerId');
     const safeEventId = requireText(eventId, 'eventId');
     const safeLeaseToken = requireText(leaseToken, 'leaseToken');
+    const current = currentTime(clock);
+    requireActiveConsumer(safeConsumerId, current);
     const row = selectState.get(safeConsumerId, safeEventId);
     if (!row) throw domainError('EVENT_DELIVERY_NOT_FOUND', 'consumer event delivery does not exist');
     if (row.status === 'acknowledged') {
@@ -210,7 +427,6 @@ export function openEventSubscriptions({
     if (row.lease_token !== safeLeaseToken) {
       throw domainError('LEASE_FENCED', 'ACK lease does not own this event delivery');
     }
-    const current = currentTime(clock);
     if (row.lease_expires_at <= current) {
       throw domainError('LEASE_EXPIRED', 'ACK lease has expired');
     }
@@ -245,12 +461,13 @@ export function openEventSubscriptions({
     if (!Number.isSafeInteger(retryDelaySeconds) || retryDelaySeconds < 0) {
       throw new TypeError('retryDelaySeconds must be a non-negative safe integer');
     }
+    const current = currentTime(clock);
+    requireActiveConsumer(safeConsumerId, current);
     const row = selectState.get(safeConsumerId, safeEventId);
     if (!row) throw domainError('EVENT_DELIVERY_NOT_FOUND', 'consumer event delivery does not exist');
     if (row.lease_token !== safeLeaseToken) {
       throw domainError('LEASE_FENCED', 'failure lease does not own this event delivery');
     }
-    const current = currentTime(clock);
     if (row.status !== 'processing' || row.lease_expires_at <= current) {
       throw domainError('LEASE_EXPIRED', 'failure lease is no longer active');
     }
@@ -271,6 +488,13 @@ export function openEventSubscriptions({
     return toState(selectState.get(safeConsumerId, safeEventId));
   });
 
+  const getConsumerTransaction = database.transaction(({ consumerId }) => {
+    const safeConsumerId = requireText(consumerId, 'consumerId');
+    const current = currentTime(clock);
+    const consumer = materializeAndValidate(safeConsumerId, current);
+    return toConsumer(consumer);
+  });
+
   return Object.freeze({
     subscribe(input = {}) {
       return subscribeTransaction.immediate(input);
@@ -289,6 +513,9 @@ export function openEventSubscriptions({
         requireText(consumerId, 'consumerId'),
         requireText(eventId, 'eventId'),
       ));
+    },
+    getConsumer(input = {}) {
+      return getConsumerTransaction.immediate(input);
     },
     close() {
       database.close();

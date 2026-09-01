@@ -127,11 +127,19 @@ test('real issue-35 database migrates additively and preserves legacy answer and
     idempotencyKey: `run:${run.requestId}:completed`,
     outcome: { kind: 'answer', content: { format: 'text', text: 'New canonical answer.' } },
     reply: {
+      action: 'send',
       route: { adapterId: 'feishu', targetRef: 'opaque:migrated-new' },
       disposition: 'send',
     },
   });
-  subscriptions.subscribe({ consumerId: 'new-consumer' });
+  const subscription = subscriptions.subscribe({
+    consumerId: 'new-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscription.status, 'active');
+  assert.equal(subscription.bootstrap, 'canonical_cutover');
+  assert.ok(subscription.cutoverEventRowId > 0);
+  assert.equal(subscription.legacySkippedCount, legacyEventsBefore.length);
 
   const after = new Database(dbPath, { readonly: true });
   assert.deepEqual(after.prepare(`
@@ -159,4 +167,121 @@ test('real issue-35 database migrates additively and preserves legacy answer and
   after.close();
   assert.equal(outbox.get(committed.intent.intentId).delivery.state, 'pending');
   assert.equal(ledger.get(run.requestId).status, 'completed');
+
+  const mixedWriter = openAssistantResponseStream({ dbPath, clock: () => 102 });
+  legacyAccept(mixedWriter, 'assistant.legacy.after-cutover');
+  mixedWriter.close();
+  const degraded = subscriptions.getConsumer({ consumerId: 'new-consumer' });
+  assert.equal(degraded.status, 'degraded');
+  assert.equal(degraded.degradedReason, 'NONCANONICAL_EVENT_ID');
+  assert.throws(
+    () => subscriptions.claimNext({ consumerId: 'new-consumer', ownerId: 'worker' }),
+    error => error?.code === 'EVENT_SUBSCRIPTION_DEGRADED',
+  );
+});
+
+test('previous run-ledger rows gain a conservative required reply policy and canonical route', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const legacy = openAssistantResponseStream({ dbPath, clock: () => 50 });
+  legacyAccept(legacy, 'assistant.previous-run-ledger');
+  legacy.close();
+  const database = new Database(dbPath);
+  database.exec(`
+    CREATE TABLE assistant_run_ledger (
+      acceptance_order INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL UNIQUE,
+      conversation_lane_key TEXT NOT NULL,
+      lane_sequence INTEGER NOT NULL CHECK (lane_sequence >= 1),
+      payload_hash TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      causation_id TEXT NOT NULL,
+      request_class TEXT NOT NULL DEFAULT 'ordinary',
+      priority INTEGER NOT NULL,
+      require_idle INTEGER NOT NULL DEFAULT 0,
+      runtime_lane_id TEXT NOT NULL DEFAULT 'runtime:shared',
+      turn_id TEXT NOT NULL,
+      generation INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL,
+      accepted_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_at INTEGER,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+      UNIQUE (conversation_lane_key, lane_sequence)
+    );
+    INSERT INTO assistant_run_ledger (
+      request_id, conversation_lane_key, lane_sequence, payload_hash,
+      trace_id, causation_id, request_class, priority, require_idle,
+      runtime_lane_id, turn_id, generation, status, accepted_at, updated_at
+    ) VALUES (
+      'assistant.previous-run-ledger', 'lane:previous', 1,
+      'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+      'trace:previous', 'cause:previous', 'ordinary', 2, 0,
+      'runtime:shared', 'turn:previous:1', 1, 'queued', 50, 50
+    );
+  `);
+  database.close();
+
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  assert.deepEqual(ledger.get('assistant.previous-run-ledger').replyPolicy, {
+    mode: 'required',
+    route: {
+      adapterId: 'feishu',
+      targetRef: 'opaque:assistant.previous-run-ledger',
+    },
+  });
+});
+
+test('pre-cutover WT02 consumer state migrates to an explicit degraded state', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const accepted = ledger.accept(acceptMessage()).request;
+  ledger.close();
+  const database = new Database(dbPath);
+  const eventRowId = database.prepare(`
+    SELECT id FROM assistant_response_events
+    WHERE request_id = ? AND sequence = 1
+  `).get(accepted.requestId).id;
+  database.exec(`
+    CREATE TABLE assistant_event_consumers (
+      consumer_id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE assistant_event_deliveries (
+      consumer_id TEXT NOT NULL,
+      event_row_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      available_at INTEGER NOT NULL,
+      lease_owner TEXT,
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      acknowledged_at INTEGER,
+      PRIMARY KEY (consumer_id, event_row_id)
+    );
+  `);
+  database.prepare(`
+    INSERT INTO assistant_event_consumers (consumer_id, created_at, updated_at)
+    VALUES ('old-consumer', 100, 100)
+  `).run();
+  database.prepare(`
+    INSERT INTO assistant_event_deliveries (
+      consumer_id, event_row_id, status, retry_count, available_at, created_at, updated_at
+    ) VALUES ('old-consumer', ?, 'pending', 0, 100, 100, 100)
+  `).run(eventRowId);
+  database.close();
+
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+  const migrated = subscriptions.getConsumer({ consumerId: 'old-consumer' });
+  assert.equal(migrated.status, 'degraded');
+  assert.equal(migrated.degradedReason, 'LEGACY_SUBSCRIPTION_STATE_UNPROVEN');
+  assert.throws(
+    () => subscriptions.claimNext({ consumerId: 'old-consumer', ownerId: 'worker' }),
+    error => error?.code === 'EVENT_SUBSCRIPTION_DEGRADED',
+  );
 });
