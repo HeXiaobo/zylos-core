@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from '@jest/globals';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   classifyBranch,
   probeLocalIdentity,
@@ -27,6 +27,27 @@ function writeJson(root, relativePath, value) {
 
 function git(root, args) {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+}
+
+function runGovernanceCli(root, mode, manifestPath) {
+  const result = spawnSync(
+    process.execPath,
+    [
+      'scripts/agent-governance-check.js',
+      '--root', root,
+      '--mode', mode,
+      '--manifest', manifestPath,
+      '--json',
+    ],
+    { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' },
+  );
+  let report;
+  try {
+    report = JSON.parse(result.stdout);
+  } catch (error) {
+    throw new Error(`governance CLI did not return JSON: ${error.message}\n${result.stdout}\n${result.stderr}`);
+  }
+  return { ...result, report };
 }
 
 function makeFixture({ withCapabilities = true, withSkillVersion = true } = {}) {
@@ -58,6 +79,69 @@ function makeFixture({ withCapabilities = true, withSkillVersion = true } = {}) 
   git(root, ['add', '.']);
   git(root, ['commit', '-m', 'fixture']);
   return { root, baseSha: git(root, ['rev-parse', 'HEAD']) };
+}
+
+function makeGlobalV2Manifest(fixture, {
+  status = 'HOLD',
+  deploymentAllowed = false,
+  publicationAllowed = true,
+} = {}) {
+  const feishuSha = 'b'.repeat(40);
+  const hxaSha = 'c'.repeat(40);
+  return {
+    schema: 'zylos.release-manifest/v2',
+    releaseId: 'demo-global-1.2.3-01',
+    status,
+    deploymentAllowed,
+    publicationAllowed,
+    holdReasons: status === 'HOLD' ? ['publication pending deployment decision'] : [],
+    candidate: {
+      core: {
+        repo: 'Acme/demo-core',
+        branch: 'main',
+        version: '1.2.3',
+        sha: fixture.baseSha,
+      },
+      feishu: {
+        repo: 'Acme/demo-feishu',
+        branch: 'main',
+        version: '2.3.4',
+        sha: feishuSha,
+      },
+      hxa: {
+        repo: 'Acme/demo-hxa',
+        branch: 'main',
+        packageVersion: '3.4.5',
+        sha: hxaSha,
+      },
+    },
+    sourcePolicy: {
+      deployableBranch: 'main',
+      immutableFullShaOnly: true,
+      featureReleaseArchiveBranchesAreHistoryOnly: true,
+    },
+    deploymentContract: {
+      targetMode: 'global',
+      pairComponents: ['core', 'feishu'],
+      hxaRequired: true,
+    },
+    evidence: {
+      ownerAuthorization: {
+        status: 'PASS',
+        identity: 'user',
+        scope: 'RELEASE_GLOBAL_BUNDLE',
+        publicationAuthorized: true,
+        bundle: {
+          coreSha: fixture.baseSha,
+          feishuSha,
+          hxaSha,
+        },
+      },
+      pairReport: { status: 'PASS' },
+      canary: 'PASS',
+      hxaProvenance: 'PASS',
+    },
+  };
 }
 
 beforeEach(() => {
@@ -155,21 +239,7 @@ describe('external release manifest gate', () => {
   test('accepts a global v2 release manifest without probing a per-agent identity', () => {
     const fixture = makeFixture();
     const manifestPath = path.join(tempRoot, 'global-v2-release-manifest.json');
-    writeJson(tempRoot, 'global-v2-release-manifest.json', {
-      schema: 'zylos.release-manifest/v2',
-      releaseId: 'demo-global-1.2.3-01',
-      status: 'READY',
-      deploymentAllowed: true,
-      candidate: {
-        core: {
-          repo: 'Acme/demo-core',
-          branch: 'main',
-          version: '1.2.3',
-          sha: fixture.baseSha,
-        },
-      },
-      deploymentContract: { targetMode: 'global' },
-    });
+    writeJson(tempRoot, 'global-v2-release-manifest.json', makeGlobalV2Manifest(fixture));
 
     const result = runGovernance({
       root: fixture.root,
@@ -181,29 +251,19 @@ describe('external release manifest gate', () => {
     expect(result.ok).toBe(true);
     expect(result.manifest).toMatchObject({
       releaseId: 'demo-global-1.2.3-01',
-      status: 'READY',
-      deploymentAllowed: true,
+      status: 'HOLD',
+      deploymentAllowed: false,
     });
   });
 
   test('keeps the deploy gate identity requirement for a global v2 manifest', () => {
     const fixture = makeFixture();
     const manifestPath = path.join(tempRoot, 'global-v2-deploy-manifest.json');
-    writeJson(tempRoot, 'global-v2-deploy-manifest.json', {
-      schema: 'zylos.release-manifest/v2',
-      releaseId: 'demo-global-1.2.3-02',
+    writeJson(tempRoot, 'global-v2-deploy-manifest.json', makeGlobalV2Manifest(fixture, {
       status: 'READY',
       deploymentAllowed: true,
-      candidate: {
-        core: {
-          repo: 'Acme/demo-core',
-          branch: 'main',
-          version: '1.2.3',
-          sha: fixture.baseSha,
-        },
-      },
-      deploymentContract: { targetMode: 'global' },
-    });
+      publicationAllowed: false,
+    }));
 
     const result = runGovernance({
       root: fixture.root,
@@ -214,6 +274,335 @@ describe('external release manifest gate', () => {
 
     expect(result.ok).toBe(false);
     expect(result.errors.join('\n')).toMatch(/target\.agent|required|identity probe/);
+  });
+
+  test('uses only candidate.core for v2 and rejects stable or top-level fallbacks', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-missing-candidate-core.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    delete manifest.candidate.core;
+    manifest.stable = {
+      core: {
+        repo: 'Acme/demo-core',
+        branch: 'main',
+        version: '1.2.3',
+        sha: fixture.baseSha,
+      },
+    };
+    manifest.core = manifest.stable.core;
+    writeJson(tempRoot, 'global-v2-missing-candidate-core.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/candidate\.core is required/);
+  });
+
+  test('public CLI fails closed when v2 candidate.core is replaced by a legacy fallback', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-cli-fallback.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    const candidate = manifest.candidate.core;
+    delete manifest.candidate.core;
+    manifest.stable = { core: candidate };
+    manifest.core = candidate;
+    writeJson(tempRoot, 'global-v2-cli-fallback.json', manifest);
+
+    const result = runGovernanceCli(fixture.root, 'release', manifestPath);
+
+    expect(result.status).toBe(1);
+    expect(result.report.ok).toBe(false);
+    expect(result.report.errors.join('\n')).toMatch(/no zylos-core component entry|candidate\.core is required/);
+  });
+
+  test('release mode requires publication permission and permits a held non-deployable v2 root', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-publication-permission.json');
+    const manifest = makeGlobalV2Manifest(fixture, {
+      status: 'HOLD',
+      deploymentAllowed: false,
+      publicationAllowed: false,
+    });
+    writeJson(tempRoot, 'global-v2-publication-permission.json', manifest);
+
+    const blocked = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+    expect(blocked.ok).toBe(false);
+    expect(blocked.errors.join('\n')).toMatch(/publicationAllowed.*true/);
+
+    manifest.publicationAllowed = true;
+    manifest.deploymentAllowed = true;
+    writeJson(tempRoot, 'global-v2-publication-permission.json', manifest);
+    const invalidHeldDeployment = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+    expect(invalidHeldDeployment.ok).toBe(false);
+    expect(invalidHeldDeployment.errors.join('\n')).toMatch(/deploymentAllowed=true.*READY|Publication HOLD.*false/);
+  });
+
+  test('uses root status and permissions for v2 instead of candidate overrides', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-root-permissions.json');
+    const manifest = makeGlobalV2Manifest(fixture, {
+      status: 'CANCELLED',
+      deploymentAllowed: false,
+      publicationAllowed: false,
+    });
+    manifest.candidate.core.status = 'READY';
+    manifest.candidate.core.deploymentAllowed = true;
+    manifest.candidate.core.publicationAllowed = true;
+    writeJson(tempRoot, 'global-v2-root-permissions.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/publicationAllowed.*true|CANCELLED|status HOLD or READY/);
+  });
+
+  test('requires the exact global deployment contract for v2 publication', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-invalid-contract.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.deploymentContract = {
+      targetMode: 'per-agent',
+      pairComponents: ['feishu', 'core', 'hxa'],
+      hxaRequired: false,
+    };
+    writeJson(tempRoot, 'global-v2-invalid-contract.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/targetMode.*global/);
+    expect(result.errors.join('\n')).toMatch(/pairComponents.*core.*feishu/);
+    expect(result.errors.join('\n')).toMatch(/hxaRequired.*true/);
+  });
+
+  test('requires owner publication authorization and an exact three-repository bundle', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-invalid-owner-authorization.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.evidence.ownerAuthorization = {
+      status: 'HOLD',
+      identity: 'agent',
+      publicationAuthorized: false,
+      scope: 'LOCAL_ONLY',
+      bundle: {
+        coreSha: 'd'.repeat(40),
+        feishuSha: 'not-a-sha',
+        hxaSha: 'e'.repeat(40),
+      },
+    };
+    writeJson(tempRoot, 'global-v2-invalid-owner-authorization.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/ownerAuthorization.*status.*PASS/);
+    expect(result.errors.join('\n')).toMatch(/ownerAuthorization.*identity.*user/);
+    expect(result.errors.join('\n')).toMatch(/publicationAuthorized.*true/);
+    expect(result.errors.join('\n')).toMatch(/scope.*RELEASE_GLOBAL_BUNDLE/i);
+    expect(result.errors.join('\n')).toMatch(/bundle\.coreSha.*does not match candidate/);
+    expect(result.errors.join('\n')).toMatch(/bundle\.feishuSha.*full.*SHA/);
+  });
+
+  test('requires immutable main source policy and strict candidate identity fields', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-invalid-source-policy.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.sourcePolicy = {
+      deployableBranch: 'release/1.2.3',
+      immutableFullShaOnly: false,
+      featureReleaseArchiveBranchesAreHistoryOnly: false,
+    };
+    manifest.candidate.core.branch = 'codex/unpublished-candidate';
+    manifest.candidate.core.sha = manifest.candidate.core.sha.toUpperCase();
+    writeJson(tempRoot, 'global-v2-invalid-source-policy.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/sourcePolicy\.deployableBranch.*main/);
+    expect(result.errors.join('\n')).toMatch(/immutableFullShaOnly.*true/);
+    expect(result.errors.join('\n')).toMatch(/featureReleaseArchiveBranchesAreHistoryOnly.*true/);
+    expect(result.errors.join('\n')).toMatch(/candidate\.core\.sha.*lowercase/);
+    expect(result.errors.join('\n')).toMatch(/candidate\.core.*branch.*current branch|manifest branch/);
+  });
+
+  test('requires every v2 candidate component to use the deployable branch', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-component-branch.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.candidate.feishu.branch = 'codex/unpublished-candidate';
+    writeJson(tempRoot, 'global-v2-component-branch.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/candidate\.feishu branch.*deployable branch/);
+  });
+
+  test('rejects a v2 candidate branch ref instead of normalizing it into main', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-branch-ref.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.candidate.core.branch = 'refs/heads/main';
+    writeJson(tempRoot, 'global-v2-branch-ref.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/candidate\.core branch.*deployable branch/);
+  });
+
+  test('rejects a non-GitHub repository URL even when its path matches', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-evil-repository.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.candidate.core.repo = 'https://evil.example/Acme/demo-core.git';
+    writeJson(tempRoot, 'global-v2-evil-repository.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/repo.*does not exactly match Acme\/demo-core|GitHub/);
+  });
+
+  test('rejects a v2 manifest when the repository origin is a non-GitHub lookalike', () => {
+    const fixture = makeFixture();
+    git(fixture.root, ['remote', 'add', 'origin', 'https://evil.example/Acme/demo-core.git']);
+    const manifestPath = path.join(tempRoot, 'global-v2-evil-origin.json');
+    writeJson(tempRoot, 'global-v2-evil-origin.json', makeGlobalV2Manifest(fixture));
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/origin.*does not identify a valid GitHub repository/);
+  });
+
+  test('does not probe HXA identity for a malformed v2 release target', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-invalid-target.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.target = { agent: 'ss', profileId: 'profile-ss', hostname: 'host-ss' };
+    writeJson(tempRoot, 'global-v2-invalid-target.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/must not contain a per-agent target/);
+    expect(result.errors.join('\n')).not.toMatch(/identity probe required/);
+  });
+
+  test('requires both publication and deployment permissions to be false for CANCELLED v2 manifests', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-cancelled-permissions.json');
+    const manifest = makeGlobalV2Manifest(fixture, {
+      status: 'CANCELLED',
+      deploymentAllowed: true,
+      publicationAllowed: true,
+    });
+    writeJson(tempRoot, 'global-v2-cancelled-permissions.json', manifest);
+
+    const releaseResult = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+    const deployResult = runGovernance({
+      root: fixture.root,
+      mode: 'deploy',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'deploy-probe-missing.mjs'),
+    });
+
+    expect(releaseResult.ok).toBe(false);
+    expect(deployResult.ok).toBe(false);
+    expect(`${releaseResult.errors.join('\n')}\n${deployResult.errors.join('\n')}`).toMatch(/CANCELLED.*publicationAllowed=false/);
+    expect(`${releaseResult.errors.join('\n')}\n${deployResult.errors.join('\n')}`).toMatch(/CANCELLED.*deploymentAllowed=false/);
+  });
+
+  test('deploy mode still requires READY and deploymentAllowed=true for v2', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-deploy-state.json');
+    writeJson(tempRoot, 'global-v2-deploy-state.json', makeGlobalV2Manifest(fixture, {
+      status: 'HOLD',
+      deploymentAllowed: false,
+      publicationAllowed: true,
+    }));
+
+    const result = validateReleaseManifest({
+      root: fixture.root,
+      manifestPath,
+      sha: fixture.baseSha,
+      version: '1.2.3',
+      branch: 'main',
+      packageName: 'demo-core',
+      repository: 'Acme/demo-core',
+      mode: 'deploy',
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/status=READY/);
+    expect(result.errors.join('\n')).toMatch(/deploymentAllowed=true/);
   });
 
   test('uses a fresh HXA profile probe instead of trusting a command-line agent label', () => {
@@ -338,6 +727,17 @@ describe('external release manifest gate', () => {
     expect(validateDeploymentReadiness({ evidence: {} }).join('\n')).toMatch(/pairReport|canary=PASS|hxaProvenance=PASS/);
     expect(validateDeploymentReadiness({
       evidence: { pairReport: '/reports/pair.json', canary: 'PASS', hxaProvenance: 'PASS' },
+    })).toEqual([]);
+  });
+
+  test('accepts the v2 structured pair report for deploy readiness', () => {
+    expect(validateDeploymentReadiness({
+      schema: 'zylos.release-manifest/v2',
+      evidence: {
+        pairReport: { status: 'PASS' },
+        canary: 'PASS',
+        hxa: { status: 'PASS' },
+      },
     })).toEqual([]);
   });
 });

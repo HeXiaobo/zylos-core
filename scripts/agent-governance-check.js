@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
+const LOWERCASE_FULL_SHA_RE = /^[0-9a-f]{40}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const RELEASE_MANIFEST_V1 = 'zylos.release-manifest/v1';
 const RELEASE_MANIFEST_V2 = 'zylos.release-manifest/v2';
@@ -539,6 +540,40 @@ function normalizeRepository(value) {
   }
 }
 
+/**
+ * Parse the GitHub repository identity used by the v2 release contract.
+ * Unlike the historical v1 normalizer, this rejects arbitrary hosts, query
+ * strings, credentials, and paths with more than one repository component.
+ */
+function normalizeGitHubRepository(value) {
+  const raw = typeof value === 'string' ? value : value?.url;
+  if (!asNonEmptyString(raw)) return null;
+  let text = raw.trim().replace(/^git\+/, '').replace(/\/+$/, '');
+
+  if (/^[^/\\\s:#?]+\/[^/\\\s:#?]+(?:\.git)?$/i.test(text)) {
+    return text.replace(/\.git$/i, '');
+  }
+
+  const scp = /^git@github\.com:([^/\\\s:#?]+\/[^/\\\s:#?]+)$/i.exec(text);
+  if (scp) return scp[1].replace(/\.git$/i, '');
+
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return null;
+  }
+  if (!['https:', 'ssh:'].includes(parsed.protocol) || parsed.hostname.toLowerCase() !== 'github.com') {
+    return null;
+  }
+  if (parsed.search || parsed.hash) return null;
+  if (parsed.protocol === 'https:' && (parsed.username || parsed.password)) return null;
+  if (parsed.protocol === 'ssh:' && parsed.username && parsed.username !== 'git') return null;
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  if (parts.length !== 2) return null;
+  return `${parts[0]}/${parts[1].replace(/\.git$/i, '')}`;
+}
+
 function repoSlug(value) {
   const normalized = normalizeRepository(value) || String(value || '').trim();
   return normalized.split('/').filter(Boolean).pop() || null;
@@ -573,6 +608,111 @@ function manifestTarget(manifest, expectedRepoSlug, { sha = null, version = null
     || (version && String(value.version || value.release || value.packageVersion) === String(version)))
     || matchingRepo[0];
   return target || manifest;
+}
+
+function validateGlobalV2CandidateComponent(manifest, componentName, versionKey, errors, { expectedBranch = null } = {}) {
+  const component = manifest.candidate?.[componentName];
+  const label = `Release manifest candidate.${componentName}`;
+  if (!isObject(component)) {
+    errors.push(`Release manifest has no zylos-${componentName} component entry; ${label} is required`);
+    return null;
+  }
+  if (!asNonEmptyString(component.repo) || !normalizeGitHubRepository(component.repo)) {
+    errors.push(`${label}.repo is required and must identify a repository`);
+  }
+  const version = asNonEmptyString(component[versionKey]);
+  if (!version) errors.push(`${label}.${versionKey} is required`);
+  else if (!VERSION_RE.test(version)) errors.push(`${label}.${versionKey} must be a valid version`);
+  if (!LOWERCASE_FULL_SHA_RE.test(String(component.sha || ''))) {
+    errors.push(`${label}.sha must be a full 40-character lowercase SHA`);
+  }
+  if (!asNonEmptyString(component.branch)) {
+    errors.push(`${label}.branch is required`);
+  } else if (expectedBranch && component.branch !== expectedBranch) {
+    errors.push(`Release manifest ${label.replace('Release manifest ', '')} branch ${component.branch} does not match deployable branch ${expectedBranch}`);
+  }
+  return component;
+}
+
+function validateGlobalV2SourcePolicy(manifest, errors) {
+  const policy = manifest.sourcePolicy;
+  if (!isObject(policy)) {
+    errors.push('Release manifest sourcePolicy.deployableBranch is required for v2');
+    return;
+  }
+  if (!asNonEmptyString(policy.deployableBranch)) {
+    errors.push('Release manifest sourcePolicy.deployableBranch is required for v2');
+  }
+  if (policy.deployableBranch !== 'main') {
+    errors.push('Release manifest sourcePolicy.deployableBranch must be main');
+  }
+  if (policy.immutableFullShaOnly !== true) {
+    errors.push('Release manifest sourcePolicy.immutableFullShaOnly must be true');
+  }
+  if (policy.featureReleaseArchiveBranchesAreHistoryOnly !== true) {
+    errors.push('Release manifest sourcePolicy.featureReleaseArchiveBranchesAreHistoryOnly must be true');
+  }
+}
+
+function validateGlobalV2DeploymentContract(manifest, errors) {
+  const contract = manifest.deploymentContract;
+  if (!isObject(contract)) {
+    errors.push('Release manifest deploymentContract is required for v2');
+    return;
+  }
+  if (contract.targetMode !== 'global') {
+    errors.push('Release manifest deploymentContract.targetMode must be global');
+  }
+  if (!Array.isArray(contract.pairComponents)
+    || contract.pairComponents.length !== 2
+    || contract.pairComponents[0] !== 'core'
+    || contract.pairComponents[1] !== 'feishu') {
+    errors.push("Release manifest deploymentContract.pairComponents must be exactly ['core','feishu']");
+  }
+  if (contract.hxaRequired !== true) {
+    errors.push('Release manifest deploymentContract.hxaRequired must be true');
+  }
+}
+
+function validateGlobalV2PublicationAuthorization(manifest, errors) {
+  const label = 'Release manifest evidence.ownerAuthorization';
+  const authorization = manifest.evidence?.ownerAuthorization;
+  if (!isObject(authorization)) {
+    errors.push(`${label} is required for publication`);
+    return;
+  }
+  if (authorization.status !== 'PASS') errors.push(`${label}.status must be PASS`);
+  if (authorization.identity !== 'user') errors.push(`${label}.identity must be user`);
+  if (authorization.publicationAuthorized !== true) {
+    errors.push(`${label}.publicationAuthorized must be true`);
+  }
+  if (authorization.scope !== 'RELEASE_GLOBAL_BUNDLE') {
+    errors.push(`${label}.scope must be exactly RELEASE_GLOBAL_BUNDLE`);
+  }
+
+  const bundle = authorization.bundle;
+  if (!isObject(bundle)) {
+    errors.push(`${label}.bundle is required`);
+    return;
+  }
+  const expected = {
+    coreSha: manifest.candidate?.core?.sha,
+    feishuSha: manifest.candidate?.feishu?.sha,
+    hxaSha: manifest.candidate?.hxa?.sha,
+  };
+  const expectedFields = Object.keys(expected).sort();
+  const actualFields = Object.keys(bundle).sort();
+  if (JSON.stringify(actualFields) !== JSON.stringify(expectedFields)) {
+    errors.push(`${label}.bundle must contain exactly coreSha, feishuSha, and hxaSha`);
+  }
+  for (const [field, candidateSha] of Object.entries(expected)) {
+    const value = bundle[field];
+    if (!LOWERCASE_FULL_SHA_RE.test(String(value || ''))) {
+      errors.push(`${label}.bundle.${field} must be a full 40-character lowercase SHA`);
+    } else if (value !== candidateSha) {
+      errors.push(`${label}.bundle.${field} does not match candidate`);
+    }
+  }
 }
 
 function manifestValue(manifest, target, keys) {
@@ -648,38 +788,97 @@ export function validateReleaseManifest({
   const manifest = readJson(resolvedManifestPath, 'Release manifest', errors);
   if (!manifest) return { ok: false, errors, path: resolvedManifestPath };
 
-  const expectedSlug = repoSlug(repository) || repoSlug(packageName) || path.basename(repoRoot);
-  const target = manifestTarget(manifest, expectedSlug, { sha, version });
-  const releaseId = asNonEmptyString(manifest.releaseId) || asNonEmptyString(manifest.id);
-  const status = manifestValue(manifest, target, ['status', 'state']);
-  const deploymentAllowed = manifestValue(manifest, target, ['deploymentAllowed']);
-  const manifestRepo = manifestValue(manifest, target, ['repo', 'repository']);
-  const manifestBranch = manifestValue(manifest, target, ['branch', 'ref']);
-  const manifestSha = manifestValue(manifest, target, ['sha', 'commit', 'commitSha', 'headSha']);
-  const manifestVersion = manifestValue(manifest, target, ['version', 'release', 'packageVersion']);
-
   const manifestSchema = manifest.schema === undefined ? RELEASE_MANIFEST_V1 : manifest.schema;
-  const isGlobalV2Manifest = manifestSchema === RELEASE_MANIFEST_V2 && manifest.target === undefined;
+  const isV2Manifest = manifestSchema === RELEASE_MANIFEST_V2;
   if (![RELEASE_MANIFEST_V1, RELEASE_MANIFEST_V2].includes(manifestSchema)) {
     errors.push(`Release manifest schema is unsupported: ${manifest.schema}`);
   }
-  if (manifestSchema === RELEASE_MANIFEST_V2 && manifest.target !== undefined) {
+  if (isV2Manifest && manifest.target !== undefined) {
     errors.push('Global v2 release manifest must not contain a per-agent target');
   }
-  if (!releaseId) errors.push('Release manifest must declare releaseId');
-  if (status !== 'READY') errors.push(`Release manifest status must be READY (found ${status ?? '(missing)'})`);
-  if (deploymentAllowed !== true) errors.push('Release manifest deploymentAllowed must be true');
-  if (status === 'READY' && Array.isArray(manifest.holdReasons) && manifest.holdReasons.length > 0) {
-    errors.push('READY release manifest must not contain holdReasons');
+
+  const expectedSlug = repoSlug(repository) || repoSlug(packageName) || path.basename(repoRoot);
+  const target = isV2Manifest ? (isObject(manifest.candidate?.core) ? manifest.candidate.core : {})
+    : manifestTarget(manifest, expectedSlug, { sha, version });
+  const releaseId = isV2Manifest
+    ? asNonEmptyString(manifest.releaseId)
+    : asNonEmptyString(manifest.releaseId) || asNonEmptyString(manifest.id);
+  const status = isV2Manifest ? manifest.status : manifestValue(manifest, target, ['status', 'state']);
+  const deploymentAllowed = isV2Manifest
+    ? manifest.deploymentAllowed
+    : manifestValue(manifest, target, ['deploymentAllowed']);
+  const publicationAllowed = isV2Manifest ? manifest.publicationAllowed : undefined;
+  const manifestRepo = isV2Manifest ? target.repo : manifestValue(manifest, target, ['repo', 'repository']);
+  const manifestBranch = isV2Manifest ? target.branch : manifestValue(manifest, target, ['branch', 'ref']);
+  const manifestSha = isV2Manifest ? target.sha : manifestValue(manifest, target, ['sha', 'commit', 'commitSha', 'headSha']);
+  const manifestVersion = isV2Manifest ? target.version : manifestValue(manifest, target, ['version', 'release', 'packageVersion']);
+
+  if (isV2Manifest) {
+    validateGlobalV2SourcePolicy(manifest, errors);
+    const deployableBranch = asNonEmptyString(manifest.sourcePolicy?.deployableBranch);
+    validateGlobalV2CandidateComponent(manifest, 'core', 'version', errors, { expectedBranch: deployableBranch });
+    validateGlobalV2CandidateComponent(manifest, 'feishu', 'version', errors, { expectedBranch: deployableBranch });
+    validateGlobalV2CandidateComponent(manifest, 'hxa', 'packageVersion', errors, { expectedBranch: deployableBranch });
+    validateGlobalV2DeploymentContract(manifest, errors);
+    if (!['HOLD', 'READY', 'DEPLOYED', 'ROLLED_BACK', 'CANCELLED'].includes(status)) {
+      errors.push(`Release manifest status is invalid: ${status ?? '(missing)'}`);
+    }
+    if (typeof deploymentAllowed !== 'boolean') {
+      errors.push('Release manifest deploymentAllowed must be boolean');
+    }
+    if (publicationAllowed !== undefined && typeof publicationAllowed !== 'boolean') {
+      errors.push('Release manifest publicationAllowed must be boolean');
+    }
+    if (!Array.isArray(manifest.holdReasons)) errors.push('Release manifest holdReasons must be an array');
+    if (status === 'READY' && Array.isArray(manifest.holdReasons) && manifest.holdReasons.length > 0) {
+      errors.push('READY release manifest must not contain holdReasons');
+    }
+    if (deploymentAllowed === true && status !== 'READY') {
+      errors.push('deploymentAllowed=true requires status=READY');
+    }
+    if (status === 'CANCELLED') {
+      if (publicationAllowed !== false) errors.push('CANCELLED manifest must have publicationAllowed=false');
+      if (deploymentAllowed !== false) errors.push('CANCELLED manifest must have deploymentAllowed=false');
+    }
+    if (mode === 'deploy') {
+      if (status !== 'READY') errors.push(`Deploy mode requires manifest status=READY (found ${status ?? '(missing)'})`);
+      if (deploymentAllowed !== true) errors.push('Deploy mode requires deploymentAllowed=true');
+    }
   }
+  if (!releaseId) errors.push('Release manifest must declare releaseId');
+  if (!isV2Manifest) {
+    if (status !== 'READY') errors.push(`Release manifest status must be READY (found ${status ?? '(missing)'})`);
+    if (deploymentAllowed !== true) errors.push('Release manifest deploymentAllowed must be true');
+    if (status === 'READY' && Array.isArray(manifest.holdReasons) && manifest.holdReasons.length > 0) {
+      errors.push('READY release manifest must not contain holdReasons');
+    }
+  }
+  const normalizedManifestRepo = isV2Manifest
+    ? normalizeGitHubRepository(manifestRepo)
+    : normalizeRepository(manifestRepo);
+  const normalizedRepository = isV2Manifest
+    ? normalizeGitHubRepository(repository)
+    : normalizeRepository(repository);
   if (!manifestRepo) errors.push('Release manifest must declare repo');
-  else if (normalizeRepository(manifestRepo) !== normalizeRepository(repository)) {
+  else if (normalizedManifestRepo !== normalizedRepository) {
     errors.push(`Release manifest repo ${manifestRepo} does not exactly match ${repository}`);
   } else if (repoSlug(manifestRepo) !== expectedSlug) {
     errors.push(`Release manifest repo ${manifestRepo} does not target ${expectedSlug}`);
   }
+  if (isV2Manifest) {
+    const origin = git(repoRoot, ['remote', 'get-url', 'origin'], { allowFailure: true });
+    if (origin && normalizeGitHubRepository(origin) !== normalizedRepository) {
+      errors.push(`Release manifest origin ${origin} does not identify a valid GitHub repository matching ${repository}`);
+    }
+  }
   if (!manifestBranch) errors.push('Release manifest must declare branch');
-  else if (branch && String(manifestBranch).replace(/^refs\/heads\//, '') !== String(branch).replace(/^refs\/heads\//, '')) {
+  else if (isV2Manifest) {
+    const deployableBranch = String(manifest.sourcePolicy?.deployableBranch || '');
+    const candidateBranch = String(manifestBranch);
+    if (deployableBranch && candidateBranch !== deployableBranch) {
+      errors.push(`Release manifest branch ${manifestBranch} does not match deployable branch ${manifest.sourcePolicy.deployableBranch}`);
+    }
+  } else if (branch && String(manifestBranch).replace(/^refs\/heads\//, '') !== String(branch).replace(/^refs\/heads\//, '')) {
     errors.push(`Release manifest branch ${manifestBranch} does not match current branch ${branch}`);
   }
   if (!FULL_SHA_RE.test(String(manifestSha || ''))) {
@@ -698,11 +897,24 @@ export function validateReleaseManifest({
     }
   }
 
+  if (isV2Manifest && mode === 'release') {
+    if (publicationAllowed !== true) {
+      errors.push('Release manifest publicationAllowed must be true for publication');
+    }
+    if (!['HOLD', 'READY'].includes(status)) {
+      errors.push(`Publication requires manifest status HOLD or READY (found ${status ?? '(missing)'})`);
+    }
+    if (status === 'HOLD' && deploymentAllowed !== false) {
+      errors.push('Publication HOLD must have deploymentAllowed=false');
+    }
+    if (publicationAllowed === true) validateGlobalV2PublicationAuthorization(manifest, errors);
+  }
+
   const targetIdentity = manifest.target;
   const targetAgent = asNonEmptyString(targetIdentity?.agent);
   const targetProfileId = asNonEmptyString(targetIdentity?.profileId);
   const targetHostname = asNonEmptyString(targetIdentity?.hostname);
-  const identityRequired = mode === 'deploy' || !isGlobalV2Manifest;
+  const identityRequired = mode === 'deploy' || !isV2Manifest;
   if (identityRequired) {
     if (!targetAgent) errors.push('Release manifest target.agent is required');
     if (!targetProfileId) errors.push('Release manifest target.profileId is required');
@@ -745,13 +957,23 @@ export function validateReleaseManifest({
 /** Validate evidence that is required only when the operation will deploy. */
 export function validateDeploymentReadiness(manifest) {
   const errors = [];
-  if (!asNonEmptyString(manifest?.evidence?.pairReport)) {
+  if (manifest?.schema === RELEASE_MANIFEST_V2) {
+    if (!isObject(manifest?.evidence?.pairReport)) {
+      errors.push('Deploy mode requires evidence.pairReport');
+    } else if (manifest.evidence.pairReport.status !== 'PASS') {
+      errors.push(`Deploy mode requires evidence.pairReport.status=PASS (found ${manifest.evidence.pairReport.status ?? '(missing)'})`);
+    }
+  } else if (!asNonEmptyString(manifest?.evidence?.pairReport)) {
     errors.push('Deploy mode requires evidence.pairReport');
   }
   if (manifest?.evidence?.canary !== 'PASS') {
     errors.push(`Deploy mode requires evidence.canary=PASS (found ${manifest?.evidence?.canary ?? '(missing)'})`);
   }
-  if (manifest?.evidence?.hxaProvenance !== 'PASS') {
+  if (manifest?.schema === RELEASE_MANIFEST_V2) {
+    if (!isObject(manifest?.evidence?.hxa) || manifest.evidence.hxa.status !== 'PASS') {
+      errors.push(`Deploy mode requires evidence.hxa.status=PASS (found ${manifest?.evidence?.hxa?.status ?? '(missing)'})`);
+    }
+  } else if (manifest?.evidence?.hxaProvenance !== 'PASS') {
     errors.push(`Deploy mode requires evidence.hxaProvenance=PASS (found ${manifest?.evidence?.hxaProvenance ?? '(missing)'})`);
   }
   return errors;
