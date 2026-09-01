@@ -545,9 +545,9 @@ export function openRuntimePendingQueue({
       stale.request_id,
       sequence,
       JSON.stringify({
-        runtimeLaneId: RUNTIME_LANE_ID,
-        recoveredFromTurnId: stale.turn_id,
         recoveredAdmissionStatus: stale.status,
+        recoveredFromTurnId: stale.turn_id,
+        runtimeLaneId: RUNTIME_LANE_ID,
       }),
       `run:${stale.request_id}:recovered:g${nextGeneration}`,
       current,

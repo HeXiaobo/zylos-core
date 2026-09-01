@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,16 @@ function temporaryDatabase(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-event-subscription-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   return path.join(directory, 'c4.db');
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function acceptMessage(id) {
@@ -394,7 +405,7 @@ test('same-request canonical sequence gaps degrade the subscription and fail cla
               'pending', 100, 100, ?, ?, 1, ?, ?, 'runtime:shared')
   `).run(
     run.requestId,
-    `run:${run.requestId}:progress:gap`,
+    `run:${run.requestId}:progress:1`,
     `evt:${run.requestId}:4`,
     run.turnId,
     run.traceId,
@@ -457,20 +468,30 @@ test('unknown event types cannot masquerade as canonical subscription events', (
 test('canonical-looking events must extend their request causation chain', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
   t.after(() => ledger.close());
-  const run = ledger.accept(acceptMessage('bad-causation')).request;
+  t.after(() => queue.close());
+  const accepted = ledger.accept(acceptMessage('bad-causation')).request;
+  const claim = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: 'runtime:bad-causation',
+  }).request;
   const inject = new Database(dbPath);
   inject.prepare(`
     INSERT INTO assistant_response_events (
       request_id, sequence, event_type, payload_json, idempotency_key,
       delivery_status, available_at, created_at, event_id, turn_id,
       generation, trace_id, causation_id, producer
-    ) VALUES (?, 3, 'ProgressUpdated', '{"stage":"bad-cause"}', ?,
+    ) VALUES (?, 4, 'ProgressUpdated', '{"stage":"bad-cause"}', ?,
               'pending', 100, 100, ?, ?, 1, ?, 'BOGUS_CAUSE', 'runtime:shared')
   `).run(
     run.requestId,
-    `run:${run.requestId}:progress:bad-cause`,
-    `evt:${run.requestId}:3`,
+    `run:${run.requestId}:progress:1`,
+    `evt:${run.requestId}:4`,
     run.turnId,
     run.traceId,
   );
@@ -500,7 +521,7 @@ test('RunStarted requires a canonical runtime session identity', (t) => {
               'pending', 100, 100, ?, ?, 1, ?, ?, 'core:runtime-lane')
   `).run(
     run.requestId,
-    `run:${run.requestId}:started`,
+    `run:${run.requestId}:started:g1`,
     `evt:${run.requestId}:3`,
     run.turnId,
     run.traceId,
@@ -525,8 +546,18 @@ test('canonical-looking terminals require a durable matching ReplyOutcome', (t) 
   ]) {
     const dbPath = temporaryDatabase(t);
     const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
     t.after(() => ledger.close());
-    const run = ledger.accept(acceptMessage(id)).request;
+    t.after(() => queue.close());
+    const accepted = ledger.accept(acceptMessage(id)).request;
+    const claim = queue.claimNext();
+    const run = queue.confirmStarted({
+      admissionId: claim.admission.id,
+      requestId: accepted.requestId,
+      turnId: accepted.turnId,
+      generation: accepted.generation,
+      runtimeSessionId: `runtime:${id}`,
+    }).request;
     const payload = id === 'missing-outcome-id'
       ? {}
       : { outcomeId: `outcome:${run.requestId}` };
@@ -536,15 +567,15 @@ test('canonical-looking terminals require a durable matching ReplyOutcome', (t) 
         request_id, sequence, event_type, payload_json, idempotency_key,
         delivery_status, available_at, created_at, event_id, turn_id,
         generation, trace_id, causation_id, producer
-      ) VALUES (?, 3, 'RunCompleted', ?, ?, 'pending', 100, 100, ?, ?, 1, ?, ?, 'runtime:shared')
+      ) VALUES (?, 4, 'RunCompleted', ?, ?, 'pending', 100, 100, ?, ?, 1, ?, ?, 'runtime:shared')
     `).run(
       run.requestId,
       JSON.stringify(payload),
       `run:${run.requestId}:completed`,
-      `evt:${run.requestId}:3`,
+      `evt:${run.requestId}:4`,
       run.turnId,
       run.traceId,
-      `evt:${run.requestId}:2`,
+      `evt:${run.requestId}:3`,
     );
     inject.close();
     const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
@@ -556,6 +587,188 @@ test('canonical-looking terminals require a durable matching ReplyOutcome', (t) 
     assert.equal(subscribed.status, 'degraded');
     assert.equal(subscribed.degradedReason, expectedReason);
   }
+});
+
+test('RunCompleted cannot jump directly from RunQueued even with a matching Outcome', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => subscriptions.close());
+  const run = ledger.accept(acceptMessage('queued-terminal-jump')).request;
+  const outcome = {
+    schemaVersion: 1,
+    type: 'ReplyOutcome',
+    outcomeId: `outcome:${run.requestId}`,
+    requestId: run.requestId,
+    turnId: run.turnId,
+    traceId: run.traceId,
+    kind: 'answer',
+    content: { format: 'text', text: 'Impossible completion.' },
+  };
+  const outcomeJson = canonicalJson(outcome);
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    INSERT INTO assistant_reply_outcomes (
+      outcome_id, request_id, turn_id, generation, trace_id, kind,
+      envelope_json, canonical_hash, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'answer', ?, ?, 100)
+  `).run(
+    outcome.outcomeId,
+    run.requestId,
+    run.turnId,
+    run.generation,
+    run.traceId,
+    outcomeJson,
+    createHash('sha256').update(outcomeJson).digest('hex'),
+  );
+  inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, 3, 'RunCompleted', ?, ?, 'pending', 100, 100, ?, ?, ?, ?, ?, 'runtime:shared')
+  `).run(
+    run.requestId,
+    canonicalJson({ outcomeId: outcome.outcomeId }),
+    `run:${run.requestId}:completed`,
+    `evt:${run.requestId}:3`,
+    run.turnId,
+    run.generation,
+    run.traceId,
+    `evt:${run.requestId}:2`,
+  );
+  inject.close();
+
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'queued-terminal-jump-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'NONCANONICAL_EVENT_TRANSITION');
+});
+
+test('RunCancelled requires a matching durable cancellation command cause', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => subscriptions.close());
+  const run = ledger.accept(acceptMessage('cancel-without-command')).request;
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, 3, 'RunCancelled', '{"mode":"queued"}', ?,
+              'pending', 100, 100, ?, ?, ?, ?, 'BOGUS_CANCEL_CAUSE', 'core:runtime-lane')
+  `).run(
+    run.requestId,
+    `run:${run.requestId}:cancelled:g${run.generation}`,
+    `evt:${run.requestId}:3`,
+    run.turnId,
+    run.generation,
+    run.traceId,
+  );
+  inject.close();
+
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'cancel-without-command-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'RUN_CANCEL_CAUSE_NOT_FOUND');
+});
+
+test('RunCancelled rejects noncanonical idempotency and payload', (t) => {
+  for (const scenario of [
+    {
+      id: 'bad-cancel-key',
+      idempotencyKey: 'arbitrary-cancel-key',
+      payload: { mode: 'queued' },
+      reason: 'NONCANONICAL_EVENT_IDEMPOTENCY',
+    },
+    {
+      id: 'bad-cancel-payload',
+      idempotencyKey: null,
+      payload: { arbitrary: true },
+      reason: 'NONCANONICAL_CANCELLED_PAYLOAD',
+    },
+  ]) {
+    const dbPath = temporaryDatabase(t);
+    const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+    t.after(() => ledger.close());
+    t.after(() => subscriptions.close());
+    const run = ledger.accept(acceptMessage(scenario.id)).request;
+    const inject = new Database(dbPath);
+    inject.prepare(`
+      INSERT INTO assistant_response_events (
+        request_id, sequence, event_type, payload_json, idempotency_key,
+        delivery_status, available_at, created_at, event_id, turn_id,
+        generation, trace_id, causation_id, producer
+      ) VALUES (?, 3, 'RunCancelled', ?, ?, 'pending', 100, 100, ?, ?, ?, ?, ?, 'core:runtime-lane')
+    `).run(
+      run.requestId,
+      canonicalJson(scenario.payload),
+      scenario.idempotencyKey ?? `run:${run.requestId}:cancelled:g${run.generation}`,
+      `evt:${run.requestId}:3`,
+      run.turnId,
+      run.generation,
+      run.traceId,
+      `cancel:${scenario.id}`,
+    );
+    inject.close();
+
+    const subscribed = subscriptions.subscribe({
+      consumerId: `consumer:${scenario.id}`,
+      bootstrap: 'canonical_cutover',
+    });
+    assert.equal(subscribed.status, 'degraded');
+    assert.equal(subscribed.degradedReason, scenario.reason);
+  }
+});
+
+test('active RunCancelled cause must match its durable runtime confirmation', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { ledger, run } = createProgressEvents(t, dbPath);
+  ledger.cancel({
+    schemaVersion: 1,
+    type: 'CancelRequest',
+    commandId: 'cancel:bad-active-cause',
+    idempotencyKey: `cancel:${run.requestId}:g${run.generation}`,
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: 'cancel-requested:bad-active-cause',
+    mode: 'cooperative',
+    reason: 'user_requested',
+  });
+  ledger.confirmCancellation({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: 'runtime-confirmed:bad-active-cause',
+    producer: 'runtime:shared',
+  });
+  const mutate = new Database(dbPath);
+  mutate.prepare(`
+    UPDATE assistant_response_events SET causation_id = 'BOGUS_CONFIRMATION_CAUSE'
+    WHERE request_id = ? AND event_type = 'RunCancelled'
+  `).run(run.requestId);
+  mutate.close();
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'bad-active-cancel-cause-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'RUN_CANCEL_CAUSE_NOT_FOUND');
 });
 
 test('a canonical event after a terminal degrades the stream', (t) => {
@@ -656,6 +869,12 @@ test('canonical event identity and body are immutable while legacy delivery_stat
   );
   assert.throws(
     () => mutate.prepare(`
+      UPDATE assistant_response_events SET id = 99 WHERE sequence = 1
+    `).run(),
+    /canonical assistant event is immutable/,
+  );
+  assert.throws(
+    () => mutate.prepare(`
       DELETE FROM assistant_response_events WHERE sequence = 1
     `).run(),
     /canonical assistant event is immutable/,
@@ -671,4 +890,83 @@ test('canonical event identity and body are immutable while legacy delivery_stat
     consumerId: 'immutable-consumer',
     ownerId: 'worker',
   }).event.type, 'RunAccepted');
+});
+
+test('canonical ReplyOutcome rows are immutable', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { ledger, run } = createProgressEvents(t, dbPath);
+  const outcomes = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => outcomes.close());
+  outcomes.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Immutable answer.' } },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: 'opaque:progress' },
+      disposition: 'send',
+    },
+  });
+  const mutate = new Database(dbPath);
+  assert.throws(
+    () => mutate.prepare(`
+      UPDATE assistant_reply_outcomes SET envelope_json = '{"tampered":true}'
+      WHERE request_id = ?
+    `).run(run.requestId),
+    /canonical ReplyOutcome is immutable/,
+  );
+  assert.throws(
+    () => mutate.prepare(`
+      DELETE FROM assistant_reply_outcomes WHERE request_id = ?
+    `).run(run.requestId),
+    /canonical ReplyOutcome is immutable/,
+  );
+  mutate.close();
+});
+
+test('subscription degrades when a legacy database contains a tampered Outcome envelope/hash', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { ledger, run } = createProgressEvents(t, dbPath);
+  const outcomes = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  outcomes.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Original answer.' } },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: 'opaque:progress' },
+      disposition: 'send',
+    },
+  });
+  outcomes.close();
+  const tamper = new Database(dbPath);
+  const stored = tamper.prepare(`
+    SELECT envelope_json FROM assistant_reply_outcomes WHERE request_id = ?
+  `).get(run.requestId);
+  const envelope = JSON.parse(stored.envelope_json);
+  envelope.content.text = 'Tampered answer.';
+  tamper.exec('DROP TRIGGER assistant_reply_outcomes_immutable');
+  tamper.prepare(`
+    UPDATE assistant_reply_outcomes SET envelope_json = ? WHERE request_id = ?
+  `).run(canonicalJson(envelope), run.requestId);
+  tamper.close();
+
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 102 });
+  t.after(() => subscriptions.close());
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'tampered-outcome-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'OUTCOME_CANONICAL_HASH_MISMATCH');
 });

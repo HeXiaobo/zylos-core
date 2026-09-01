@@ -54,6 +54,20 @@ function currentTime(clock) {
   return current;
 }
 
+function requireClaimEpoch(value) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError('claimEpoch must be a positive safe integer');
+  }
+  return value;
+}
+
+function requireAction(value) {
+  if (!['send', 'reconcile'].includes(value)) {
+    throw new TypeError('action must be send or reconcile');
+  }
+  return value;
+}
+
 function toIntent(row) {
   return row ? JSON.parse(row.envelope_json) : null;
 }
@@ -65,6 +79,7 @@ function toDelivery(row) {
     state: row.delivery_state,
     attemptCount: row.attempt_count,
     currentAttemptId: row.current_attempt_id,
+    claimEpoch: row.claim_epoch,
     availableAt: row.available_at,
     redriveCount: row.redrive_count,
     lastError: row.last_error,
@@ -145,8 +160,25 @@ export function openReplyIntentOutbox({
   ensureAssistantReplyReliabilitySchema(database);
 
   const selectIntent = database.prepare(`SELECT * FROM assistant_reply_intents WHERE intent_id = ?`);
+  database.prepare(`
+    UPDATE assistant_reply_intents
+    SET claim_epoch = 1,
+        delivery_state = CASE
+          WHEN delivery_state = 'sending' THEN 'reconcile_required'
+          ELSE delivery_state
+        END,
+        lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+        last_error = 'LEGACY_LEASE_EPOCH_UNPROVEN', updated_at = ?
+    WHERE claim_epoch = 0
+      AND (
+        delivery_state IN ('sending', 'reconcile_required')
+        OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL
+      )
+  `).run(currentTime(clock));
+
   const selectReceipt = database.prepare(`
-    SELECT envelope_json, canonical_hash FROM assistant_delivery_receipts WHERE receipt_id = ?
+    SELECT envelope_json, canonical_hash, attempt_id, claim_action, claim_epoch, lease_token
+    FROM assistant_delivery_receipts WHERE receipt_id = ?
   `);
   const selectLatestSettlement = database.prepare(`
     SELECT * FROM assistant_delivery_settlements
@@ -161,6 +193,7 @@ export function openReplyIntentOutbox({
       intent: toIntent(row),
       deliveryId: `delivery:${row.intent_id}`,
       attemptId: row.current_attempt_id,
+      claimEpoch: row.claim_epoch,
       leaseOwner: row.lease_owner,
       leaseToken: row.lease_token,
       leaseExpiresAt: row.lease_expires_at,
@@ -176,25 +209,45 @@ export function openReplyIntentOutbox({
     const active = database.prepare(`
       SELECT * FROM assistant_reply_intents
       WHERE lease_owner = ? AND lease_token IS NOT NULL AND lease_expires_at > ?
+        AND claim_epoch > 0
         AND delivery_state IN ('sending', 'reconcile_required')
       ORDER BY created_at ASC, intent_id ASC LIMIT 1
     `).get(safeOwnerId, current);
     if (active) return claimView(active, { replayed: true });
 
-    database.prepare(`
+    const expiredLeases = database.prepare(`
+      SELECT intent_id, delivery_state, current_attempt_id, claim_epoch,
+             lease_owner, lease_token, lease_expires_at
+      FROM assistant_reply_intents
+      WHERE delivery_state IN ('sending', 'reconcile_required')
+        AND claim_epoch > 0 AND lease_token IS NOT NULL AND lease_expires_at <= ?
+      ORDER BY intent_id ASC
+    `).all(current);
+    const recoverExpired = database.prepare(`
       UPDATE assistant_reply_intents
       SET delivery_state = 'reconcile_required', lease_owner = NULL,
           lease_token = NULL, lease_expires_at = NULL, updated_at = ?,
           last_error = COALESCE(last_error, 'LEASE_EXPIRED_RECONCILE_REQUIRED')
-      WHERE delivery_state = 'sending' AND lease_token IS NOT NULL
-        AND lease_expires_at <= ?
-    `).run(current, current);
-    database.prepare(`
-      UPDATE assistant_reply_intents
-      SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
-      WHERE delivery_state = 'reconcile_required' AND lease_token IS NOT NULL
-        AND lease_expires_at <= ?
-    `).run(current, current);
+      WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id IS ?
+        AND claim_epoch = ? AND lease_owner = ? AND lease_token = ?
+        AND lease_expires_at = ? AND lease_expires_at <= ?
+    `);
+    for (const expired of expiredLeases) {
+      const recovered = recoverExpired.run(
+        current,
+        expired.intent_id,
+        expired.delivery_state,
+        expired.current_attempt_id,
+        expired.claim_epoch,
+        expired.lease_owner,
+        expired.lease_token,
+        expired.lease_expires_at,
+        current,
+      );
+      if (recovered.changes !== 1) {
+        throw domainError('LEASE_CONFLICT', 'expired delivery recovery lost its lease fence');
+      }
+    }
 
     const candidate = database.prepare(`
       SELECT * FROM assistant_reply_intents
@@ -219,21 +272,26 @@ export function openReplyIntentOutbox({
       throw domainError('DELIVERY_STATE_CORRUPT', 'reconciliation has no original attempt identity');
     }
     const leaseToken = requireText(leaseTokenFactory(candidate), 'generated leaseToken');
+    const claimEpoch = candidate.claim_epoch + 1;
     const leaseExpiresAt = current + leaseSeconds;
     const updated = database.prepare(`
       UPDATE assistant_reply_intents
       SET delivery_state = ?, attempt_count = ?, current_attempt_id = ?,
-          lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
-      WHERE intent_id = ? AND lease_token IS NULL AND delivery_state = ?
+          claim_epoch = ?, lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
+      WHERE intent_id = ? AND claim_epoch = ? AND current_attempt_id IS ?
+        AND lease_token IS NULL AND delivery_state = ?
     `).run(
       action === 'send' ? 'sending' : 'reconcile_required',
       nextAttemptCount,
       attemptId,
+      claimEpoch,
       safeOwnerId,
       leaseToken,
       leaseExpiresAt,
       current,
       candidate.intent_id,
+      candidate.claim_epoch,
+      candidate.current_attempt_id,
       candidate.delivery_state,
     );
     if (updated.changes !== 1) {
@@ -285,14 +343,40 @@ export function openReplyIntentOutbox({
     return settlement;
   }
 
-  const receiptTransaction = database.transaction(({ leaseToken, rawReceipt }) => {
+  const receiptTransaction = database.transaction(({
+    action,
+    claimEpoch,
+    leaseToken,
+    rawReceipt,
+  }) => {
     const receipt = normalizeReceipt(rawReceipt);
+    const safeAction = requireAction(action);
+    const safeClaimEpoch = requireClaimEpoch(claimEpoch);
+    const safeLeaseToken = requireText(leaseToken, 'leaseToken');
     const receiptJson = canonicalJson(receipt);
     const receiptHash = sha256(receiptJson);
     const existingReceipt = selectReceipt.get(receipt.receiptId);
     if (existingReceipt) {
       if (existingReceipt.canonical_hash !== receiptHash) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'DeliveryReceipt identity has another payload');
+      }
+      if (
+        existingReceipt.claim_action === null
+        || existingReceipt.claim_epoch === null
+        || existingReceipt.lease_token === null
+      ) {
+        throw domainError(
+          'LEGACY_RECEIPT_LEASE_UNPROVEN',
+          'legacy DeliveryReceipt has no durable lease fence identity',
+        );
+      }
+      if (
+        existingReceipt.claim_action !== safeAction
+        || existingReceipt.claim_epoch !== safeClaimEpoch
+        || existingReceipt.lease_token !== safeLeaseToken
+        || existingReceipt.attempt_id !== receipt.attemptId
+      ) {
+        throw domainError('LEASE_FENCED', 'receipt replay lease does not own this delivery');
       }
       const replayIntent = selectIntent.get(receipt.intentId);
       return {
@@ -304,6 +388,19 @@ export function openReplyIntentOutbox({
     }
     const intent = selectIntent.get(receipt.intentId);
     if (!intent) throw domainError('INTENT_NOT_FOUND', `unknown ReplyIntent: ${receipt.intentId}`);
+    const current = currentTime(clock);
+    const expectedState = safeAction === 'send' ? 'sending' : 'reconcile_required';
+    if (
+      intent.delivery_state !== expectedState
+      || intent.current_attempt_id !== receipt.attemptId
+      || intent.claim_epoch !== safeClaimEpoch
+      || intent.lease_token !== safeLeaseToken
+    ) {
+      throw domainError('LEASE_FENCED', 'receipt lease does not own this delivery');
+    }
+    if (intent.lease_expires_at <= current) {
+      throw domainError('LEASE_EXPIRED', 'receipt lease has expired');
+    }
     const route = JSON.parse(intent.route_json);
     const expected = {
       deliveryId: `delivery:${intent.intent_id}`,
@@ -317,76 +414,107 @@ export function openReplyIntentOutbox({
         throw domainError('RECEIPT_IDENTITY_CONFLICT', `receipt.${field} does not match its intent`);
       }
     }
-    const safeLeaseToken = requireText(leaseToken, 'leaseToken');
-    const current = currentTime(clock);
-    if (intent.lease_token !== safeLeaseToken) {
-      throw domainError('LEASE_FENCED', 'receipt lease does not own this delivery');
-    }
-    if (intent.lease_expires_at <= current) {
-      throw domainError('LEASE_EXPIRED', 'receipt lease has expired');
-    }
-    if (receipt.outcome === 'reconciled' && intent.delivery_state !== 'reconcile_required') {
+    if (receipt.outcome === 'reconciled' && safeAction !== 'reconcile') {
       throw domainError('RECONCILE_REQUIRED', 'reconciled is only valid after an unknown result');
     }
-    if (receipt.outcome === 'unknown' && intent.delivery_state !== 'sending') {
+    if (receipt.outcome === 'unknown' && safeAction !== 'send') {
       throw domainError('INVALID_DELIVERY_TRANSITION', 'unknown is only valid for a send attempt');
     }
-    if (receipt.outcome === 'platform_accepted' && intent.delivery_state !== 'sending') {
+    if (receipt.outcome === 'platform_accepted' && safeAction !== 'send') {
       throw domainError('INVALID_DELIVERY_TRANSITION', 'platform_accepted requires a send attempt');
     }
     database.prepare(`
       INSERT INTO assistant_delivery_receipts (
-        receipt_id, intent_id, delivery_id, request_id, attempt_id, trace_id,
+        receipt_id, intent_id, delivery_id, request_id, attempt_id,
+        claim_action, claim_epoch, lease_token, trace_id,
         adapter_id, outcome, envelope_json, canonical_hash, observed_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       receipt.receiptId, receipt.intentId, receipt.deliveryId, receipt.requestId,
-      receipt.attemptId, receipt.traceId, receipt.adapterId, receipt.outcome,
+      receipt.attemptId, safeAction, safeClaimEpoch, safeLeaseToken,
+      receipt.traceId, receipt.adapterId, receipt.outcome,
       receiptJson, receiptHash, receipt.observedAt, current,
     );
 
     let settlement = null;
+    let updated;
     if (receipt.outcome === 'unknown') {
-      database.prepare(`
+      updated = database.prepare(`
         UPDATE assistant_reply_intents
         SET delivery_state = 'reconcile_required', lease_owner = NULL,
             lease_token = NULL, lease_expires_at = NULL, updated_at = ?,
             last_error = 'UNKNOWN_RECONCILE_REQUIRED'
-        WHERE intent_id = ? AND lease_token = ?
-      `).run(current, intent.intent_id, safeLeaseToken);
+        WHERE intent_id = ? AND delivery_state = 'sending'
+          AND current_attempt_id = ? AND claim_epoch = ? AND lease_token = ?
+          AND lease_expires_at > ?
+      `).run(
+        current,
+        intent.intent_id,
+        receipt.attemptId,
+        safeClaimEpoch,
+        safeLeaseToken,
+        current,
+      );
     } else if (['platform_accepted', 'reconciled'].includes(receipt.outcome)) {
       const basis = receipt.outcome;
       settlement = createSettlement(intent, basis, current);
-      database.prepare(`
+      updated = database.prepare(`
         UPDATE assistant_reply_intents
         SET delivery_state = 'accepted', lease_owner = NULL, lease_token = NULL,
             lease_expires_at = NULL, updated_at = ?, last_error = NULL
-        WHERE intent_id = ? AND lease_token = ?
-      `).run(current, intent.intent_id, safeLeaseToken);
+        WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id = ?
+          AND claim_epoch = ? AND lease_token = ? AND lease_expires_at > ?
+      `).run(
+        current,
+        intent.intent_id,
+        expectedState,
+        receipt.attemptId,
+        safeClaimEpoch,
+        safeLeaseToken,
+        current,
+      );
     } else {
       const retry = receipt.retryable && intent.attempt_count < maxAttempts;
       if (retry) {
-        database.prepare(`
+        updated = database.prepare(`
           UPDATE assistant_reply_intents
           SET delivery_state = 'retrying', available_at = ?, lease_owner = NULL,
               lease_token = NULL, lease_expires_at = NULL, updated_at = ?, last_error = ?
-          WHERE intent_id = ? AND lease_token = ?
+          WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id = ?
+            AND claim_epoch = ? AND lease_token = ? AND lease_expires_at > ?
         `).run(
           current + retryDelaySeconds,
           current,
           receipt.errorCode,
           intent.intent_id,
+          expectedState,
+          receipt.attemptId,
+          safeClaimEpoch,
           safeLeaseToken,
+          current,
         );
       } else {
         settlement = createSettlement(intent, 'retry_exhausted', current);
-        database.prepare(`
+        updated = database.prepare(`
           UPDATE assistant_reply_intents
           SET delivery_state = 'unpresentable', lease_owner = NULL, lease_token = NULL,
               lease_expires_at = NULL, updated_at = ?, last_error = ?
-          WHERE intent_id = ? AND lease_token = ?
-        `).run(current, receipt.errorCode, intent.intent_id, safeLeaseToken);
+          WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id = ?
+            AND claim_epoch = ? AND lease_token = ? AND lease_expires_at > ?
+        `).run(
+          current,
+          receipt.errorCode,
+          intent.intent_id,
+          expectedState,
+          receipt.attemptId,
+          safeClaimEpoch,
+          safeLeaseToken,
+          current,
+        );
       }
+    }
+    if (updated.changes !== 1) {
+      throw domainError('LEASE_CONFLICT', 'receipt update lost its delivery lease fence');
     }
     return {
       replayed: false,
@@ -428,8 +556,8 @@ export function openReplyIntentOutbox({
     claimNext({ ownerId, leaseSeconds = 30 } = {}) {
       return claimTransaction.immediate({ ownerId, leaseSeconds });
     },
-    recordReceipt({ leaseToken, receipt } = {}) {
-      return receiptTransaction.immediate({ leaseToken, rawReceipt: receipt });
+    recordReceipt({ action, claimEpoch, leaseToken, receipt } = {}) {
+      return receiptTransaction.immediate({ action, claimEpoch, leaseToken, rawReceipt: receipt });
     },
     get(intentId) {
       const row = selectIntent.get(requireText(intentId, 'intentId'));

@@ -493,6 +493,7 @@ export function ensureAssistantRunLedgerSchema(database, options = {}) {
       payload_hash TEXT NOT NULL,
       trace_id TEXT NOT NULL,
       causation_id TEXT NOT NULL,
+      confirmation_causation_id TEXT,
       status TEXT NOT NULL CHECK (status IN ('requested', 'confirmed')),
       requested_at INTEGER NOT NULL,
       confirmed_at INTEGER,
@@ -506,6 +507,11 @@ export function ensureAssistantRunLedgerSchema(database, options = {}) {
   const cancelColumns = getColumnNames(database, 'assistant_cancel_requests');
   if (!cancelColumns.has('command_id')) {
     database.exec('ALTER TABLE assistant_cancel_requests ADD COLUMN command_id TEXT');
+  }
+  if (!cancelColumns.has('confirmation_causation_id')) {
+    database.exec(`
+      ALTER TABLE assistant_cancel_requests ADD COLUMN confirmation_causation_id TEXT
+    `);
   }
 
   const runLedgerColumns = getColumnNames(database, 'assistant_run_ledger');
@@ -610,6 +616,7 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
         )),
       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
       current_attempt_id TEXT,
+      claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0),
       lease_owner TEXT,
       lease_token TEXT,
       lease_expires_at INTEGER,
@@ -635,6 +642,9 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       delivery_id TEXT NOT NULL,
       request_id TEXT NOT NULL,
       attempt_id TEXT NOT NULL,
+      claim_action TEXT NOT NULL CHECK (claim_action IN ('send', 'reconcile')),
+      claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+      lease_token TEXT NOT NULL,
       trace_id TEXT NOT NULL,
       adapter_id TEXT NOT NULL,
       outcome TEXT NOT NULL
@@ -711,9 +721,16 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
 
     CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_immutable
     BEFORE UPDATE OF
-      request_id, sequence, event_type, payload_json, idempotency_key,
+      id, request_id, sequence, event_type, payload_json, idempotency_key,
       event_id, turn_id, generation, trace_id, causation_id, producer, created_at
     ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_id_immutable
+    BEFORE UPDATE OF id ON assistant_response_events
     WHEN OLD.event_id IS NOT NULL
     BEGIN
       SELECT RAISE(ABORT, 'canonical assistant event is immutable');
@@ -725,7 +742,55 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     BEGIN
       SELECT RAISE(ABORT, 'canonical assistant event is immutable');
     END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_reply_outcomes_immutable
+    BEFORE UPDATE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_reply_outcomes_no_delete
+    BEFORE DELETE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
   `);
+
+  const intentColumns = getColumnNames(database, 'assistant_reply_intents');
+  const migratedUnfencedIntentLeases = !intentColumns.has('claim_epoch');
+  if (migratedUnfencedIntentLeases) {
+    database.exec(`
+      ALTER TABLE assistant_reply_intents
+      ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0)
+    `);
+    database.prepare(`
+      UPDATE assistant_reply_intents
+      SET claim_epoch = 1
+    `).run();
+    database.prepare(`
+      UPDATE assistant_reply_intents
+      SET delivery_state = CASE
+            WHEN delivery_state = 'sending' THEN 'reconcile_required'
+            ELSE delivery_state
+          END,
+          lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+          last_error = 'LEGACY_LEASE_EPOCH_UNPROVEN'
+      WHERE delivery_state IN ('sending', 'reconcile_required')
+        OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL
+    `).run();
+  }
+
+  const receiptColumns = getColumnNames(database, 'assistant_delivery_receipts');
+  const receiptColumnDefinitions = {
+    claim_action: "TEXT CHECK (claim_action IN ('send', 'reconcile'))",
+    claim_epoch: 'INTEGER CHECK (claim_epoch >= 1)',
+    lease_token: 'TEXT',
+  };
+  for (const [column, definition] of Object.entries(receiptColumnDefinitions)) {
+    if (!receiptColumns.has(column)) {
+      database.exec(`ALTER TABLE assistant_delivery_receipts ADD COLUMN ${column} ${definition}`);
+    }
+  }
 
   const consumerColumns = getColumnNames(database, 'assistant_event_consumers');
   const migratedUnprovenConsumers = !consumerColumns.has('bootstrap_mode');

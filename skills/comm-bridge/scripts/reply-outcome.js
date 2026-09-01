@@ -4,14 +4,9 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { canonicalRunEventChainFailure } from './canonical-run-event.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
-
-const TERMINAL_PREDECESSOR_PRODUCERS = Object.freeze({
-  RunStarted: 'core:runtime-lane',
-  ProgressUpdated: 'runtime:shared',
-  OutputDelta: 'runtime:shared',
-});
 
 function domainError(code, message) {
   const error = new Error(message);
@@ -302,12 +297,12 @@ export function openReplyOutcomeTransactions({
     WHERE request_id = ? AND event_type IN ('RunCompleted', 'RunFailed', 'RunCancelled')
     ORDER BY sequence ASC LIMIT 1
   `);
-  const selectLatestEvent = database.prepare(`
+  const selectRunEvents = database.prepare(`
     SELECT request_id, sequence, event_type, payload_json, idempotency_key,
            event_id, turn_id, generation, trace_id, causation_id, producer, created_at
     FROM assistant_response_events
     WHERE request_id = ?
-    ORDER BY sequence DESC LIMIT 1
+    ORDER BY sequence ASC
   `);
   const selectEventBySequence = database.prepare(`
     SELECT request_id, sequence, event_type, payload_json, idempotency_key,
@@ -377,9 +372,17 @@ export function openReplyOutcomeTransactions({
     const expectedIdempotencyKey = terminalType === 'RunFailed'
       ? `run:${requestId}:failed`
       : `run:${requestId}:completed`;
+    const events = selectRunEvents.all(requestId);
+    const chainFailure = canonicalRunEventChainFailure(events);
+    if (chainFailure) {
+      throw domainError(
+        'NONCANONICAL_RUN_EVENT_CHAIN',
+        `terminal cannot extend malformed event ${chainFailure.event?.event_id ?? 'unknown'}: ${chainFailure.reason}`,
+      );
+    }
     const predecessor = terminal
       ? selectEventBySequence.get(requestId, terminal.sequence - 1)
-      : selectLatestEvent.get(requestId);
+      : events.at(-1);
     if (
       producer !== 'runtime:shared'
       || idempotencyKey !== expectedIdempotencyKey
@@ -388,7 +391,7 @@ export function openReplyOutcomeTransactions({
       || predecessor.turn_id !== turnId
       || predecessor.generation !== generation
       || predecessor.trace_id !== traceId
-      || predecessor.producer !== TERMINAL_PREDECESSOR_PRODUCERS[predecessor.event_type]
+      || !['RunStarted', 'ProgressUpdated', 'OutputDelta'].includes(predecessor.event_type)
       || causationId !== predecessor.event_id
     ) {
       throw domainError(

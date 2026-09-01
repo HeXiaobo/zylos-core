@@ -191,6 +191,202 @@ test('terminal identity must extend the current canonical event-chain head', (t)
   ]);
 });
 
+test('malformed canonical-looking ProgressUpdated head cannot authorize a terminal write', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'malformed-progress-head');
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, 4, 'ProgressUpdated', '{"stage":"working"}', ?,
+              'pending', 100, 100, ?, ?, ?, ?, 'BOGUS_PREDECESSOR_CAUSE', 'runtime:shared')
+  `).run(
+    run.requestId,
+    `run:${run.requestId}:progress:1`,
+    `evt:${run.requestId}:4`,
+    run.turnId,
+    run.generation,
+    run.traceId,
+  );
+  inject.prepare(`
+    UPDATE assistant_requests SET next_sequence = 5 WHERE request_id = ?
+  `).run(run.requestId);
+  inject.close();
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      requestId: run.requestId,
+      turnId: run.turnId,
+      generation: run.generation,
+      traceId: run.traceId,
+      causationId: `evt:${run.requestId}:4`,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${run.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Must not commit.' } },
+      reply: { action: 'send', disposition: 'send' },
+    }),
+    error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN',
+  );
+
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.deepEqual(inspect.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM assistant_reply_outcomes WHERE request_id = ?) AS outcomes,
+      (SELECT COUNT(*) FROM assistant_reply_intents WHERE request_id = ?) AS intents,
+      (SELECT COUNT(*) FROM assistant_response_events
+       WHERE request_id = ? AND event_type IN ('RunCompleted', 'RunFailed')) AS terminals
+  `).get(run.requestId, run.requestId, run.requestId), {
+    outcomes: 0,
+    intents: 0,
+    terminals: 0,
+  });
+  inspect.close();
+});
+
+test('malformed RunStarted head cannot authorize a terminal write', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  const run = startRun(ledger, queue, 'malformed-started-head');
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    UPDATE assistant_response_events
+    SET payload_json = '{"runtimeLaneId":"runtime:shared"}'
+    WHERE request_id = ? AND sequence = 3
+  `).run(run.requestId);
+  inject.close();
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => replies.close());
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      requestId: run.requestId,
+      turnId: run.turnId,
+      generation: run.generation,
+      traceId: run.traceId,
+      causationId: `evt:${run.requestId}:3`,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${run.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Must not commit.' } },
+      reply: { action: 'send', disposition: 'send' },
+    }),
+    error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN',
+  );
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunStarted',
+  ]);
+});
+
+test('canonical ProgressUpdated and OutputDelta heads can complete and replay', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'canonical-progress-delta');
+  const progress = ledger.appendEvent({
+    type: 'ProgressUpdated',
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: `evt:${run.requestId}:3`,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:progress:1`,
+    payload: { stage: 'working' },
+  }).event;
+  const delta = ledger.appendEvent({
+    type: 'OutputDelta',
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: progress.eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:delta:1`,
+    payload: { deltaIndex: 1, text: 'Draft output.' },
+  }).event;
+  const command = {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: delta.eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Final output.' } },
+    reply: { action: 'send', disposition: 'send' },
+  };
+
+  const committed = replies.commitRunOutcome(command);
+  const replay = replies.commitRunOutcome(command);
+  assert.equal(committed.replayed, false);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.terminal, committed.terminal);
+  assert.deepEqual(replay.intent, committed.intent);
+  assert.equal(ledger.get(run.requestId).status, 'completed');
+});
+
+test('canonical runtime recovery generation can start and complete', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  const ledger = openRunLedger({ dbPath, clock: () => now });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => now });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => now });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const accepted = ledger.accept(acceptMessage('canonical-recovery')).request;
+  queue.claimNext();
+  now = 200;
+  const recovered = queue.recoverStale({ staleBefore: 150 }).request;
+  const claim = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: recovered.requestId,
+    turnId: recovered.turnId,
+    generation: recovered.generation,
+    runtimeSessionId: 'runtime:canonical-recovery:g2',
+  }).request;
+  const committed = replies.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Recovered answer.' } },
+    reply: { action: 'send', disposition: 'send' },
+  });
+
+  assert.equal(committed.terminal.type, 'RunCompleted');
+  assert.equal(run.generation, accepted.generation + 1);
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunQueued',
+    'RunStarted',
+    'RunCompleted',
+  ]);
+});
+
 test('explicit silent completes execution without creating a ReplyIntent', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });

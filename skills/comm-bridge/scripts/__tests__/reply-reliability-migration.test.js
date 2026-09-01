@@ -285,3 +285,89 @@ test('pre-cutover WT02 consumer state migrates to an explicit degraded state', (
     error => error?.code === 'EVENT_SUBSCRIPTION_DEGRADED',
   );
 });
+
+test('pre-epoch outbox leases migrate to an unfenced reconcile boundary', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  const ledger = openRunLedger({ dbPath, clock: () => now });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => now });
+  const outcomes = openReplyOutcomeTransactions({ dbPath, clock: () => now });
+  const accepted = ledger.accept(acceptMessage()).request;
+  const admission = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: admission.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: 'runtime:pre-epoch-migration',
+  }).request;
+  const committed = outcomes.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Migration answer.' } },
+    reply: { action: 'send', disposition: 'send' },
+  });
+  ledger.close();
+  queue.close();
+  outcomes.close();
+  const legacyOwner = openReplyIntentOutbox({
+    dbPath,
+    clock: () => now,
+    leaseTokenFactory: () => 'same-migrated-token',
+  });
+  const stale = legacyOwner.claimNext({ ownerId: 'legacy-owner', leaseSeconds: 30 });
+  legacyOwner.close();
+  const downgrade = new Database(dbPath);
+  downgrade.exec('ALTER TABLE assistant_reply_intents DROP COLUMN claim_epoch');
+  downgrade.close();
+
+  const migrated = openReplyIntentOutbox({
+    dbPath,
+    clock: () => now,
+    leaseTokenFactory: () => 'same-migrated-token',
+  });
+  t.after(() => migrated.close());
+  const recovered = migrated.get(committed.intent.intentId).delivery;
+  assert.equal(recovered.state, 'reconcile_required');
+  assert.equal(recovered.claimEpoch, 1);
+  assert.equal(recovered.lastError, 'LEGACY_LEASE_EPOCH_UNPROVEN');
+  const current = migrated.claimNext({ ownerId: 'current-owner', leaseSeconds: 30 });
+  assert.equal(current.action, 'reconcile');
+  assert.equal(current.claimEpoch, 2);
+  assert.equal(current.leaseToken, stale.leaseToken);
+  const receipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:pre-epoch-migration:reconciled',
+    intentId: committed.intent.intentId,
+    deliveryId: current.deliveryId,
+    requestId: run.requestId,
+    attemptId: current.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'reconciled',
+    externalRef: 'opaque:migrated-message',
+    observedAt: '2026-09-01T00:10:00.000Z',
+  };
+  assert.throws(
+    () => migrated.recordReceipt({
+      action: stale.action,
+      claimEpoch: stale.claimEpoch,
+      leaseToken: stale.leaseToken,
+      receipt,
+    }),
+    error => error?.code === 'LEASE_FENCED',
+  );
+  const settled = migrated.recordReceipt({
+    action: current.action,
+    claimEpoch: current.claimEpoch,
+    leaseToken: current.leaseToken,
+    receipt,
+  });
+  assert.equal(settled.delivery.state, 'accepted');
+});

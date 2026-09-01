@@ -83,6 +83,16 @@ function createAnswerIntent(t, dbPath, id, clock = () => 100) {
   return { ledger, run, intent: committed.intent };
 }
 
+function recordReceiptForClaim(outbox, claim, receipt, overrides = {}) {
+  return outbox.recordReceipt({
+    action: claim.action,
+    claimEpoch: claim.claimEpoch,
+    leaseToken: claim.leaseToken,
+    receipt,
+    ...overrides,
+  });
+}
+
 test('unknown delivery reconciles before retry and only reconciled settles accepted', (t) => {
   const dbPath = temporaryDatabase(t);
   let now = 100;
@@ -113,26 +123,20 @@ test('unknown delivery reconciles before retry and only reconciled settles accep
     observedAt: '2026-09-01T00:01:00.000Z',
     nextAction: 'reconcile_before_retry',
   };
-  const unknownResult = outbox.recordReceipt({
-    leaseToken: sendClaim.leaseToken,
-    receipt: unknown,
-  });
+  const unknownResult = recordReceiptForClaim(outbox, sendClaim, unknown);
   assert.equal(unknownResult.delivery.state, 'reconcile_required');
   assert.equal(unknownResult.settlement, null);
 
   const reconcileClaim = outbox.claimNext({ ownerId: 'adapter-b', leaseSeconds: 30 });
   assert.equal(reconcileClaim.action, 'reconcile');
   assert.equal(reconcileClaim.attemptId, sendClaim.attemptId);
-  const reconciled = outbox.recordReceipt({
-    leaseToken: reconcileClaim.leaseToken,
-    receipt: {
+  const reconciled = recordReceiptForClaim(outbox, reconcileClaim, {
       ...unknown,
       receiptId: `receipt:${sendClaim.attemptId}:reconciled`,
       outcome: 'reconciled',
       externalRef: 'opaque:platform-message-1',
       observedAt: '2026-09-01T00:02:00.000Z',
       nextAction: undefined,
-    },
   });
   assert.equal(reconciled.delivery.state, 'accepted');
   assert.equal(reconciled.settlement.type, 'DeliverySettlement');
@@ -141,6 +145,159 @@ test('unknown delivery reconciles before retry and only reconciled settles accep
   assert.equal(reconciled.settlement.presented, true);
   assert.equal(ledger.get(run.requestId).status, 'completed');
   assert.equal(outbox.claimNext({ ownerId: 'adapter-c' }), null);
+});
+
+test('reconciliation claim epoch fences a stale owner when lease tokens are reused', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  const { run, intent } = createAnswerIntent(t, dbPath, 'reconcile-epoch-aba', () => now);
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => now,
+    leaseTokenFactory: () => 'same-token',
+  });
+  t.after(() => outbox.close());
+  const send = outbox.claimNext({ ownerId: 'owner-a', leaseSeconds: 5 });
+  const baseReceipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    intentId: intent.intentId,
+    deliveryId: send.deliveryId,
+    requestId: run.requestId,
+    attemptId: send.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    externalRef: null,
+    observedAt: '2026-09-01T00:01:00.000Z',
+  };
+  outbox.recordReceipt({
+    action: send.action,
+    claimEpoch: send.claimEpoch,
+    leaseToken: send.leaseToken,
+    receipt: {
+      ...baseReceipt,
+      receiptId: 'receipt:reconcile-epoch-aba:unknown',
+      outcome: 'unknown',
+      nextAction: 'reconcile_before_retry',
+    },
+  });
+  const ownerB = outbox.claimNext({ ownerId: 'owner-b', leaseSeconds: 5 });
+  assert.equal(ownerB.action, 'reconcile');
+  now = 106;
+  const ownerC = outbox.claimNext({ ownerId: 'owner-c', leaseSeconds: 5 });
+  assert.equal(ownerC.action, 'reconcile');
+  assert.equal(ownerB.leaseToken, ownerC.leaseToken);
+  assert.notEqual(ownerB.claimEpoch, ownerC.claimEpoch);
+  const reconciledReceipt = {
+    ...baseReceipt,
+    receiptId: 'receipt:reconcile-epoch-aba:reconciled',
+    outcome: 'reconciled',
+    externalRef: 'opaque:reconciled-message',
+    observedAt: '2026-09-01T00:02:00.000Z',
+  };
+  for (const staleReceipt of [
+    reconciledReceipt,
+    {
+      ...baseReceipt,
+      receiptId: 'receipt:reconcile-epoch-aba:rejected',
+      outcome: 'rejected',
+      errorCode: 'NOT_FOUND',
+      retryable: true,
+    },
+    {
+      ...baseReceipt,
+      receiptId: 'receipt:reconcile-epoch-aba:unknown-again',
+      outcome: 'unknown',
+      nextAction: 'reconcile_before_retry',
+    },
+  ]) {
+    assert.throws(
+      () => outbox.recordReceipt({
+        action: ownerB.action,
+        claimEpoch: ownerB.claimEpoch,
+        leaseToken: ownerB.leaseToken,
+        receipt: staleReceipt,
+      }),
+      error => error?.code === 'LEASE_FENCED',
+    );
+  }
+  const accepted = outbox.recordReceipt({
+    action: ownerC.action,
+    claimEpoch: ownerC.claimEpoch,
+    leaseToken: ownerC.leaseToken,
+    receipt: reconciledReceipt,
+  });
+  assert.equal(accepted.delivery.state, 'accepted');
+  assert.equal(accepted.settlement.basis, 'reconciled');
+  const replay = outbox.recordReceipt({
+    action: ownerC.action,
+    claimEpoch: ownerC.claimEpoch,
+    leaseToken: ownerC.leaseToken,
+    receipt: reconciledReceipt,
+  });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.settlement, accepted.settlement);
+});
+
+test('send claim epoch fences an expired owner when a later send reuses the token', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  const { run, intent } = createAnswerIntent(t, dbPath, 'send-epoch-aba', () => now);
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => now,
+    leaseTokenFactory: () => 'same-send-token',
+  });
+  t.after(() => outbox.close());
+  const ownerA = outbox.claimNext({ ownerId: 'owner-a', leaseSeconds: 5 });
+  now = 106;
+  const reconcile = outbox.claimNext({ ownerId: 'owner-b', leaseSeconds: 5 });
+  const rejected = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:send-epoch-aba:reconcile-rejected',
+    intentId: intent.intentId,
+    deliveryId: reconcile.deliveryId,
+    requestId: run.requestId,
+    attemptId: reconcile.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'rejected',
+    externalRef: null,
+    observedAt: '2026-09-01T00:03:00.000Z',
+    errorCode: 'NOT_FOUND',
+    retryable: true,
+  };
+  recordReceiptForClaim(outbox, reconcile, rejected);
+  const ownerC = outbox.claimNext({ ownerId: 'owner-c', leaseSeconds: 5 });
+  assert.equal(ownerC.action, 'send');
+  assert.equal(ownerA.leaseToken, ownerC.leaseToken);
+  assert.notEqual(ownerA.claimEpoch, ownerC.claimEpoch);
+  const staleAccepted = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:send-epoch-aba:stale-accepted',
+    intentId: intent.intentId,
+    deliveryId: ownerA.deliveryId,
+    requestId: run.requestId,
+    attemptId: ownerA.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'platform_accepted',
+    externalRef: 'opaque:stale-message',
+    observedAt: '2026-09-01T00:04:00.000Z',
+  };
+  assert.throws(
+    () => recordReceiptForClaim(outbox, ownerA, staleAccepted),
+    error => error?.code === 'LEASE_FENCED',
+  );
+  const accepted = recordReceiptForClaim(outbox, ownerC, {
+    ...staleAccepted,
+    receiptId: 'receipt:send-epoch-aba:current-accepted',
+    attemptId: ownerC.attemptId,
+    externalRef: 'opaque:current-message',
+  });
+  assert.equal(accepted.delivery.state, 'accepted');
 });
 
 test('rejected delivery retries with a new attempt then settles unpresentable at exhaustion', (t) => {
@@ -172,20 +329,22 @@ test('rejected delivery retries with a new attempt then settles unpresentable at
     errorCode: 'PLATFORM_REJECTED',
     retryable: true,
   });
-  const firstRejected = outbox.recordReceipt({
-    leaseToken: first.leaseToken,
-    receipt: rejectedReceipt(first, 'receipt:retry:1'),
-  });
+  const firstRejected = recordReceiptForClaim(
+    outbox,
+    first,
+    rejectedReceipt(first, 'receipt:retry:1'),
+  );
   assert.equal(firstRejected.delivery.state, 'retrying');
   assert.equal(firstRejected.settlement, null);
 
   const second = outbox.claimNext({ ownerId: 'adapter-b' });
   assert.equal(second.action, 'send');
   assert.notEqual(second.attemptId, first.attemptId);
-  const exhausted = outbox.recordReceipt({
-    leaseToken: second.leaseToken,
-    receipt: rejectedReceipt(second, 'receipt:retry:2'),
-  });
+  const exhausted = recordReceiptForClaim(
+    outbox,
+    second,
+    rejectedReceipt(second, 'receipt:retry:2'),
+  );
   assert.equal(exhausted.delivery.state, 'unpresentable');
   assert.equal(exhausted.settlement.state, 'unpresentable');
   assert.equal(exhausted.settlement.basis, 'retry_exhausted');
@@ -225,12 +384,12 @@ test('leases replay for one owner and fail closed for wrong, expired or supersed
     observedAt: '2026-09-01T00:04:00.000Z',
   };
   assert.throws(
-    () => outbox.recordReceipt({ leaseToken: 'wrong-token', receipt: accepted }),
+    () => recordReceiptForClaim(outbox, claim, accepted, { leaseToken: 'wrong-token' }),
     error => error?.code === 'LEASE_FENCED',
   );
   now = 110;
   assert.throws(
-    () => outbox.recordReceipt({ leaseToken: claim.leaseToken, receipt: accepted }),
+    () => recordReceiptForClaim(outbox, claim, accepted),
     error => error?.code === 'LEASE_EXPIRED',
   );
 
@@ -238,7 +397,7 @@ test('leases replay for one owner and fail closed for wrong, expired or supersed
   assert.equal(reconcile.action, 'reconcile');
   assert.notEqual(reconcile.leaseToken, claim.leaseToken);
   assert.throws(
-    () => outbox.recordReceipt({ leaseToken: claim.leaseToken, receipt: accepted }),
+    () => recordReceiptForClaim(outbox, claim, accepted),
     error => error?.code === 'LEASE_FENCED',
   );
 });
@@ -305,8 +464,8 @@ test('platform_accepted receipt and accepted settlement are idempotent and fail 
     observedAt: '2026-09-01T00:05:00.000Z',
   };
 
-  const first = outbox.recordReceipt({ leaseToken: claim.leaseToken, receipt });
-  const replay = outbox.recordReceipt({ leaseToken: claim.leaseToken, receipt });
+  const first = recordReceiptForClaim(outbox, claim, receipt);
+  const replay = recordReceiptForClaim(outbox, claim, receipt);
   assert.equal(first.replayed, false);
   assert.equal(replay.replayed, true);
   assert.equal(first.settlement.basis, 'platform_accepted');
@@ -314,10 +473,11 @@ test('platform_accepted receipt and accepted settlement are idempotent and fail 
   assert.equal(outbox.listReceipts(intent.intentId).length, 1);
   assert.equal(outbox.listSettlements(intent.intentId).length, 1);
   assert.throws(
-    () => outbox.recordReceipt({
-      leaseToken: claim.leaseToken,
-      receipt: { ...receipt, externalRef: 'opaque:different-message' },
-    }),
+    () => recordReceiptForClaim(
+      outbox,
+      claim,
+      { ...receipt, externalRef: 'opaque:different-message' },
+    ),
     error => error?.code === 'IDEMPOTENCY_CONFLICT',
   );
 });
@@ -334,9 +494,7 @@ test('dead-letter redrive keeps the original ReplyIntent identity', (t) => {
   });
   t.after(() => outbox.close());
   const claim = outbox.claimNext({ ownerId: 'adapter-a' });
-  outbox.recordReceipt({
-    leaseToken: claim.leaseToken,
-    receipt: {
+  recordReceiptForClaim(outbox, claim, {
       schemaVersion: 1,
       type: 'DeliveryReceipt',
       receiptId: 'receipt:redrive:rejected',
@@ -351,7 +509,6 @@ test('dead-letter redrive keeps the original ReplyIntent identity', (t) => {
       observedAt: '2026-09-01T00:06:00.000Z',
       errorCode: 'PLATFORM_REJECTED',
       retryable: true,
-    },
   });
 
   const redriven = outbox.redrive({ intentId: intent.intentId });

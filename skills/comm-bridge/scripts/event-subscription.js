@@ -4,31 +4,15 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import {
+  canonicalRunEventFailure as canonicalEventFailure,
+  canonicalRunEventLinkFailure,
+} from './canonical-run-event.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
 
 const BOOTSTRAP_MODE = 'canonical_cutover';
-const RUN_EVENT_TYPES = new Set([
-  'RunAccepted',
-  'RunQueued',
-  'RunStarted',
-  'ProgressUpdated',
-  'OutputDelta',
-  'RunCompleted',
-  'RunFailed',
-  'RunCancelled',
-]);
 const TERMINAL_EVENT_TYPES = new Set(['RunCompleted', 'RunFailed', 'RunCancelled']);
-const EVENT_PRODUCERS = Object.freeze({
-  RunAccepted: new Set(['core:message-intake']),
-  RunQueued: new Set(['core:runtime-pending-queue']),
-  RunStarted: new Set(['core:runtime-lane']),
-  ProgressUpdated: new Set(['runtime:shared']),
-  OutputDelta: new Set(['runtime:shared']),
-  RunCompleted: new Set(['runtime:shared']),
-  RunFailed: new Set(['runtime:shared']),
-  RunCancelled: new Set(['core:runtime-lane', 'runtime:shared']),
-});
 
 function domainError(code, message, details = {}) {
   const error = new Error(message);
@@ -76,104 +60,59 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function canonicalEventFailure(row) {
-  for (const field of [
-    'event_id',
-    'request_id',
-    'event_type',
-    'idempotency_key',
-    'turn_id',
-    'trace_id',
-    'causation_id',
-    'producer',
-  ]) {
-    if (typeof row[field] !== 'string' || row[field].trim() === '') {
-      return `NONCANONICAL_${field.toUpperCase()}`;
-    }
+function canonicalOutcomeFailure(row) {
+  if (sha256(row.envelope_json) !== row.canonical_hash) {
+    return 'OUTCOME_CANONICAL_HASH_MISMATCH';
   }
-  if (!Number.isSafeInteger(row.sequence) || row.sequence < 1) {
-    return 'NONCANONICAL_SEQUENCE';
-  }
-  if (!Number.isSafeInteger(row.generation) || row.generation < 1) {
-    return 'NONCANONICAL_GENERATION';
-  }
-  if (!Number.isSafeInteger(row.created_at) || row.created_at < 0) {
-    return 'NONCANONICAL_CREATED_AT';
-  }
-  if (row.event_id !== `evt:${row.request_id}:${row.sequence}`) {
-    return 'NONCANONICAL_EVENT_ID';
-  }
-  if (!RUN_EVENT_TYPES.has(row.event_type)) {
-    return 'NONCANONICAL_EVENT_TYPE';
-  }
-  if (!EVENT_PRODUCERS[row.event_type].has(row.producer)) {
-    return 'NONCANONICAL_PRODUCER';
-  }
-  if (
-    (row.sequence === 1 && row.event_type !== 'RunAccepted')
-    || (row.sequence !== 1 && row.event_type === 'RunAccepted')
-  ) {
-    return 'NONCANONICAL_ACCEPT_SEQUENCE';
-  }
-  let payload;
+  let envelope;
   try {
-    payload = JSON.parse(row.payload_json);
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-      return 'NONCANONICAL_PAYLOAD';
-    }
+    envelope = JSON.parse(row.envelope_json);
   } catch {
-    return 'NONCANONICAL_PAYLOAD';
+    return 'OUTCOME_CANONICAL_ENVELOPE_INVALID';
+  }
+  if (canonicalJson(envelope) !== row.envelope_json) {
+    return 'OUTCOME_CANONICAL_BYTES_MISMATCH';
   }
   if (
-    ['RunQueued', 'RunStarted'].includes(row.event_type)
-    && payload.runtimeLaneId !== 'runtime:shared'
+    envelope.schemaVersion !== 1
+    || envelope.type !== 'ReplyOutcome'
+    || envelope.outcomeId !== row.outcome_id
+    || envelope.requestId !== row.request_id
+    || envelope.turnId !== row.turn_id
+    || envelope.traceId !== row.trace_id
+    || envelope.kind !== row.kind
   ) {
-    return 'NONCANONICAL_RUNTIME_LANE';
+    return 'OUTCOME_CANONICAL_IDENTITY_MISMATCH';
   }
   if (
-    row.event_type === 'RunStarted'
-    && (typeof payload.runtimeSessionId !== 'string' || payload.runtimeSessionId.trim() === '')
-  ) {
-    return 'NONCANONICAL_RUNTIME_SESSION';
-  }
-  if (['RunCompleted', 'RunFailed'].includes(row.event_type)) {
-    if (typeof payload.outcomeId !== 'string' || payload.outcomeId.trim() === '') {
-      return 'TERMINAL_OUTCOME_ID_REQUIRED';
-    }
-    if (payload.outcomeId !== `outcome:${row.request_id}`) {
-      return 'TERMINAL_OUTCOME_ID_MISMATCH';
-    }
-    for (const field of ['text', 'content', 'output', 'outputText']) {
-      if (Object.hasOwn(payload, field)) return 'NONCANONICAL_TERMINAL_PAYLOAD';
-    }
-  }
-  if (
-    row.event_type === 'RunFailed'
+    row.kind === 'answer'
     && (
-      typeof payload.code !== 'string'
-      || payload.code.trim() === ''
-      || typeof payload.retryable !== 'boolean'
+      envelope.content?.format !== 'text'
+      || typeof envelope.content.text !== 'string'
+      || envelope.content.text.trim() === ''
     )
   ) {
-    return 'NONCANONICAL_FAILED_PAYLOAD';
+    return 'OUTCOME_CANONICAL_PAYLOAD_INVALID';
   }
   if (
-    row.event_type === 'RunCancelled'
-    && (Object.hasOwn(payload, 'outcomeId') || Object.hasOwn(payload, 'outcome'))
+    row.kind === 'silent'
+    && (
+      envelope.explicit !== true
+      || typeof envelope.reason !== 'string'
+      || envelope.reason.trim() === ''
+    )
   ) {
-    return 'NONCANONICAL_CANCELLED_PAYLOAD';
+    return 'OUTCOME_CANONICAL_PAYLOAD_INVALID';
   }
   if (
-    row.event_type === 'RunCompleted'
-    && row.idempotency_key !== `run:${row.request_id}:completed`
+    row.kind === 'failure'
+    && (
+      typeof envelope.code !== 'string'
+      || envelope.code.trim() === ''
+      || typeof envelope.retryable !== 'boolean'
+    )
   ) {
-    return 'NONCANONICAL_TERMINAL_IDEMPOTENCY';
-  }
-  if (
-    row.event_type === 'RunFailed'
-    && row.idempotency_key !== `run:${row.request_id}:failed`
-  ) {
-    return 'NONCANONICAL_TERMINAL_IDEMPOTENCY';
+    return 'OUTCOME_CANONICAL_PAYLOAD_INVALID';
   }
   return null;
 }
@@ -294,9 +233,16 @@ export function openEventSubscriptions({
     ORDER BY sequence ASC LIMIT 1
   `);
   const selectOutcome = database.prepare(`
-    SELECT outcome_id, request_id, turn_id, generation, trace_id, kind
+    SELECT outcome_id, request_id, turn_id, generation, trace_id, kind,
+           envelope_json, canonical_hash
     FROM assistant_reply_outcomes
     WHERE outcome_id = ?
+  `);
+  const selectConfirmedCancellation = database.prepare(`
+    SELECT command_id, causation_id, confirmation_causation_id, status
+    FROM assistant_cancel_requests
+    WHERE request_id = ? AND turn_id = ? AND generation = ? AND status = 'confirmed'
+    ORDER BY requested_at DESC LIMIT 1
   `);
   const selectDeliveryFingerprint = database.prepare(`
     SELECT event_fingerprint
@@ -361,11 +307,9 @@ export function openEventSubscriptions({
           degrade(consumerId, 'NONCANONICAL_SEQUENCE_PREDECESSOR', predecessor.id, current);
           return selectConsumer.get(consumerId);
         }
-        if (
-          event.event_type !== 'RunCancelled'
-          && event.causation_id !== predecessor.event_id
-        ) {
-          degrade(consumerId, 'NONCANONICAL_CAUSATION_CHAIN', event.id, current);
+        const linkFailure = canonicalRunEventLinkFailure(event, predecessor);
+        if (linkFailure) {
+          degrade(consumerId, linkFailure, event.id, current);
           return selectConsumer.get(consumerId);
         }
       }
@@ -374,10 +318,27 @@ export function openEventSubscriptions({
           degrade(consumerId, 'EVENT_AFTER_TERMINAL', event.id, current);
           return selectConsumer.get(consumerId);
         }
-        if (event.event_type !== 'RunCancelled') {
+        if (event.event_type === 'RunCancelled') {
+          const payload = JSON.parse(event.payload_json);
+          const cancellation = selectConfirmedCancellation.get(
+            event.request_id,
+            event.turn_id,
+            event.generation,
+          );
+          if (
+            !cancellation
+            || (payload.mode === 'queued' && event.causation_id !== cancellation.command_id)
+            || (payload.mode === 'active'
+              && event.causation_id !== cancellation.confirmation_causation_id)
+          ) {
+            degrade(consumerId, 'RUN_CANCEL_CAUSE_NOT_FOUND', event.id, current);
+            return selectConsumer.get(consumerId);
+          }
+        } else {
           const payload = JSON.parse(event.payload_json);
           const outcome = selectOutcome.get(payload.outcomeId);
           const expectedKind = event.event_type === 'RunFailed' ? 'failure' : null;
+          const outcomeFailure = outcome ? canonicalOutcomeFailure(outcome) : null;
           if (
             !outcome
             || outcome.request_id !== event.request_id
@@ -387,6 +348,10 @@ export function openEventSubscriptions({
             || (expectedKind ? outcome.kind !== expectedKind : outcome.kind === 'failure')
           ) {
             degrade(consumerId, 'TERMINAL_OUTCOME_NOT_FOUND', event.id, current);
+            return selectConsumer.get(consumerId);
+          }
+          if (outcomeFailure) {
+            degrade(consumerId, outcomeFailure, event.id, current);
             return selectConsumer.get(consumerId);
           }
         }

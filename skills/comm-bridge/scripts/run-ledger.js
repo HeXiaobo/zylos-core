@@ -760,11 +760,12 @@ export function openRunLedger({
     const current = safeClock();
     database.prepare(`
       UPDATE assistant_cancel_requests
-      SET status = 'confirmed', confirmed_at = ?
+      SET status = 'confirmed', confirmed_at = ?, confirmation_causation_id = ?
       WHERE request_id = ? AND turn_id = ? AND generation = ?
         AND status = 'requested'
     `).run(
       current,
+      confirmation.causationId,
       confirmation.requestId,
       confirmation.turnId,
       confirmation.generation,
