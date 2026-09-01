@@ -539,6 +539,46 @@ test('RunStarted requires a canonical runtime session identity', (t) => {
   assert.equal(subscribed.degradedReason, 'NONCANONICAL_RUNTIME_SESSION');
 });
 
+test('subscription validates RunAccepted intake and RunStarted admission persistence facts', (t) => {
+  for (const scenario of ['accepted-cause', 'started-session']) {
+    const dbPath = temporaryDatabase(t);
+    const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+    const accepted = ledger.accept(acceptMessage(`persistent-${scenario}`)).request;
+    const claim = queue.claimNext();
+    queue.confirmStarted({
+      admissionId: claim.admission.id,
+      requestId: accepted.requestId,
+      turnId: accepted.turnId,
+      generation: accepted.generation,
+      runtimeSessionId: `runtime:persistent-${scenario}`,
+    });
+    // Install the complete schema first, then simulate a pre-trigger buggy writer.
+    const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+    const mutate = new Database(dbPath);
+    if (scenario === 'accepted-cause') {
+      mutate.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
+      mutate.prepare(`UPDATE assistant_response_events SET causation_id = 'attacker' WHERE request_id = ? AND sequence = 1`)
+        .run(accepted.requestId);
+    } else {
+      mutate.prepare(`UPDATE runtime_turn_admissions SET runtime_session_id = 'runtime:attacker' WHERE request_id = ?`)
+        .run(accepted.requestId);
+    }
+    mutate.close();
+    const subscribed = subscriptions.subscribe({
+      consumerId: `persistent-${scenario}-consumer`,
+      bootstrap: 'canonical_cutover',
+    });
+    assert.equal(subscribed.status, 'degraded');
+    assert.equal(subscribed.degradedReason, scenario === 'accepted-cause'
+      ? 'RUN_ACCEPTED_LEDGER_MISMATCH'
+      : 'RUN_STARTED_ADMISSION_MISMATCH');
+    subscriptions.close();
+    queue.close();
+    ledger.close();
+  }
+});
+
 test('canonical-looking terminals require a durable matching ReplyOutcome', (t) => {
   for (const [id, expectedReason] of [
     ['missing-outcome-id', 'TERMINAL_OUTCOME_ID_REQUIRED'],

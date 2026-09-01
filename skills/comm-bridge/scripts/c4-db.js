@@ -792,6 +792,100 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     }
   }
 
+  // Trigger definitions are deliberately replaced, rather than guarded by
+  // IF NOT EXISTS. Older databases may already have a trigger with the same
+  // name but a narrower protected-column set.
+  const replaceCanonicalImmutabilityTriggers = database.transaction(() => database.exec(`
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_id_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_no_delete;
+    DROP TRIGGER IF EXISTS assistant_reply_outcomes_immutable;
+    DROP TRIGGER IF EXISTS assistant_reply_outcomes_no_delete;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_immutable;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_no_delete;
+    DROP TRIGGER IF EXISTS assistant_delivery_receipts_immutable;
+    DROP TRIGGER IF EXISTS assistant_delivery_receipts_no_delete;
+    DROP TRIGGER IF EXISTS assistant_delivery_settlements_immutable;
+    DROP TRIGGER IF EXISTS assistant_delivery_settlements_no_delete;
+
+    CREATE TRIGGER assistant_response_events_canonical_immutable
+    BEFORE UPDATE OF
+      id, request_id, sequence, event_type, payload_json, idempotency_key,
+      event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_canonical_id_immutable
+    BEFORE UPDATE OF id ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_canonical_no_delete
+    BEFORE DELETE ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_outcomes_immutable
+    BEFORE UPDATE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_outcomes_no_delete
+    BEFORE DELETE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_intents_canonical_immutable
+    BEFORE UPDATE OF
+      intent_id, request_id, trace_id, cause_kind, cause_event_id,
+      route_json, route_hash, disposition, payload_json, envelope_json,
+      content_hash, idempotency_key, canonical_hash, created_at
+    ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_intents_canonical_no_delete
+    BEFORE DELETE ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_receipts_immutable
+    BEFORE UPDATE ON assistant_delivery_receipts
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_receipts_no_delete
+    BEFORE DELETE ON assistant_delivery_receipts
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_settlements_immutable
+    BEFORE UPDATE ON assistant_delivery_settlements
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_settlements_no_delete
+    BEFORE DELETE ON assistant_delivery_settlements
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');
+    END;
+  `));
+  replaceCanonicalImmutabilityTriggers.immediate();
+
   const consumerColumns = getColumnNames(database, 'assistant_event_consumers');
   const migratedUnprovenConsumers = !consumerColumns.has('bootstrap_mode');
   const consumerColumnDefinitions = {

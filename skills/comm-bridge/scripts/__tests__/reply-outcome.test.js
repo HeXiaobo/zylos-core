@@ -62,6 +62,24 @@ function startRun(ledger, queue, id = 'answer', replyMode = 'required') {
   }).request;
 }
 
+function answerCommand(ledger, run, id, text = 'Stable answer.') {
+  return {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text } },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: `opaque:${id}` },
+      disposition: 'send',
+    },
+  };
+}
+
 test('answer commits one canonical outcome, terminal and pending intent atomically', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -189,6 +207,103 @@ test('terminal identity must extend the current canonical event-chain head', (t)
     'RunQueued',
     'RunStarted',
   ]);
+});
+
+test('terminal write atomically fences request.next_sequence against the canonical head', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  for (const [id, nextSequence] of [['sequence-gap', 10], ['sequence-rewind', 3]]) {
+    const run = startRun(ledger, queue, id);
+    const mutate = new Database(dbPath);
+    mutate.prepare(`UPDATE assistant_requests SET next_sequence = ? WHERE request_id = ?`)
+      .run(nextSequence, run.requestId);
+    mutate.close();
+    assert.throws(
+      () => replies.commitRunOutcome(answerCommand(ledger, run, id)),
+      error => error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
+    );
+    assert.equal(ledger.get(run.requestId).status, 'active');
+    const inspect = new Database(dbPath, { readonly: true });
+    assert.deepEqual(inspect.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM assistant_reply_outcomes WHERE request_id = ?) AS outcomes,
+        (SELECT COUNT(*) FROM assistant_reply_intents WHERE request_id = ?) AS intents,
+        (SELECT COUNT(*) FROM assistant_response_events WHERE request_id = ? AND event_type = 'RunCompleted') AS terminals
+    `).get(run.requestId, run.requestId, run.requestId), { outcomes: 0, intents: 0, terminals: 0 });
+    inspect.close();
+    // Release the global WT01 admission so the second adversarial run can start.
+    if (id === 'sequence-gap') {
+      const cleanup = new Database(dbPath);
+      cleanup.prepare(`UPDATE runtime_turn_admissions SET status = 'completed' WHERE request_id = ?`).run(run.requestId);
+      cleanup.close();
+    }
+  }
+});
+
+test('terminal write binds RunAccepted and RunStarted to ledger and admission facts', (t) => {
+  for (const scenario of ['accepted-cause', 'started-session']) {
+    const dbPath = temporaryDatabase(t);
+    const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+    const run = startRun(ledger, queue, `ledger-link-${scenario}`);
+    const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+    const mutate = new Database(dbPath);
+    if (scenario === 'accepted-cause') {
+      mutate.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
+      mutate.prepare(`UPDATE assistant_response_events SET causation_id = 'attacker-cause' WHERE request_id = ? AND sequence = 1`)
+        .run(run.requestId);
+    } else {
+      mutate.prepare(`UPDATE runtime_turn_admissions SET runtime_session_id = 'runtime:attacker' WHERE request_id = ?`)
+        .run(run.requestId);
+    }
+    mutate.close();
+    assert.throws(
+      () => replies.commitRunOutcome(answerCommand(ledger, run, `ledger-link-${scenario}`)),
+      error => error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
+    );
+    assert.equal(ledger.get(run.requestId).status, 'active');
+    replies.close();
+    queue.close();
+    ledger.close();
+  }
+});
+
+test('outcome and intent replay validate durable canonical bytes before returning', (t) => {
+  for (const target of ['outcome', 'intent']) {
+    const dbPath = temporaryDatabase(t);
+    const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+    const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+    const id = `replay-corrupt-${target}`;
+    const run = startRun(ledger, queue, id);
+    const command = answerCommand(ledger, run, id);
+    const committed = replies.commitRunOutcome(command);
+    const mutate = new Database(dbPath);
+    if (target === 'outcome') {
+      mutate.exec('DROP TRIGGER assistant_reply_outcomes_immutable');
+      mutate.prepare(`UPDATE assistant_reply_outcomes SET envelope_json = json_set(envelope_json, '$.content.text', 'attacker') WHERE request_id = ?`)
+        .run(run.requestId);
+    } else {
+      mutate.exec('DROP TRIGGER assistant_reply_intents_canonical_immutable');
+      mutate.prepare(`UPDATE assistant_reply_intents SET envelope_json = json_set(envelope_json, '$.payload.text', 'attacker') WHERE intent_id = ?`)
+        .run(committed.intent.intentId);
+    }
+    mutate.close();
+    assert.throws(
+      () => replies.commitRunOutcome(command),
+      error => error?.code === (target === 'outcome'
+        ? 'CANONICAL_REPLY_OUTCOME_CORRUPT'
+        : 'CANONICAL_REPLY_INTENT_CORRUPT'),
+    );
+    replies.close();
+    queue.close();
+    ledger.close();
+  }
 });
 
 test('malformed canonical-looking ProgressUpdated head cannot authorize a terminal write', (t) => {
@@ -789,6 +904,43 @@ test('task_receipt accepts only a task_effect cause and replays by canonical ide
     }),
     error => error?.code === 'IDEMPOTENCY_CONFLICT',
   );
+});
+
+test('task_receipt durable replay fails closed when its stored intent is corrupt', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const run = ledger.accept(acceptMessage('task-receipt-corrupt')).request;
+  const command = {
+    requestId: run.requestId,
+    traceId: run.traceId,
+    cause: { kind: 'task_effect', eventId: 'task-effect-corrupt-001' },
+    route: { adapterId: 'feishu', targetRef: 'opaque:task-receipt-corrupt' },
+    disposition: 'task_receipt',
+    payload: { format: 'text', text: 'Task created.' },
+  };
+  const replies = openReplyOutcomeTransactions({
+    dbPath,
+    clock: () => 101,
+    taskEffectVerifier: () => ({
+      canonical: true,
+      applied: true,
+      eventId: command.cause.eventId,
+      requestId: command.requestId,
+      traceId: command.traceId,
+    }),
+  });
+  const first = replies.commitTaskReceipt(command);
+  const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER assistant_reply_intents_canonical_immutable');
+  mutate.prepare(`UPDATE assistant_reply_intents SET cause_event_id = 'task-effect-attacker' WHERE intent_id = ?`)
+    .run(first.intent.intentId);
+  mutate.close();
+  assert.throws(
+    () => replies.commitTaskReceipt(command),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CORRUPT',
+  );
+  replies.close();
+  ledger.close();
 });
 
 test('stale generation is fenced and RunCancelled never gains an Outcome or Intent', (t) => {

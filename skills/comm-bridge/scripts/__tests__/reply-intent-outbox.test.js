@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+
+import Database from 'better-sqlite3';
 
 import { openReplyIntentOutbox } from '../reply-intent-outbox.js';
 import { openReplyOutcomeTransactions } from '../reply-outcome.js';
@@ -92,6 +95,184 @@ function recordReceiptForClaim(outbox, claim, receipt, overrides = {}) {
     ...overrides,
   });
 }
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+test('tampered ReplyIntent canonical bytes fail closed before claim or settlement', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { intent } = createAnswerIntent(t, dbPath, 'tampered-intent');
+  const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_immutable');
+  mutate.prepare(`
+    UPDATE assistant_reply_intents
+    SET route_json = '{"adapterId":"feishu","targetRef":"opaque:attacker"}',
+        envelope_json = json_set(envelope_json, '$.route.targetRef', 'opaque:attacker')
+    WHERE intent_id = ?
+  `).run(intent.intentId);
+  mutate.close();
+
+  const outbox = openReplyIntentOutbox({ dbPath, clock: () => 100 });
+  t.after(() => outbox.close());
+  assert.throws(
+    () => outbox.claimNext({ ownerId: 'adapter-a' }),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CORRUPT',
+  );
+  assert.throws(
+    () => outbox.listSettlements(intent.intentId),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CORRUPT',
+  );
+});
+
+test('ReplyIntent identity/body and DeliveryReceipt/Settlement rows are immutable', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { run, intent } = createAnswerIntent(t, dbPath, 'immutable-delivery-ledger');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => 'immutable-lease',
+  });
+  t.after(() => outbox.close());
+  const claim = outbox.claimNext({ ownerId: 'adapter-a' });
+  recordReceiptForClaim(outbox, claim, {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:immutable-delivery-ledger:accepted',
+    intentId: intent.intentId,
+    deliveryId: claim.deliveryId,
+    requestId: run.requestId,
+    attemptId: claim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'platform_accepted',
+    externalRef: 'opaque:accepted',
+    observedAt: '2026-09-01T00:05:00.000Z',
+  });
+  const mutate = new Database(dbPath);
+  for (const statement of [
+    `UPDATE assistant_reply_intents SET route_json = '{}' WHERE intent_id = ?`,
+    `UPDATE assistant_reply_intents SET payload_json = '{}' WHERE intent_id = ?`,
+    `UPDATE assistant_reply_intents SET cause_event_id = 'evt:attacker:1' WHERE intent_id = ?`,
+    `UPDATE assistant_reply_intents SET canonical_hash = 'attacker' WHERE intent_id = ?`,
+    `UPDATE assistant_reply_intents SET envelope_json = '{}' WHERE intent_id = ?`,
+    `DELETE FROM assistant_reply_intents WHERE intent_id = ?`,
+  ]) {
+    assert.throws(() => mutate.prepare(statement).run(intent.intentId), /immutable/);
+  }
+  assert.throws(
+    () => mutate.prepare(`UPDATE assistant_delivery_receipts SET outcome = 'unknown' WHERE intent_id = ?`).run(intent.intentId),
+    /immutable/,
+  );
+  assert.throws(
+    () => mutate.prepare(`DELETE FROM assistant_delivery_receipts WHERE intent_id = ?`).run(intent.intentId),
+    /immutable/,
+  );
+  assert.throws(
+    () => mutate.prepare(`UPDATE assistant_delivery_settlements SET basis = 'reconciled' WHERE intent_id = ?`).run(intent.intentId),
+    /immutable/,
+  );
+  assert.throws(
+    () => mutate.prepare(`DELETE FROM assistant_delivery_settlements WHERE intent_id = ?`).run(intent.intentId),
+    /immutable/,
+  );
+  mutate.close();
+  assert.equal(outbox.get(intent.intentId).delivery.state, 'accepted');
+});
+
+test('schema migration replaces a same-name legacy trigger with the complete protected-column set', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { intent } = createAnswerIntent(t, dbPath, 'legacy-trigger-upgrade');
+  const legacy = new Database(dbPath);
+  legacy.exec(`
+    DROP TRIGGER assistant_reply_intents_canonical_immutable;
+    CREATE TRIGGER assistant_reply_intents_canonical_immutable
+    BEFORE UPDATE OF route_json ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'legacy narrow trigger');
+    END;
+  `);
+  legacy.close();
+  const migrated = openReplyIntentOutbox({ dbPath, clock: () => 100 });
+  t.after(() => migrated.close());
+  const inspect = new Database(dbPath);
+  const sql = inspect.prepare(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?`)
+    .get('assistant_reply_intents_canonical_immutable').sql;
+  assert.match(sql, /envelope_json/);
+  assert.match(sql, /cause_event_id/);
+  assert.throws(
+    () => inspect.prepare(`UPDATE assistant_reply_intents SET envelope_json = '{}' WHERE intent_id = ?`).run(intent.intentId),
+    /immutable/,
+  );
+  inspect.close();
+});
+
+test('legacy receipt and settlement tampering fails canonical replay and list validation', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { run, intent } = createAnswerIntent(t, dbPath, 'tampered-delivery-ledger');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => 'tampered-ledger-lease',
+  });
+  t.after(() => outbox.close());
+  const claim = outbox.claimNext({ ownerId: 'adapter-a' });
+  const receipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:tampered-delivery-ledger:accepted',
+    intentId: intent.intentId,
+    deliveryId: claim.deliveryId,
+    requestId: run.requestId,
+    attemptId: claim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'platform_accepted',
+    externalRef: 'opaque:accepted',
+    observedAt: '2026-09-01T00:05:00.000Z',
+  };
+  recordReceiptForClaim(outbox, claim, receipt);
+  const mutate = new Database(dbPath);
+  mutate.exec(`
+    DROP TRIGGER assistant_delivery_receipts_immutable;
+    DROP TRIGGER assistant_delivery_settlements_immutable;
+  `);
+  const receiptEnvelope = { ...receipt, outcome: 'unknown', externalRef: null, nextAction: 'reconcile_before_retry' };
+  const receiptJson = canonicalJson(receiptEnvelope);
+  mutate.prepare(`UPDATE assistant_delivery_receipts SET envelope_json = ?, canonical_hash = ? WHERE receipt_id = ?`)
+    .run(receiptJson, sha256(receiptJson), receipt.receiptId);
+  const settlement = mutate.prepare(`SELECT * FROM assistant_delivery_settlements WHERE intent_id = ?`).get(intent.intentId);
+  const settlementEnvelope = { ...JSON.parse(settlement.envelope_json), basis: 'reconciled' };
+  const settlementJson = canonicalJson(settlementEnvelope);
+  mutate.prepare(`UPDATE assistant_delivery_settlements SET envelope_json = ?, canonical_hash = ? WHERE settlement_id = ?`)
+    .run(settlementJson, sha256(settlementJson), settlement.settlement_id);
+  mutate.close();
+  assert.throws(
+    () => outbox.listReceipts(intent.intentId),
+    error => error?.code === 'CANONICAL_DELIVERY_RECEIPT_CORRUPT',
+  );
+  assert.throws(
+    () => recordReceiptForClaim(outbox, claim, receipt),
+    error => error?.code === 'CANONICAL_DELIVERY_RECEIPT_CORRUPT',
+  );
+  const restore = new Database(dbPath);
+  const originalReceiptJson = canonicalJson(receipt);
+  restore.prepare(`UPDATE assistant_delivery_receipts SET envelope_json = ?, canonical_hash = ? WHERE receipt_id = ?`)
+    .run(originalReceiptJson, sha256(originalReceiptJson), receipt.receiptId);
+  restore.close();
+  assert.throws(
+    () => outbox.listSettlements(intent.intentId),
+    error => error?.code === 'CANONICAL_DELIVERY_SETTLEMENT_CORRUPT',
+  );
+});
 
 test('unknown delivery reconciles before retry and only reconciled settles accepted', (t) => {
   const dbPath = temporaryDatabase(t);

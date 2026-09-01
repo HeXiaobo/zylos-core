@@ -4,7 +4,14 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
-import { canonicalRunEventChainFailure } from './canonical-run-event.js';
+import {
+  canonicalRunEventChainFailure,
+  canonicalRunPersistenceFailure,
+} from './canonical-run-event.js';
+import {
+  canonicalReplyIntentFailure,
+  canonicalReplyOutcomeFailure,
+} from './canonical-reply-records.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
 
@@ -286,7 +293,7 @@ export function openReplyOutcomeTransactions({
     WHERE l.request_id = ?
   `);
   const selectOutcome = database.prepare(`
-    SELECT envelope_json, canonical_hash
+    SELECT *
     FROM assistant_reply_outcomes
     WHERE request_id = ?
   `);
@@ -319,6 +326,34 @@ export function openReplyOutcomeTransactions({
   const selectIntentById = database.prepare(`
     SELECT * FROM assistant_reply_intents WHERE intent_id = ?
   `);
+  const selectRequestFacts = database.prepare(`
+    SELECT request_id, status, runtime_session_id, next_sequence
+    FROM assistant_requests WHERE request_id = ?
+  `);
+  const selectAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status
+    FROM runtime_turn_admissions
+    WHERE request_id = ? AND turn_id = ? AND generation = ?
+    ORDER BY id DESC LIMIT 1
+  `);
+
+  function requireCanonicalOutcome(row) {
+    if (!row) return null;
+    const failure = canonicalReplyOutcomeFailure(row);
+    if (failure) {
+      throw domainError('CANONICAL_REPLY_OUTCOME_CORRUPT', `ReplyOutcome failed validation: ${failure}`);
+    }
+    return JSON.parse(row.envelope_json);
+  }
+
+  function requireCanonicalIntent(row) {
+    if (!row) return null;
+    const failure = canonicalReplyIntentFailure(row);
+    if (failure) {
+      throw domainError('CANONICAL_REPLY_INTENT_CORRUPT', `ReplyIntent failed validation: ${failure}`);
+    }
+    return JSON.parse(row.envelope_json);
+  }
 
   function resultFor(requestId, replayed) {
     const outcomeRow = selectOutcome.get(requestId);
@@ -328,9 +363,9 @@ export function openReplyOutcomeTransactions({
       : null;
     return {
       replayed,
-      outcome: outcomeRow ? JSON.parse(outcomeRow.envelope_json) : null,
+      outcome: requireCanonicalOutcome(outcomeRow),
       terminal,
-      intent: intentRow ? JSON.parse(intentRow.canonical_hash ? intentRow.envelope_json : '{}') : null,
+      intent: requireCanonicalIntent(intentRow),
       delivery: toDelivery(intentRow),
     };
   }
@@ -378,6 +413,18 @@ export function openReplyOutcomeTransactions({
       throw domainError(
         'NONCANONICAL_RUN_EVENT_CHAIN',
         `terminal cannot extend malformed event ${chainFailure.event?.event_id ?? 'unknown'}: ${chainFailure.reason}`,
+      );
+    }
+    const persistenceFailure = canonicalRunPersistenceFailure({
+      rows: events,
+      run: selectRun.get(requestId),
+      request: selectRequestFacts.get(requestId),
+      admission: selectAdmissionFacts.get(requestId, turnId, generation),
+    });
+    if (persistenceFailure) {
+      throw domainError(
+        'NONCANONICAL_RUN_PERSISTENCE',
+        `terminal cannot extend a run that disagrees with durable facts: ${persistenceFailure}`,
       );
     }
     const predecessor = terminal
@@ -434,6 +481,7 @@ export function openReplyOutcomeTransactions({
     });
     const replyPolicy = replyPolicyFor(run);
     if (existingOutcome) {
+      requireCanonicalOutcome(existingOutcome);
       if (existingOutcome.canonical_hash !== outcomeHash) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'canonical ReplyOutcome already has another payload');
       }
@@ -473,6 +521,7 @@ export function openReplyOutcomeTransactions({
         replyPolicy,
       });
       const storedIntent = selectIntentByCause.get('run_terminal', existingTerminal.event_id);
+      requireCanonicalIntent(storedIntent);
       if ((expectedIntent === null) !== (storedIntent === undefined)) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'outcome replay changes ReplyIntent visibility');
       }
@@ -495,6 +544,13 @@ export function openReplyOutcomeTransactions({
       SELECT next_sequence FROM assistant_requests WHERE request_id = ?
     `).get(requestId);
     const sequence = request.next_sequence;
+    const headSequence = selectRunEvents.all(requestId).at(-1)?.sequence;
+    if (sequence !== headSequence + 1) {
+      throw domainError(
+        'RUN_SEQUENCE_FENCE_MISMATCH',
+        'request.next_sequence does not immediately follow the canonical event head',
+      );
+    }
     const terminalType = outcome.kind === 'failure' ? 'RunFailed' : 'RunCompleted';
     const terminalPayload = outcome.kind === 'failure'
       ? { outcomeId: outcome.outcomeId, code: outcome.code, retryable: outcome.retryable }
@@ -596,6 +652,7 @@ export function openReplyOutcomeTransactions({
     const canonicalHash = sha256(canonicalJson(intent));
     const existing = selectIntentById.get(intent.intentId);
     if (existing) {
+      requireCanonicalIntent(existing);
       if (existing.canonical_hash !== canonicalHash) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'ReplyIntent identity has another payload');
       }

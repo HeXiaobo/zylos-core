@@ -308,3 +308,52 @@ export function canonicalRunEventChainFailure(rows) {
   }
   return null;
 }
+
+export function canonicalRunPersistenceFailure({ rows, run, request, admission }) {
+  if (!run || !request) return 'RUN_LEDGER_FACTS_MISSING';
+  if (!Array.isArray(rows) || rows.length === 0) return 'RUN_EVENT_CHAIN_MISSING';
+  const chainFailure = canonicalRunEventChainFailure(rows);
+  if (chainFailure) return chainFailure.reason;
+  const accepted = rows[0];
+  const head = rows.at(-1);
+  if (
+    accepted.request_id !== run.request_id
+    || accepted.turn_id !== `turn:${run.request_id}:1`
+    || accepted.generation !== 1
+    || accepted.trace_id !== run.trace_id
+    || accepted.causation_id !== run.causation_id
+  ) return 'RUN_ACCEPTED_LEDGER_MISMATCH';
+  if (
+    request.request_id !== run.request_id
+    || request.next_sequence !== head.sequence + 1
+    || head.request_id !== run.request_id
+  ) return 'RUN_REQUEST_SEQUENCE_MISMATCH';
+  if (
+    head.turn_id !== run.turn_id
+    || head.generation !== run.generation
+    || head.trace_id !== run.trace_id
+  ) return 'RUN_HEAD_LEDGER_FENCE_MISMATCH';
+  const expectedRequestStatus = {
+    queued: 'queued', active: 'started', completed: 'completed', failed: 'failed', cancelled: 'failed',
+  }[run.status];
+  if (expectedRequestStatus && request.status !== expectedRequestStatus) {
+    return 'RUN_REQUEST_STATUS_MISMATCH';
+  }
+  const started = [...rows].reverse().find(event => event.event_type === 'RunStarted');
+  if (started) {
+    const payload = JSON.parse(started.payload_json);
+    if (
+      !admission
+      || admission.request_id !== run.request_id
+      || admission.turn_id !== run.turn_id
+      || admission.generation !== run.generation
+      || admission.runtime_lane_id !== 'runtime:shared'
+      || admission.runtime_session_id !== payload.runtimeSessionId
+      || request.runtime_session_id !== payload.runtimeSessionId
+      || !['started', 'completed'].includes(admission.status)
+    ) return 'RUN_STARTED_ADMISSION_MISMATCH';
+  } else if (run.status === 'active') {
+    return 'RUN_ACTIVE_WITHOUT_STARTED';
+  }
+  return null;
+}

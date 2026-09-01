@@ -4,6 +4,11 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import {
+  canonicalDeliveryReceiptFailure,
+  canonicalDeliverySettlementFailure,
+  canonicalReplyIntentFailure,
+} from './canonical-reply-records.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
 
@@ -69,7 +74,12 @@ function requireAction(value) {
 }
 
 function toIntent(row) {
-  return row ? JSON.parse(row.envelope_json) : null;
+  if (!row) return null;
+  const failure = canonicalReplyIntentFailure(row);
+  if (failure) {
+    throw domainError('CANONICAL_REPLY_INTENT_CORRUPT', `ReplyIntent failed validation: ${failure}`);
+  }
+  return JSON.parse(row.envelope_json);
 }
 
 function toDelivery(row) {
@@ -84,10 +94,6 @@ function toDelivery(row) {
     redriveCount: row.redrive_count,
     lastError: row.last_error,
   };
-}
-
-function toSettlement(row) {
-  return row ? JSON.parse(row.envelope_json) : null;
 }
 
 function normalizeReceipt(raw) {
@@ -160,37 +166,110 @@ export function openReplyIntentOutbox({
   ensureAssistantReplyReliabilitySchema(database);
 
   const selectIntent = database.prepare(`SELECT * FROM assistant_reply_intents WHERE intent_id = ?`);
-  database.prepare(`
-    UPDATE assistant_reply_intents
-    SET claim_epoch = 1,
-        delivery_state = CASE
-          WHEN delivery_state = 'sending' THEN 'reconcile_required'
-          ELSE delivery_state
-        END,
-        lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-        last_error = 'LEGACY_LEASE_EPOCH_UNPROVEN', updated_at = ?
-    WHERE claim_epoch = 0
-      AND (
-        delivery_state IN ('sending', 'reconcile_required')
-        OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL
-      )
-  `).run(currentTime(clock));
+  const recoverLegacyLeases = database.transaction(() => {
+    const legacyRows = database.prepare(`
+      SELECT * FROM assistant_reply_intents
+      WHERE claim_epoch = 0
+        AND (
+          delivery_state IN ('sending', 'reconcile_required')
+          OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL
+        )
+      ORDER BY intent_id ASC
+    `).all();
+    const current = currentTime(clock);
+    for (const row of legacyRows) {
+      toIntent(row);
+      const updated = database.prepare(`
+        UPDATE assistant_reply_intents
+        SET claim_epoch = 1,
+            delivery_state = CASE
+              WHEN delivery_state = 'sending' THEN 'reconcile_required'
+              ELSE delivery_state
+            END,
+            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+            last_error = 'LEGACY_LEASE_EPOCH_UNPROVEN', updated_at = ?
+        WHERE intent_id = ? AND claim_epoch = 0 AND canonical_hash = ?
+      `).run(current, row.intent_id, row.canonical_hash);
+      if (updated.changes !== 1) {
+        throw domainError('LEASE_CONFLICT', 'legacy delivery recovery lost its durable fence');
+      }
+    }
+  });
+  recoverLegacyLeases.immediate();
 
-  const selectReceipt = database.prepare(`
-    SELECT envelope_json, canonical_hash, attempt_id, claim_action, claim_epoch, lease_token
-    FROM assistant_delivery_receipts WHERE receipt_id = ?
-  `);
+  const selectReceipt = database.prepare(`SELECT * FROM assistant_delivery_receipts WHERE receipt_id = ?`);
   const selectLatestSettlement = database.prepare(`
     SELECT * FROM assistant_delivery_settlements
     WHERE intent_id = ? ORDER BY rowid DESC LIMIT 1
   `);
+  const selectReceiptsForIntent = database.prepare(`
+    SELECT * FROM assistant_delivery_receipts
+    WHERE intent_id = ? ORDER BY created_at ASC, receipt_id ASC
+  `);
+  const selectSettlementsForIntent = database.prepare(`
+    SELECT * FROM assistant_delivery_settlements
+    WHERE intent_id = ? ORDER BY created_at ASC, settlement_id ASC
+  `);
+
+  function requireCanonicalReceipt(row, intent) {
+    const failure = canonicalDeliveryReceiptFailure(row, intent);
+    if (failure) {
+      throw domainError(
+        'CANONICAL_DELIVERY_RECEIPT_CORRUPT',
+        `DeliveryReceipt failed validation: ${failure}`,
+      );
+    }
+    return JSON.parse(row.envelope_json);
+  }
+
+  function requireCanonicalSettlement(row, intent, receipts = null) {
+    if (!row) return null;
+    const failure = canonicalDeliverySettlementFailure(row, intent);
+    if (failure) {
+      throw domainError(
+        'CANONICAL_DELIVERY_SETTLEMENT_CORRUPT',
+        `DeliverySettlement failed validation: ${failure}`,
+      );
+    }
+    const durableReceipts = receipts ?? selectReceiptsForIntent.all(intent.intent_id);
+    const expectedOutcome = row.basis === 'retry_exhausted' ? 'rejected' : row.basis;
+    if (!durableReceipts.some((receipt) => {
+      requireCanonicalReceipt(receipt, intent);
+      return receipt.outcome === expectedOutcome;
+    })) {
+      throw domainError(
+        'CANONICAL_DELIVERY_SETTLEMENT_CORRUPT',
+        `DeliverySettlement has no canonical ${expectedOutcome} receipt basis`,
+      );
+    }
+    return JSON.parse(row.envelope_json);
+  }
+
+  function validateDeliveryLedger(intent) {
+    toIntent(intent);
+    const receipts = selectReceiptsForIntent.all(intent.intent_id);
+    receipts.forEach(receipt => requireCanonicalReceipt(receipt, intent));
+    const settlements = selectSettlementsForIntent.all(intent.intent_id);
+    settlements.forEach(settlement => requireCanonicalSettlement(settlement, intent, receipts));
+    if (intent.delivery_state === 'accepted' && !settlements.some(row => row.state === 'accepted')) {
+      throw domainError('CANONICAL_DELIVERY_LEDGER_CORRUPT', 'accepted delivery has no accepted Settlement');
+    }
+    if (intent.delivery_state === 'unpresentable' && !settlements.some(row => row.state === 'unpresentable')) {
+      throw domainError(
+        'CANONICAL_DELIVERY_LEDGER_CORRUPT',
+        'unpresentable delivery has no unpresentable Settlement',
+      );
+    }
+    return { receipts, settlements };
+  }
 
   function claimView(row, { replayed }) {
     if (!row) return null;
+    const intent = toIntent(row);
     return {
       replayed,
       action: row.delivery_state === 'reconcile_required' ? 'reconcile' : 'send',
-      intent: toIntent(row),
+      intent,
       deliveryId: `delivery:${row.intent_id}`,
       attemptId: row.current_attempt_id,
       claimEpoch: row.claim_epoch,
@@ -213,11 +292,13 @@ export function openReplyIntentOutbox({
         AND delivery_state IN ('sending', 'reconcile_required')
       ORDER BY created_at ASC, intent_id ASC LIMIT 1
     `).get(safeOwnerId, current);
-    if (active) return claimView(active, { replayed: true });
+    if (active) {
+      validateDeliveryLedger(active);
+      return claimView(active, { replayed: true });
+    }
 
     const expiredLeases = database.prepare(`
-      SELECT intent_id, delivery_state, current_attempt_id, claim_epoch,
-             lease_owner, lease_token, lease_expires_at
+      SELECT *
       FROM assistant_reply_intents
       WHERE delivery_state IN ('sending', 'reconcile_required')
         AND claim_epoch > 0 AND lease_token IS NOT NULL AND lease_expires_at <= ?
@@ -233,6 +314,7 @@ export function openReplyIntentOutbox({
         AND lease_expires_at = ? AND lease_expires_at <= ?
     `);
     for (const expired of expiredLeases) {
+      validateDeliveryLedger(expired);
       const recovered = recoverExpired.run(
         current,
         expired.intent_id,
@@ -261,6 +343,7 @@ export function openReplyIntentOutbox({
       LIMIT 1
     `).get(current);
     if (!candidate) return null;
+    validateDeliveryLedger(candidate);
     const action = candidate.delivery_state === 'reconcile_required' ? 'reconcile' : 'send';
     const nextAttemptCount = action === 'send'
       ? candidate.attempt_count + 1
@@ -301,6 +384,7 @@ export function openReplyIntentOutbox({
   });
 
   function createSettlement(intent, basis, current) {
+    toIntent(intent);
     const state = basis === 'retry_exhausted' ? 'unpresentable' : 'accepted';
     const suffix = basis === 'platform_accepted'
       ? 'accepted'
@@ -321,13 +405,14 @@ export function openReplyIntentOutbox({
     const envelopeJson = canonicalJson(settlement);
     const canonicalHash = sha256(envelopeJson);
     const existing = database.prepare(`
-      SELECT canonical_hash FROM assistant_delivery_settlements WHERE settlement_id = ?
+      SELECT * FROM assistant_delivery_settlements WHERE settlement_id = ?
     `).get(settlement.settlementId);
     if (existing) {
+      requireCanonicalSettlement(existing, intent);
       if (existing.canonical_hash !== canonicalHash) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'DeliverySettlement identity has another payload');
       }
-      return settlement;
+      return JSON.parse(existing.envelope_json);
     }
     database.prepare(`
       INSERT INTO assistant_delivery_settlements (
@@ -357,6 +442,8 @@ export function openReplyIntentOutbox({
     const receiptHash = sha256(receiptJson);
     const existingReceipt = selectReceipt.get(receipt.receiptId);
     if (existingReceipt) {
+      const replayIntent = selectIntent.get(existingReceipt.intent_id);
+      requireCanonicalReceipt(existingReceipt, replayIntent);
       if (existingReceipt.canonical_hash !== receiptHash) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'DeliveryReceipt identity has another payload');
       }
@@ -378,16 +465,19 @@ export function openReplyIntentOutbox({
       ) {
         throw domainError('LEASE_FENCED', 'receipt replay lease does not own this delivery');
       }
-      const replayIntent = selectIntent.get(receipt.intentId);
       return {
         replayed: true,
         receipt: JSON.parse(existingReceipt.envelope_json),
         delivery: toDelivery(replayIntent),
-        settlement: toSettlement(selectLatestSettlement.get(receipt.intentId)),
+        settlement: requireCanonicalSettlement(
+          selectLatestSettlement.get(receipt.intentId),
+          replayIntent,
+        ),
       };
     }
     const intent = selectIntent.get(receipt.intentId);
     if (!intent) throw domainError('INTENT_NOT_FOUND', `unknown ReplyIntent: ${receipt.intentId}`);
+    validateDeliveryLedger(intent);
     const current = currentTime(clock);
     const expectedState = safeAction === 'send' ? 'sending' : 'reconcile_required';
     if (
@@ -528,6 +618,7 @@ export function openReplyIntentOutbox({
     const safeIntentId = requireText(intentId, 'intentId');
     const intent = selectIntent.get(safeIntentId);
     if (!intent) throw domainError('INTENT_NOT_FOUND', `unknown ReplyIntent: ${safeIntentId}`);
+    validateDeliveryLedger(intent);
     if (intent.delivery_state === 'pending' && intent.redrive_count > 0) {
       return { replayed: true, intent: toIntent(intent), delivery: toDelivery(intent) };
     }
@@ -561,19 +652,23 @@ export function openReplyIntentOutbox({
     },
     get(intentId) {
       const row = selectIntent.get(requireText(intentId, 'intentId'));
-      return row ? { intent: toIntent(row), delivery: toDelivery(row) } : null;
+      if (!row) return null;
+      validateDeliveryLedger(row);
+      return { intent: toIntent(row), delivery: toDelivery(row) };
     },
     listReceipts(intentId) {
-      return database.prepare(`
-        SELECT envelope_json FROM assistant_delivery_receipts
-        WHERE intent_id = ? ORDER BY created_at ASC, receipt_id ASC
-      `).all(requireText(intentId, 'intentId')).map(row => JSON.parse(row.envelope_json));
+      const safeIntentId = requireText(intentId, 'intentId');
+      const intent = selectIntent.get(safeIntentId);
+      if (!intent) return [];
+      const { receipts } = validateDeliveryLedger(intent);
+      return receipts.map(row => JSON.parse(row.envelope_json));
     },
     listSettlements(intentId) {
-      return database.prepare(`
-        SELECT envelope_json FROM assistant_delivery_settlements
-        WHERE intent_id = ? ORDER BY created_at ASC, settlement_id ASC
-      `).all(requireText(intentId, 'intentId')).map(row => JSON.parse(row.envelope_json));
+      const safeIntentId = requireText(intentId, 'intentId');
+      const intent = selectIntent.get(safeIntentId);
+      if (!intent) return [];
+      const { settlements } = validateDeliveryLedger(intent);
+      return settlements.map(row => JSON.parse(row.envelope_json));
     },
     redrive(input = {}) {
       return redriveTransaction.immediate(input);

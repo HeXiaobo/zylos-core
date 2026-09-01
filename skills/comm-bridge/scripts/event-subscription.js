@@ -7,7 +7,12 @@ import Database from 'better-sqlite3';
 import {
   canonicalRunEventFailure as canonicalEventFailure,
   canonicalRunEventLinkFailure,
+  canonicalRunPersistenceFailure,
 } from './canonical-run-event.js';
+import {
+  canonicalReplyIntentFailure,
+  canonicalReplyOutcomeFailure,
+} from './canonical-reply-records.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
 
@@ -58,63 +63,6 @@ function canonicalJson(value) {
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function canonicalOutcomeFailure(row) {
-  if (sha256(row.envelope_json) !== row.canonical_hash) {
-    return 'OUTCOME_CANONICAL_HASH_MISMATCH';
-  }
-  let envelope;
-  try {
-    envelope = JSON.parse(row.envelope_json);
-  } catch {
-    return 'OUTCOME_CANONICAL_ENVELOPE_INVALID';
-  }
-  if (canonicalJson(envelope) !== row.envelope_json) {
-    return 'OUTCOME_CANONICAL_BYTES_MISMATCH';
-  }
-  if (
-    envelope.schemaVersion !== 1
-    || envelope.type !== 'ReplyOutcome'
-    || envelope.outcomeId !== row.outcome_id
-    || envelope.requestId !== row.request_id
-    || envelope.turnId !== row.turn_id
-    || envelope.traceId !== row.trace_id
-    || envelope.kind !== row.kind
-  ) {
-    return 'OUTCOME_CANONICAL_IDENTITY_MISMATCH';
-  }
-  if (
-    row.kind === 'answer'
-    && (
-      envelope.content?.format !== 'text'
-      || typeof envelope.content.text !== 'string'
-      || envelope.content.text.trim() === ''
-    )
-  ) {
-    return 'OUTCOME_CANONICAL_PAYLOAD_INVALID';
-  }
-  if (
-    row.kind === 'silent'
-    && (
-      envelope.explicit !== true
-      || typeof envelope.reason !== 'string'
-      || envelope.reason.trim() === ''
-    )
-  ) {
-    return 'OUTCOME_CANONICAL_PAYLOAD_INVALID';
-  }
-  if (
-    row.kind === 'failure'
-    && (
-      typeof envelope.code !== 'string'
-      || envelope.code.trim() === ''
-      || typeof envelope.retryable !== 'boolean'
-    )
-  ) {
-    return 'OUTCOME_CANONICAL_PAYLOAD_INVALID';
-  }
-  return null;
 }
 
 function eventFingerprint(row) {
@@ -238,6 +186,25 @@ export function openEventSubscriptions({
     FROM assistant_reply_outcomes
     WHERE outcome_id = ?
   `);
+  const selectIntentByCause = database.prepare(`
+    SELECT * FROM assistant_reply_intents
+    WHERE cause_kind = 'run_terminal' AND cause_event_id = ?
+    ORDER BY created_at ASC, intent_id ASC LIMIT 1
+  `);
+  const selectRunFacts = database.prepare(`
+    SELECT * FROM assistant_run_ledger WHERE request_id = ?
+  `);
+  const selectRequestFacts = database.prepare(`
+    SELECT request_id, status, runtime_session_id, next_sequence
+    FROM assistant_requests WHERE request_id = ?
+  `);
+  const selectAdmissionFacts = database.prepare(`
+    SELECT request_id, turn_id, generation, runtime_lane_id, runtime_session_id, status
+    FROM runtime_turn_admissions
+    WHERE request_id = ? AND turn_id = ? AND generation = ?
+    ORDER BY id DESC LIMIT 1
+  `);
+  const selectRunChain = database.prepare(`${eventProjection} WHERE request_id = ? ORDER BY sequence ASC`);
   const selectConfirmedCancellation = database.prepare(`
     SELECT command_id, causation_id, confirmation_causation_id, status
     FROM assistant_cancel_requests
@@ -290,6 +257,7 @@ export function openEventSubscriptions({
       WHERE id >= ? AND event_id IS NOT NULL
       ORDER BY id ASC
     `).all(consumer.start_event_row_id);
+    const validatedRequests = new Set();
     for (const event of canonicalRows) {
       const failure = canonicalEventFailure(event);
       if (failure) {
@@ -338,7 +306,7 @@ export function openEventSubscriptions({
           const payload = JSON.parse(event.payload_json);
           const outcome = selectOutcome.get(payload.outcomeId);
           const expectedKind = event.event_type === 'RunFailed' ? 'failure' : null;
-          const outcomeFailure = outcome ? canonicalOutcomeFailure(outcome) : null;
+          const outcomeFailure = outcome ? canonicalReplyOutcomeFailure(outcome) : null;
           if (
             !outcome
             || outcome.request_id !== event.request_id
@@ -354,6 +322,43 @@ export function openEventSubscriptions({
             degrade(consumerId, outcomeFailure, event.id, current);
             return selectConsumer.get(consumerId);
           }
+          const intent = selectIntentByCause.get(event.event_id);
+          if (outcome.kind === 'silent') {
+            if (intent) {
+              degrade(consumerId, 'SILENT_TERMINAL_HAS_INTENT', event.id, current);
+              return selectConsumer.get(consumerId);
+            }
+          } else {
+            const intentFailure = intent ? canonicalReplyIntentFailure(intent) : null;
+            if (!intent || intent.request_id !== event.request_id || intent.trace_id !== event.trace_id) {
+              degrade(consumerId, 'TERMINAL_INTENT_NOT_FOUND', event.id, current);
+              return selectConsumer.get(consumerId);
+            }
+            if (intentFailure) {
+              degrade(consumerId, intentFailure, event.id, current);
+              return selectConsumer.get(consumerId);
+            }
+          }
+        }
+      }
+      if (!validatedRequests.has(event.request_id)) {
+        const chain = selectRunChain.all(event.request_id);
+        if (chain.at(-1)?.id === event.id) {
+          const run = selectRunFacts.get(event.request_id);
+          const request = selectRequestFacts.get(event.request_id);
+          const persistenceFailure = canonicalRunPersistenceFailure({
+            rows: chain,
+            run,
+            request,
+            admission: run
+              ? selectAdmissionFacts.get(event.request_id, run.turn_id, run.generation)
+              : null,
+          });
+          if (persistenceFailure) {
+            degrade(consumerId, persistenceFailure, event.id, current);
+            return selectConsumer.get(consumerId);
+          }
+          validatedRequests.add(event.request_id);
         }
       }
       const fingerprint = eventFingerprint(event);
