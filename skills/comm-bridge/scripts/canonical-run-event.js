@@ -359,6 +359,12 @@ export function canonicalRunPersistenceFailure({ rows, run, request, admission, 
   if (!terminalStatus && ['completed', 'failed', 'cancelled'].includes(run.status)) {
     return 'RUN_LEDGER_TERMINAL_WITHOUT_EVENT';
   }
+  if (
+    ['RunStarted', 'ProgressUpdated', 'OutputDelta'].includes(head.event_type)
+    && (!['active', 'cancel_requested'].includes(run.status) || request.status !== 'started')
+  ) {
+    return 'RUN_STARTED_STATUS_MISMATCH';
+  }
   const expectedRequestStatus = {
     queued: 'queued', active: 'started', completed: 'completed', failed: 'failed', cancelled: 'cancelled',
   }[run.status];

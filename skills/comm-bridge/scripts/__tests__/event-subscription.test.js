@@ -765,6 +765,43 @@ test('getState revalidates terminal event, RunLedger and request status integrit
   ledger.close();
 });
 
+test('RunStarted cannot be projected from a RunLedger and request rewound to queued', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  const accepted = ledger.accept(acceptMessage('started-status-rewind')).request;
+  const claim = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: 'runtime:started-status-rewind',
+  }).request;
+  const tamper = new Database(dbPath);
+  tamper.prepare(`UPDATE assistant_run_ledger SET status = 'queued' WHERE request_id = ?`)
+    .run(run.requestId);
+  tamper.prepare(`UPDATE assistant_requests SET status = 'queued' WHERE request_id = ?`)
+    .run(run.requestId);
+  tamper.close();
+
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'started-status-rewind-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  const stream = subscriptions.getStream({
+    consumerId: 'started-status-rewind-consumer',
+    requestId: run.requestId,
+  });
+  assert.equal(stream.status, 'degraded');
+  assert.equal(stream.degradedReason, 'RUN_STARTED_STATUS_MISMATCH');
+});
+
 test('RunCompleted cannot jump directly from RunQueued even with a matching Outcome', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -1166,4 +1203,68 @@ test('subscription degrades when a legacy database contains a tampered Outcome e
   });
   assert.equal(subscribed.status, 'degraded');
   assert.equal(subscribed.degradedReason, 'OUTCOME_CANONICAL_HASH_MISMATCH');
+});
+
+test('subscription validates visible terminal Outcome, Intent payload and durable reply route as one fact', (t) => {
+  for (const scenario of ['outcome-content', 'ledger-route']) {
+    const dbPath = temporaryDatabase(t);
+    const { ledger, run } = createProgressEvents(t, dbPath);
+    const outcomes = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+    outcomes.commitRunOutcome({
+      requestId: run.requestId,
+      turnId: run.turnId,
+      generation: run.generation,
+      traceId: run.traceId,
+      causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${run.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Original answer.' } },
+      reply: {
+        action: 'send',
+        route: { adapterId: 'feishu', targetRef: 'opaque:progress' },
+        disposition: 'send',
+      },
+    });
+    outcomes.close();
+    const tamper = new Database(dbPath);
+    if (scenario === 'outcome-content') {
+      const row = tamper.prepare(`
+        SELECT envelope_json FROM assistant_reply_outcomes WHERE request_id = ?
+      `).get(run.requestId);
+      const envelope = JSON.parse(row.envelope_json);
+      envelope.content.text = 'Attacker rewrote the canonical answer.';
+      const envelopeJson = canonicalJson(envelope);
+      tamper.exec('DROP TRIGGER assistant_reply_outcomes_immutable');
+      tamper.prepare(`
+        UPDATE assistant_reply_outcomes
+        SET envelope_json = ?, canonical_hash = ? WHERE request_id = ?
+      `).run(
+        envelopeJson,
+        createHash('sha256').update(envelopeJson).digest('hex'),
+        run.requestId,
+      );
+    } else {
+      tamper.prepare(`
+        UPDATE assistant_run_ledger SET reply_route_json = ? WHERE request_id = ?
+      `).run(
+        canonicalJson({ adapterId: 'feishu', targetRef: 'opaque:attacker-route' }),
+        run.requestId,
+      );
+    }
+    tamper.close();
+
+    const subscriptions = openEventSubscriptions({ dbPath, clock: () => 102 });
+    t.after(() => subscriptions.close());
+    const subscribed = subscriptions.subscribe({
+      consumerId: `terminal-linkage:${scenario}`,
+      bootstrap: 'canonical_cutover',
+    });
+    assert.equal(subscribed.status, 'degraded');
+    assert.equal(
+      subscribed.degradedReason,
+      scenario === 'outcome-content'
+        ? 'RUN_TERMINAL_INTENT_POLICY_MISMATCH'
+        : 'RUN_REPLY_ROUTE_MISMATCH',
+    );
+  }
 });

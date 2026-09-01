@@ -156,6 +156,9 @@ function normalizeReceipt(raw) {
   if (['platform_accepted', 'reconciled'].includes(outcome) && normalized.externalRef === null) {
     throw domainError('MISSING_EXTERNAL_REF', `${outcome} requires an externalRef`);
   }
+  if (['unknown', 'rejected'].includes(outcome) && normalized.externalRef !== null) {
+    throw domainError('INVALID_EXTERNAL_REF', `${outcome} requires externalRef=null`);
+  }
   return normalized;
 }
 
@@ -606,6 +609,28 @@ export function openReplyIntentOutbox({
     }
     if (receipt.outcome === 'platform_accepted' && safeAction !== 'send') {
       throw domainError('INVALID_DELIVERY_TRANSITION', 'platform_accepted requires a send attempt');
+    }
+    const candidateFailure = canonicalDeliveryReceiptFailure({
+      receipt_id: receipt.receiptId,
+      intent_id: receipt.intentId,
+      delivery_id: receipt.deliveryId,
+      request_id: receipt.requestId,
+      attempt_id: receipt.attemptId,
+      claim_action: safeAction,
+      claim_epoch: safeClaimEpoch,
+      lease_token: safeLeaseToken,
+      trace_id: receipt.traceId,
+      adapter_id: receipt.adapterId,
+      outcome: receipt.outcome,
+      envelope_json: receiptJson,
+      canonical_hash: receiptHash,
+      observed_at: receipt.observedAt,
+    }, intent);
+    if (candidateFailure) {
+      throw domainError(
+        'NONCANONICAL_DELIVERY_RECEIPT',
+        `DeliveryReceipt candidate failed validation: ${candidateFailure}`,
+      );
     }
     database.prepare(`
       INSERT INTO assistant_delivery_receipts (

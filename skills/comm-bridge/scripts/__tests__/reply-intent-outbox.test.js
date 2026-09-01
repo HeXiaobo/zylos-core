@@ -542,6 +542,84 @@ test('unknown delivery reconciles before retry and only reconciled settles accep
   assert.equal(outbox.claimNext({ ownerId: 'adapter-c' }), null);
 });
 
+test('unknown and rejected receipts with an externalRef fail atomically before ledger mutation', (t) => {
+  for (const outcome of ['unknown', 'rejected']) {
+    const dbPath = temporaryDatabase(t);
+    const { run, intent } = createAnswerIntent(t, dbPath, `invalid-${outcome}-external-ref`);
+    const outbox = openReplyIntentOutbox({
+      dbPath,
+      clock: () => 100,
+      leaseTokenFactory: () => `lease:invalid-${outcome}-external-ref`,
+    });
+    t.after(() => outbox.close());
+    const claim = outbox.claimNext({ ownerId: 'adapter-a' });
+    const receipt = {
+      schemaVersion: 1,
+      type: 'DeliveryReceipt',
+      receiptId: `receipt:invalid-${outcome}-external-ref`,
+      intentId: intent.intentId,
+      deliveryId: claim.deliveryId,
+      requestId: run.requestId,
+      attemptId: claim.attemptId,
+      traceId: run.traceId,
+      adapterId: 'feishu',
+      outcome,
+      externalRef: 'BAD',
+      observedAt: '2026-09-01T00:01:00.000Z',
+      ...(outcome === 'unknown'
+        ? { nextAction: 'reconcile_before_retry' }
+        : { errorCode: 'PLATFORM_REJECTED', retryable: true }),
+    };
+
+    assert.throws(
+      () => recordReceiptForClaim(outbox, claim, receipt),
+      error => error?.code === 'INVALID_EXTERNAL_REF',
+    );
+    assert.deepEqual(outbox.listReceipts(intent.intentId), []);
+    assert.deepEqual(outbox.listSettlements(intent.intentId), []);
+    assert.equal(outbox.get(intent.intentId).delivery.state, 'sending');
+  }
+});
+
+test('a noncanonical receipt candidate is rejected before its first durable insert', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { run, intent } = createAnswerIntent(t, dbPath, 'noncanonical-receipt-candidate');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => 'lease:noncanonical-receipt-candidate',
+  });
+  t.after(() => outbox.close());
+  const claim = outbox.claimNext({ ownerId: 'adapter-a' });
+  const tamper = new Database(dbPath);
+  tamper.prepare(`
+    UPDATE assistant_reply_intents SET current_attempt_id = 'attempt:attacker'
+    WHERE intent_id = ?
+  `).run(intent.intentId);
+  tamper.close();
+  const receipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:noncanonical-receipt-candidate',
+    intentId: intent.intentId,
+    deliveryId: claim.deliveryId,
+    requestId: run.requestId,
+    attemptId: 'attempt:attacker',
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'platform_accepted',
+    externalRef: 'opaque:accepted',
+    observedAt: '2026-09-01T00:01:00.000Z',
+  };
+
+  assert.throws(
+    () => recordReceiptForClaim(outbox, claim, receipt),
+    error => error?.code === 'NONCANONICAL_DELIVERY_RECEIPT',
+  );
+  assert.deepEqual(outbox.listReceipts(intent.intentId), []);
+  assert.deepEqual(outbox.listSettlements(intent.intentId), []);
+});
+
 test('outbox public claims and DeliveryReceipt inputs reject unknown v1 fields', (t) => {
   const dbPath = temporaryDatabase(t);
   const { run, intent } = createAnswerIntent(t, dbPath, 'strict-delivery-receipt');

@@ -12,6 +12,7 @@ import {
 import {
   canonicalReplyIntentFailure,
   canonicalReplyOutcomeFailure,
+  canonicalRunTerminalIntentCauseFailure,
 } from './canonical-reply-records.js';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
@@ -404,6 +405,23 @@ export function openEventSubscriptions({
             }
             if (intentFailure) {
               degrade(consumerId, event.request_id, intentFailure, event.id, current);
+              continue;
+            }
+            const run = selectRunFacts.get(event.request_id);
+            const linkageFailure = canonicalRunTerminalIntentCauseFailure({
+              intentRow: intent,
+              terminal: event,
+              outcome,
+              run,
+              request: selectRequestFacts.get(event.request_id),
+              admission: run
+                ? selectAdmissionFacts.get(event.request_id, run.turn_id, run.generation)
+                : null,
+              admissions: selectAllAdmissionFacts.all(event.request_id),
+              events: selectRunChain.all(event.request_id),
+            });
+            if (linkageFailure) {
+              degrade(consumerId, event.request_id, linkageFailure, event.id, current);
               continue;
             }
           }

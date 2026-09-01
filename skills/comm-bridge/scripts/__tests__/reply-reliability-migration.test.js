@@ -164,6 +164,7 @@ test('real issue-35 database migrates additively and preserves legacy answer and
     'assistant_event_deliveries',
     'assistant_event_stream_health',
   ]) assert.ok(tables.has(table), table);
+  assert.deepEqual(after.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
   assert.deepEqual(after.pragma('foreign_key_check'), []);
   after.close();
   assert.equal(outbox.get(committed.intent.intentId).delivery.state, 'pending');
