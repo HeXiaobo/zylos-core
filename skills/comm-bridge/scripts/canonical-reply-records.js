@@ -207,6 +207,9 @@ export function canonicalDeliveryReceiptFailure(row, intentRow = null) {
   if (!['send', 'reconcile'].includes(row.claim_action) || !Number.isSafeInteger(row.claim_epoch) || row.claim_epoch < 1 || !isText(row.lease_token)) {
     return 'RECEIPT_LEASE_IDENTITY_INVALID';
   }
+  if (!Number.isSafeInteger(row.delivery_generation) || row.delivery_generation < 0) {
+    return 'RECEIPT_DELIVERY_GENERATION_INVALID';
+  }
   if (
     (['platform_accepted', 'unknown'].includes(row.outcome) && row.claim_action !== 'send')
     || (row.outcome === 'reconciled' && row.claim_action !== 'reconcile')
@@ -219,6 +222,7 @@ export function canonicalDeliveryReceiptFailure(row, intentRow = null) {
       row.intent_id !== intentRow.intent_id || row.delivery_id !== `delivery:${intentRow.intent_id}`
       || row.request_id !== intentRow.request_id || row.trace_id !== intentRow.trace_id
       || row.adapter_id !== route.adapterId
+      || row.delivery_generation > intentRow.delivery_generation
       || !new RegExp(`^attempt:delivery:${intentRow.intent_id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:[1-9][0-9]*$`).test(row.attempt_id)
     ) return 'RECEIPT_INTENT_LINK_MISMATCH';
   }
@@ -243,11 +247,15 @@ export function canonicalDeliverySettlementFailure(row, intentRow = null) {
   ) return 'SETTLEMENT_IDENTITY_MISMATCH';
   const suffix = envelope.basis === 'platform_accepted' ? 'accepted'
     : envelope.basis === 'reconciled' ? 'reconciled' : 'unpresentable';
+  if (!Number.isSafeInteger(row.delivery_generation) || row.delivery_generation < 0) {
+    return 'SETTLEMENT_DELIVERY_GENERATION_INVALID';
+  }
+  const generationSuffix = row.delivery_generation === 0 ? '' : `:g${row.delivery_generation}`;
   const expectedState = envelope.basis === 'retry_exhausted' ? 'unpresentable' : 'accepted';
   if (
     !SETTLEMENT_BASES.has(envelope.basis) || envelope.state !== expectedState
     || envelope.presented !== (expectedState === 'accepted')
-    || envelope.settlementId !== `settlement:delivery:${envelope.intentId}:${suffix}`
+    || envelope.settlementId !== `settlement:delivery:${envelope.intentId}:${suffix}${generationSuffix}`
     || envelope.deliveryId !== `delivery:${envelope.intentId}`
   ) return 'SETTLEMENT_DERIVED_IDENTITY_MISMATCH';
   if (intentRow) {
@@ -257,6 +265,7 @@ export function canonicalDeliverySettlementFailure(row, intentRow = null) {
     if (
       row.intent_id !== intentRow.intent_id || row.request_id !== intentRow.request_id
       || row.trace_id !== intentRow.trace_id || row.adapter_id !== route.adapterId
+      || row.delivery_generation > intentRow.delivery_generation
     ) return 'SETTLEMENT_INTENT_LINK_MISMATCH';
   }
   return null;

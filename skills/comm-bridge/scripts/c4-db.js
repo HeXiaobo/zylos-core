@@ -750,6 +750,9 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       lease_expires_at INTEGER,
       available_at INTEGER NOT NULL,
       redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
+      delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
+      generation_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK (generation_attempt_count >= 0),
       last_error TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
@@ -787,6 +790,7 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       attempt_id TEXT NOT NULL,
       claim_action TEXT NOT NULL CHECK (claim_action IN ('send', 'reconcile')),
       claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+      delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
       lease_token TEXT NOT NULL,
       trace_id TEXT NOT NULL,
       adapter_id TEXT NOT NULL,
@@ -812,6 +816,7 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       state TEXT NOT NULL CHECK (state IN ('accepted', 'unpresentable')),
       basis TEXT NOT NULL CHECK (basis IN ('platform_accepted', 'reconciled', 'retry_exhausted')),
       presented INTEGER NOT NULL CHECK (presented IN (0, 1)),
+      delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
       envelope_json TEXT NOT NULL,
       canonical_hash TEXT NOT NULL,
       created_at INTEGER NOT NULL,
@@ -820,9 +825,6 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
 
     CREATE INDEX IF NOT EXISTS idx_assistant_delivery_settlements_intent
       ON assistant_delivery_settlements(intent_id, created_at, settlement_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_delivery_settlements_one_terminal
-      ON assistant_delivery_settlements(intent_id);
-
     CREATE TABLE IF NOT EXISTS assistant_event_consumers (
       consumer_id TEXT PRIMARY KEY,
       bootstrap_mode TEXT NOT NULL DEFAULT 'canonical_cutover'
@@ -942,10 +944,36 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     `).run();
   }
 
+  if (!intentColumns.has('delivery_generation')) {
+    database.exec(`
+      ALTER TABLE assistant_reply_intents
+      ADD COLUMN delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0)
+    `);
+    database.exec(`
+      UPDATE assistant_reply_intents SET delivery_generation = redrive_count
+    `);
+  }
+  if (!intentColumns.has('generation_attempt_count')) {
+    database.exec(`
+      ALTER TABLE assistant_reply_intents
+      ADD COLUMN generation_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK (generation_attempt_count >= 0)
+    `);
+    database.exec(`
+      UPDATE assistant_reply_intents
+      SET generation_attempt_count = CASE
+        WHEN redrive_count = 0 THEN attempt_count
+        WHEN current_attempt_id IS NOT NULL THEN 1
+        ELSE 0
+      END
+    `);
+  }
+
   const receiptColumns = getColumnNames(database, 'assistant_delivery_receipts');
   const receiptColumnDefinitions = {
     claim_action: "TEXT CHECK (claim_action IN ('send', 'reconcile'))",
     claim_epoch: 'INTEGER CHECK (claim_epoch >= 1)',
+    delivery_generation: 'INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0)',
     lease_token: 'TEXT',
   };
   for (const [column, definition] of Object.entries(receiptColumnDefinitions)) {
@@ -953,6 +981,51 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
       database.exec(`ALTER TABLE assistant_delivery_receipts ADD COLUMN ${column} ${definition}`);
     }
   }
+  if (!receiptColumns.has('delivery_generation')) {
+    const migrateReceiptGenerations = database.transaction(() => database.exec(`
+      DROP TRIGGER IF EXISTS assistant_delivery_receipts_immutable;
+      UPDATE assistant_delivery_receipts AS receipt
+      SET delivery_generation = COALESCE((
+        SELECT CASE
+          WHEN intent.redrive_count = 0 THEN 0
+          WHEN CAST(substr(
+            receipt.attempt_id,
+            length('attempt:delivery:' || receipt.intent_id) + 2
+          ) AS INTEGER) > COALESCE((
+            SELECT MAX(CAST(substr(
+              prior.attempt_id,
+              length('attempt:delivery:' || prior.intent_id) + 2
+            ) AS INTEGER))
+            FROM assistant_delivery_receipts AS prior
+            WHERE prior.intent_id = receipt.intent_id AND prior.outcome = 'rejected'
+          ), 0) THEN intent.redrive_count
+          ELSE 0
+        END
+        FROM assistant_reply_intents AS intent
+        WHERE intent.intent_id = receipt.intent_id
+      ), 0)
+      ;
+      CREATE TRIGGER assistant_delivery_receipts_immutable
+      BEFORE UPDATE ON assistant_delivery_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+      END;
+    `));
+    migrateReceiptGenerations.immediate();
+  }
+
+  const settlementColumns = getColumnNames(database, 'assistant_delivery_settlements');
+  if (!settlementColumns.has('delivery_generation')) {
+    database.exec(`
+      ALTER TABLE assistant_delivery_settlements
+      ADD COLUMN delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0)
+    `);
+  }
+  database.exec(`
+    DROP INDEX IF EXISTS idx_assistant_delivery_settlements_one_terminal;
+    CREATE UNIQUE INDEX idx_assistant_delivery_settlements_one_terminal
+      ON assistant_delivery_settlements(intent_id, delivery_generation);
+  `);
 
   // Trigger definitions are deliberately replaced, rather than guarded by
   // IF NOT EXISTS. Older databases may already have a trigger with the same
@@ -1090,7 +1163,8 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     BEFORE INSERT ON assistant_delivery_settlements
     WHEN EXISTS (
       SELECT 1 FROM assistant_delivery_settlements
-      WHERE settlement_id = NEW.settlement_id OR intent_id = NEW.intent_id
+      WHERE settlement_id = NEW.settlement_id
+         OR (intent_id = NEW.intent_id AND delivery_generation = NEW.delivery_generation)
     )
     BEGIN
       SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');

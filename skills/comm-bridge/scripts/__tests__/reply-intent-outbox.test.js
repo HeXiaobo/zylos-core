@@ -1041,3 +1041,320 @@ test('dead-letter redrive keeps the original ReplyIntent identity', (t) => {
   assert.notEqual(redriveClaim.attemptId, claim.attemptId);
   assert.equal(outbox.listSettlements(intent.intentId).length, 1);
 });
+
+test('redrive preserves retry exhaustion history and settles a later accepted generation', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let token = 0;
+  const { run, intent } = createAnswerIntent(t, dbPath, 'redrive-accepted-generation');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => `redrive-accepted-lease-${++token}`,
+    maxAttempts: 1,
+  });
+  t.after(() => outbox.close());
+  const firstClaim = outbox.claimNext({ ownerId: 'adapter-a' });
+  const exhausted = recordReceiptForClaim(outbox, firstClaim, {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-accepted-generation:rejected',
+    intentId: intent.intentId,
+    deliveryId: firstClaim.deliveryId,
+    requestId: run.requestId,
+    attemptId: firstClaim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'rejected',
+    externalRef: null,
+    observedAt: '2026-09-01T00:06:00.000Z',
+    errorCode: 'PLATFORM_REJECTED',
+    retryable: true,
+  });
+  assert.equal(exhausted.delivery.state, 'unpresentable');
+  assert.equal(exhausted.settlement.basis, 'retry_exhausted');
+
+  outbox.redrive({ intentId: intent.intentId });
+  const secondClaim = outbox.claimNext({ ownerId: 'adapter-b' });
+  const acceptedReceipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-accepted-generation:accepted',
+    intentId: intent.intentId,
+    deliveryId: secondClaim.deliveryId,
+    requestId: run.requestId,
+    attemptId: secondClaim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'platform_accepted',
+    externalRef: 'opaque:redrive-accepted-message',
+    observedAt: '2026-09-01T00:07:00.000Z',
+  };
+  const accepted = recordReceiptForClaim(outbox, secondClaim, acceptedReceipt);
+  assert.equal(accepted.delivery.state, 'accepted');
+  assert.equal(accepted.settlement.basis, 'platform_accepted');
+  assert.notEqual(accepted.settlement.settlementId, exhausted.settlement.settlementId);
+  assert.deepEqual(
+    outbox.listSettlements(intent.intentId).map(settlement => settlement.basis),
+    ['retry_exhausted', 'platform_accepted'],
+  );
+  assert.deepEqual(
+    recordReceiptForClaim(outbox, secondClaim, acceptedReceipt).settlement,
+    accepted.settlement,
+  );
+});
+
+test('redrive resets retry exhaustion accounting for the new generation', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let token = 0;
+  const { run, intent } = createAnswerIntent(t, dbPath, 'redrive-retry-budget');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => `redrive-retry-budget-lease-${++token}`,
+    maxAttempts: 2,
+  });
+  t.after(() => outbox.close());
+  const reject = (claim, receiptId) => recordReceiptForClaim(outbox, claim, {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId,
+    intentId: intent.intentId,
+    deliveryId: claim.deliveryId,
+    requestId: run.requestId,
+    attemptId: claim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'rejected',
+    externalRef: null,
+    observedAt: '2026-09-01T00:06:00.000Z',
+    errorCode: 'PLATFORM_REJECTED',
+    retryable: true,
+  });
+
+  assert.equal(reject(
+    outbox.claimNext({ ownerId: 'generation-0-attempt-1' }),
+    'receipt:redrive-retry-budget:g0:1',
+  ).delivery.state, 'retrying');
+  assert.equal(reject(
+    outbox.claimNext({ ownerId: 'generation-0-attempt-2' }),
+    'receipt:redrive-retry-budget:g0:2',
+  ).delivery.state, 'unpresentable');
+  outbox.redrive({ intentId: intent.intentId });
+  assert.equal(reject(
+    outbox.claimNext({ ownerId: 'generation-1-attempt-1' }),
+    'receipt:redrive-retry-budget:g1:1',
+  ).delivery.state, 'retrying');
+  assert.equal(reject(
+    outbox.claimNext({ ownerId: 'generation-1-attempt-2' }),
+    'receipt:redrive-retry-budget:g1:2',
+  ).delivery.state, 'unpresentable');
+  const settlements = outbox.listSettlements(intent.intentId);
+  assert.deepEqual(settlements.map(row => row.basis), ['retry_exhausted', 'retry_exhausted']);
+  assert.notEqual(settlements[0].settlementId, settlements[1].settlementId);
+});
+
+test('redrive unknown survives restart and reconciles without replacing prior exhaustion', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let token = 0;
+  const { run, intent } = createAnswerIntent(t, dbPath, 'redrive-reconciled-generation');
+  let outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => `redrive-reconciled-lease-${++token}`,
+    maxAttempts: 1,
+  });
+  const firstClaim = outbox.claimNext({ ownerId: 'adapter-a' });
+  recordReceiptForClaim(outbox, firstClaim, {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-reconciled-generation:rejected',
+    intentId: intent.intentId,
+    deliveryId: firstClaim.deliveryId,
+    requestId: run.requestId,
+    attemptId: firstClaim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'rejected',
+    externalRef: null,
+    observedAt: '2026-09-01T00:06:00.000Z',
+    errorCode: 'PLATFORM_REJECTED',
+    retryable: true,
+  });
+  outbox.redrive({ intentId: intent.intentId });
+  const redriveClaim = outbox.claimNext({ ownerId: 'adapter-b' });
+  recordReceiptForClaim(outbox, redriveClaim, {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-reconciled-generation:unknown',
+    intentId: intent.intentId,
+    deliveryId: redriveClaim.deliveryId,
+    requestId: run.requestId,
+    attemptId: redriveClaim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'unknown',
+    externalRef: null,
+    observedAt: '2026-09-01T00:07:00.000Z',
+    nextAction: 'reconcile_before_retry',
+  });
+  outbox.close();
+
+  outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 101,
+    leaseTokenFactory: () => `redrive-reconciled-lease-${++token}`,
+    maxAttempts: 1,
+  });
+  t.after(() => outbox.close());
+  const reconcile = outbox.claimNext({ ownerId: 'adapter-c' });
+  assert.equal(reconcile.action, 'reconcile');
+  assert.equal(reconcile.attemptId, redriveClaim.attemptId);
+  const reconciledReceipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-reconciled-generation:reconciled',
+    intentId: intent.intentId,
+    deliveryId: reconcile.deliveryId,
+    requestId: run.requestId,
+    attemptId: reconcile.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'reconciled',
+    externalRef: 'opaque:redrive-reconciled-message',
+    observedAt: '2026-09-01T00:08:00.000Z',
+  };
+  const reconciled = recordReceiptForClaim(outbox, reconcile, reconciledReceipt);
+  assert.equal(reconciled.delivery.state, 'accepted');
+  assert.equal(reconciled.settlement.basis, 'reconciled');
+  assert.deepEqual(
+    outbox.listSettlements(intent.intentId).map(settlement => settlement.basis),
+    ['retry_exhausted', 'reconciled'],
+  );
+  assert.equal(outbox.listReceipts(intent.intentId).length, 3);
+  assert.deepEqual(
+    recordReceiptForClaim(outbox, reconcile, reconciledReceipt).settlement,
+    reconciled.settlement,
+  );
+});
+
+test('redrive generation fences stale owners while preserving exact historical receipt replay', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { run, intent } = createAnswerIntent(t, dbPath, 'redrive-generation-fence');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => 'same-redrive-generation-token',
+    maxAttempts: 1,
+  });
+  t.after(() => outbox.close());
+  const oldClaim = outbox.claimNext({ ownerId: 'old-owner' });
+  const rejectedReceipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-generation-fence:rejected',
+    intentId: intent.intentId,
+    deliveryId: oldClaim.deliveryId,
+    requestId: run.requestId,
+    attemptId: oldClaim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'rejected',
+    externalRef: null,
+    observedAt: '2026-09-01T00:06:00.000Z',
+    errorCode: 'PLATFORM_REJECTED',
+    retryable: true,
+  };
+  const exhausted = recordReceiptForClaim(outbox, oldClaim, rejectedReceipt);
+  outbox.redrive({ intentId: intent.intentId });
+  const newClaim = outbox.claimNext({ ownerId: 'new-owner' });
+  assert.equal(oldClaim.leaseToken, newClaim.leaseToken);
+  assert.notEqual(oldClaim.claimEpoch, newClaim.claimEpoch);
+
+  const historicalReplay = recordReceiptForClaim(outbox, oldClaim, rejectedReceipt);
+  assert.equal(historicalReplay.replayed, true);
+  assert.deepEqual(historicalReplay.settlement, exhausted.settlement);
+  assert.equal(outbox.get(intent.intentId).delivery.state, 'sending');
+  assert.throws(
+    () => recordReceiptForClaim(outbox, newClaim, {
+      ...rejectedReceipt,
+      attemptId: newClaim.attemptId,
+    }),
+    error => error?.code === 'IDEMPOTENCY_CONFLICT',
+  );
+  const {
+    errorCode: _rejectedErrorCode,
+    retryable: _rejectedRetryable,
+    ...staleReceiptBase
+  } = rejectedReceipt;
+  assert.throws(
+    () => recordReceiptForClaim(outbox, oldClaim, {
+      ...staleReceiptBase,
+      receiptId: 'receipt:redrive-generation-fence:stale-owner',
+      outcome: 'platform_accepted',
+      externalRef: 'opaque:stale-owner-message',
+      observedAt: '2026-09-01T00:07:00.000Z',
+    }),
+    error => error?.code === 'LEASE_FENCED',
+  );
+  const accepted = recordReceiptForClaim(outbox, newClaim, {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-generation-fence:accepted',
+    intentId: intent.intentId,
+    deliveryId: newClaim.deliveryId,
+    requestId: run.requestId,
+    attemptId: newClaim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'platform_accepted',
+    externalRef: 'opaque:new-owner-message',
+    observedAt: '2026-09-01T00:08:00.000Z',
+  });
+  assert.equal(accepted.delivery.state, 'accepted');
+  assert.equal(outbox.listReceipts(intent.intentId).length, 2);
+  assert.equal(outbox.listSettlements(intent.intentId).length, 2);
+});
+
+test('delivery generation cannot diverge from its durable redrive history', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { run, intent } = createAnswerIntent(t, dbPath, 'redrive-generation-corrupt');
+  const outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => 'redrive-generation-corrupt-lease',
+    maxAttempts: 1,
+  });
+  t.after(() => outbox.close());
+  const claim = outbox.claimNext({ ownerId: 'adapter-a' });
+  recordReceiptForClaim(outbox, claim, {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:redrive-generation-corrupt:rejected',
+    intentId: intent.intentId,
+    deliveryId: claim.deliveryId,
+    requestId: run.requestId,
+    attemptId: claim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'rejected',
+    externalRef: null,
+    observedAt: '2026-09-01T00:06:00.000Z',
+    errorCode: 'PLATFORM_REJECTED',
+    retryable: true,
+  });
+  outbox.redrive({ intentId: intent.intentId });
+  const tamper = new Database(dbPath);
+  tamper.prepare(`
+    UPDATE assistant_reply_intents SET delivery_generation = 2 WHERE intent_id = ?
+  `).run(intent.intentId);
+  tamper.close();
+
+  assert.throws(
+    () => outbox.get(intent.intentId),
+    error => error?.code === 'CANONICAL_DELIVERY_LEDGER_CORRUPT',
+  );
+  assert.throws(
+    () => outbox.claimNext({ ownerId: 'adapter-b' }),
+    error => error?.code === 'CANONICAL_DELIVERY_LEDGER_CORRUPT',
+  );
+});

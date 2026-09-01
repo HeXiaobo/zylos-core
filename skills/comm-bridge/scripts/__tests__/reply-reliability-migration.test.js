@@ -393,3 +393,148 @@ test('pre-epoch outbox leases migrate to an unfenced reconcile boundary', (t) =>
   });
   assert.equal(settled.delivery.state, 'accepted');
 });
+
+test('pre-generation redrive history migrates and can settle a later generation', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const outcomes = openReplyOutcomeTransactions({ dbPath, clock: () => 100 });
+  const accepted = ledger.accept(acceptMessage()).request;
+  const admission = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: admission.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: 'runtime:pre-generation-redrive',
+  }).request;
+  const committed = outcomes.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Migration answer.' } },
+    reply: { action: 'send', disposition: 'send' },
+  });
+  ledger.close();
+  queue.close();
+  outcomes.close();
+  let outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 100,
+    leaseTokenFactory: () => 'pre-generation-redrive-lease',
+    maxAttempts: 1,
+  });
+  const first = outbox.claimNext({ ownerId: 'adapter-a' });
+  outbox.recordReceipt({
+    action: first.action,
+    claimEpoch: first.claimEpoch,
+    leaseToken: first.leaseToken,
+    receipt: {
+      schemaVersion: 1,
+      type: 'DeliveryReceipt',
+      receiptId: 'receipt:pre-generation-redrive:rejected',
+      intentId: committed.intent.intentId,
+      deliveryId: first.deliveryId,
+      requestId: run.requestId,
+      attemptId: first.attemptId,
+      traceId: run.traceId,
+      adapterId: 'feishu',
+      outcome: 'rejected',
+      externalRef: null,
+      observedAt: '2026-09-01T00:10:00.000Z',
+      errorCode: 'PLATFORM_REJECTED',
+      retryable: true,
+    },
+  });
+  outbox.redrive({ intentId: committed.intent.intentId });
+  const preMigrationClaim = outbox.claimNext({ ownerId: 'adapter-b' });
+  const unknownReceipt = {
+    schemaVersion: 1,
+    type: 'DeliveryReceipt',
+    receiptId: 'receipt:pre-generation-redrive:unknown',
+    intentId: committed.intent.intentId,
+    deliveryId: preMigrationClaim.deliveryId,
+    requestId: run.requestId,
+    attemptId: preMigrationClaim.attemptId,
+    traceId: run.traceId,
+    adapterId: 'feishu',
+    outcome: 'unknown',
+    externalRef: null,
+    observedAt: '2026-09-01T00:10:30.000Z',
+    nextAction: 'reconcile_before_retry',
+  };
+  outbox.recordReceipt({
+    action: preMigrationClaim.action,
+    claimEpoch: preMigrationClaim.claimEpoch,
+    leaseToken: preMigrationClaim.leaseToken,
+    receipt: unknownReceipt,
+  });
+  outbox.close();
+
+  const downgrade = new Database(dbPath);
+  downgrade.exec(`
+    DROP TRIGGER assistant_delivery_settlements_no_replace;
+    DROP INDEX idx_assistant_delivery_settlements_one_terminal;
+    ALTER TABLE assistant_delivery_receipts DROP COLUMN delivery_generation;
+    ALTER TABLE assistant_delivery_settlements DROP COLUMN delivery_generation;
+    ALTER TABLE assistant_reply_intents DROP COLUMN generation_attempt_count;
+    ALTER TABLE assistant_reply_intents DROP COLUMN delivery_generation;
+    CREATE UNIQUE INDEX idx_assistant_delivery_settlements_one_terminal
+      ON assistant_delivery_settlements(intent_id);
+  `);
+  downgrade.close();
+
+  outbox = openReplyIntentOutbox({
+    dbPath,
+    clock: () => 101,
+    leaseTokenFactory: () => 'pre-generation-redrive-lease-2',
+    maxAttempts: 1,
+  });
+  t.after(() => outbox.close());
+  const migrated = outbox.get(committed.intent.intentId).delivery;
+  assert.equal(migrated.state, 'reconcile_required');
+  assert.equal(migrated.redriveCount, 1);
+  const second = outbox.claimNext({ ownerId: 'adapter-b' });
+  assert.equal(second.action, 'reconcile');
+  assert.equal(second.attemptId, preMigrationClaim.attemptId);
+  const settled = outbox.recordReceipt({
+    action: second.action,
+    claimEpoch: second.claimEpoch,
+    leaseToken: second.leaseToken,
+    receipt: {
+      schemaVersion: 1,
+      type: 'DeliveryReceipt',
+      receiptId: 'receipt:pre-generation-redrive:reconciled',
+      intentId: committed.intent.intentId,
+      deliveryId: second.deliveryId,
+      requestId: run.requestId,
+      attemptId: second.attemptId,
+      traceId: run.traceId,
+      adapterId: 'feishu',
+      outcome: 'reconciled',
+      externalRef: 'opaque:pre-generation-redrive-message',
+      observedAt: '2026-09-01T00:11:00.000Z',
+    },
+  });
+  assert.equal(settled.delivery.state, 'accepted');
+  assert.deepEqual(
+    outbox.listSettlements(committed.intent.intentId).map(row => row.basis),
+    ['retry_exhausted', 'reconciled'],
+  );
+  const historicalReplay = outbox.recordReceipt({
+    action: preMigrationClaim.action,
+    claimEpoch: preMigrationClaim.claimEpoch,
+    leaseToken: preMigrationClaim.leaseToken,
+    receipt: unknownReceipt,
+  });
+  assert.equal(historicalReplay.replayed, true);
+  assert.deepEqual(historicalReplay.settlement, settled.settlement);
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.deepEqual(inspect.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
+  assert.deepEqual(inspect.pragma('foreign_key_check'), []);
+  inspect.close();
+});

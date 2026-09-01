@@ -220,9 +220,9 @@ export function openReplyIntentOutbox({
   recoverLegacyLeases.immediate();
 
   const selectReceipt = database.prepare(`SELECT * FROM assistant_delivery_receipts WHERE receipt_id = ?`);
-  const selectLatestSettlement = database.prepare(`
+  const selectSettlementForGeneration = database.prepare(`
     SELECT * FROM assistant_delivery_settlements
-    WHERE intent_id = ? ORDER BY rowid DESC LIMIT 1
+    WHERE intent_id = ? AND delivery_generation = ?
   `);
   const selectReceiptsForIntent = database.prepare(`
     SELECT * FROM assistant_delivery_receipts
@@ -230,7 +230,7 @@ export function openReplyIntentOutbox({
   `);
   const selectSettlementsForIntent = database.prepare(`
     SELECT * FROM assistant_delivery_settlements
-    WHERE intent_id = ? ORDER BY created_at ASC, settlement_id ASC
+    WHERE intent_id = ? ORDER BY delivery_generation ASC, created_at ASC, settlement_id ASC
   `);
   const selectTerminalCause = database.prepare(`
     SELECT request_id, sequence, event_type, payload_json, idempotency_key,
@@ -325,7 +325,8 @@ export function openReplyIntentOutbox({
     const expectedOutcome = row.basis === 'retry_exhausted' ? 'rejected' : row.basis;
     if (!durableReceipts.some((receipt) => {
       requireCanonicalReceipt(receipt, intent);
-      return receipt.outcome === expectedOutcome;
+      return receipt.delivery_generation === row.delivery_generation
+        && receipt.outcome === expectedOutcome;
     })) {
       throw domainError(
         'CANONICAL_DELIVERY_SETTLEMENT_CORRUPT',
@@ -338,20 +339,36 @@ export function openReplyIntentOutbox({
   function validateDeliveryLedger(intent) {
     toIntent(intent);
     requireCanonicalIntentCause(intent);
+    if (
+      !Number.isSafeInteger(intent.delivery_generation)
+      || intent.delivery_generation < 0
+      || intent.delivery_generation !== intent.redrive_count
+      || !Number.isSafeInteger(intent.generation_attempt_count)
+      || intent.generation_attempt_count < 0
+      || intent.generation_attempt_count > intent.attempt_count
+    ) {
+      throw domainError(
+        'CANONICAL_DELIVERY_LEDGER_CORRUPT',
+        'ReplyIntent delivery generation disagrees with its redrive or attempt history',
+      );
+    }
     const receipts = selectReceiptsForIntent.all(intent.intent_id);
     receipts.forEach(receipt => requireCanonicalReceipt(receipt, intent));
     const settlements = selectSettlementsForIntent.all(intent.intent_id);
     settlements.forEach(settlement => requireCanonicalSettlement(settlement, intent, receipts));
-    if (settlements.length > 1) {
+    if (new Set(settlements.map(row => row.delivery_generation)).size !== settlements.length) {
       throw domainError(
         'CANONICAL_DELIVERY_LEDGER_CORRUPT',
-        'ReplyIntent has conflicting terminal DeliverySettlements',
+        'ReplyIntent has conflicting terminal DeliverySettlements in one generation',
       );
     }
-    if (intent.delivery_state === 'accepted' && !settlements.some(row => row.state === 'accepted')) {
+    const currentSettlement = settlements.find(
+      row => row.delivery_generation === intent.delivery_generation,
+    );
+    if (intent.delivery_state === 'accepted' && currentSettlement?.state !== 'accepted') {
       throw domainError('CANONICAL_DELIVERY_LEDGER_CORRUPT', 'accepted delivery has no accepted Settlement');
     }
-    if (intent.delivery_state === 'unpresentable' && !settlements.some(row => row.state === 'unpresentable')) {
+    if (intent.delivery_state === 'unpresentable' && currentSettlement?.state !== 'unpresentable') {
       throw domainError(
         'CANONICAL_DELIVERY_LEDGER_CORRUPT',
         'unpresentable delivery has no unpresentable Settlement',
@@ -408,6 +425,7 @@ export function openReplyIntentOutbox({
           last_error = COALESCE(last_error, 'LEASE_EXPIRED_RECONCILE_REQUIRED')
       WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id IS ?
         AND claim_epoch = ? AND lease_owner = ? AND lease_token = ?
+        AND delivery_generation = ?
         AND lease_expires_at = ? AND lease_expires_at <= ?
     `);
     for (const expired of expiredLeases) {
@@ -420,6 +438,7 @@ export function openReplyIntentOutbox({
         expired.claim_epoch,
         expired.lease_owner,
         expired.lease_token,
+        expired.delivery_generation,
         expired.lease_expires_at,
         current,
       );
@@ -445,6 +464,9 @@ export function openReplyIntentOutbox({
     const nextAttemptCount = action === 'send'
       ? candidate.attempt_count + 1
       : candidate.attempt_count;
+    const nextGenerationAttemptCount = action === 'send'
+      ? candidate.generation_attempt_count + 1
+      : candidate.generation_attempt_count;
     const attemptId = action === 'send'
       ? `attempt:delivery:${candidate.intent_id}:${nextAttemptCount}`
       : candidate.current_attempt_id;
@@ -456,13 +478,14 @@ export function openReplyIntentOutbox({
     const leaseExpiresAt = current + leaseSeconds;
     const updated = database.prepare(`
       UPDATE assistant_reply_intents
-      SET delivery_state = ?, attempt_count = ?, current_attempt_id = ?,
+      SET delivery_state = ?, attempt_count = ?, generation_attempt_count = ?, current_attempt_id = ?,
           claim_epoch = ?, lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
       WHERE intent_id = ? AND claim_epoch = ? AND current_attempt_id IS ?
-        AND lease_token IS NULL AND delivery_state = ?
+        AND delivery_generation = ? AND lease_token IS NULL AND delivery_state = ?
     `).run(
       action === 'send' ? 'sending' : 'reconcile_required',
       nextAttemptCount,
+      nextGenerationAttemptCount,
       attemptId,
       claimEpoch,
       safeOwnerId,
@@ -472,6 +495,7 @@ export function openReplyIntentOutbox({
       candidate.intent_id,
       candidate.claim_epoch,
       candidate.current_attempt_id,
+      candidate.delivery_generation,
       candidate.delivery_state,
     );
     if (updated.changes !== 1) {
@@ -486,10 +510,13 @@ export function openReplyIntentOutbox({
     const suffix = basis === 'platform_accepted'
       ? 'accepted'
       : basis === 'reconciled' ? 'reconciled' : 'unpresentable';
+    const generationSuffix = intent.delivery_generation === 0
+      ? ''
+      : `:g${intent.delivery_generation}`;
     const settlement = {
       schemaVersion: 1,
       type: 'DeliverySettlement',
-      settlementId: `settlement:delivery:${intent.intent_id}:${suffix}`,
+      settlementId: `settlement:delivery:${intent.intent_id}:${suffix}${generationSuffix}`,
       intentId: intent.intent_id,
       deliveryId: `delivery:${intent.intent_id}`,
       requestId: intent.request_id,
@@ -514,13 +541,13 @@ export function openReplyIntentOutbox({
     database.prepare(`
       INSERT INTO assistant_delivery_settlements (
         settlement_id, intent_id, delivery_id, request_id, trace_id, adapter_id,
-        state, basis, presented, envelope_json, canonical_hash, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        state, basis, presented, delivery_generation, envelope_json, canonical_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       settlement.settlementId, settlement.intentId, settlement.deliveryId,
       settlement.requestId, settlement.traceId, settlement.adapterId,
       settlement.state, settlement.basis, settlement.presented ? 1 : 0,
-      envelopeJson, canonicalHash, current,
+      intent.delivery_generation, envelopeJson, canonicalHash, current,
     );
     return settlement;
   }
@@ -567,7 +594,10 @@ export function openReplyIntentOutbox({
         receipt: JSON.parse(existingReceipt.envelope_json),
         delivery: toDelivery(replayIntent),
         settlement: requireCanonicalSettlement(
-          selectLatestSettlement.get(receipt.intentId),
+          selectSettlementForGeneration.get(
+            receipt.intentId,
+            existingReceipt.delivery_generation,
+          ),
           replayIntent,
         ),
       };
@@ -618,6 +648,7 @@ export function openReplyIntentOutbox({
       attempt_id: receipt.attemptId,
       claim_action: safeAction,
       claim_epoch: safeClaimEpoch,
+      delivery_generation: intent.delivery_generation,
       lease_token: safeLeaseToken,
       trace_id: receipt.traceId,
       adapter_id: receipt.adapterId,
@@ -635,12 +666,12 @@ export function openReplyIntentOutbox({
     database.prepare(`
       INSERT INTO assistant_delivery_receipts (
         receipt_id, intent_id, delivery_id, request_id, attempt_id,
-        claim_action, claim_epoch, lease_token, trace_id,
+        claim_action, claim_epoch, delivery_generation, lease_token, trace_id,
         adapter_id, outcome, envelope_json, canonical_hash, observed_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       receipt.receiptId, receipt.intentId, receipt.deliveryId, receipt.requestId,
-      receipt.attemptId, safeAction, safeClaimEpoch, safeLeaseToken,
+      receipt.attemptId, safeAction, safeClaimEpoch, intent.delivery_generation, safeLeaseToken,
       receipt.traceId, receipt.adapterId, receipt.outcome,
       receiptJson, receiptHash, receipt.observedAt, current,
     );
@@ -655,6 +686,7 @@ export function openReplyIntentOutbox({
             last_error = 'UNKNOWN_RECONCILE_REQUIRED'
         WHERE intent_id = ? AND delivery_state = 'sending'
           AND current_attempt_id = ? AND claim_epoch = ? AND lease_token = ?
+          AND delivery_generation = ?
           AND lease_expires_at > ?
       `).run(
         current,
@@ -662,6 +694,7 @@ export function openReplyIntentOutbox({
         receipt.attemptId,
         safeClaimEpoch,
         safeLeaseToken,
+        intent.delivery_generation,
         current,
       );
     } else if (['platform_accepted', 'reconciled'].includes(receipt.outcome)) {
@@ -672,7 +705,8 @@ export function openReplyIntentOutbox({
         SET delivery_state = 'accepted', lease_owner = NULL, lease_token = NULL,
             lease_expires_at = NULL, updated_at = ?, last_error = NULL
         WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id = ?
-          AND claim_epoch = ? AND lease_token = ? AND lease_expires_at > ?
+          AND claim_epoch = ? AND lease_token = ? AND delivery_generation = ?
+          AND lease_expires_at > ?
       `).run(
         current,
         intent.intent_id,
@@ -680,17 +714,19 @@ export function openReplyIntentOutbox({
         receipt.attemptId,
         safeClaimEpoch,
         safeLeaseToken,
+        intent.delivery_generation,
         current,
       );
     } else {
-      const retry = receipt.retryable && intent.attempt_count < maxAttempts;
+      const retry = receipt.retryable && intent.generation_attempt_count < maxAttempts;
       if (retry) {
         updated = database.prepare(`
           UPDATE assistant_reply_intents
           SET delivery_state = 'retrying', available_at = ?, lease_owner = NULL,
               lease_token = NULL, lease_expires_at = NULL, updated_at = ?, last_error = ?
           WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id = ?
-            AND claim_epoch = ? AND lease_token = ? AND lease_expires_at > ?
+            AND claim_epoch = ? AND lease_token = ? AND delivery_generation = ?
+            AND lease_expires_at > ?
         `).run(
           current + retryDelaySeconds,
           current,
@@ -700,6 +736,7 @@ export function openReplyIntentOutbox({
           receipt.attemptId,
           safeClaimEpoch,
           safeLeaseToken,
+          intent.delivery_generation,
           current,
         );
       } else {
@@ -709,7 +746,8 @@ export function openReplyIntentOutbox({
           SET delivery_state = 'unpresentable', lease_owner = NULL, lease_token = NULL,
               lease_expires_at = NULL, updated_at = ?, last_error = ?
           WHERE intent_id = ? AND delivery_state = ? AND current_attempt_id = ?
-            AND claim_epoch = ? AND lease_token = ? AND lease_expires_at > ?
+            AND claim_epoch = ? AND lease_token = ? AND delivery_generation = ?
+            AND lease_expires_at > ?
         `).run(
           current,
           receipt.errorCode,
@@ -718,6 +756,7 @@ export function openReplyIntentOutbox({
           receipt.attemptId,
           safeClaimEpoch,
           safeLeaseToken,
+          intent.delivery_generation,
           current,
         );
       }
@@ -751,10 +790,18 @@ export function openReplyIntentOutbox({
     const updated = database.prepare(`
       UPDATE assistant_reply_intents
       SET delivery_state = 'pending', available_at = ?, redrive_count = redrive_count + 1,
+          delivery_generation = delivery_generation + 1, generation_attempt_count = 0,
           current_attempt_id = NULL, lease_owner = NULL, lease_token = NULL,
           lease_expires_at = NULL, last_error = NULL, updated_at = ?
       WHERE intent_id = ? AND delivery_state = 'unpresentable'
-    `).run(current, current, safeIntentId);
+        AND delivery_generation = ? AND redrive_count = ?
+    `).run(
+      current,
+      current,
+      safeIntentId,
+      intent.delivery_generation,
+      intent.redrive_count,
+    );
     if (updated.changes !== 1) {
       throw domainError('REDRIVE_CONFLICT', 'delivery changed while redrive was applied');
     }
