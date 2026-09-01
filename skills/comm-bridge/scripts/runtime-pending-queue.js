@@ -7,12 +7,25 @@ import { DB_PATH } from './c4-config.js';
 import { ensureAssistantRunLedgerSchema } from './c4-db.js';
 import { RUNTIME_LANE_ID } from './run-ledger.js';
 
+function domainError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 function requireText(value, field, maxLength = 8_192) {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new TypeError(`${field} must be a non-empty string`);
   }
   if (Array.from(value).length > maxLength) {
     throw new TypeError(`${field} exceeds ${maxLength} characters`);
+  }
+  return value;
+}
+
+function requireGeneration(value, field = 'generation') {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError(`${field} must be a positive safe integer`);
   }
   return value;
 }
@@ -49,6 +62,29 @@ function toRun(row) {
   };
 }
 
+function toAdmission(row, { legacy = false } = {}) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    requestId: row.request_id,
+    routeChannel: row.route_channel,
+    status: row.status,
+    runtimeSessionId: row.runtime_session_id,
+    acquiredAt: row.acquired_at,
+    startedAt: row.started_at,
+    terminalAt: row.terminal_at,
+    updatedAt: row.updated_at,
+    lifecycleVersion: row.lifecycle_version,
+    bindingMode: row.binding_mode,
+    terminalReason: row.terminal_reason,
+    turnId: row.turn_id,
+    generation: row.generation,
+    runtimeLaneId: row.runtime_lane_id,
+    legacy,
+  };
+}
+
 export function openRuntimePendingQueue({
   dbPath = DB_PATH,
   clock = () => Math.floor(Date.now() / 1_000),
@@ -69,15 +105,31 @@ export function openRuntimePendingQueue({
     FROM assistant_run_ledger AS l
     JOIN assistant_requests AS r ON r.request_id = l.request_id
   `;
+  const admissionProjection = `
+    SELECT id, conversation_id, request_id, route_channel, status,
+           runtime_session_id, acquired_at, started_at, terminal_at, updated_at,
+           lifecycle_version, binding_mode, terminal_reason,
+           turn_id, generation, runtime_lane_id
+    FROM runtime_turn_admissions
+  `;
   const selectRun = database.prepare(`${runProjection} WHERE l.request_id = ?`);
-  const selectActive = database.prepare(`
+  const selectRunForFence = database.prepare(`
     ${runProjection}
-    JOIN runtime_turn_admissions AS a ON a.request_id = l.request_id
-      AND a.turn_id = l.turn_id
-      AND a.generation = l.generation
-    WHERE a.status IN ('submitted', 'started')
-      AND a.runtime_lane_id = ?
-    ORDER BY a.id DESC
+    WHERE l.request_id = ? AND l.turn_id = ? AND l.generation = ?
+  `);
+  // Capacity belongs to the pre-existing global singleton admission table.
+  // It must not depend on whether a row can be projected into the new ledger.
+  const selectActiveAdmission = database.prepare(`
+    ${admissionProjection}
+    WHERE status IN ('submitted', 'started')
+    ORDER BY id ASC
+    LIMIT 1
+  `);
+  const selectAdmissionById = database.prepare(`${admissionProjection} WHERE id = ?`);
+  const selectAdmissionForFence = database.prepare(`
+    ${admissionProjection}
+    WHERE request_id = ? AND turn_id = ? AND generation = ?
+    ORDER BY id DESC
     LIMIT 1
   `);
   const selectCandidate = database.prepare(`
@@ -94,53 +146,81 @@ export function openRuntimePendingQueue({
     ORDER BY l.priority ASC, l.acceptance_order ASC
     LIMIT 1
   `);
-  const selectStaleActive = database.prepare(`
-    SELECT l.*, r.conversation_id, r.route_channel,
-           a.id AS admission_id, a.updated_at AS admission_updated_at
-    FROM assistant_run_ledger AS l
-    JOIN assistant_requests AS r ON r.request_id = l.request_id
-    JOIN runtime_turn_admissions AS a ON a.request_id = l.request_id
-      AND a.turn_id = l.turn_id
-      AND a.generation = l.generation
-    WHERE a.status IN ('submitted', 'started')
-      AND a.runtime_lane_id = ?
-      AND a.updated_at <= ?
-    ORDER BY a.id DESC
+  const selectStaleAdmission = database.prepare(`
+    ${admissionProjection}
+    WHERE status IN ('submitted', 'started') AND updated_at <= ?
+    ORDER BY id ASC
     LIMIT 1
   `);
 
-  const claimTransaction = database.transaction(({ runtimeIdle }) => {
-    if (selectActive.get(RUNTIME_LANE_ID)) return null;
-    const candidate = selectCandidate.get(runtimeIdle ? 1 : 0);
-    if (!candidate) return null;
-    const current = safeClock();
-    const sequence = database.prepare(`
-      SELECT next_sequence FROM assistant_requests WHERE request_id = ?
-    `).get(candidate.request_id).next_sequence;
-    const previousEvent = database.prepare(`
-      SELECT event_id
-      FROM assistant_response_events
-      WHERE request_id = ?
-      ORDER BY sequence DESC
-      LIMIT 1
-    `).get(candidate.request_id);
+  function projectionFor(admission) {
+    if (
+      !admission
+      || admission.turn_id === null
+      || admission.generation === null
+      || admission.runtime_lane_id !== RUNTIME_LANE_ID
+    ) {
+      return null;
+    }
+    return selectRunForFence.get(
+      admission.request_id,
+      admission.turn_id,
+      admission.generation,
+    ) ?? null;
+  }
 
-    database.prepare(`
+  function activeView(row) {
+    if (!row) return null;
+    const projection = projectionFor(row);
+    return {
+      ...toAdmission(row, { legacy: projection === null }),
+      request: toRun(projection),
+    };
+  }
+
+  function assertRunFence({ requestId, turnId, generation }) {
+    const run = selectRun.get(requestId);
+    if (!run) throw domainError('RUN_NOT_FOUND', `unknown Assistant Request: ${requestId}`);
+    if (run.turn_id !== turnId || run.generation !== generation) {
+      throw domainError('RUN_EVENT_FENCED', 'runtime admission targets a stale turn/generation');
+    }
+    return run;
+  }
+
+  const claimTransaction = database.transaction(({ runtimeIdle }) => {
+    const active = selectActiveAdmission.get();
+    if (active) {
+      return {
+        claimed: false,
+        reason: 'capacity_occupied',
+        admission: toAdmission(active, { legacy: projectionFor(active) === null }),
+        request: null,
+      };
+    }
+    const candidate = selectCandidate.get(runtimeIdle ? 1 : 0);
+    if (!candidate) {
+      return {
+        claimed: false,
+        reason: 'no_eligible_request',
+        admission: null,
+        request: null,
+      };
+    }
+    const current = safeClock();
+    const inserted = database.prepare(`
       INSERT INTO runtime_turn_admissions (
         singleton_key, conversation_id, request_id, route_channel, status,
         runtime_session_id, acquired_at, started_at, terminal_at, updated_at,
         lifecycle_version, lifecycle_observed_at_ms, binding_mode,
         turn_id, generation, runtime_lane_id
       ) VALUES (
-        1, ?, ?, ?, 'started', ?, ?, ?, NULL, ?,
-        1, ?, 'bound', ?, ?, ?
+        1, ?, ?, ?, 'submitted', NULL, ?, NULL, NULL, ?,
+        0, ?, 'pending', ?, ?, ?
       )
     `).run(
       candidate.conversation_id,
       candidate.request_id,
       candidate.route_channel,
-      RUNTIME_LANE_ID,
-      current,
       current,
       current,
       current * 1_000,
@@ -148,22 +228,107 @@ export function openRuntimePendingQueue({
       candidate.generation,
       RUNTIME_LANE_ID,
     );
-    database.prepare(`
+    return {
+      claimed: true,
+      reason: null,
+      admission: toAdmission(selectAdmissionById.get(Number(inserted.lastInsertRowid))),
+      request: toRun(selectRun.get(candidate.request_id)),
+    };
+  });
+
+  const confirmStartedTransaction = database.transaction(({
+    requestId,
+    turnId,
+    generation,
+    runtimeSessionId,
+  }) => {
+    const safeRequestId = requireText(requestId, 'requestId');
+    const safeTurnId = requireText(turnId, 'turnId');
+    const safeGeneration = requireGeneration(generation);
+    const safeRuntimeSessionId = requireText(runtimeSessionId, 'runtimeSessionId');
+    const run = assertRunFence({
+      requestId: safeRequestId,
+      turnId: safeTurnId,
+      generation: safeGeneration,
+    });
+    const admission = selectAdmissionForFence.get(
+      safeRequestId,
+      safeTurnId,
+      safeGeneration,
+    );
+    if (!admission) {
+      throw domainError('RUNTIME_ADMISSION_NOT_FOUND', 'no runtime admission matches the run fence');
+    }
+    if (admission.status === 'started') {
+      if (admission.runtime_session_id !== safeRuntimeSessionId) {
+        throw domainError(
+          'RUNTIME_SESSION_CONFLICT',
+          'runtime admission is already bound to another runtime session',
+        );
+      }
+      return {
+        started: true,
+        replayed: true,
+        admission: toAdmission(admission),
+        request: toRun(run),
+      };
+    }
+    if (admission.status !== 'submitted') {
+      throw domainError(
+        'INVALID_RUNTIME_ADMISSION_STATE',
+        `cannot confirm a ${admission.status} runtime admission`,
+      );
+    }
+    if (run.status !== 'queued') {
+      throw domainError('INVALID_RUN_START_STATE', `cannot start a ${run.status} run`);
+    }
+
+    const current = safeClock();
+    const sequence = database.prepare(`
+      SELECT next_sequence FROM assistant_requests WHERE request_id = ?
+    `).get(safeRequestId).next_sequence;
+    const previousEvent = database.prepare(`
+      SELECT event_id
+      FROM assistant_response_events
+      WHERE request_id = ?
+      ORDER BY sequence DESC
+      LIMIT 1
+    `).get(safeRequestId);
+    const admissionUpdate = database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET status = 'started', runtime_session_id = ?, started_at = ?, updated_at = ?,
+          lifecycle_version = lifecycle_version + 1, binding_mode = 'bound',
+          binding_reason = 'runtime_submit_confirmed'
+      WHERE id = ? AND status = 'submitted'
+        AND request_id = ? AND turn_id = ? AND generation = ?
+    `).run(
+      safeRuntimeSessionId,
+      current,
+      current,
+      admission.id,
+      safeRequestId,
+      safeTurnId,
+      safeGeneration,
+    );
+    const runUpdate = database.prepare(`
       UPDATE assistant_run_ledger
       SET status = 'active', updated_at = ?
-      WHERE request_id = ? AND status = 'queued'
-    `).run(current, candidate.request_id);
-    database.prepare(`
+      WHERE request_id = ? AND turn_id = ? AND generation = ? AND status = 'queued'
+    `).run(current, safeRequestId, safeTurnId, safeGeneration);
+    const requestUpdate = database.prepare(`
       UPDATE assistant_requests
       SET status = 'started', runtime_session_id = ?,
           next_sequence = next_sequence + 1, updated_at = ?
       WHERE request_id = ? AND status = 'queued'
-    `).run(RUNTIME_LANE_ID, current, candidate.request_id);
+    `).run(safeRuntimeSessionId, current, safeRequestId);
+    if (admissionUpdate.changes !== 1 || runUpdate.changes !== 1 || requestUpdate.changes !== 1) {
+      throw domainError('RUNTIME_START_CONFLICT', 'runtime start confirmation lost its fence');
+    }
     database.prepare(`
       UPDATE conversations
       SET status = 'delivered', delivery_action = 'runtime-started'
       WHERE id = ?
-    `).run(candidate.conversation_id);
+    `).run(run.conversation_id);
     database.prepare(`
       INSERT INTO assistant_response_events (
         request_id, sequence, event_type, payload_json, idempotency_key,
@@ -171,25 +336,102 @@ export function openRuntimePendingQueue({
         generation, trace_id, causation_id, producer
       ) VALUES (?, ?, 'RunStarted', ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      candidate.request_id,
+      safeRequestId,
       sequence,
-      JSON.stringify({ runtimeLaneId: RUNTIME_LANE_ID }),
-      `run:${candidate.request_id}:started:g${candidate.generation}`,
+      JSON.stringify({
+        runtimeLaneId: RUNTIME_LANE_ID,
+        runtimeSessionId: safeRuntimeSessionId,
+      }),
+      `run:${safeRequestId}:started:g${safeGeneration}`,
       current,
       current,
-      `evt:${candidate.request_id}:${sequence}`,
-      candidate.turn_id,
-      candidate.generation,
-      candidate.trace_id,
+      `evt:${safeRequestId}:${sequence}`,
+      safeTurnId,
+      safeGeneration,
+      run.trace_id,
       previousEvent.event_id,
       'core:runtime-lane',
     );
-    return toRun(selectRun.get(candidate.request_id));
+    return {
+      started: true,
+      replayed: false,
+      admission: toAdmission(selectAdmissionById.get(admission.id)),
+      request: toRun(selectRun.get(safeRequestId)),
+    };
+  });
+
+  const releaseSubmittedTransaction = database.transaction(({
+    requestId,
+    turnId,
+    generation,
+    reason,
+  }) => {
+    const safeRequestId = requireText(requestId, 'requestId');
+    const safeTurnId = requireText(turnId, 'turnId');
+    const safeGeneration = requireGeneration(generation);
+    const safeReason = requireText(reason, 'reason', 64);
+    const run = assertRunFence({
+      requestId: safeRequestId,
+      turnId: safeTurnId,
+      generation: safeGeneration,
+    });
+    const admission = selectAdmissionForFence.get(
+      safeRequestId,
+      safeTurnId,
+      safeGeneration,
+    );
+    if (!admission) {
+      throw domainError('RUNTIME_ADMISSION_NOT_FOUND', 'no runtime admission matches the run fence');
+    }
+    if (admission.status === 'released') {
+      return {
+        released: true,
+        replayed: true,
+        admission: toAdmission(admission),
+        request: toRun(run),
+      };
+    }
+    if (admission.status !== 'submitted') {
+      throw domainError(
+        'INVALID_RUNTIME_ADMISSION_STATE',
+        `cannot release a ${admission.status} runtime admission as unsubmitted`,
+      );
+    }
+    const current = safeClock();
+    database.prepare(`
+      UPDATE runtime_turn_admissions
+      SET status = 'released', terminal_at = ?, updated_at = ?,
+          binding_mode = 'closed', terminal_reason = ?
+      WHERE id = ? AND status = 'submitted'
+    `).run(current, current, safeReason, admission.id);
+    return {
+      released: true,
+      replayed: false,
+      admission: toAdmission(selectAdmissionById.get(admission.id)),
+      request: toRun(selectRun.get(safeRequestId)),
+    };
   });
 
   const recoverStaleTransaction = database.transaction(({ staleBefore }) => {
-    const stale = selectStaleActive.get(RUNTIME_LANE_ID, staleBefore);
-    if (!stale) return { recovered: false, request: null };
+    const stale = selectStaleAdmission.get(staleBefore);
+    if (!stale) {
+      return {
+        recovered: false,
+        reason: 'no_stale_admission',
+        admission: null,
+        request: null,
+      };
+    }
+    const projectedRun = projectionFor(stale);
+    if (!projectedRun) {
+      return {
+        recovered: false,
+        reason: 'legacy_admission_owned_by_assistant_response_stream',
+        admission: toAdmission(stale, { legacy: true }),
+        request: null,
+      };
+    }
+
     const current = safeClock();
     const nextGeneration = stale.generation + 1;
     const nextTurnId = `turn:${stale.request_id}:${nextGeneration}`;
@@ -207,14 +449,21 @@ export function openRuntimePendingQueue({
     database.prepare(`
       UPDATE runtime_turn_admissions
       SET status = 'released', terminal_at = ?, updated_at = ?,
-          binding_mode = 'closed', terminal_reason = 'stale_recovery_generation_fence'
+          binding_mode = 'closed', terminal_reason = ?
       WHERE id = ? AND status IN ('submitted', 'started')
-    `).run(current, current, stale.admission_id);
-    database.prepare(`
+    `).run(
+      current,
+      current,
+      stale.status === 'submitted'
+        ? 'stale_unconfirmed_submission_generation_fence'
+        : 'stale_started_generation_fence',
+      stale.id,
+    );
+    const runUpdate = database.prepare(`
       UPDATE assistant_run_ledger
       SET status = 'queued', turn_id = ?, generation = ?, updated_at = ?
       WHERE request_id = ? AND turn_id = ? AND generation = ?
-        AND status IN ('active', 'cancel_requested')
+        AND status IN ('queued', 'active', 'cancel_requested')
     `).run(
       nextTurnId,
       nextGeneration,
@@ -223,12 +472,15 @@ export function openRuntimePendingQueue({
       stale.turn_id,
       stale.generation,
     );
-    database.prepare(`
+    const requestUpdate = database.prepare(`
       UPDATE assistant_requests
       SET status = 'queued', runtime_session_id = NULL,
           next_sequence = next_sequence + 1, updated_at = ?
-      WHERE request_id = ? AND status = 'started'
+      WHERE request_id = ? AND status IN ('queued', 'started')
     `).run(current, stale.request_id);
+    if (runUpdate.changes !== 1 || requestUpdate.changes !== 1) {
+      throw domainError('RUNTIME_RECOVERY_CONFLICT', 'stale recovery lost its run fence');
+    }
     database.prepare(`
       UPDATE conversations
       SET status = 'pending', delivery_action = 'queued'
@@ -243,18 +495,29 @@ export function openRuntimePendingQueue({
     `).run(
       stale.request_id,
       sequence,
-      JSON.stringify({ runtimeLaneId: RUNTIME_LANE_ID, recoveredFromTurnId: stale.turn_id }),
+      JSON.stringify({
+        runtimeLaneId: RUNTIME_LANE_ID,
+        recoveredFromTurnId: stale.turn_id,
+        recoveredAdmissionStatus: stale.status,
+      }),
       `run:${stale.request_id}:recovered:g${nextGeneration}`,
       current,
       current,
       `evt:${stale.request_id}:${sequence}`,
       nextTurnId,
       nextGeneration,
-      stale.trace_id,
+      projectedRun.trace_id,
       previousEvent.event_id,
       'core:runtime-recovery',
     );
-    return { recovered: true, request: toRun(selectRun.get(stale.request_id)) };
+    return {
+      recovered: true,
+      reason: stale.status === 'submitted'
+        ? 'unconfirmed_submission_fenced'
+        : 'started_run_fenced',
+      admission: toAdmission(selectAdmissionById.get(stale.id)),
+      request: toRun(selectRun.get(stale.request_id)),
+    };
   });
 
   return Object.freeze({
@@ -262,8 +525,14 @@ export function openRuntimePendingQueue({
       if (typeof runtimeIdle !== 'boolean') throw new TypeError('runtimeIdle must be a boolean');
       return claimTransaction.immediate({ runtimeIdle });
     },
+    confirmStarted(input = {}) {
+      return confirmStartedTransaction.immediate(input);
+    },
+    releaseSubmitted({ reason = 'runtime_submit_failed', ...input } = {}) {
+      return releaseSubmittedTransaction.immediate({ ...input, reason });
+    },
     getActive() {
-      return toRun(selectActive.get(RUNTIME_LANE_ID));
+      return activeView(selectActiveAdmission.get());
     },
     recoverStale({ staleBefore } = {}) {
       if (!Number.isSafeInteger(staleBefore) || staleBefore < 0) {

@@ -94,6 +94,17 @@ function cancelCommand(run, id = 'cancel-1') {
   };
 }
 
+function claimAndStart(queue, options = {}) {
+  const claim = queue.claimNext(options);
+  assert.equal(claim.claimed, true);
+  return queue.confirmStarted({
+    requestId: claim.request.requestId,
+    turnId: claim.request.turnId,
+    generation: claim.request.generation,
+    runtimeSessionId: `runtime-session:${claim.request.requestId}:g${claim.request.generation}`,
+  }).request;
+}
+
 test('events preserve complete fenced identity, monotonic sequence, and exactly one final terminal', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -102,7 +113,7 @@ test('events preserve complete fenced identity, monotonic sequence, and exactly 
   t.after(() => queue.close());
 
   const accepted = ledger.accept(command('10')).request;
-  const run = queue.claimNext();
+  const run = claimAndStart(queue);
   const started = ledger.listEvents(run.requestId).at(-1);
   const progress = ledger.appendEvent(eventFor(
     run,
@@ -204,7 +215,7 @@ test('queued cancellation is idempotent, terminal, and produces no outcome refer
   const terminal = ledger.listEvents(queued.requestId).at(-1);
   assert.equal(terminal.type, 'RunCancelled');
   assert.equal(Object.hasOwn(terminal.payload, 'outcomeId'), false);
-  assert.equal(queue.claimNext().requestId, next.requestId);
+  assert.equal(queue.claimNext().request.requestId, next.requestId);
 });
 
 test('active cancellation retains the runtime owner until cooperative confirmation', (t) => {
@@ -215,7 +226,7 @@ test('active cancellation retains the runtime owner until cooperative confirmati
   t.after(() => queue.close());
 
   ledger.accept(command('13', 'lane:active'));
-  const active = queue.claimNext();
+  const active = claimAndStart(queue);
   ledger.accept(command('14', 'lane:other'));
   assert.throws(
     () => ledger.appendEvent(eventFor(
@@ -232,7 +243,7 @@ test('active cancellation retains the runtime owner until cooperative confirmati
   assert.equal(requested.status, 'cancel_requested');
   assert.equal(ledger.get(active.requestId).status, 'cancel_requested');
   assert.equal(queue.getActive().requestId, active.requestId);
-  assert.equal(queue.claimNext(), null);
+  assert.equal(queue.claimNext().reason, 'capacity_occupied');
   assert.equal(ledger.listEvents(active.requestId).at(-1).type, 'RunStarted');
 
   const confirmed = ledger.confirmCancellation({
@@ -255,7 +266,7 @@ test('active cancellation retains the runtime owner until cooperative confirmati
   assert.equal(confirmationReplay.replayed, true);
   assert.equal(queue.getActive(), null);
   assert.equal(ledger.listEvents(active.requestId).at(-1).type, 'RunCancelled');
-  assert.ok(queue.claimNext());
+  assert.equal(queue.claimNext().claimed, true);
 });
 
 test('explicit stale recovery advances generation, fences late events, and never creates two owners', (t) => {
@@ -267,14 +278,18 @@ test('explicit stale recovery advances generation, fences late events, and never
   t.after(() => queue.close());
 
   ledger.accept(command('15', 'lane:recovery', 2));
-  const stale = queue.claimNext();
+  const stale = claimAndStart(queue);
   const staleStarted = ledger.listEvents(stale.requestId).at(-1);
   const newer = ledger.accept(command('16', 'lane:newer', 1)).request;
   queue.close();
 
   now = 200;
   queue = openRuntimePendingQueue({ dbPath, clock: () => now });
-  assert.equal(queue.claimNext(), null, 'ordinary dispatch must not implicitly recover stale work');
+  assert.equal(
+    queue.claimNext().reason,
+    'capacity_occupied',
+    'ordinary dispatch must not implicitly recover stale work',
+  );
   const recovered = queue.recoverStale({ staleBefore: 150 });
   assert.equal(recovered.recovered, true);
   assert.equal(recovered.request.requestId, stale.requestId);
@@ -282,9 +297,9 @@ test('explicit stale recovery advances generation, fences late events, and never
   assert.notEqual(recovered.request.turnId, stale.turnId);
   assert.equal(queue.getActive(), null);
 
-  const active = queue.claimNext();
+  const active = claimAndStart(queue);
   assert.equal(active.requestId, newer.requestId);
-  assert.equal(queue.claimNext(), null);
+  assert.equal(queue.claimNext().reason, 'capacity_occupied');
   assert.throws(
     () => ledger.appendEvent(eventFor(
       stale,
