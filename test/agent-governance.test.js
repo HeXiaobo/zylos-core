@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from '@jest/globals';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,6 +28,10 @@ function writeJson(root, relativePath, value) {
 
 function git(root, args) {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+}
+
+function sha256File(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
 function runGovernanceCli(root, mode, manifestPath) {
@@ -78,7 +83,67 @@ function makeFixture({ withCapabilities = true, withSkillVersion = true } = {}) 
   git(root, ['config', 'user.name', 'Governance Test']);
   git(root, ['add', '.']);
   git(root, ['commit', '-m', 'fixture']);
-  return { root, baseSha: git(root, ['rev-parse', 'HEAD']) };
+  const baseSha = git(root, ['rev-parse', 'HEAD']);
+  git(root, ['remote', 'add', 'origin', 'https://github.com/HeXiaobo/zylos-core.git']);
+  git(root, ['update-ref', 'refs/remotes/origin/main', baseSha]);
+  return { root, baseSha };
+}
+
+function bindV2OwnerAuthorizationReport(manifest, fileName = 'owner-authorization.json') {
+  const authorization = manifest.evidence.ownerAuthorization;
+  const report = { ...authorization };
+  delete report.report;
+  delete report.reportSha256;
+  const reportPath = path.join(tempRoot, fileName);
+  writeJson(tempRoot, fileName, report);
+  authorization.report = reportPath;
+  authorization.reportSha256 = sha256File(reportPath);
+  return manifest;
+}
+
+function bindV2PreflightReceipt(manifest, mode, fileName = `${mode}-preflight.json`) {
+  const isDeploy = mode === 'deploy';
+  const report = {
+    schema: 'zylos.agent-preflight/v1',
+    receiptType: isDeploy ? 'workspace-deploy' : 'workspace-publish',
+    releaseId: manifest.releaseId,
+    releaseStatus: manifest.status,
+    mode,
+    gate: isDeploy ? 'FINALIZE' : 'PUBLICATION',
+    deploymentStage: isDeploy ? 'final' : null,
+    status: 'PASS',
+    deploymentAllowed: manifest.deploymentAllowed,
+    publicationAllowed: manifest.publicationAllowed,
+    targetMode: 'global',
+    candidateBundle: {
+      coreSha: manifest.candidate.core.sha,
+      feishuSha: manifest.candidate.feishu.sha,
+      hxaSha: manifest.candidate.hxa.sha,
+    },
+    dispositions: {
+      publicationAllowed: manifest.publicationAllowed,
+      deploymentAllowed: manifest.deploymentAllowed,
+    },
+    generatedAt: new Date().toISOString(),
+  };
+  if (isDeploy) {
+    report.runtimeTarget = {
+      agent: 'test-agent',
+      profileId: 'test-profile',
+      hostname: 'test-host',
+      deploymentOrgLabel: 'zylos',
+      deploymentProfileId: 'test-profile',
+      identityObservedAt: new Date().toISOString(),
+    };
+  }
+  const reportPath = path.join(tempRoot, fileName);
+  writeJson(tempRoot, fileName, report);
+  manifest.evidence[isDeploy ? 'globalPreflight' : 'workspacePublish'] = {
+    receiptType: report.receiptType,
+    report: reportPath,
+    reportSha256: sha256File(reportPath),
+  };
+  return manifest;
 }
 
 function makeGlobalV2Manifest(fixture, {
@@ -88,28 +153,30 @@ function makeGlobalV2Manifest(fixture, {
 } = {}) {
   const feishuSha = 'b'.repeat(40);
   const hxaSha = 'c'.repeat(40);
-  return {
+  const isDeploy = deploymentAllowed === true && publicationAllowed === false;
+  const releaseId = 'demo-global-1.2.3-01';
+  const manifest = {
     schema: 'zylos.release-manifest/v2',
-    releaseId: 'demo-global-1.2.3-01',
+    releaseId,
     status,
     deploymentAllowed,
     publicationAllowed,
     holdReasons: status === 'HOLD' ? ['publication pending deployment decision'] : [],
     candidate: {
       core: {
-        repo: 'Acme/demo-core',
+        repo: 'HeXiaobo/zylos-core',
         branch: 'main',
         version: '1.2.3',
         sha: fixture.baseSha,
       },
       feishu: {
-        repo: 'Acme/demo-feishu',
+        repo: 'HeXiaobo/zylos-feishu',
         branch: 'main',
         version: '2.3.4',
         sha: feishuSha,
       },
       hxa: {
-        repo: 'Acme/demo-hxa',
+        repo: 'HeXiaobo/zylos-hxa-connect',
         branch: 'main',
         packageVersion: '3.4.5',
         sha: hxaSha,
@@ -124,13 +191,22 @@ function makeGlobalV2Manifest(fixture, {
       targetMode: 'global',
       pairComponents: ['core', 'feishu'],
       hxaRequired: true,
+      immutableFullShaOnly: true,
+      cleanWorktreeRequired: true,
+      dryRunRequired: true,
+      pairReportRequired: true,
+      canaryRequired: true,
     },
     evidence: {
       ownerAuthorization: {
+        schema: isDeploy ? 'zylos.release-deployment-authorization/v1' : 'zylos.release-publication-authorization/v1',
         status: 'PASS',
+        releaseId,
         identity: 'user',
-        scope: 'RELEASE_GLOBAL_BUNDLE',
-        publicationAuthorized: true,
+        authorizedBy: 'owner@example.invalid',
+        authorizationRef: `task:${releaseId}`,
+        authorizedAt: new Date().toISOString(),
+        ...(isDeploy ? { deploymentAuthorized: true, scope: 'DEPLOY_GLOBAL_BUNDLE' } : { publicationAuthorized: true, scope: 'RELEASE_GLOBAL_BUNDLE' }),
         bundle: {
           coreSha: fixture.baseSha,
           feishuSha,
@@ -142,6 +218,9 @@ function makeGlobalV2Manifest(fixture, {
       hxaProvenance: 'PASS',
     },
   };
+  bindV2OwnerAuthorizationReport(manifest);
+  bindV2PreflightReceipt(manifest, isDeploy ? 'deploy' : 'publish');
+  return manifest;
 }
 
 beforeEach(() => {
@@ -400,6 +479,24 @@ describe('external release manifest gate', () => {
     expect(result.errors.join('\n')).toMatch(/hxaRequired.*true/);
   });
 
+  test.each(['immutableFullShaOnly', 'cleanWorktreeRequired', 'dryRunRequired', 'pairReportRequired', 'canaryRequired'])('requires deploymentContract.%s', (field) => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, `global-v2-missing-${field}.json`);
+    const manifest = makeGlobalV2Manifest(fixture);
+    delete manifest.deploymentContract[field];
+    writeJson(tempRoot, `global-v2-missing-${field}.json`, manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(new RegExp(`deploymentContract\\.${field}.*true`));
+  });
+
   test('requires owner publication authorization and an exact three-repository bundle', () => {
     const fixture = makeFixture();
     const manifestPath = path.join(tempRoot, 'global-v2-invalid-owner-authorization.json');
@@ -433,6 +530,135 @@ describe('external release manifest gate', () => {
     expect(result.errors.join('\n')).toMatch(/bundle\.feishuSha.*full.*SHA/);
   });
 
+  test('requires the publication authorization schema and report binding', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-owner-schema.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    delete manifest.evidence.ownerAuthorization.schema;
+    writeJson(tempRoot, 'global-v2-owner-schema.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/ownerAuthorization\.schema.*zylos\.release-publication-authorization\/v1/);
+  });
+
+  test('uses an independent deployment authorization schema and scope', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-deploy-owner-schema.json');
+    const manifest = makeGlobalV2Manifest(fixture, {
+      status: 'READY',
+      deploymentAllowed: true,
+      publicationAllowed: false,
+    });
+    manifest.evidence.ownerAuthorization.schema = 'zylos.release-publication-authorization/v1';
+    writeJson(tempRoot, 'global-v2-deploy-owner-schema.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'deploy',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/ownerAuthorization\.schema.*zylos\.release-deployment-authorization\/v1/);
+  });
+
+  test('rejects an authorization report whose body no longer matches the manifest evidence', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-owner-report-tampered.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    manifest.evidence.ownerAuthorization.authorizedBy = 'different-owner@example.invalid';
+    writeJson(tempRoot, 'global-v2-owner-report-tampered.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/ownerAuthorization\.report body does not match authorization/);
+  });
+
+  test('requires a typed, release-bound workspace publication receipt', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-publish-receipt.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    const receiptPath = manifest.evidence.workspacePublish.report;
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    delete receipt.dispositions;
+    writeJson(tempRoot, path.basename(receiptPath), receipt);
+    manifest.evidence.workspacePublish.reportSha256 = sha256File(receiptPath);
+    writeJson(tempRoot, 'global-v2-publish-receipt.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/workspacePublish\.report\.dispositions/);
+  });
+
+  test('binds the publication receipt to the root release status and exact envelope shape', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-publish-receipt-binding.json');
+    const manifest = makeGlobalV2Manifest(fixture);
+    const receiptPath = manifest.evidence.workspacePublish.report;
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    delete receipt.releaseStatus;
+    writeJson(tempRoot, path.basename(receiptPath), receipt);
+    manifest.evidence.workspacePublish.reportSha256 = sha256File(receiptPath);
+    manifest.evidence.workspacePublish.unexpected = true;
+    writeJson(tempRoot, 'global-v2-publish-receipt-binding.json', manifest);
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/workspacePublish.*exactly receiptType, report, and reportSha256/);
+    expect(result.errors.join('\n')).toMatch(/workspacePublish\.report\.releaseStatus.*match/);
+  });
+
+  test('requires a fresh runtime-bound global deployment receipt', () => {
+    const fixture = makeFixture();
+    const manifest = makeGlobalV2Manifest(fixture, {
+      status: 'READY',
+      deploymentAllowed: true,
+      publicationAllowed: false,
+    });
+    const receiptPath = manifest.evidence.globalPreflight.report;
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    delete receipt.runtimeTarget.identityObservedAt;
+    writeJson(tempRoot, path.basename(receiptPath), receipt);
+    manifest.evidence.globalPreflight.reportSha256 = sha256File(receiptPath);
+    const result = validateDeploymentReadiness({
+      ...manifest,
+      evidence: {
+        ...manifest.evidence,
+        pairReport: { status: 'PASS' },
+        canary: 'PASS',
+        hxa: { status: 'PASS' },
+      },
+    });
+
+    expect(result.join('\n')).toMatch(/globalPreflight\.report\.runtimeTarget\.identityObservedAt/);
+  });
+
   test('requires immutable main source policy and strict candidate identity fields', () => {
     const fixture = makeFixture();
     const manifestPath = path.join(tempRoot, 'global-v2-invalid-source-policy.json');
@@ -459,6 +685,68 @@ describe('external release manifest gate', () => {
     expect(result.errors.join('\n')).toMatch(/featureReleaseArchiveBranchesAreHistoryOnly.*true/);
     expect(result.errors.join('\n')).toMatch(/candidate\.core\.sha.*lowercase/);
     expect(result.errors.join('\n')).toMatch(/candidate\.core.*branch.*current branch|manifest branch/);
+  });
+
+  test('does not allow a CI branch value to override the real symbolic-ref in release mode', () => {
+    const fixture = makeFixture();
+    const manifestPath = path.join(tempRoot, 'global-v2-branch-authority.json');
+    writeJson(tempRoot, 'global-v2-branch-authority.json', makeGlobalV2Manifest(fixture));
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      branch: 'release/forged',
+      env: { GITHUB_REF_NAME: 'release/forged' },
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.branch).toBe('main');
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/CI branch ref .*does not match actual symbolic-ref\/HEAD main/);
+  });
+
+  test('does not fall back to package repository metadata when v2 origin is missing', () => {
+    const fixture = makeFixture();
+    git(fixture.root, ['remote', 'remove', 'origin']);
+    const manifestPath = path.join(tempRoot, 'global-v2-missing-origin.json');
+    writeJson(tempRoot, 'global-v2-missing-origin.json', makeGlobalV2Manifest(fixture));
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/origin .*does not identify GitHub repository HeXiaobo\/zylos-core/);
+  });
+
+  test('requires the candidate SHA to be an ancestor of origin/main', () => {
+    const fixture = makeFixture();
+    const emptyTree = execFileSync('git', ['mktree'], {
+      cwd: fixture.root,
+      input: '',
+      encoding: 'utf8',
+    }).trim();
+    const unrelatedSha = execFileSync('git', ['commit-tree', emptyTree, '-m', 'unrelated origin head'], {
+      cwd: fixture.root,
+      encoding: 'utf8',
+    }).trim();
+    git(fixture.root, ['update-ref', 'refs/remotes/origin/main', unrelatedSha]);
+    const manifestPath = path.join(tempRoot, 'global-v2-non-ancestor.json');
+    writeJson(tempRoot, 'global-v2-non-ancestor.json', makeGlobalV2Manifest(fixture));
+
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'release',
+      manifestPath,
+      identityProbePath: path.join(tempRoot, 'probe-do-not-run.mjs'),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join('\n')).toMatch(/must be an ancestor of origin\/main/);
   });
 
   test('requires every v2 candidate component to use the deployable branch', () => {
@@ -512,12 +800,12 @@ describe('external release manifest gate', () => {
     });
 
     expect(result.ok).toBe(false);
-    expect(result.errors.join('\n')).toMatch(/repo.*does not exactly match Acme\/demo-core|GitHub/);
+    expect(result.errors.join('\n')).toMatch(/repo.*does not exactly match HeXiaobo\/zylos-core|GitHub/);
   });
 
   test('rejects a v2 manifest when the repository origin is a non-GitHub lookalike', () => {
     const fixture = makeFixture();
-    git(fixture.root, ['remote', 'add', 'origin', 'https://evil.example/Acme/demo-core.git']);
+    git(fixture.root, ['remote', 'set-url', 'origin', 'https://evil.example/Acme/demo-core.git']);
     const manifestPath = path.join(tempRoot, 'global-v2-evil-origin.json');
     writeJson(tempRoot, 'global-v2-evil-origin.json', makeGlobalV2Manifest(fixture));
 
@@ -529,7 +817,7 @@ describe('external release manifest gate', () => {
     });
 
     expect(result.ok).toBe(false);
-    expect(result.errors.join('\n')).toMatch(/origin.*does not identify a valid GitHub repository/);
+    expect(result.errors.join('\n')).toMatch(/origin.*does not identify(?: a valid)? GitHub repository/);
   });
 
   test('does not probe HXA identity for a malformed v2 release target', () => {
@@ -731,13 +1019,16 @@ describe('external release manifest gate', () => {
   });
 
   test('accepts the v2 structured pair report for deploy readiness', () => {
-    expect(validateDeploymentReadiness({
-      schema: 'zylos.release-manifest/v2',
-      evidence: {
-        pairReport: { status: 'PASS' },
-        canary: 'PASS',
-        hxa: { status: 'PASS' },
-      },
-    })).toEqual([]);
+    const fixture = makeFixture();
+    const manifest = makeGlobalV2Manifest(fixture, {
+      status: 'READY',
+      deploymentAllowed: true,
+      publicationAllowed: true,
+    });
+    manifest.evidence.pairReport = { status: 'PASS' };
+    manifest.evidence.canary = 'PASS';
+    manifest.evidence.hxa = { status: 'PASS' };
+    bindV2PreflightReceipt(manifest, 'deploy');
+    expect(validateDeploymentReadiness(manifest)).toEqual([]);
   });
 });

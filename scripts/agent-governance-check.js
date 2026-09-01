@@ -12,6 +12,7 @@
  */
 
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -23,6 +24,15 @@ const LOWERCASE_FULL_SHA_RE = /^[0-9a-f]{40}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const RELEASE_MANIFEST_V1 = 'zylos.release-manifest/v1';
 const RELEASE_MANIFEST_V2 = 'zylos.release-manifest/v2';
+const V2_REPOSITORY = 'HeXiaobo/zylos-core';
+const PREFLIGHT_SCHEMA = 'zylos.agent-preflight/v1';
+const PUBLICATION_AUTHORIZATION_SCHEMA = 'zylos.release-publication-authorization/v1';
+const DEPLOYMENT_AUTHORIZATION_SCHEMA = 'zylos.release-deployment-authorization/v1';
+const PUBLICATION_SCOPE = 'RELEASE_GLOBAL_BUNDLE';
+const DEPLOYMENT_SCOPE = 'DEPLOY_GLOBAL_BUNDLE';
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const PREFLIGHT_MAX_AGE_MS = 15 * 60 * 1000;
+const PREFLIGHT_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
 const VERSION_KEYS = ['version', 'release', 'releaseVersion', 'packageVersion'];
 const TASK_BRANCH_PREFIXES = [
   'codex', 'feat', 'feature', 'fix', 'chore', 'docs', 'refactor', 'test',
@@ -391,11 +401,19 @@ function currentSha(root) {
   return sha.toLowerCase();
 }
 
-function currentBranch(root, explicitBranch) {
-  if (explicitBranch) return String(explicitBranch).replace(/^refs\/heads\//, '').trim();
-  const envBranch = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME;
-  if (envBranch) return String(envBranch).replace(/^refs\/heads\//, '').trim();
-  return git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { allowFailure: true });
+function normalizeBranchName(value) {
+  return String(value || '').replace(/^refs\/heads\//, '').trim();
+}
+
+function actualBranch(root) {
+  return normalizeBranchName(git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { allowFailure: true }));
+}
+
+function currentBranch(root, explicitBranch, env = process.env) {
+  if (explicitBranch) return normalizeBranchName(explicitBranch);
+  const envBranch = env.ZYLOS_BRANCH || env.GITHUB_HEAD_REF || env.GITHUB_REF_NAME;
+  if (envBranch) return normalizeBranchName(envBranch);
+  return actualBranch(root);
 }
 
 function worktreeDirty(root) {
@@ -450,6 +468,42 @@ function parseJsonText(text) {
     return JSON.parse(text);
   } catch {
     return null;
+  }
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256File(filename) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function canonicalIsoTimestamp(value) {
+  if (!asNonEmptyString(value)) return false;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function freshIsoTimestamp(value, now = Date.now()) {
+  if (!canonicalIsoTimestamp(value)) return false;
+  const timestamp = Date.parse(value);
+  return timestamp >= now - PREFLIGHT_MAX_AGE_MS && timestamp <= now + PREFLIGHT_MAX_FUTURE_SKEW_MS;
+}
+
+function readJsonFile(filename) {
+  try {
+    return { value: JSON.parse(readText(filename)), error: null };
+  } catch (error) {
+    return { value: null, error };
   }
 }
 
@@ -574,6 +628,13 @@ function normalizeGitHubRepository(value) {
   return `${parts[0]}/${parts[1].replace(/\.git$/i, '')}`;
 }
 
+function isExactGitHubOrigin(value, expectedRepository) {
+  if (!asNonEmptyString(value)) return false;
+  const text = value.trim().replace(/^git\+/, '');
+  const hasGitHubHost = /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)/i.test(text);
+  return hasGitHubHost && normalizeGitHubRepository(text) === expectedRepository;
+}
+
 function repoSlug(value) {
   const normalized = normalizeRepository(value) || String(value || '').trim();
   return normalized.split('/').filter(Boolean).pop() || null;
@@ -608,6 +669,155 @@ function manifestTarget(manifest, expectedRepoSlug, { sha = null, version = null
     || (version && String(value.version || value.release || value.packageVersion) === String(version)))
     || matchingRepo[0];
   return target || manifest;
+}
+
+function validateEvidencePath(label, reportPath, errors) {
+  if (!asNonEmptyString(reportPath) || !path.isAbsolute(reportPath)) {
+    errors.push(`${label}.report must be an absolute path`);
+    return null;
+  }
+  if (!fs.existsSync(reportPath)) {
+    errors.push(`${label}.report does not exist: ${reportPath}`);
+    return null;
+  }
+  return path.normalize(reportPath);
+}
+
+function candidateBundle(manifest) {
+  return {
+    coreSha: manifest?.candidate?.core?.sha,
+    feishuSha: manifest?.candidate?.feishu?.sha,
+    hxaSha: manifest?.candidate?.hxa?.sha,
+  };
+}
+
+function validateExactCandidateBundle(label, bundle, expected, errors) {
+  if (!isObject(bundle)) {
+    errors.push(`${label} must be an object`);
+    return;
+  }
+  const expectedFields = Object.keys(expected).sort();
+  if (stableJson(Object.keys(bundle).sort()) !== stableJson(expectedFields)) {
+    errors.push(`${label} must contain exactly coreSha, feishuSha, and hxaSha`);
+  }
+  for (const [field, expectedSha] of Object.entries(expected)) {
+    const value = bundle[field];
+    if (!LOWERCASE_FULL_SHA_RE.test(String(value || ''))) {
+      errors.push(`${label}.${field} must be a full 40-character lowercase SHA`);
+    } else if (value !== expectedSha) {
+      errors.push(`${label}.${field} does not match candidate`);
+    }
+  }
+}
+
+function withoutReportBinding(value) {
+  if (!isObject(value)) return value;
+  const { report: _report, reportSha256: _reportSha256, ...body } = value;
+  return body;
+}
+
+function validateReceiptDispositions(label, receipt, manifest, errors) {
+  const expected = {
+    publicationAllowed: manifest.publicationAllowed === true,
+    deploymentAllowed: manifest.deploymentAllowed === true,
+  };
+  if (!isObject(receipt.dispositions)) {
+    errors.push(`${label}.report.dispositions must be an object`);
+    return;
+  }
+  if (stableJson(Object.keys(receipt.dispositions).sort()) !== stableJson(Object.keys(expected).sort())) {
+    errors.push(`${label}.report.dispositions must contain exactly publicationAllowed and deploymentAllowed`);
+  }
+  for (const [field, expectedValue] of Object.entries(expected)) {
+    if (receipt.dispositions[field] !== expectedValue) {
+      errors.push(`${label}.report.dispositions.${field} must match manifest`);
+    }
+  }
+}
+
+function validateGlobalV2PreflightReceipt(manifest, errors, { mode }) {
+  const isDeploy = mode === 'deploy';
+  const key = isDeploy ? 'globalPreflight' : 'workspacePublish';
+  const receiptType = isDeploy ? 'workspace-deploy' : 'workspace-publish';
+  const label = `Release manifest evidence.${key}`;
+  const envelope = manifest.evidence?.[key];
+  if (!isObject(envelope)) {
+    errors.push(`${label} receipt is required and must include an absolute report and SHA-256`);
+    return;
+  }
+  if (envelope.receiptType !== receiptType) {
+    errors.push(`${label}.receiptType must be ${receiptType}`);
+  }
+  if (stableJson(Object.keys(envelope).sort()) !== stableJson(['receiptType', 'report', 'reportSha256'])) {
+    errors.push(`${label} must contain exactly receiptType, report, and reportSha256`);
+  }
+  const reportPath = validateEvidencePath(label, envelope.report, errors);
+  if (!SHA256_RE.test(String(envelope.reportSha256 || ''))) {
+    errors.push(`${label}.reportSha256 must be a 64-character lowercase SHA-256`);
+  }
+  if (!reportPath || !SHA256_RE.test(String(envelope.reportSha256 || ''))) return;
+  if (sha256File(reportPath) !== envelope.reportSha256) {
+    errors.push(`${label}.reportSha256 mismatch`);
+    return;
+  }
+  const parsed = readJsonFile(reportPath);
+  if (parsed.error) {
+    errors.push(`${label}.report is not valid JSON: ${parsed.error.message}`);
+    return;
+  }
+  const receipt = parsed.value;
+  if (!isObject(receipt)) {
+    errors.push(`${label}.report must be an object`);
+    return;
+  }
+  if (receipt.schema !== PREFLIGHT_SCHEMA) errors.push(`${label}.report.schema must be ${PREFLIGHT_SCHEMA}`);
+  if (receipt.receiptType !== receiptType) errors.push(`${label}.report.receiptType must be ${receiptType}`);
+  if (receipt.mode !== (isDeploy ? 'deploy' : 'publish')) errors.push(`${label}.report.mode must be ${isDeploy ? 'deploy' : 'publish'}`);
+  if (receipt.status !== 'PASS') errors.push(`${label}.report.status must be PASS`);
+  if (receipt.releaseId !== manifest.releaseId) errors.push(`${label}.report.releaseId must match releaseId`);
+  if (receipt.releaseStatus !== manifest.status) errors.push(`${label}.report.releaseStatus must match manifest status`);
+  if (receipt.targetMode !== 'global') errors.push(`${label}.report.targetMode must be global`);
+  if (receipt.gate !== (isDeploy ? 'FINALIZE' : 'PUBLICATION')) {
+    errors.push(`${label}.report.gate must be ${isDeploy ? 'FINALIZE' : 'PUBLICATION'}`);
+  }
+  if (isDeploy) {
+    if (receipt.deploymentStage !== 'final') errors.push(`${label}.report.deploymentStage must be final`);
+    if (receipt.deploymentAllowed !== true) errors.push(`${label}.report.deploymentAllowed must be true`);
+  } else {
+    if (receipt.deploymentStage !== null && receipt.deploymentStage !== undefined) {
+      errors.push(`${label}.report.deploymentStage must be null for publication`);
+    }
+    if (receipt.publicationAllowed !== true) errors.push(`${label}.report.publicationAllowed must be true`);
+    if (typeof receipt.deploymentAllowed !== 'boolean') errors.push(`${label}.report.deploymentAllowed must be boolean`);
+  }
+  if (typeof receipt.publicationAllowed !== 'boolean') {
+    errors.push(`${label}.report.publicationAllowed must be boolean`);
+  } else if (receipt.publicationAllowed !== manifest.publicationAllowed) {
+    errors.push(`${label}.report.publicationAllowed must match manifest`);
+  }
+  if (typeof receipt.deploymentAllowed !== 'boolean') {
+    errors.push(`${label}.report.deploymentAllowed must be boolean`);
+  } else if (receipt.deploymentAllowed !== manifest.deploymentAllowed) {
+    errors.push(`${label}.report.deploymentAllowed must match manifest`);
+  }
+  validateReceiptDispositions(label, receipt, manifest, errors);
+  validateExactCandidateBundle(`${label}.report.candidateBundle`, receipt.candidateBundle, candidateBundle(manifest), errors);
+  if (!freshIsoTimestamp(receipt.generatedAt)) {
+    errors.push(`${label}.report.generatedAt must be a fresh canonical ISO timestamp`);
+  }
+
+  if (!isDeploy) return;
+  const runtimeTarget = receipt.runtimeTarget;
+  if (!isObject(runtimeTarget)) {
+    errors.push(`${label}.report.runtimeTarget is required`);
+    return;
+  }
+  for (const field of ['agent', 'profileId', 'hostname', 'deploymentOrgLabel', 'deploymentProfileId']) {
+    if (!asNonEmptyString(runtimeTarget[field])) errors.push(`${label}.report.runtimeTarget.${field} is required`);
+  }
+  if (!canonicalIsoTimestamp(runtimeTarget.identityObservedAt) || !freshIsoTimestamp(runtimeTarget.identityObservedAt)) {
+    errors.push(`${label}.report.runtimeTarget.identityObservedAt must be a fresh canonical ISO timestamp`);
+  }
 }
 
 function validateGlobalV2CandidateComponent(manifest, componentName, versionKey, errors, { expectedBranch = null } = {}) {
@@ -672,46 +882,69 @@ function validateGlobalV2DeploymentContract(manifest, errors) {
   if (contract.hxaRequired !== true) {
     errors.push('Release manifest deploymentContract.hxaRequired must be true');
   }
+  for (const field of ['immutableFullShaOnly', 'cleanWorktreeRequired', 'dryRunRequired', 'pairReportRequired', 'canaryRequired']) {
+    if (contract[field] !== true) {
+      errors.push(`Release manifest deploymentContract.${field} must be true`);
+    }
+  }
 }
 
-function validateGlobalV2PublicationAuthorization(manifest, errors) {
-  const label = 'Release manifest evidence.ownerAuthorization';
+function validateGlobalV2OwnerAuthorization(manifest, errors, { mode = 'release' } = {}) {
+  const isDeploy = mode === 'deploy';
+  const label = `Release manifest evidence.ownerAuthorization`;
   const authorization = manifest.evidence?.ownerAuthorization;
   if (!isObject(authorization)) {
-    errors.push(`${label} is required for publication`);
+    errors.push(`${label} is required for ${mode}`);
     return;
+  }
+  const expectedSchema = isDeploy ? DEPLOYMENT_AUTHORIZATION_SCHEMA : PUBLICATION_AUTHORIZATION_SCHEMA;
+  const expectedScope = isDeploy ? DEPLOYMENT_SCOPE : PUBLICATION_SCOPE;
+  const expectedFlag = isDeploy ? 'deploymentAuthorized' : 'publicationAuthorized';
+  if (authorization.schema !== expectedSchema) {
+    errors.push(`${label}.schema must be ${expectedSchema}`);
   }
   if (authorization.status !== 'PASS') errors.push(`${label}.status must be PASS`);
+  if (authorization.releaseId !== manifest.releaseId) errors.push(`${label}.releaseId must match releaseId`);
   if (authorization.identity !== 'user') errors.push(`${label}.identity must be user`);
-  if (authorization.publicationAuthorized !== true) {
-    errors.push(`${label}.publicationAuthorized must be true`);
+  if (!asNonEmptyString(authorization.authorizedBy)) {
+    errors.push(`${label}.authorizedBy is required`);
   }
-  if (authorization.scope !== 'RELEASE_GLOBAL_BUNDLE') {
-    errors.push(`${label}.scope must be exactly RELEASE_GLOBAL_BUNDLE`);
+  if (!asNonEmptyString(authorization.authorizationRef)) {
+    errors.push(`${label}.authorizationRef is required`);
+  }
+  if (!canonicalIsoTimestamp(authorization.authorizedAt)) {
+    errors.push(`${label}.authorizedAt must be a canonical ISO timestamp`);
+  }
+  if (authorization[expectedFlag] !== true) {
+    errors.push(`${label}.${expectedFlag} must be true`);
+  }
+  if (authorization.scope !== expectedScope) {
+    errors.push(`${label}.scope must be exactly ${expectedScope}`);
   }
 
-  const bundle = authorization.bundle;
-  if (!isObject(bundle)) {
-    errors.push(`${label}.bundle is required`);
+  validateExactCandidateBundle(`${label}.bundle`, authorization.bundle, candidateBundle(manifest), errors);
+
+  const reportPath = validateEvidencePath(label, authorization.report, errors);
+  if (!SHA256_RE.test(String(authorization.reportSha256 || ''))) {
+    errors.push(`${label}.reportSha256 must be a 64-character lowercase SHA-256`);
+  }
+  if (!reportPath || !SHA256_RE.test(String(authorization.reportSha256 || ''))) return;
+  const actualHash = sha256File(reportPath);
+  if (actualHash !== authorization.reportSha256) {
+    errors.push(`${label}.reportSha256 mismatch`);
     return;
   }
-  const expected = {
-    coreSha: manifest.candidate?.core?.sha,
-    feishuSha: manifest.candidate?.feishu?.sha,
-    hxaSha: manifest.candidate?.hxa?.sha,
-  };
-  const expectedFields = Object.keys(expected).sort();
-  const actualFields = Object.keys(bundle).sort();
-  if (JSON.stringify(actualFields) !== JSON.stringify(expectedFields)) {
-    errors.push(`${label}.bundle must contain exactly coreSha, feishuSha, and hxaSha`);
+  const parsed = readJsonFile(reportPath);
+  if (parsed.error) {
+    errors.push(`${label}.report is not valid JSON: ${parsed.error.message}`);
+    return;
   }
-  for (const [field, candidateSha] of Object.entries(expected)) {
-    const value = bundle[field];
-    if (!LOWERCASE_FULL_SHA_RE.test(String(value || ''))) {
-      errors.push(`${label}.bundle.${field} must be a full 40-character lowercase SHA`);
-    } else if (value !== candidateSha) {
-      errors.push(`${label}.bundle.${field} does not match candidate`);
-    }
+  if (!isObject(parsed.value)) {
+    errors.push(`${label}.report must be an object`);
+    return;
+  }
+  if (stableJson(parsed.value) !== stableJson(withoutReportBinding(authorization))) {
+    errors.push(`${label}.report body does not match authorization`);
   }
 }
 
@@ -826,7 +1059,7 @@ export function validateReleaseManifest({
     if (typeof deploymentAllowed !== 'boolean') {
       errors.push('Release manifest deploymentAllowed must be boolean');
     }
-    if (publicationAllowed !== undefined && typeof publicationAllowed !== 'boolean') {
+    if (typeof publicationAllowed !== 'boolean') {
       errors.push('Release manifest publicationAllowed must be boolean');
     }
     if (!Array.isArray(manifest.holdReasons)) errors.push('Release manifest holdReasons must be an array');
@@ -867,8 +1100,11 @@ export function validateReleaseManifest({
   }
   if (isV2Manifest) {
     const origin = git(repoRoot, ['remote', 'get-url', 'origin'], { allowFailure: true });
-    if (origin && normalizeGitHubRepository(origin) !== normalizedRepository) {
-      errors.push(`Release manifest origin ${origin} does not identify a valid GitHub repository matching ${repository}`);
+    if (!isExactGitHubOrigin(origin, V2_REPOSITORY)) {
+      errors.push(`Release manifest origin ${origin || '(missing)'} does not identify GitHub repository ${V2_REPOSITORY}`);
+    }
+    if (normalizedManifestRepo && normalizedManifestRepo !== V2_REPOSITORY) {
+      errors.push(`Release manifest repo ${manifestRepo} must exactly identify GitHub repository ${V2_REPOSITORY}`);
     }
   }
   if (!manifestBranch) errors.push('Release manifest must declare branch');
@@ -885,6 +1121,14 @@ export function validateReleaseManifest({
     errors.push('Release manifest must pin a full 40-character commit SHA');
   } else if (sha && String(manifestSha).toLowerCase() !== String(sha).toLowerCase()) {
     errors.push(`Release manifest SHA ${manifestSha} does not match current HEAD ${sha}`);
+  }
+  if (isV2Manifest && FULL_SHA_RE.test(String(manifestSha || ''))) {
+    const originMain = resolveCommit(repoRoot, 'origin/main');
+    if (!originMain) {
+      errors.push('Release manifest v2 requires a resolvable origin/main for ancestry validation');
+    } else if (git(repoRoot, ['merge-base', '--is-ancestor', String(manifestSha).toLowerCase(), 'origin/main'], { allowFailure: true }) === null) {
+      errors.push(`Release manifest SHA ${manifestSha} must be an ancestor of origin/main`);
+    }
   }
   if (!asNonEmptyString(manifestVersion)) errors.push('Release manifest must declare version');
   else if (version && String(manifestVersion).trim() !== String(version).trim()) {
@@ -907,7 +1151,13 @@ export function validateReleaseManifest({
     if (status === 'HOLD' && deploymentAllowed !== false) {
       errors.push('Publication HOLD must have deploymentAllowed=false');
     }
-    if (publicationAllowed === true) validateGlobalV2PublicationAuthorization(manifest, errors);
+    if (publicationAllowed === true) {
+      validateGlobalV2OwnerAuthorization(manifest, errors, { mode: 'release' });
+      validateGlobalV2PreflightReceipt(manifest, errors, { mode: 'publish' });
+    }
+  }
+  if (isV2Manifest && mode === 'deploy') {
+    validateGlobalV2OwnerAuthorization(manifest, errors, { mode: 'deploy' });
   }
 
   const targetIdentity = manifest.target;
@@ -973,6 +1223,7 @@ export function validateDeploymentReadiness(manifest) {
     if (!isObject(manifest?.evidence?.hxa) || manifest.evidence.hxa.status !== 'PASS') {
       errors.push(`Deploy mode requires evidence.hxa.status=PASS (found ${manifest?.evidence?.hxa?.status ?? '(missing)'})`);
     }
+    validateGlobalV2PreflightReceipt(manifest, errors, { mode: 'deploy' });
   } else if (manifest?.evidence?.hxaProvenance !== 'PASS') {
     errors.push(`Deploy mode requires evidence.hxaProvenance=PASS (found ${manifest?.evidence?.hxaProvenance ?? '(missing)'})`);
   }
@@ -1030,6 +1281,7 @@ export function runGovernance({
   branch = null,
   manifestPath = null,
   identityProbePath = null,
+  env = process.env,
 } = {}) {
   const repoRoot = path.resolve(root);
   const errors = [];
@@ -1040,10 +1292,27 @@ export function runGovernance({
   } catch (error) {
     errors.push(error.message);
   }
-  const actualBranch = currentBranch(repoRoot, branch);
-  const branchInfo = classifyBranch(actualBranch);
-  if (!actualBranch) errors.push('Unable to determine current branch; pass --branch in detached CI checkouts');
-  if (branchInfo.kind === 'unknown') errors.push(`Branch ${actualBranch || '(missing)'} does not use an approved category (main, release/*, feat/*, fix/*, codex/*, wip/*, archive/*, etc.)`);
+  const immutableMode = mode === 'release' || mode === 'deploy';
+  const observedBranch = actualBranch(repoRoot);
+  const suppliedBranches = [
+    branch,
+    env.ZYLOS_BRANCH,
+    env.GITHUB_HEAD_REF,
+    env.GITHUB_REF_NAME,
+    env.GITHUB_REF,
+  ].filter(asNonEmptyString).map(normalizeBranchName);
+  const resolvedBranch = immutableMode ? observedBranch : currentBranch(repoRoot, branch, env);
+  if (immutableMode) {
+    for (const suppliedBranch of suppliedBranches) {
+      if (suppliedBranch !== observedBranch) {
+        errors.push(`CI branch ref ${suppliedBranch} does not match actual symbolic-ref/HEAD ${observedBranch || '(detached HEAD)'}`);
+      }
+    }
+  }
+  const actualBranchName = resolvedBranch;
+  const branchInfo = classifyBranch(actualBranchName);
+  if (!actualBranchName) errors.push('Unable to determine current branch from git symbolic-ref');
+  if (branchInfo.kind === 'unknown') errors.push(`Branch ${actualBranchName || '(missing)'} does not use an approved category (main, release/*, feat/*, fix/*, codex/*, wip/*, archive/*, etc.)`);
 
   const metadata = validateReleaseMetadata({ root: repoRoot });
   errors.push(...metadata.errors);
@@ -1055,7 +1324,7 @@ export function runGovernance({
     if (!baseSha) {
       versionGate = { ok: false, errors: ['Feature branch checks require a resolvable base commit; pass --base <sha>'], changedFiles: [], checkedFiles: [] };
     } else {
-      versionGate = validateNoVersionMetadataChanges({ root: repoRoot, baseSha, branch: actualBranch });
+      versionGate = validateNoVersionMetadataChanges({ root: repoRoot, baseSha, branch: actualBranchName });
     }
     errors.push(...versionGate.errors);
   }
@@ -1063,15 +1332,15 @@ export function runGovernance({
   const dirty = worktreeDirty(repoRoot);
   let manifest = null;
   if (mode === 'release' || mode === 'deploy') {
-    if (!branchInfo.releaseAllowed) errors.push(`${mode} mode is only allowed on main or release/* branches (found ${actualBranch || '(missing)'})`);
+    if (!branchInfo.releaseAllowed) errors.push(`${mode} mode is only allowed on main or release/* branches (found ${actualBranchName || '(missing)'})`);
     if (dirty) errors.push(`${mode} mode requires a clean worktree`);
-    const resolvedManifestPath = manifestPath || process.env.ZYLOS_RELEASE_MANIFEST || null;
+    const resolvedManifestPath = manifestPath || env.ZYLOS_RELEASE_MANIFEST || null;
     manifest = validateReleaseManifest({
       root: repoRoot,
       manifestPath: resolvedManifestPath,
       sha,
       version: metadata.version,
-      branch: actualBranch,
+      branch: actualBranchName,
       packageName: metadata.packageName,
       repository: metadata.repository,
       identityProbePath,
@@ -1089,7 +1358,7 @@ export function runGovernance({
     mode,
     repo: metadata.repository || path.basename(repoRoot),
     root: repoRoot,
-    branch: actualBranch,
+    branch: actualBranchName,
     branchKind: branchInfo.kind,
     sha,
     version: metadata.version,
