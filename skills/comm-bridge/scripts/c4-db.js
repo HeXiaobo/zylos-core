@@ -408,6 +408,136 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
   `).run(migrationObservedAtMs);
 }
 
+/**
+ * Additive storage for the Assistant Reply v1 Run Ledger.  The canonical
+ * request and event rows remain in assistant_requests and
+ * assistant_response_events; this schema only adds the identities, lane
+ * ordering, runtime fencing, and cancellation facts that those legacy tables
+ * cannot represent.
+ */
+export function ensureAssistantRunLedgerSchema(database, options = {}) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      direction TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      endpoint_id TEXT,
+      content TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      delivery_action TEXT,
+      priority INTEGER DEFAULT 3,
+      require_idle INTEGER DEFAULT 0,
+      retry_count INTEGER DEFAULT 0
+    )
+  `);
+  ensureAssistantResponseSchema(database, options);
+
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS assistant_run_ledger (
+      acceptance_order INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL UNIQUE,
+      conversation_lane_key TEXT NOT NULL,
+      lane_sequence INTEGER NOT NULL CHECK (lane_sequence >= 1),
+      payload_hash TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      causation_id TEXT NOT NULL,
+      request_class TEXT NOT NULL DEFAULT 'ordinary'
+        CHECK (request_class IN ('ordinary', 'maintenance', 'control')),
+      priority INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 3),
+      require_idle INTEGER NOT NULL DEFAULT 0 CHECK (require_idle IN (0, 1)),
+      runtime_lane_id TEXT NOT NULL DEFAULT 'runtime:shared'
+        CHECK (runtime_lane_id = 'runtime:shared'),
+      turn_id TEXT NOT NULL,
+      generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+      status TEXT NOT NULL
+        CHECK (status IN (
+          'queued', 'active', 'cancel_requested',
+          'completed', 'failed', 'cancelled'
+        )),
+      accepted_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_at INTEGER,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+      UNIQUE (conversation_lane_key, lane_sequence)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_run_ledger_pending
+      ON assistant_run_ledger(status, priority, acceptance_order);
+    CREATE INDEX IF NOT EXISTS idx_assistant_run_ledger_lane
+      ON assistant_run_ledger(conversation_lane_key, lane_sequence, status);
+
+    CREATE TABLE IF NOT EXISTS assistant_source_receipts (
+      identity_kind TEXT NOT NULL
+        CHECK (identity_kind IN ('idempotency', 'transport', 'logical')),
+      identity_key TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (identity_kind, identity_key),
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_source_receipts_request
+      ON assistant_source_receipts(request_id);
+
+    CREATE TABLE IF NOT EXISTS assistant_cancel_requests (
+      idempotency_key TEXT PRIMARY KEY,
+      command_id TEXT,
+      request_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK (generation >= 1),
+      payload_hash TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      causation_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('requested', 'confirmed')),
+      requested_at INTEGER NOT NULL,
+      confirmed_at INTEGER,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_cancel_requests_request
+      ON assistant_cancel_requests(request_id, generation);
+  `);
+
+  const cancelColumns = getColumnNames(database, 'assistant_cancel_requests');
+  if (!cancelColumns.has('command_id')) {
+    database.exec('ALTER TABLE assistant_cancel_requests ADD COLUMN command_id TEXT');
+  }
+
+  const eventColumns = getColumnNames(database, 'assistant_response_events');
+  const eventColumnDefinitions = {
+    event_id: 'TEXT',
+    turn_id: 'TEXT',
+    generation: 'INTEGER CHECK (generation IS NULL OR generation >= 1)',
+    trace_id: 'TEXT',
+    causation_id: 'TEXT',
+    producer: 'TEXT',
+  };
+  for (const [column, definition] of Object.entries(eventColumnDefinitions)) {
+    if (!eventColumns.has(column)) {
+      database.exec(`ALTER TABLE assistant_response_events ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_response_events_event_id
+      ON assistant_response_events(event_id)
+      WHERE event_id IS NOT NULL;
+  `);
+
+  const admissionColumns = getColumnNames(database, 'runtime_turn_admissions');
+  const admissionColumnDefinitions = {
+    turn_id: 'TEXT',
+    generation: 'INTEGER CHECK (generation IS NULL OR generation >= 1)',
+    runtime_lane_id: 'TEXT CHECK (runtime_lane_id IS NULL OR runtime_lane_id = \'runtime:shared\')',
+  };
+  for (const [column, definition] of Object.entries(admissionColumnDefinitions)) {
+    if (!admissionColumns.has(column)) {
+      database.exec(`ALTER TABLE runtime_turn_admissions ADD COLUMN ${column} ${definition}`);
+    }
+  }
+}
+
 function toCommitmentIntakeView(row) {
   if (!row) return null;
   return {
