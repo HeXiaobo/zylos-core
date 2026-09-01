@@ -4,7 +4,7 @@
  * Runs as a pretest hook so `npm test` works out of the box.
  */
 
-import { mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -106,6 +106,34 @@ function readOwner(ownerPath) {
   }
 }
 
+function readLeaseOwner(directory) {
+  try {
+    const owners = readdirSync(directory)
+      .map((entry) => /^owner-(\d+)-([0-9a-f-]+)\.lease$/.exec(entry))
+      .filter(Boolean);
+    if (owners.length !== 1) return null;
+    const pid = Number(owners[0][1]);
+    const token = owners[0][2];
+    if (!Number.isInteger(pid) || pid <= 0 || token.length === 0) return null;
+    return { pid, token };
+  } catch {
+    return null;
+  }
+}
+
+function readDirectoryOwner(directory) {
+  return readLeaseOwner(directory) ?? readOwner(join(directory, 'owner.json'));
+}
+
+function hasInvalidOwnerEvidence(directory) {
+  try {
+    return existsSync(join(directory, 'owner.json'))
+      || readdirSync(directory).some((entry) => entry.startsWith('owner-') && entry.endsWith('.lease'));
+  } catch {
+    return false;
+  }
+}
+
 function processIsAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -116,8 +144,9 @@ function processIsAlive(pid) {
 }
 
 function lockIsStale(lockDir) {
-  const owner = readOwner(join(lockDir, 'owner.json'));
+  const owner = readDirectoryOwner(lockDir);
   if (owner) return !processIsAlive(owner.pid);
+  if (hasInvalidOwnerEvidence(lockDir)) return false;
   try {
     return Date.now() - statSync(lockDir).mtimeMs >= incompleteOwnerGraceMs;
   } catch {
@@ -126,16 +155,20 @@ function lockIsStale(lockDir) {
 }
 
 function releaseOwnedDirectory(directory, token) {
-  const owner = readOwner(join(directory, 'owner.json'));
+  const owner = readDirectoryOwner(directory);
   if (owner?.pid === process.pid && owner.token === token) rmSync(directory, { recursive: true, force: true });
 }
 
 function createOwnedDirectory(directory, token) {
-  mkdirSync(directory, { mode: 0o700 });
+  const pendingDirectory = `${directory}.pending-${process.pid}-${token}`;
+  mkdirSync(pendingDirectory, { mode: 0o700 });
   try {
-    writeFileSync(join(directory, 'owner.json'), `${JSON.stringify({ pid: process.pid, token })}\n`, { mode: 0o600 });
+    writeFileSync(join(pendingDirectory, `owner-${process.pid}-${token}.lease`), '', { mode: 0o600 });
+    writeFileSync(join(pendingDirectory, 'owner.json'), `${JSON.stringify({ pid: process.pid, token })}\n`, { mode: 0o600 });
+    renameSync(pendingDirectory, directory);
   } catch (error) {
-    rmSync(directory, { recursive: true, force: true });
+    rmSync(pendingDirectory, { recursive: true, force: true });
+    if (error?.code === 'ENOTEMPTY') error.code = 'EEXIST';
     throw error;
   }
 }
@@ -214,6 +247,11 @@ for (const name of readdirSync(skillsDir, { withFileTypes: true })) {
   withSkillLock(name.name, () => {
     if (existsSync(modules)) return;
     console.log(`[pretest] Installing deps for skills/${name.name}`);
-    execFileSync('npm', ['ci', '--omit=dev'], { cwd: dir, stdio: 'inherit' });
+    try {
+      execFileSync('npm', ['ci', '--omit=dev'], { cwd: dir, stdio: 'inherit' });
+    } catch (error) {
+      rmSync(modules, { recursive: true, force: true });
+      throw error;
+    }
   });
 }

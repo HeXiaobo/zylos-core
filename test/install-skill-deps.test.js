@@ -54,6 +54,10 @@ if (delayMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, de
 const failOnce = process.env.INSTALL_SKILL_DEPS_NPM_FAIL_ONCE;
 if (failOnce && !fs.existsSync(failOnce)) {
   fs.writeFileSync(failOnce, 'failed once\\n');
+  if (process.env.INSTALL_SKILL_DEPS_NPM_LEAVE_PARTIAL_ON_FAILURE) {
+    fs.mkdirSync(path.join(process.cwd(), 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(process.cwd(), 'node_modules', 'partial'), 'incomplete\\n');
+  }
   fs.appendFileSync(events, JSON.stringify({ event: 'end', pid: process.pid, at: Date.now(), status: 23 }) + '\\n');
   process.exit(23);
 }
@@ -316,6 +320,31 @@ describe('skill dependency pretest', () => {
     expect(git(fixture.root, ['status', '--porcelain'])).toBe('');
   });
 
+  test('does not steal a live install lock when owner.json becomes corrupt', async () => {
+    const fixture = makeFixture({
+      corruptOwner: {
+        packageJson: { name: 'corrupt-owner-skill', private: true, dependencies: { example: '1.0.0' } },
+        packageLock: {
+          name: 'corrupt-owner-skill',
+          lockfileVersion: 3,
+          packages: { '': { name: 'corrupt-owner-skill', dependencies: { example: '1.0.0' } } },
+        },
+      },
+    });
+    const lockDir = path.join(fixture.lockRoot, 'corruptOwner.lock');
+    const first = startInstaller(fixture, { INSTALL_SKILL_DEPS_NPM_DELAY_MS: '6500' });
+    await waitFor(() => npmCalls(fixture).length === 1 && fs.existsSync(path.join(lockDir, 'owner.json')));
+
+    writeFile(lockDir, 'owner.json', '{');
+    const second = runInstallerAsync(fixture, { INSTALL_SKILL_DEPS_NPM_DELAY_MS: '100' });
+    const results = await Promise.all([first.completed, second]);
+
+    expect(results.map((result) => result.status)).toEqual([0, 0]);
+    expect(npmCalls(fixture)).toHaveLength(1);
+    expect(fs.existsSync(path.join(fixture.root, 'skills', 'corruptOwner', 'node_modules'))).toBe(true);
+    expect(git(fixture.root, ['status', '--porcelain'])).toBe('');
+  }, 15_000);
+
   test('recovers a stale recovery guard left by a crashed owner', async () => {
     const fixture = makeFixture({
       stale: {
@@ -392,6 +421,33 @@ describe('skill dependency pretest', () => {
     expect(npmCalls(fixture)).toHaveLength(2);
     expect(fs.existsSync(lockDir)).toBe(false);
     expect(fs.existsSync(path.join(fixture.root, 'skills', 'retryable', 'node_modules'))).toBe(true);
+    expect(git(fixture.root, ['status', '--porcelain'])).toBe('');
+  });
+
+  test('retries npm after a failed install leaves partial node_modules', () => {
+    const fixture = makeFixture({
+      partial: {
+        packageJson: { name: 'partial-skill', private: true, dependencies: { example: '1.0.0' } },
+        packageLock: {
+          name: 'partial-skill',
+          lockfileVersion: 3,
+          packages: { '': { name: 'partial-skill', dependencies: { example: '1.0.0' } } },
+        },
+      },
+    });
+    const failOncePath = path.join(tempRoot, 'npm-left-partial-once');
+    const failureEnv = {
+      INSTALL_SKILL_DEPS_NPM_FAIL_ONCE: failOncePath,
+      INSTALL_SKILL_DEPS_NPM_LEAVE_PARTIAL_ON_FAILURE: '1',
+    };
+
+    const failed = runInstaller(fixture, failureEnv);
+    const retried = runInstaller(fixture, failureEnv);
+
+    expect(failed.status).not.toBe(0);
+    expect(retried.status).toBe(0);
+    expect(npmCalls(fixture)).toHaveLength(2);
+    expect(fs.existsSync(path.join(fixture.root, 'skills', 'partial', 'node_modules', 'partial'))).toBe(false);
     expect(git(fixture.root, ['status', '--porcelain'])).toBe('');
   });
 
