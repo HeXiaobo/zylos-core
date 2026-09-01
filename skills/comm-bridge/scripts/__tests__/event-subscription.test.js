@@ -99,11 +99,13 @@ test('consumer ACK is independent, ordered and ignores legacy global delivery_st
   const ack = subscriptions.ack({
     consumerId: 'consumer-a',
     eventId: a1.event.eventId,
+    claimEpoch: a1.claimEpoch,
     leaseToken: a1.leaseToken,
   });
   const duplicateAck = subscriptions.ack({
     consumerId: 'consumer-a',
     eventId: a1.event.eventId,
+    claimEpoch: a1.claimEpoch,
     leaseToken: a1.leaseToken,
   });
   const b1 = subscriptions.claimNext({ consumerId: 'consumer-b', ownerId: 'worker-b' });
@@ -155,6 +157,7 @@ test('a leased or delayed stream does not block another request for the same con
   subscriptions.fail({
     consumerId: 'parallel-consumer',
     eventId: first.event.eventId,
+    claimEpoch: first.claimEpoch,
     leaseToken: first.leaseToken,
     error: 'poison stream delay',
     retryDelaySeconds: 60,
@@ -162,6 +165,7 @@ test('a leased or delayed stream does not block another request for the same con
   subscriptions.ack({
     consumerId: 'parallel-consumer',
     eventId: second.event.eventId,
+    claimEpoch: second.claimEpoch,
     leaseToken: second.leaseToken,
   });
   const nextB = subscriptions.claimNext({
@@ -179,6 +183,7 @@ test('a leased or delayed stream does not block another request for the same con
   subscriptions.fail({
     consumerId: 'fair-consumer',
     eventId: poisonA.event.eventId,
+    claimEpoch: poisonA.claimEpoch,
     leaseToken: poisonA.leaseToken,
     error: 'immediate poison retry',
     retryDelaySeconds: 0,
@@ -209,6 +214,7 @@ test('wrong and expired event leases cannot ACK, while restart recovery has one 
     () => crashed.ack({
       consumerId: 'restart-consumer',
       eventId: first.event.eventId,
+      claimEpoch: first.claimEpoch,
       leaseToken: 'wrong-event-lease',
     }),
     error => error?.code === 'LEASE_FENCED',
@@ -218,6 +224,7 @@ test('wrong and expired event leases cannot ACK, while restart recovery has one 
     () => crashed.ack({
       consumerId: 'restart-consumer',
       eventId: first.event.eventId,
+      claimEpoch: first.claimEpoch,
       leaseToken: first.leaseToken,
     }),
     error => error?.code === 'LEASE_EXPIRED',
@@ -254,10 +261,52 @@ test('wrong and expired event leases cannot ACK, while restart recovery has one 
     () => ownerA.ack({
       consumerId: 'restart-consumer',
       eventId: first.event.eventId,
+      claimEpoch: first.claimEpoch,
       leaseToken: first.leaseToken,
     }),
     error => error?.code === 'LEASE_FENCED',
   );
+});
+
+test('claim epoch fences a reused lease token after expiration', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  createProgressEvents(t, dbPath);
+  const subscriptions = openEventSubscriptions({
+    dbPath,
+    clock: () => now,
+    leaseTokenFactory: () => 'same-token',
+  });
+  t.after(() => subscriptions.close());
+  subscriptions.subscribe({ consumerId: 'epoch-consumer', bootstrap: 'canonical_cutover' });
+  const oldLease = subscriptions.claimNext({
+    consumerId: 'epoch-consumer',
+    ownerId: 'old-owner',
+    leaseSeconds: 1,
+  });
+  now = 101;
+  const newLease = subscriptions.claimNext({
+    consumerId: 'epoch-consumer',
+    ownerId: 'new-owner',
+    leaseSeconds: 30,
+  });
+  assert.equal(oldLease.leaseToken, newLease.leaseToken);
+  assert.notEqual(oldLease.claimEpoch, newLease.claimEpoch);
+  assert.throws(
+    () => subscriptions.ack({
+      consumerId: 'epoch-consumer',
+      eventId: oldLease.event.eventId,
+      leaseToken: oldLease.leaseToken,
+      claimEpoch: oldLease.claimEpoch,
+    }),
+    error => error?.code === 'LEASE_FENCED',
+  );
+  assert.equal(subscriptions.ack({
+    consumerId: 'epoch-consumer',
+    eventId: newLease.event.eventId,
+    leaseToken: newLease.leaseToken,
+    claimEpoch: newLease.claimEpoch,
+  }).state.status, 'acknowledged');
 });
 
 test('progress failure, lag and duplicate event replay cannot block the final ReplyIntent or change Run terminal', (t) => {
@@ -280,6 +329,7 @@ test('progress failure, lag and duplicate event replay cannot block the final Re
     subscriptions.ack({
       consumerId: 'projection',
       eventId: claimed.event.eventId,
+      claimEpoch: claimed.claimEpoch,
       leaseToken: claimed.leaseToken,
     });
   }
@@ -288,6 +338,7 @@ test('progress failure, lag and duplicate event replay cannot block the final Re
   const failed = subscriptions.fail({
     consumerId: 'projection',
     eventId: progress.event.eventId,
+    claimEpoch: progress.claimEpoch,
     leaseToken: progress.leaseToken,
     error: 'projection unavailable',
     retryDelaySeconds: 60,
@@ -366,6 +417,229 @@ test('same-request canonical sequence gaps degrade the subscription and fail cla
   );
 });
 
+test('unknown event types cannot masquerade as canonical subscription events', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  const run = ledger.accept(acceptMessage('unknown-event-type')).request;
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, 3, 'UnknownRunFact', '{}', ?, 'pending', 100, 100, ?, ?, 1, ?, ?, ?)
+  `).run(
+    run.requestId,
+    `run:${run.requestId}:unknown`,
+    `evt:${run.requestId}:3`,
+    run.turnId,
+    run.traceId,
+    `evt:${run.requestId}:2`,
+    'runtime:shared',
+  );
+  inject.close();
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'unknown-type-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'NONCANONICAL_EVENT_TYPE');
+  assert.throws(
+    () => subscriptions.claimNext({ consumerId: 'unknown-type-consumer', ownerId: 'worker' }),
+    error => error?.code === 'EVENT_SUBSCRIPTION_DEGRADED',
+  );
+});
+
+test('canonical-looking events must extend their request causation chain', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  const run = ledger.accept(acceptMessage('bad-causation')).request;
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, 3, 'ProgressUpdated', '{"stage":"bad-cause"}', ?,
+              'pending', 100, 100, ?, ?, 1, ?, 'BOGUS_CAUSE', 'runtime:shared')
+  `).run(
+    run.requestId,
+    `run:${run.requestId}:progress:bad-cause`,
+    `evt:${run.requestId}:3`,
+    run.turnId,
+    run.traceId,
+  );
+  inject.close();
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'bad-causation-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'NONCANONICAL_CAUSATION_CHAIN');
+});
+
+test('RunStarted requires a canonical runtime session identity', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  const run = ledger.accept(acceptMessage('bad-runtime-session')).request;
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, 3, 'RunStarted', '{"runtimeLaneId":"runtime:shared"}', ?,
+              'pending', 100, 100, ?, ?, 1, ?, ?, 'core:runtime-lane')
+  `).run(
+    run.requestId,
+    `run:${run.requestId}:started`,
+    `evt:${run.requestId}:3`,
+    run.turnId,
+    run.traceId,
+    `evt:${run.requestId}:2`,
+  );
+  inject.close();
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'bad-runtime-session-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'NONCANONICAL_RUNTIME_SESSION');
+});
+
+test('canonical-looking terminals require a durable matching ReplyOutcome', (t) => {
+  for (const [id, expectedReason] of [
+    ['missing-outcome-id', 'TERMINAL_OUTCOME_ID_REQUIRED'],
+    ['dangling-outcome-id', 'TERMINAL_OUTCOME_NOT_FOUND'],
+  ]) {
+    const dbPath = temporaryDatabase(t);
+    const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    t.after(() => ledger.close());
+    const run = ledger.accept(acceptMessage(id)).request;
+    const payload = id === 'missing-outcome-id'
+      ? {}
+      : { outcomeId: `outcome:${run.requestId}` };
+    const inject = new Database(dbPath);
+    inject.prepare(`
+      INSERT INTO assistant_response_events (
+        request_id, sequence, event_type, payload_json, idempotency_key,
+        delivery_status, available_at, created_at, event_id, turn_id,
+        generation, trace_id, causation_id, producer
+      ) VALUES (?, 3, 'RunCompleted', ?, ?, 'pending', 100, 100, ?, ?, 1, ?, ?, 'runtime:shared')
+    `).run(
+      run.requestId,
+      JSON.stringify(payload),
+      `run:${run.requestId}:completed`,
+      `evt:${run.requestId}:3`,
+      run.turnId,
+      run.traceId,
+      `evt:${run.requestId}:2`,
+    );
+    inject.close();
+    const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+    t.after(() => subscriptions.close());
+    const subscribed = subscriptions.subscribe({
+      consumerId: `terminal-consumer:${id}`,
+      bootstrap: 'canonical_cutover',
+    });
+    assert.equal(subscribed.status, 'degraded');
+    assert.equal(subscribed.degradedReason, expectedReason);
+  }
+});
+
+test('a canonical event after a terminal degrades the stream', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  const run = ledger.accept(acceptMessage('terminal-last')).request;
+  const inject = new Database(dbPath);
+  const insert = inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, ?, ?, ?, ?, 'pending', 100, 100, ?, ?, 1, ?, ?, ?)
+  `);
+  insert.run(
+    run.requestId,
+    3,
+    'RunCancelled',
+    '{"mode":"queued"}',
+    `run:${run.requestId}:cancelled:g1`,
+    `evt:${run.requestId}:3`,
+    run.turnId,
+    run.traceId,
+    'cancel:terminal-last',
+    'core:runtime-lane',
+  );
+  insert.run(
+    run.requestId,
+    4,
+    'ProgressUpdated',
+    '{"stage":"too-late"}',
+    `run:${run.requestId}:progress:late`,
+    `evt:${run.requestId}:4`,
+    run.turnId,
+    run.traceId,
+    `evt:${run.requestId}:3`,
+    'runtime:shared',
+  );
+  inject.close();
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'terminal-last-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'degraded');
+  assert.equal(subscribed.degradedReason, 'EVENT_AFTER_TERMINAL');
+});
+
+test('cooperative runtime cancellation remains a canonical terminal stream', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const { ledger, run } = createProgressEvents(t, dbPath);
+  ledger.cancel({
+    schemaVersion: 1,
+    type: 'CancelRequest',
+    commandId: 'cancel:runtime-terminal',
+    idempotencyKey: `cancel:${run.requestId}:g${run.generation}`,
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: 'cancel-requested:runtime-terminal',
+    mode: 'cooperative',
+    reason: 'user_requested',
+  });
+  ledger.confirmCancellation({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: 'runtime-stop-confirmed',
+    producer: 'runtime:shared',
+  });
+  const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
+  t.after(() => subscriptions.close());
+
+  const subscribed = subscriptions.subscribe({
+    consumerId: 'runtime-cancel-consumer',
+    bootstrap: 'canonical_cutover',
+  });
+  assert.equal(subscribed.status, 'active');
+});
+
 test('canonical event identity and body are immutable while legacy delivery_status stays mutable', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -373,11 +647,16 @@ test('canonical event identity and body are immutable while legacy delivery_stat
   ledger.accept(acceptMessage('immutable'));
   const subscriptions = openEventSubscriptions({ dbPath, clock: () => 101 });
   t.after(() => subscriptions.close());
-  subscriptions.subscribe({ consumerId: 'immutable-consumer', bootstrap: 'canonical_cutover' });
   const mutate = new Database(dbPath);
   assert.throws(
     () => mutate.prepare(`
       UPDATE assistant_response_events SET payload_json = '{"changed":true}' WHERE sequence = 1
+    `).run(),
+    /canonical assistant event is immutable/,
+  );
+  assert.throws(
+    () => mutate.prepare(`
+      DELETE FROM assistant_response_events WHERE sequence = 1
     `).run(),
     /canonical assistant event is immutable/,
   );
@@ -386,6 +665,7 @@ test('canonical event identity and body are immutable while legacy delivery_stat
   `).run();
   mutate.close();
 
+  subscriptions.subscribe({ consumerId: 'immutable-consumer', bootstrap: 'canonical_cutover' });
   assert.equal(subscriptions.getConsumer({ consumerId: 'immutable-consumer' }).status, 'active');
   assert.equal(subscriptions.claimNext({
     consumerId: 'immutable-consumer',

@@ -150,6 +150,47 @@ test('required reply policy rejects a missing delivery decision before any termi
   inspect.close();
 });
 
+test('terminal identity must extend the current canonical event-chain head', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'terminal-chain-fence');
+  const head = ledger.listEvents(run.requestId).at(-1);
+  assert.equal(head.type, 'RunStarted');
+  const command = {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: head.eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Fenced answer.' } },
+    reply: { action: 'send', disposition: 'send' },
+  };
+
+  for (const mutation of [
+    { causationId: 'BOGUS_CAUSE' },
+    { producer: 'bogus-producer' },
+    { idempotencyKey: 'arbitrary-terminal-key' },
+  ]) {
+    assert.throws(
+      () => replies.commitRunOutcome({ ...command, ...mutation }),
+      error => error?.code === 'TERMINAL_IDENTITY_MISMATCH',
+    );
+  }
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunStarted',
+  ]);
+});
+
 test('explicit silent completes execution without creating a ReplyIntent', (t) => {
   const dbPath = temporaryDatabase(t);
   const ledger = openRunLedger({ dbPath, clock: () => 100 });
@@ -520,10 +561,19 @@ test('task_receipt accepts only a task_effect cause and replays by canonical ide
   );
   taskEffect = { ...taskEffect, canonical: true };
   const first = replies.commitTaskReceipt(command);
+  taskEffect = null;
   const replay = replies.commitTaskReceipt(command);
   assert.equal(first.replayed, false);
   assert.equal(replay.replayed, true);
   assert.deepEqual(replay.intent, first.intent);
+  const offlineReplay = openReplyOutcomeTransactions({ dbPath, clock: () => 102 });
+  try {
+    const durableReplay = offlineReplay.commitTaskReceipt(command);
+    assert.equal(durableReplay.replayed, true);
+    assert.deepEqual(durableReplay.intent, first.intent);
+  } finally {
+    offlineReplay.close();
+  }
   assert.equal(first.intent.cause.kind, 'task_effect');
   assert.match(first.intent.intentId, /^reply:task-effect-applied-001:[a-f0-9]{64}$/);
   assert.equal(first.delivery.state, 'pending');

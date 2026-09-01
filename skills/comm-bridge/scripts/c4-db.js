@@ -718,6 +718,13 @@ export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
     BEGIN
       SELECT RAISE(ABORT, 'canonical assistant event is immutable');
     END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_no_delete
+    BEFORE DELETE ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
   `);
 
   const consumerColumns = getColumnNames(database, 'assistant_event_consumers');

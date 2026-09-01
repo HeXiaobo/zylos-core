@@ -7,6 +7,12 @@ import Database from 'better-sqlite3';
 import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
 
+const TERMINAL_PREDECESSOR_PRODUCERS = Object.freeze({
+  RunStarted: 'core:runtime-lane',
+  ProgressUpdated: 'runtime:shared',
+  OutputDelta: 'runtime:shared',
+});
+
 function domainError(code, message) {
   const error = new Error(message);
   error.code = code;
@@ -296,6 +302,19 @@ export function openReplyOutcomeTransactions({
     WHERE request_id = ? AND event_type IN ('RunCompleted', 'RunFailed', 'RunCancelled')
     ORDER BY sequence ASC LIMIT 1
   `);
+  const selectLatestEvent = database.prepare(`
+    SELECT request_id, sequence, event_type, payload_json, idempotency_key,
+           event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    FROM assistant_response_events
+    WHERE request_id = ?
+    ORDER BY sequence DESC LIMIT 1
+  `);
+  const selectEventBySequence = database.prepare(`
+    SELECT request_id, sequence, event_type, payload_json, idempotency_key,
+           event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    FROM assistant_response_events
+    WHERE request_id = ? AND sequence = ?
+  `);
   const selectIntentByCause = database.prepare(`
     SELECT *
     FROM assistant_reply_intents
@@ -342,6 +361,43 @@ export function openReplyOutcomeTransactions({
       && canonicalJson(JSON.parse(row.payload_json)) === canonicalJson(expected.payload);
   }
 
+  function assertTerminalCommandIdentity({
+    requestId,
+    turnId,
+    generation,
+    traceId,
+    causationId,
+    producer,
+    idempotencyKey,
+    outcome,
+    terminal,
+    replay,
+  }) {
+    const terminalType = outcome.kind === 'failure' ? 'RunFailed' : 'RunCompleted';
+    const expectedIdempotencyKey = terminalType === 'RunFailed'
+      ? `run:${requestId}:failed`
+      : `run:${requestId}:completed`;
+    const predecessor = terminal
+      ? selectEventBySequence.get(requestId, terminal.sequence - 1)
+      : selectLatestEvent.get(requestId);
+    if (
+      producer !== 'runtime:shared'
+      || idempotencyKey !== expectedIdempotencyKey
+      || !predecessor
+      || predecessor.event_id !== `evt:${requestId}:${predecessor.sequence}`
+      || predecessor.turn_id !== turnId
+      || predecessor.generation !== generation
+      || predecessor.trace_id !== traceId
+      || predecessor.producer !== TERMINAL_PREDECESSOR_PRODUCERS[predecessor.event_type]
+      || causationId !== predecessor.event_id
+    ) {
+      throw domainError(
+        replay ? 'IDEMPOTENCY_CONFLICT' : 'TERMINAL_IDENTITY_MISMATCH',
+        `${terminalType} must extend the current canonical runtime event-chain head`,
+      );
+    }
+  }
+
   const commitTransaction = database.transaction((input) => {
     const command = requireRecord(input, 'commitRunOutcome input');
     const requestId = requireText(command.requestId, 'requestId');
@@ -357,15 +413,28 @@ export function openReplyOutcomeTransactions({
       throw domainError('RUN_EVENT_FENCED', 'outcome targets a stale request/turn/generation');
     }
     const outcome = normalizeOutcome(command.outcome, { requestId, turnId, traceId });
-    const replyPolicy = replyPolicyFor(run);
     const outcomeJson = canonicalJson(outcome);
     const outcomeHash = sha256(outcomeJson);
     const existingOutcome = selectOutcome.get(requestId);
+    const currentTerminal = selectTerminal.get(requestId);
+    assertTerminalCommandIdentity({
+      requestId,
+      turnId,
+      generation,
+      traceId,
+      causationId,
+      producer,
+      idempotencyKey,
+      outcome,
+      terminal: currentTerminal,
+      replay: Boolean(existingOutcome),
+    });
+    const replyPolicy = replyPolicyFor(run);
     if (existingOutcome) {
       if (existingOutcome.canonical_hash !== outcomeHash) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'canonical ReplyOutcome already has another payload');
       }
-      const existingTerminal = selectTerminal.get(requestId);
+      const existingTerminal = currentTerminal;
       if (!existingTerminal) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'outcome replay does not match its terminal');
       }
@@ -412,7 +481,7 @@ export function openReplyOutcomeTransactions({
     if (run.status !== 'active') {
       throw domainError('INVALID_RUN_TRANSITION', `cannot record outcome while run is ${run.status}`);
     }
-    if (selectTerminal.get(requestId)) {
+    if (currentTerminal) {
       throw domainError('TERMINAL_CONFLICT', 'run already has a terminal without a canonical outcome');
     }
     const current = clock();
@@ -521,6 +590,18 @@ export function openReplyOutcomeTransactions({
     if (run.trace_id !== intent.traceId) {
       throw domainError('TRACE_ID_MISMATCH', 'task receipt traceId does not match its request');
     }
+    const canonicalHash = sha256(canonicalJson(intent));
+    const existing = selectIntentById.get(intent.intentId);
+    if (existing) {
+      if (existing.canonical_hash !== canonicalHash) {
+        throw domainError('IDEMPOTENCY_CONFLICT', 'ReplyIntent identity has another payload');
+      }
+      return {
+        replayed: true,
+        intent: JSON.parse(existing.envelope_json),
+        delivery: toDelivery(existing),
+      };
+    }
     if (!taskEffectVerifier) {
       throw domainError(
         'TASK_EFFECT_VERIFICATION_REQUIRED',
@@ -547,18 +628,6 @@ export function openReplyOutcomeTransactions({
         'TASK_EFFECT_NOT_VERIFIED',
         'task effect must be canonical, applied, and match requestId/traceId',
       );
-    }
-    const canonicalHash = sha256(canonicalJson(intent));
-    const existing = selectIntentById.get(intent.intentId);
-    if (existing) {
-      if (existing.canonical_hash !== canonicalHash) {
-        throw domainError('IDEMPOTENCY_CONFLICT', 'ReplyIntent identity has another payload');
-      }
-      return {
-        replayed: true,
-        intent: JSON.parse(existing.envelope_json),
-        delivery: toDelivery(existing),
-      };
     }
     const current = clock();
     if (!Number.isSafeInteger(current) || current < 0) {

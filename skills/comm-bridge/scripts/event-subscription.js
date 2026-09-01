@@ -8,6 +8,27 @@ import { DB_PATH } from './c4-config.js';
 import { ensureAssistantReplyReliabilitySchema } from './c4-db.js';
 
 const BOOTSTRAP_MODE = 'canonical_cutover';
+const RUN_EVENT_TYPES = new Set([
+  'RunAccepted',
+  'RunQueued',
+  'RunStarted',
+  'ProgressUpdated',
+  'OutputDelta',
+  'RunCompleted',
+  'RunFailed',
+  'RunCancelled',
+]);
+const TERMINAL_EVENT_TYPES = new Set(['RunCompleted', 'RunFailed', 'RunCancelled']);
+const EVENT_PRODUCERS = Object.freeze({
+  RunAccepted: new Set(['core:message-intake']),
+  RunQueued: new Set(['core:runtime-pending-queue']),
+  RunStarted: new Set(['core:runtime-lane']),
+  ProgressUpdated: new Set(['runtime:shared']),
+  OutputDelta: new Set(['runtime:shared']),
+  RunCompleted: new Set(['runtime:shared']),
+  RunFailed: new Set(['runtime:shared']),
+  RunCancelled: new Set(['core:runtime-lane', 'runtime:shared']),
+});
 
 function domainError(code, message, details = {}) {
   const error = new Error(message);
@@ -32,6 +53,13 @@ function currentTime(clock) {
     throw new TypeError('clock must return a non-negative safe integer');
   }
   return current;
+}
+
+function requireClaimEpoch(value) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError('claimEpoch must be a positive safe integer');
+  }
+  return value;
 }
 
 function canonicalJson(value) {
@@ -75,13 +103,77 @@ function canonicalEventFailure(row) {
   if (row.event_id !== `evt:${row.request_id}:${row.sequence}`) {
     return 'NONCANONICAL_EVENT_ID';
   }
+  if (!RUN_EVENT_TYPES.has(row.event_type)) {
+    return 'NONCANONICAL_EVENT_TYPE';
+  }
+  if (!EVENT_PRODUCERS[row.event_type].has(row.producer)) {
+    return 'NONCANONICAL_PRODUCER';
+  }
+  if (
+    (row.sequence === 1 && row.event_type !== 'RunAccepted')
+    || (row.sequence !== 1 && row.event_type === 'RunAccepted')
+  ) {
+    return 'NONCANONICAL_ACCEPT_SEQUENCE';
+  }
+  let payload;
   try {
-    const payload = JSON.parse(row.payload_json);
+    payload = JSON.parse(row.payload_json);
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       return 'NONCANONICAL_PAYLOAD';
     }
   } catch {
     return 'NONCANONICAL_PAYLOAD';
+  }
+  if (
+    ['RunQueued', 'RunStarted'].includes(row.event_type)
+    && payload.runtimeLaneId !== 'runtime:shared'
+  ) {
+    return 'NONCANONICAL_RUNTIME_LANE';
+  }
+  if (
+    row.event_type === 'RunStarted'
+    && (typeof payload.runtimeSessionId !== 'string' || payload.runtimeSessionId.trim() === '')
+  ) {
+    return 'NONCANONICAL_RUNTIME_SESSION';
+  }
+  if (['RunCompleted', 'RunFailed'].includes(row.event_type)) {
+    if (typeof payload.outcomeId !== 'string' || payload.outcomeId.trim() === '') {
+      return 'TERMINAL_OUTCOME_ID_REQUIRED';
+    }
+    if (payload.outcomeId !== `outcome:${row.request_id}`) {
+      return 'TERMINAL_OUTCOME_ID_MISMATCH';
+    }
+    for (const field of ['text', 'content', 'output', 'outputText']) {
+      if (Object.hasOwn(payload, field)) return 'NONCANONICAL_TERMINAL_PAYLOAD';
+    }
+  }
+  if (
+    row.event_type === 'RunFailed'
+    && (
+      typeof payload.code !== 'string'
+      || payload.code.trim() === ''
+      || typeof payload.retryable !== 'boolean'
+    )
+  ) {
+    return 'NONCANONICAL_FAILED_PAYLOAD';
+  }
+  if (
+    row.event_type === 'RunCancelled'
+    && (Object.hasOwn(payload, 'outcomeId') || Object.hasOwn(payload, 'outcome'))
+  ) {
+    return 'NONCANONICAL_CANCELLED_PAYLOAD';
+  }
+  if (
+    row.event_type === 'RunCompleted'
+    && row.idempotency_key !== `run:${row.request_id}:completed`
+  ) {
+    return 'NONCANONICAL_TERMINAL_IDEMPOTENCY';
+  }
+  if (
+    row.event_type === 'RunFailed'
+    && row.idempotency_key !== `run:${row.request_id}:failed`
+  ) {
+    return 'NONCANONICAL_TERMINAL_IDEMPOTENCY';
   }
   return null;
 }
@@ -127,6 +219,7 @@ function toState(row) {
     eventId: row.event_id,
     status: row.status,
     retryCount: row.retry_count,
+    claimEpoch: row.claim_epoch,
     availableAt: row.available_at,
     leaseOwner: row.lease_owner,
     leaseToken: row.lease_token,
@@ -195,6 +288,16 @@ export function openEventSubscriptions({
   const selectEventBySequence = database.prepare(`
     ${eventProjection} WHERE request_id = ? AND sequence = ?
   `);
+  const selectLaterEvent = database.prepare(`
+    ${eventProjection}
+    WHERE request_id = ? AND sequence > ?
+    ORDER BY sequence ASC LIMIT 1
+  `);
+  const selectOutcome = database.prepare(`
+    SELECT outcome_id, request_id, turn_id, generation, trace_id, kind
+    FROM assistant_reply_outcomes
+    WHERE outcome_id = ?
+  `);
   const selectDeliveryFingerprint = database.prepare(`
     SELECT event_fingerprint
     FROM assistant_event_deliveries
@@ -257,6 +360,35 @@ export function openEventSubscriptions({
         if (predecessorFailure) {
           degrade(consumerId, 'NONCANONICAL_SEQUENCE_PREDECESSOR', predecessor.id, current);
           return selectConsumer.get(consumerId);
+        }
+        if (
+          event.event_type !== 'RunCancelled'
+          && event.causation_id !== predecessor.event_id
+        ) {
+          degrade(consumerId, 'NONCANONICAL_CAUSATION_CHAIN', event.id, current);
+          return selectConsumer.get(consumerId);
+        }
+      }
+      if (TERMINAL_EVENT_TYPES.has(event.event_type)) {
+        if (selectLaterEvent.get(event.request_id, event.sequence)) {
+          degrade(consumerId, 'EVENT_AFTER_TERMINAL', event.id, current);
+          return selectConsumer.get(consumerId);
+        }
+        if (event.event_type !== 'RunCancelled') {
+          const payload = JSON.parse(event.payload_json);
+          const outcome = selectOutcome.get(payload.outcomeId);
+          const expectedKind = event.event_type === 'RunFailed' ? 'failure' : null;
+          if (
+            !outcome
+            || outcome.request_id !== event.request_id
+            || outcome.turn_id !== event.turn_id
+            || outcome.generation !== event.generation
+            || outcome.trace_id !== event.trace_id
+            || (expectedKind ? outcome.kind !== expectedKind : outcome.kind === 'failure')
+          ) {
+            degrade(consumerId, 'TERMINAL_OUTCOME_NOT_FOUND', event.id, current);
+            return selectConsumer.get(consumerId);
+          }
         }
       }
       const fingerprint = eventFingerprint(event);
@@ -404,27 +536,34 @@ export function openEventSubscriptions({
     return {
       replayed: false,
       event: toEvent(claimed),
+      claimEpoch: claimed.claim_epoch,
       leaseOwner: claimed.lease_owner,
       leaseToken: claimed.lease_token,
       leaseExpiresAt: claimed.lease_expires_at,
     };
   });
 
-  const ackTransaction = database.transaction(({ consumerId, eventId, leaseToken }) => {
+  const ackTransaction = database.transaction(({
+    consumerId,
+    eventId,
+    claimEpoch,
+    leaseToken,
+  }) => {
     const safeConsumerId = requireText(consumerId, 'consumerId');
     const safeEventId = requireText(eventId, 'eventId');
+    const safeClaimEpoch = requireClaimEpoch(claimEpoch);
     const safeLeaseToken = requireText(leaseToken, 'leaseToken');
     const current = currentTime(clock);
     requireActiveConsumer(safeConsumerId, current);
     const row = selectState.get(safeConsumerId, safeEventId);
     if (!row) throw domainError('EVENT_DELIVERY_NOT_FOUND', 'consumer event delivery does not exist');
     if (row.status === 'acknowledged') {
-      if (row.lease_token !== safeLeaseToken) {
+      if (row.claim_epoch !== safeClaimEpoch || row.lease_token !== safeLeaseToken) {
         throw domainError('LEASE_FENCED', 'ACK lease does not own this event delivery');
       }
       return { replayed: true, state: toState(row) };
     }
-    if (row.lease_token !== safeLeaseToken) {
+    if (row.claim_epoch !== safeClaimEpoch || row.lease_token !== safeLeaseToken) {
       throw domainError('LEASE_FENCED', 'ACK lease does not own this event delivery');
     }
     if (row.lease_expires_at <= current) {
@@ -434,12 +573,13 @@ export function openEventSubscriptions({
       UPDATE assistant_event_deliveries
       SET status = 'acknowledged', acknowledged_at = ?, updated_at = ?, last_error = NULL
       WHERE consumer_id = ? AND event_row_id = ? AND status = 'processing'
-        AND lease_token = ? AND lease_expires_at > ?
+        AND claim_epoch = ? AND lease_token = ? AND lease_expires_at > ?
     `).run(
       current,
       current,
       safeConsumerId,
       row.event_row_id,
+      safeClaimEpoch,
       safeLeaseToken,
       current,
     );
@@ -450,12 +590,14 @@ export function openEventSubscriptions({
   const failTransaction = database.transaction(({
     consumerId,
     eventId,
+    claimEpoch,
     leaseToken,
     error,
     retryDelaySeconds,
   }) => {
     const safeConsumerId = requireText(consumerId, 'consumerId');
     const safeEventId = requireText(eventId, 'eventId');
+    const safeClaimEpoch = requireClaimEpoch(claimEpoch);
     const safeLeaseToken = requireText(leaseToken, 'leaseToken');
     const safeError = requireText(error, 'error');
     if (!Number.isSafeInteger(retryDelaySeconds) || retryDelaySeconds < 0) {
@@ -465,26 +607,31 @@ export function openEventSubscriptions({
     requireActiveConsumer(safeConsumerId, current);
     const row = selectState.get(safeConsumerId, safeEventId);
     if (!row) throw domainError('EVENT_DELIVERY_NOT_FOUND', 'consumer event delivery does not exist');
-    if (row.lease_token !== safeLeaseToken) {
+    if (row.claim_epoch !== safeClaimEpoch || row.lease_token !== safeLeaseToken) {
       throw domainError('LEASE_FENCED', 'failure lease does not own this event delivery');
     }
     if (row.status !== 'processing' || row.lease_expires_at <= current) {
       throw domainError('LEASE_EXPIRED', 'failure lease is no longer active');
     }
-    database.prepare(`
+    const updated = database.prepare(`
       UPDATE assistant_event_deliveries
       SET status = 'pending', retry_count = retry_count + 1,
           available_at = ?, lease_owner = NULL, lease_token = NULL,
           lease_expires_at = NULL, last_error = ?, updated_at = ?
-      WHERE consumer_id = ? AND event_row_id = ? AND lease_token = ?
+      WHERE consumer_id = ? AND event_row_id = ?
+        AND status = 'processing' AND claim_epoch = ? AND lease_token = ?
     `).run(
       current + retryDelaySeconds,
       safeError,
       current,
       safeConsumerId,
       row.event_row_id,
+      safeClaimEpoch,
       safeLeaseToken,
     );
+    if (updated.changes !== 1) {
+      throw domainError('LEASE_CONFLICT', 'failure update lost its lease fence');
+    }
     return toState(selectState.get(safeConsumerId, safeEventId));
   });
 
