@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.25] - 2026-09-02
+
+### Fixed
+- Stop inferring that a Codex assistant request was abandoned merely because
+  the activity monitor reports sustained idle; Codex has no lifecycle fence
+  that makes idle a safe completion signal.
+- Require request-scoped Codex turns to terminalize explicitly through
+  `c4-send`, using `[SKIP]` for an intentionally silent outcome.
+
 ## [0.7.2-rc.24] - 2026-09-02
 
 ### Fixed
