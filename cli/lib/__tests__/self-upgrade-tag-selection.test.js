@@ -163,7 +163,7 @@ describe('self-upgrade tag selection', () => {
 
     assert.equal(result.success, true);
     assert.equal(result.hasUpdate, false);
-    assert.equal(result.current, '0.7.2-rc.24');
+    assert.equal(result.current, '0.7.2-rc.25');
     assert.equal(result.latest, '0.7.2-rc.22');
     assert.deepEqual(result.source, {
       repo: 'HeXiaobo/zylos-core',
