@@ -1102,6 +1102,13 @@ function detectCoreSkillChanges() {
   return results;
 }
 
+function formatSelfUpgradeSource(source) {
+  if (!source?.repo) return null;
+  const ref = source.ref || 'no selected ref';
+  const tag = source.tag || 'none';
+  return `Source: ${source.repo} @ ${ref} (tag ${tag}; ${source.policy})`;
+}
+
 /**
  * Handle --self --check: check for zylos-core updates only (no lock needed).
  * Downloads new version to temp dir for file comparison by Claude.
@@ -1129,7 +1136,7 @@ function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
     // Download new version to temp dir (for template/file comparison by Claude)
     let dlResult;
     try {
-      dlResult = downloadCoreToTemp(check.latest, branch);
+      dlResult = downloadCoreToTemp(check.latest, branch, check.source);
     } catch (err) {
       dlResult = { success: false, error: err.message };
     }
@@ -1140,18 +1147,20 @@ function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
       const fullChangelog = readCoreChangelog(tempDir);
       changelog = filterChangelog(fullChangelog, check.current);
     } else {
-      // Fallback: fetch changelog from remote
-      try {
-        const rawChangelog = fetchRawFile(CORE_REPO, 'CHANGELOG.md', `v${check.latest}`);
-        changelog = filterChangelog(rawChangelog, check.current);
-      } catch {
-        try {
-          const rawChangelog = fetchRawFile(CORE_REPO, 'CHANGELOG.md');
-          changelog = filterChangelog(rawChangelog, check.current);
-        } catch {
-          // CHANGELOG.md may not exist
-        }
+      const failure = {
+        success: false,
+        error: 'self_upgrade_download_failed',
+        message: dlResult.error,
+        source: dlResult.source || check.source,
+      };
+      if (jsonOutput) {
+        const errOutput = { action: 'check', target: 'zylos-core', ...failure };
+        errOutput.reply = formatC4Reply('error', failure);
+        console.log(JSON.stringify(errOutput, null, 2));
+      } else {
+        console.error(`Error: ${failure.message}`);
       }
+      process.exit(1);
     }
   }
 
@@ -1171,8 +1180,10 @@ function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
   } else {
     if (!check.hasUpdate && !branch) {
       console.log(success(`${bold('zylos-core')} is up to date (v${check.current})`));
+      console.log(dim(formatSelfUpgradeSource(check.source)));
     } else {
       console.log(`${bold('zylos-core')}: ${dim(check.current)} → ${bold(check.latest)}`);
+      console.log(dim(formatSelfUpgradeSource(check.source)));
 
       if (allLocalChanges.length > 0) {
         console.log(`\n${warn('Local modifications:')}`);
@@ -1240,6 +1251,7 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
         console.log(JSON.stringify(output, null, 2));
       } else {
         console.log(success(`${bold('zylos-core')} is up to date (v${check.current})`));
+        console.log(dim(formatSelfUpgradeSource(check.source)));
       }
       return true;
     }
@@ -1253,17 +1265,23 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
 
     let dlResult;
     try {
-      dlResult = downloadCoreToTemp(check.latest, branch);
+      dlResult = downloadCoreToTemp(check.latest, branch, check.source);
     } catch (err) {
       dlResult = { success: false, error: err.message };
     }
     if (!dlResult.success) {
+      const failure = {
+        success: false,
+        error: 'self_upgrade_download_failed',
+        message: dlResult.error,
+        source: dlResult.source || check.source,
+      };
       if (jsonOutput) {
-        const errOutput = { action: 'self_upgrade', success: false, error: dlResult.error };
-        errOutput.reply = formatC4Reply('error', { message: dlResult.error });
+        const errOutput = { action: 'self_upgrade', ...failure };
+        errOutput.reply = formatC4Reply('error', failure);
         console.log(JSON.stringify(errOutput, null, 2));
       } else {
-        console.error(`Error: ${dlResult.error}`);
+        console.error(`Error: ${failure.message}`);
       }
       return false;
     }
@@ -1279,8 +1297,9 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
     if (!jsonOutput) {
       console.log(`\n${bold('zylos-core')}: ${dim(check.current)} → ${bold(check.latest)}`);
       const targetVersion = check.latest || (branch ? `branch:${branch}` : 'unknown');
-      const targetRef = branch ? `branch:${branch}` : `tag:v${check.latest}`;
+      const targetRef = check.source?.ref || (branch ? branch : 'no selected ref');
       console.log(dim(`Target package: ${targetVersion} (${targetRef})`));
+      console.log(dim(formatSelfUpgradeSource(check.source)));
 
       if (allLocalChanges.length > 0) {
         console.log(`\n${warn('LOCAL MODIFICATIONS DETECTED:')}`);

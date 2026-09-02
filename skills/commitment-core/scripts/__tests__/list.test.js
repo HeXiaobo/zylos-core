@@ -6,6 +6,18 @@ import test from 'node:test';
 
 import { openCommitmentCore } from '../core.js';
 
+const TEST_DIRECTORY_PREFIX = 'zylos-task-list-';
+
+function createTestDirectory() {
+  return mkdtempSync(path.join(os.tmpdir(), TEST_DIRECTORY_PREFIX));
+}
+
+function removeTestDirectory(directory) {
+  assert.equal(path.dirname(directory), os.tmpdir());
+  assert.equal(path.basename(directory).startsWith(TEST_DIRECTORY_PREFIX), true);
+  rmSync(directory, { recursive: true, force: true });
+}
+
 function createTask(core, sourceId, task) {
   return core.ingest({
     idempotencyKey: `source:${sourceId}`,
@@ -15,7 +27,7 @@ function createTask(core, sourceId, task) {
 }
 
 test('list query filters tasks and uses stable recently-updated ordering', () => {
-  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-list-'));
+  const directory = createTestDirectory();
   const taskIds = ['task-1', 'task-2', 'task-3'];
   const timestamps = [
     '2026-08-25T01:00:00.000Z',
@@ -68,14 +80,15 @@ test('list query filters tasks and uses stable recently-updated ordering', () =>
     assert.deepEqual(core.query({ limit: 1 }).map((task) => task.id), ['task-2']);
   } finally {
     core.close();
-    rmSync(directory, { recursive: true, force: true });
+    removeTestDirectory(directory);
   }
 });
 
 test('list query cursor walks beyond the bounded page without gaps or duplicates', () => {
+  const directory = createTestDirectory();
   let taskNumber = 0;
   const core = openCommitmentCore({
-    dbPath: ':memory:',
+    dbPath: path.join(directory, 'commitments.db'),
     idGenerator: () => `task-${String(++taskNumber).padStart(3, '0')}`,
     clock: () => '2026-08-25T10:00:00.000Z',
   });
@@ -100,11 +113,13 @@ test('list query cursor walks beyond the bounded page without gaps or duplicates
     );
   } finally {
     core.close();
+    removeTestDirectory(directory);
   }
 });
 
 test('task and list query modes are mutually exclusive and strictly validated', () => {
-  const core = openCommitmentCore({ dbPath: ':memory:' });
+  const directory = createTestDirectory();
+  const core = openCommitmentCore({ dbPath: path.join(directory, 'commitments.db') });
 
   try {
     const invalidQueries = [
@@ -133,13 +148,15 @@ test('task and list query modes are mutually exclusive and strictly validated', 
     }
   } finally {
     core.close();
+    removeTestDirectory(directory);
   }
 });
 
 test('list query defaults to at most fifty tasks', () => {
+  const directory = createTestDirectory();
   let taskNumber = 0;
   const core = openCommitmentCore({
-    dbPath: ':memory:',
+    dbPath: path.join(directory, 'commitments.db'),
     idGenerator: () => `task-${String(++taskNumber).padStart(3, '0')}`,
   });
 
@@ -151,5 +168,6 @@ test('list query defaults to at most fifty tasks', () => {
     assert.equal(core.query({ limit: 100 }).length, 55);
   } finally {
     core.close();
+    removeTestDirectory(directory);
   }
 });

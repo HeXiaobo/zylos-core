@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { openCommitmentCore } from '../core.js';
 import { mapExternalTaskEvent } from '../external-task-adapter.js';
 
 test('an external native-task completion submits for review and cannot accept the Task', () => {
+  const testPrefix = 'zylos-external-task-adapter-';
+  const directory = mkdtempSync(path.join(os.tmpdir(), testPrefix));
   let taskEvent = 0;
   const core = openCommitmentCore({
-    dbPath: ':memory:',
+    dbPath: path.join(directory, 'commitments.db'),
     clock: () => '2026-08-25T12:00:00.000Z',
     idGenerator: () => 'task-native-completion',
     eventIdGenerator: () => `task-event-${++taskEvent}`,
@@ -51,6 +56,9 @@ test('an external native-task completion submits for review and cannot accept th
     );
   } finally {
     core.close();
+    assert.equal(path.dirname(directory), os.tmpdir());
+    assert.equal(path.basename(directory).startsWith(testPrefix), true);
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { createTaskCommentCoordinator } from '../task-comment-coordinator.js';
 import { openCommitmentCore } from '../core.js';
 
 function createHarness() {
+  const testPrefix = 'zylos-task-comment-coordinator-';
+  const directory = mkdtempSync(path.join(os.tmpdir(), testPrefix));
   let taskId = 0;
   let eventId = 0;
   const core = openCommitmentCore({
-    dbPath: ':memory:',
+    dbPath: path.join(directory, 'commitments.db'),
     idGenerator: () => `task-${++taskId}`,
     eventIdGenerator: () => `task-event-${++eventId}`,
     conversationEventIdGenerator: () => `comment-event-${++eventId}`,
@@ -25,7 +30,16 @@ function createHarness() {
       assigneeId: 'agent:yueran',
     },
   });
-  return { core, task: created.task };
+  return {
+    core,
+    task: created.task,
+    cleanup() {
+      core.close();
+      assert.equal(path.dirname(directory), os.tmpdir());
+      assert.equal(path.basename(directory).startsWith(testPrefix), true);
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
 }
 
 test('comment coordinator records once and publishes a human-audience notification decision', async () => {
@@ -61,7 +75,7 @@ test('comment coordinator records once and publishes a human-audience notificati
     );
     assert.equal(publications[0].summary, 'Please confirm before Friday.');
   } finally {
-    harness.core.close();
+    harness.cleanup();
   }
 });
 
@@ -102,7 +116,7 @@ test('an Agent exact reply notifies only the original human commenter', async ()
       ['ou_requester'],
     );
   } finally {
-    harness.core.close();
+    harness.cleanup();
   }
 });
 
@@ -151,7 +165,7 @@ test('an Agent reply keeps the original commenter when an Adapter revised the pa
       ['ou_requester'],
     );
   } finally {
-    harness.core.close();
+    harness.cleanup();
   }
 });
 
@@ -205,7 +219,7 @@ test('an Agent reply waits for a late Add event instead of freezing a revision a
       ['ou_requester'],
     );
   } finally {
-    harness.core.close();
+    harness.cleanup();
   }
 });
 
@@ -250,7 +264,7 @@ test('a human comment notifies business and explicit subscribers but not its aut
       ['ou_owner', 'ou_acceptor', 'ou_stakeholder'],
     );
   } finally {
-    harness.core.close();
+    harness.cleanup();
   }
 });
 
@@ -290,7 +304,7 @@ test('comment replay republishes the persisted decision when subscribers changed
       ['ou_acceptor'],
     );
   } finally {
-    harness.core.close();
+    harness.cleanup();
   }
 });
 
@@ -341,6 +355,6 @@ test('an exact reply can target a commenter beyond the ordinary conversation que
       ['ou_late_requester'],
     );
   } finally {
-    harness.core.close();
+    harness.cleanup();
   }
 });

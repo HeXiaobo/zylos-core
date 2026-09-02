@@ -1,0 +1,1168 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+
+import Database from 'better-sqlite3';
+
+import { openReplyOutcomeTransactions } from '../reply-outcome.js';
+import { openRunLedger } from '../run-ledger.js';
+import { openRuntimePendingQueue } from '../runtime-pending-queue.js';
+
+function temporaryDatabase(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-reply-outcome-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return path.join(directory, 'c4.db');
+}
+
+function acceptMessage(id = 'answer', replyMode = 'required') {
+  return {
+    schemaVersion: 1,
+    type: 'AcceptMessage',
+    commandId: `command:${id}`,
+    idempotencyKey: `idempotency:${id}`,
+    traceId: `trace:${id}`,
+    causationId: `cause:${id}`,
+    issuedAt: '2026-09-01T00:00:00.000Z',
+    source: {
+      adapterId: 'feishu',
+      accountRef: 'account-1',
+      targetRef: `opaque:${id}`,
+      conversationKey: `lane:${id}`,
+      messageId: `message:${id}`,
+      eventId: `event:${id}`,
+      eventType: 'message',
+      payloadHash: `sha256:${'a'.repeat(64)}`,
+    },
+    actor: { provider: 'feishu', tenantRef: 'tenant-1', externalId: 'user-1' },
+    content: { kind: 'text', text: `content ${id}` },
+    contextHints: {
+      threadRef: null,
+      rootRef: null,
+      parentRef: null,
+      quoteRefs: [],
+      mentionRefs: [],
+      attachmentRefs: [],
+    },
+    reply: { mode: replyMode, targetRef: `opaque:${id}` },
+    policy: { priority: 2, requireIdle: false },
+  };
+}
+
+function startRun(ledger, queue, id = 'answer', replyMode = 'required') {
+  const accepted = ledger.accept(acceptMessage(id, replyMode)).request;
+  const claim = queue.claimNext();
+  return queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: accepted.requestId,
+    turnId: accepted.turnId,
+    generation: accepted.generation,
+    runtimeSessionId: `runtime:${id}`,
+  }).request;
+}
+
+function answerCommand(ledger, run, id, text = 'Stable answer.') {
+  return {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text } },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: `opaque:${id}` },
+      disposition: 'send',
+    },
+  };
+}
+
+function verifiedTaskEffect(command, overrides = {}) {
+  return {
+    canonical: true,
+    applied: true,
+    eventId: command.cause.eventId,
+    effectId: command.cause.eventId,
+    taskId: `task:${command.cause.eventId}`,
+    requestId: command.requestId,
+    traceId: command.traceId,
+    route: command.route,
+    disposition: command.disposition,
+    payload: command.payload,
+    ...overrides,
+  };
+}
+
+test('answer commits one canonical outcome, terminal and pending intent atomically', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue);
+
+  const committed = replies.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: {
+      kind: 'answer',
+      content: { format: 'text', text: 'The decision is approved.' },
+    },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: 'opaque:answer' },
+      disposition: 'send',
+    },
+  });
+
+  assert.equal(committed.replayed, false);
+  assert.equal(committed.outcome.type, 'ReplyOutcome');
+  assert.equal(committed.outcome.outcomeId, `outcome:${run.requestId}`);
+  assert.equal(committed.terminal.type, 'RunCompleted');
+  assert.deepEqual(committed.terminal.payload, { outcomeId: committed.outcome.outcomeId });
+  assert.equal(committed.intent.type, 'ReplyIntent');
+  assert.equal(committed.intent.cause.eventId, committed.terminal.eventId);
+  assert.match(committed.intent.intentId, new RegExp(`^reply:${run.requestId}:[a-f0-9]{64}$`));
+  assert.equal(committed.intent.idempotencyKey, committed.intent.intentId);
+  assert.match(committed.intent.contentHash, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(committed.delivery.state, 'pending');
+  assert.equal(ledger.get(run.requestId).status, 'completed');
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunStarted',
+    'RunCompleted',
+  ]);
+});
+
+test('required reply policy rejects a missing delivery decision before any terminal write', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'required-missing-reply');
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      requestId: run.requestId,
+      turnId: run.turnId,
+      generation: run.generation,
+      traceId: run.traceId,
+      causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${run.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Must be visible.' } },
+    }),
+    error => error?.code === 'REPLY_DECISION_REQUIRED',
+  );
+
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunStarted',
+  ]);
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.deepEqual(inspect.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM assistant_reply_outcomes WHERE request_id = ?) AS outcomes,
+      (SELECT COUNT(*) FROM assistant_reply_intents WHERE request_id = ?) AS intents
+  `).get(run.requestId, run.requestId), { outcomes: 0, intents: 0 });
+  inspect.close();
+});
+
+test('terminal identity must extend the current canonical event-chain head', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'terminal-chain-fence');
+  const head = ledger.listEvents(run.requestId).at(-1);
+  assert.equal(head.type, 'RunStarted');
+  const command = {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: head.eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Fenced answer.' } },
+    reply: { action: 'send', disposition: 'send' },
+  };
+
+  for (const mutation of [
+    { causationId: 'BOGUS_CAUSE' },
+    { producer: 'bogus-producer' },
+    { idempotencyKey: 'arbitrary-terminal-key' },
+  ]) {
+    assert.throws(
+      () => replies.commitRunOutcome({ ...command, ...mutation }),
+      error => error?.code === 'TERMINAL_IDENTITY_MISMATCH',
+    );
+  }
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunStarted',
+  ]);
+});
+
+test('terminal write atomically fences request.next_sequence against the canonical head', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  for (const [id, nextSequence] of [['sequence-gap', 10], ['sequence-rewind', 3]]) {
+    const run = startRun(ledger, queue, id);
+    const mutate = new Database(dbPath);
+    mutate.prepare(`UPDATE assistant_requests SET next_sequence = ? WHERE request_id = ?`)
+      .run(nextSequence, run.requestId);
+    mutate.close();
+    assert.throws(
+      () => replies.commitRunOutcome(answerCommand(ledger, run, id)),
+      error => error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
+    );
+    const inspect = new Database(dbPath, { readonly: true });
+    assert.deepEqual(inspect.prepare(`
+      SELECT
+        (SELECT status FROM assistant_run_ledger WHERE request_id = ?) AS status,
+        (SELECT COUNT(*) FROM assistant_reply_outcomes WHERE request_id = ?) AS outcomes,
+        (SELECT COUNT(*) FROM assistant_reply_intents WHERE request_id = ?) AS intents,
+        (SELECT COUNT(*) FROM assistant_response_events WHERE request_id = ? AND event_type = 'RunCompleted') AS terminals
+    `).get(run.requestId, run.requestId, run.requestId, run.requestId), {
+      status: 'active', outcomes: 0, intents: 0, terminals: 0,
+    });
+    inspect.close();
+    // Release the global WT01 admission so the second adversarial run can start.
+    if (id === 'sequence-gap') {
+      const cleanup = new Database(dbPath);
+      cleanup.prepare(`UPDATE runtime_turn_admissions SET status = 'completed' WHERE request_id = ?`).run(run.requestId);
+      cleanup.close();
+    }
+  }
+});
+
+test('terminal write binds RunAccepted and RunStarted to ledger and admission facts', (t) => {
+  for (const scenario of ['accepted-cause', 'started-session']) {
+    const dbPath = temporaryDatabase(t);
+    const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+    const run = startRun(ledger, queue, `ledger-link-${scenario}`);
+    const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+    const mutate = new Database(dbPath);
+    if (scenario === 'accepted-cause') {
+      mutate.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
+      mutate.prepare(`UPDATE assistant_response_events SET causation_id = 'attacker-cause' WHERE request_id = ? AND sequence = 1`)
+        .run(run.requestId);
+    } else {
+      mutate.prepare(`UPDATE runtime_turn_admissions SET runtime_session_id = 'runtime:attacker' WHERE request_id = ?`)
+        .run(run.requestId);
+    }
+    mutate.close();
+    assert.throws(
+      () => replies.commitRunOutcome(answerCommand(ledger, run, `ledger-link-${scenario}`)),
+      error => error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
+    );
+    const inspect = new Database(dbPath, { readonly: true });
+    assert.equal(inspect.prepare(`SELECT status FROM assistant_run_ledger WHERE request_id = ?`)
+      .get(run.requestId).status, 'active');
+    inspect.close();
+    replies.close();
+    queue.close();
+    ledger.close();
+  }
+});
+
+test('outcome and intent replay validate durable canonical bytes before returning', (t) => {
+  for (const target of ['outcome', 'intent']) {
+    const dbPath = temporaryDatabase(t);
+    const ledger = openRunLedger({ dbPath, clock: () => 100 });
+    const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+    const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+    const id = `replay-corrupt-${target}`;
+    const run = startRun(ledger, queue, id);
+    const command = answerCommand(ledger, run, id);
+    const committed = replies.commitRunOutcome(command);
+    const mutate = new Database(dbPath);
+    if (target === 'outcome') {
+      mutate.exec('DROP TRIGGER assistant_reply_outcomes_immutable');
+      mutate.prepare(`UPDATE assistant_reply_outcomes SET envelope_json = json_set(envelope_json, '$.content.text', 'attacker') WHERE request_id = ?`)
+        .run(run.requestId);
+    } else {
+      mutate.exec('DROP TRIGGER assistant_reply_intents_canonical_immutable');
+      mutate.prepare(`UPDATE assistant_reply_intents SET envelope_json = json_set(envelope_json, '$.payload.text', 'attacker') WHERE intent_id = ?`)
+        .run(committed.intent.intentId);
+    }
+    mutate.close();
+    assert.throws(
+      () => replies.commitRunOutcome(command),
+      error => error?.code === (target === 'outcome'
+        ? 'CANONICAL_REPLY_OUTCOME_CORRUPT'
+        : 'CANONICAL_REPLY_INTENT_CORRUPT'),
+    );
+    replies.close();
+    queue.close();
+    ledger.close();
+  }
+});
+
+test('malformed canonical-looking ProgressUpdated head cannot authorize a terminal write', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'malformed-progress-head');
+  const inject = new Database(dbPath);
+  inject.prepare(`
+    INSERT INTO assistant_response_events (
+      request_id, sequence, event_type, payload_json, idempotency_key,
+      delivery_status, available_at, created_at, event_id, turn_id,
+      generation, trace_id, causation_id, producer
+    ) VALUES (?, 4, 'ProgressUpdated', '{"stage":"working"}', ?,
+              'pending', 100, 100, ?, ?, ?, ?, 'BOGUS_PREDECESSOR_CAUSE', 'runtime:shared')
+  `).run(
+    run.requestId,
+    `run:${run.requestId}:progress:1`,
+    `evt:${run.requestId}:4`,
+    run.turnId,
+    run.generation,
+    run.traceId,
+  );
+  inject.prepare(`
+    UPDATE assistant_requests SET next_sequence = 5 WHERE request_id = ?
+  `).run(run.requestId);
+  inject.close();
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      requestId: run.requestId,
+      turnId: run.turnId,
+      generation: run.generation,
+      traceId: run.traceId,
+      causationId: `evt:${run.requestId}:4`,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${run.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Must not commit.' } },
+      reply: { action: 'send', disposition: 'send' },
+    }),
+    error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN',
+  );
+
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.deepEqual(inspect.prepare(`
+    SELECT
+      (SELECT status FROM assistant_run_ledger WHERE request_id = ?) AS status,
+      (SELECT COUNT(*) FROM assistant_reply_outcomes WHERE request_id = ?) AS outcomes,
+      (SELECT COUNT(*) FROM assistant_reply_intents WHERE request_id = ?) AS intents,
+      (SELECT COUNT(*) FROM assistant_response_events
+       WHERE request_id = ? AND event_type IN ('RunCompleted', 'RunFailed')) AS terminals
+  `).get(run.requestId, run.requestId, run.requestId, run.requestId), {
+    status: 'active',
+    outcomes: 0,
+    intents: 0,
+    terminals: 0,
+  });
+  inspect.close();
+});
+
+test('malformed RunStarted head cannot authorize a terminal write', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  const run = startRun(ledger, queue, 'malformed-started-head');
+  const inject = new Database(dbPath);
+  inject.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
+  inject.prepare(`
+    UPDATE assistant_response_events
+    SET payload_json = '{"runtimeLaneId":"runtime:shared"}'
+    WHERE request_id = ? AND sequence = 3
+  `).run(run.requestId);
+  inject.close();
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => replies.close());
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      requestId: run.requestId,
+      turnId: run.turnId,
+      generation: run.generation,
+      traceId: run.traceId,
+      causationId: `evt:${run.requestId}:3`,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${run.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Must not commit.' } },
+      reply: { action: 'send', disposition: 'send' },
+    }),
+    error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN',
+  );
+  assert.throws(
+    () => ledger.get(run.requestId),
+    error => error?.code === 'CANONICAL_RUN_LEDGER_CORRUPT',
+  );
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.equal(inspect.prepare(`SELECT status FROM assistant_run_ledger WHERE request_id = ?`)
+    .get(run.requestId).status, 'active');
+  inspect.close();
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunStarted',
+  ]);
+});
+
+test('canonical ProgressUpdated and OutputDelta heads can complete and replay', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'canonical-progress-delta');
+  const progress = ledger.appendEvent({
+    type: 'ProgressUpdated',
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: `evt:${run.requestId}:3`,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:progress:1`,
+    payload: { stage: 'working' },
+  }).event;
+  const delta = ledger.appendEvent({
+    type: 'OutputDelta',
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: progress.eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:delta:1`,
+    payload: { deltaIndex: 1, text: 'Draft output.' },
+  }).event;
+  const command = {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: delta.eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Final output.' } },
+    reply: { action: 'send', disposition: 'send' },
+  };
+
+  const committed = replies.commitRunOutcome(command);
+  const replay = replies.commitRunOutcome(command);
+  assert.equal(committed.replayed, false);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.terminal, committed.terminal);
+  assert.deepEqual(replay.intent, committed.intent);
+  assert.equal(ledger.get(run.requestId).status, 'completed');
+});
+
+test('canonical runtime recovery generation can start and complete', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  const ledger = openRunLedger({ dbPath, clock: () => now });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => now });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => now });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const accepted = ledger.accept(acceptMessage('canonical-recovery')).request;
+  queue.claimNext();
+  now = 200;
+  const recovered = queue.recoverStale({ staleBefore: 150 }).request;
+  const claim = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: recovered.requestId,
+    turnId: recovered.turnId,
+    generation: recovered.generation,
+    runtimeSessionId: 'runtime:canonical-recovery:g2',
+  }).request;
+  const committed = replies.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Recovered answer.' } },
+    reply: { action: 'send', disposition: 'send' },
+  });
+
+  assert.equal(committed.terminal.type, 'RunCompleted');
+  assert.equal(run.generation, accepted.generation + 1);
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunQueued',
+    'RunStarted',
+    'RunCompleted',
+  ]);
+});
+
+test('forged recovery generation lineage cannot authorize completion', (t) => {
+  const dbPath = temporaryDatabase(t);
+  let now = 100;
+  const ledger = openRunLedger({ dbPath, clock: () => now });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => now });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => now });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  ledger.accept(acceptMessage('forged-recovery'));
+  queue.claimNext();
+  now = 200;
+  const recovered = queue.recoverStale({ staleBefore: 150 }).request;
+  const claim = queue.claimNext();
+  const run = queue.confirmStarted({
+    admissionId: claim.admission.id,
+    requestId: recovered.requestId,
+    turnId: recovered.turnId,
+    generation: recovered.generation,
+    runtimeSessionId: 'runtime:forged-recovery:g2',
+  }).request;
+  const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER assistant_response_events_canonical_immutable');
+  mutate.prepare(`
+    UPDATE assistant_response_events
+    SET payload_json = json_set(payload_json, '$.recoveredFromTurnId', 'turn:attacker:99')
+    WHERE request_id = ? AND event_type = 'RunQueued' AND producer = 'core:runtime-recovery'
+  `).run(run.requestId);
+  mutate.close();
+
+  assert.throws(
+    () => replies.commitRunOutcome(answerCommand(ledger, run, 'forged-recovery')),
+    error => error?.code === 'NONCANONICAL_RUN_EVENT_CHAIN'
+      || error?.code === 'NONCANONICAL_RUN_PERSISTENCE',
+  );
+  assert.throws(
+    () => ledger.get(run.requestId),
+    error => error?.code === 'CANONICAL_RUN_LEDGER_CORRUPT',
+  );
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.equal(inspect.prepare(`
+    SELECT status FROM assistant_run_ledger WHERE request_id = ?
+  `).get(run.requestId).status, 'active');
+  inspect.close();
+});
+
+test('explicit silent completes execution without creating a ReplyIntent', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'silent');
+
+  const committed = replies.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: {
+      kind: 'silent',
+      explicit: true,
+      reason: 'no_user_visible_reply_required',
+    },
+    reply: { action: 'suppress' },
+  });
+
+  assert.equal(committed.outcome.kind, 'silent');
+  assert.equal(committed.terminal.type, 'RunCompleted');
+  assert.equal(committed.intent, null);
+  assert.equal(committed.delivery, null);
+  assert.equal(ledger.get(run.requestId).status, 'completed');
+});
+
+test('durable optional and none policies require an explicit permitted decision', (t) => {
+  const optionalDb = temporaryDatabase(t);
+  const optionalLedger = openRunLedger({ dbPath: optionalDb, clock: () => 100 });
+  const optionalQueue = openRuntimePendingQueue({ dbPath: optionalDb, clock: () => 100 });
+  const optionalReplies = openReplyOutcomeTransactions({ dbPath: optionalDb, clock: () => 101 });
+  t.after(() => optionalLedger.close());
+  t.after(() => optionalQueue.close());
+  t.after(() => optionalReplies.close());
+  const optionalRun = startRun(optionalLedger, optionalQueue, 'optional', 'optional');
+  assert.deepEqual(optionalLedger.get(optionalRun.requestId).replyPolicy, {
+    mode: 'optional',
+    route: { adapterId: 'feishu', targetRef: 'opaque:optional' },
+  });
+  const optionalCommitted = optionalReplies.commitRunOutcome({
+    requestId: optionalRun.requestId,
+    turnId: optionalRun.turnId,
+    generation: optionalRun.generation,
+    traceId: optionalRun.traceId,
+    causationId: optionalLedger.listEvents(optionalRun.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${optionalRun.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Optional visible answer.' } },
+    reply: { action: 'send', disposition: 'send' },
+  });
+  assert.equal(optionalCommitted.intent.route.targetRef, 'opaque:optional');
+
+  const noneDb = temporaryDatabase(t);
+  const noneLedger = openRunLedger({ dbPath: noneDb, clock: () => 100 });
+  const noneQueue = openRuntimePendingQueue({ dbPath: noneDb, clock: () => 100 });
+  const noneReplies = openReplyOutcomeTransactions({ dbPath: noneDb, clock: () => 101 });
+  t.after(() => noneLedger.close());
+  t.after(() => noneQueue.close());
+  t.after(() => noneReplies.close());
+  const noneRun = startRun(noneLedger, noneQueue, 'none', 'none');
+  const noneBase = {
+    requestId: noneRun.requestId,
+    turnId: noneRun.turnId,
+    generation: noneRun.generation,
+    traceId: noneRun.traceId,
+    causationId: noneLedger.listEvents(noneRun.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${noneRun.requestId}:completed`,
+  };
+  assert.throws(
+    () => noneReplies.commitRunOutcome({
+      ...noneBase,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Forbidden answer.' } },
+      reply: { action: 'send', disposition: 'send' },
+    }),
+    error => error?.code === 'REPLY_POLICY_VIOLATION',
+  );
+  assert.equal(noneLedger.get(noneRun.requestId).status, 'active');
+  const noneCommitted = noneReplies.commitRunOutcome({
+    ...noneBase,
+    outcome: { kind: 'silent', explicit: true, reason: 'reply_policy_none' },
+    reply: { action: 'suppress' },
+  });
+  assert.equal(noneCommitted.intent, null);
+  assert.equal(noneLedger.get(noneRun.requestId).status, 'completed');
+});
+
+test('stored reply route fences visible Outcome callers', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'route-fence');
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      requestId: run.requestId,
+      turnId: run.turnId,
+      generation: run.generation,
+      traceId: run.traceId,
+      causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${run.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Wrong route.' } },
+      reply: {
+        action: 'send',
+        route: { adapterId: 'feishu', targetRef: 'opaque:another-target' },
+        disposition: 'send',
+      },
+    }),
+    error => error?.code === 'REPLY_ROUTE_MISMATCH',
+  );
+  assert.equal(ledger.get(run.requestId).status, 'active');
+});
+
+test('failure writes RunFailed and a failure_notice intent without changing delivery to accepted', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'failure');
+
+  const committed = replies.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:failed`,
+    outcome: { kind: 'failure', code: 'RUNTIME_FAILURE', retryable: true },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: 'opaque:failure' },
+      disposition: 'failure_notice',
+      payload: { format: 'text', text: 'The assistant could not complete this request.' },
+    },
+  });
+
+  assert.equal(committed.terminal.type, 'RunFailed');
+  assert.deepEqual(committed.terminal.payload, {
+    outcomeId: committed.outcome.outcomeId,
+    code: 'RUNTIME_FAILURE',
+    retryable: true,
+  });
+  assert.equal(committed.intent.disposition, 'failure_notice');
+  assert.equal(committed.delivery.state, 'pending');
+  assert.equal(ledger.get(run.requestId).status, 'failed');
+});
+
+test('empty answers, implicit silence and media without a durable content reference fail closed', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'invalid-output');
+  const base = {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+  };
+
+  for (const outcome of [
+    { kind: 'answer', content: { format: 'text', text: '' } },
+    { kind: 'answer', content: { format: 'text', text: '   ' } },
+    { kind: 'answer', content: { format: 'media' } },
+  ]) {
+    assert.throws(
+      () => replies.commitRunOutcome({ ...base, outcome }),
+      error => error?.code === 'MISSING_OUTPUT' || error instanceof TypeError,
+    );
+  }
+  assert.throws(
+    () => replies.commitRunOutcome({
+      ...base,
+      outcome: { kind: 'silent', reason: 'implicit-is-not-valid' },
+    }),
+    error => error?.code === 'SILENT_NOT_EXPLICIT',
+  );
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.equal(ledger.listEvents(run.requestId).length, 3);
+});
+
+test('commitRunOutcome rejects unknown v1 command, outcome, content, reply and route fields', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'strict-run-outcome');
+  const command = answerCommand(ledger, run, 'strict-run-outcome');
+  for (const mutation of [
+    { ...command, attacker: true },
+    { ...command, outcome: { ...command.outcome, attacker: true } },
+    { ...command, outcome: { ...command.outcome, content: { ...command.outcome.content, attacker: true } } },
+    { ...command, reply: { ...command.reply, attacker: true } },
+    { ...command, reply: { ...command.reply, route: { ...command.reply.route, attacker: true } } },
+  ]) {
+    assert.throws(
+      () => replies.commitRunOutcome(mutation),
+      error => error?.code === 'NONCANONICAL_V1_SHAPE',
+    );
+  }
+  assert.equal(ledger.get(run.requestId).status, 'active');
+});
+
+test('answer intent payload cannot diverge from its canonical ReplyOutcome content', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'answer-payload-link');
+  const command = answerCommand(ledger, run, 'answer-payload-link');
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      ...command,
+      reply: {
+        ...command.reply,
+        payload: { format: 'text', text: 'Different visible bytes.' },
+      },
+    }),
+    error => error?.code === 'REPLY_PAYLOAD_MISMATCH',
+  );
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.equal(ledger.listEvents(run.requestId).length, 3);
+});
+
+test('outcome, terminal and intent replay safely as one identity and conflict on any payload change', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'replay');
+  const command = {
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Stable answer.' } },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: 'opaque:replay' },
+      disposition: 'send',
+    },
+  };
+
+  const first = replies.commitRunOutcome(command);
+  const replay = replies.commitRunOutcome(command);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.outcome, first.outcome);
+  assert.deepEqual(replay.terminal, first.terminal);
+  assert.deepEqual(replay.intent, first.intent);
+  assert.equal(ledger.listEvents(run.requestId).length, 4);
+
+  assert.throws(
+    () => replies.commitRunOutcome({
+      ...command,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'Changed answer.' } },
+    }),
+    error => error?.code === 'IDEMPOTENCY_CONFLICT',
+  );
+  assert.throws(
+    () => replies.commitRunOutcome({
+      ...command,
+      reply: { ...command.reply, route: { ...command.reply.route, targetRef: 'opaque:other' } },
+    }),
+    error => error?.code === 'REPLY_ROUTE_MISMATCH',
+  );
+  assert.throws(
+    () => replies.commitRunOutcome({ ...command, causationId: 'evt:changed-cause' }),
+    error => error?.code === 'IDEMPOTENCY_CONFLICT',
+  );
+  assert.throws(
+    () => replies.commitRunOutcome({ ...command, producer: 'runtime:changed' }),
+    error => error?.code === 'IDEMPOTENCY_CONFLICT',
+  );
+});
+
+test('a storage failure after outcome and terminal inserts rolls the whole transaction back', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const run = startRun(ledger, queue, 'rollback');
+  const fault = new Database(dbPath);
+  fault.exec(`
+    CREATE TRIGGER fail_reply_intent_insert
+    BEFORE INSERT ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'injected intent storage failure');
+    END;
+  `);
+  fault.close();
+
+  assert.throws(() => replies.commitRunOutcome({
+    requestId: run.requestId,
+    turnId: run.turnId,
+    generation: run.generation,
+    traceId: run.traceId,
+    causationId: ledger.listEvents(run.requestId).at(-1).eventId,
+    producer: 'runtime:shared',
+    idempotencyKey: `run:${run.requestId}:completed`,
+    outcome: { kind: 'answer', content: { format: 'text', text: 'Must roll back.' } },
+    reply: {
+      action: 'send',
+      route: { adapterId: 'feishu', targetRef: 'opaque:rollback' },
+      disposition: 'send',
+    },
+  }), /injected intent storage failure/);
+
+  assert.equal(ledger.get(run.requestId).status, 'active');
+  assert.deepEqual(ledger.listEvents(run.requestId).map(event => event.type), [
+    'RunAccepted',
+    'RunQueued',
+    'RunStarted',
+  ]);
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.equal(inspect.prepare(`
+    SELECT COUNT(*) AS count FROM assistant_reply_outcomes WHERE request_id = ?
+  `).get(run.requestId).count, 0);
+  assert.equal(inspect.prepare(`
+    SELECT COUNT(*) AS count FROM assistant_reply_intents WHERE request_id = ?
+  `).get(run.requestId).count, 0);
+  inspect.close();
+});
+
+test('task_receipt accepts only a task_effect cause and replays by canonical identity', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  let taskEffect = null;
+  const replies = openReplyOutcomeTransactions({
+    dbPath,
+    clock: () => 101,
+    taskEffectVerifier: () => taskEffect,
+  });
+  t.after(() => ledger.close());
+  t.after(() => replies.close());
+  const run = ledger.accept(acceptMessage('task-receipt')).request;
+  const command = {
+    requestId: run.requestId,
+    traceId: run.traceId,
+    cause: { kind: 'task_effect', eventId: 'task-effect-applied-001' },
+    route: { adapterId: 'feishu', targetRef: 'opaque:task-receipt' },
+    disposition: 'task_receipt',
+    payload: { format: 'text', text: 'Task created.' },
+  };
+
+  const unverifiedReplies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  assert.throws(
+    () => unverifiedReplies.commitTaskReceipt(command),
+    error => error?.code === 'TASK_EFFECT_VERIFICATION_REQUIRED',
+  );
+  unverifiedReplies.close();
+  assert.throws(
+    () => replies.commitTaskReceipt(command),
+    error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
+  );
+  taskEffect = verifiedTaskEffect(command, { applied: false });
+  assert.throws(
+    () => replies.commitTaskReceipt(command),
+    error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
+  );
+  taskEffect = verifiedTaskEffect(command, { requestId: 'request:wrong' });
+  assert.throws(
+    () => replies.commitTaskReceipt(command),
+    error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
+  );
+  taskEffect = verifiedTaskEffect(command, { traceId: 'trace:wrong' });
+  assert.throws(
+    () => replies.commitTaskReceipt(command),
+    error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
+  );
+  for (const mismatch of [
+    { effectId: 'effect:wrong' },
+    { route: { adapterId: 'feishu', targetRef: 'opaque:wrong' } },
+    { disposition: 'send' },
+    { payload: { format: 'text', text: 'Wrong durable effect payload.' } },
+  ]) {
+    taskEffect = verifiedTaskEffect(command, mismatch);
+    assert.throws(
+      () => replies.commitTaskReceipt(command),
+      error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
+    );
+  }
+  taskEffect = verifiedTaskEffect(command, { canonical: false });
+  assert.throws(
+    () => replies.commitTaskReceipt(command),
+    error => error?.code === 'TASK_EFFECT_NOT_VERIFIED',
+  );
+  taskEffect = verifiedTaskEffect(command);
+  const first = replies.commitTaskReceipt(command);
+  taskEffect = null;
+  const replay = replies.commitTaskReceipt(command);
+  assert.equal(first.replayed, false);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.intent, first.intent);
+  const offlineReplay = openReplyOutcomeTransactions({ dbPath, clock: () => 102 });
+  try {
+    const durableReplay = offlineReplay.commitTaskReceipt(command);
+    assert.equal(durableReplay.replayed, true);
+    assert.deepEqual(durableReplay.intent, first.intent);
+  } finally {
+    offlineReplay.close();
+  }
+  assert.equal(first.intent.cause.kind, 'task_effect');
+  assert.match(first.intent.intentId, /^reply:task-effect-applied-001:[a-f0-9]{64}$/);
+  assert.equal(first.delivery.state, 'pending');
+  assert.equal(ledger.get(run.requestId).status, 'queued');
+
+  assert.throws(
+    () => replies.commitTaskReceipt({
+      ...command,
+      cause: { kind: 'run_terminal', eventId: 'evt:wrong' },
+    }),
+    error => error?.code === 'INVALID_REPLY_CAUSE',
+  );
+  assert.throws(
+    () => replies.commitTaskReceipt({
+      ...command,
+      payload: { format: 'text', text: 'Changed receipt.' },
+    }),
+    error => error?.code === 'IDEMPOTENCY_CONFLICT',
+  );
+});
+
+test('task_receipt durable replay fails closed when its stored intent is corrupt', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const run = ledger.accept(acceptMessage('task-receipt-corrupt')).request;
+  const command = {
+    requestId: run.requestId,
+    traceId: run.traceId,
+    cause: { kind: 'task_effect', eventId: 'task-effect-corrupt-001' },
+    route: { adapterId: 'feishu', targetRef: 'opaque:task-receipt-corrupt' },
+    disposition: 'task_receipt',
+    payload: { format: 'text', text: 'Task created.' },
+  };
+  const replies = openReplyOutcomeTransactions({
+    dbPath,
+    clock: () => 101,
+    taskEffectVerifier: () => verifiedTaskEffect(command),
+  });
+  const first = replies.commitTaskReceipt(command);
+  const mutate = new Database(dbPath);
+  mutate.exec('DROP TRIGGER assistant_reply_intents_canonical_immutable');
+  mutate.prepare(`UPDATE assistant_reply_intents SET cause_event_id = 'task-effect-attacker' WHERE intent_id = ?`)
+    .run(first.intent.intentId);
+  mutate.close();
+  assert.throws(
+    () => replies.commitTaskReceipt(command),
+    error => error?.code === 'CANONICAL_REPLY_INTENT_CORRUPT',
+  );
+  replies.close();
+  ledger.close();
+});
+
+test('commitTaskReceipt rejects unknown v1 command, cause, route and payload fields', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const run = ledger.accept(acceptMessage('strict-task-receipt')).request;
+  const command = {
+    requestId: run.requestId,
+    traceId: run.traceId,
+    cause: { kind: 'task_effect', eventId: 'task-effect-strict-001' },
+    route: { adapterId: 'feishu', targetRef: 'opaque:strict-task-receipt' },
+    disposition: 'task_receipt',
+    payload: { format: 'text', text: 'Task created.' },
+  };
+  const replies = openReplyOutcomeTransactions({
+    dbPath,
+    clock: () => 101,
+    taskEffectVerifier: () => verifiedTaskEffect(command),
+  });
+  t.after(() => replies.close());
+  t.after(() => ledger.close());
+  for (const mutation of [
+    { ...command, attacker: true },
+    { ...command, cause: { ...command.cause, attacker: true } },
+    { ...command, route: { ...command.route, attacker: true } },
+    { ...command, payload: { ...command.payload, attacker: true } },
+  ]) {
+    assert.throws(
+      () => replies.commitTaskReceipt(mutation),
+      error => error?.code === 'NONCANONICAL_V1_SHAPE',
+    );
+  }
+});
+
+test('stale generation is fenced and RunCancelled never gains an Outcome or Intent', (t) => {
+  const dbPath = temporaryDatabase(t);
+  const ledger = openRunLedger({ dbPath, clock: () => 100 });
+  const queue = openRuntimePendingQueue({ dbPath, clock: () => 100 });
+  const replies = openReplyOutcomeTransactions({ dbPath, clock: () => 101 });
+  t.after(() => ledger.close());
+  t.after(() => queue.close());
+  t.after(() => replies.close());
+  const cancelled = ledger.accept(acceptMessage('cancelled')).request;
+  ledger.cancel({
+    schemaVersion: 1,
+    type: 'CancelRequest',
+    commandId: 'cancel:cancelled',
+    idempotencyKey: `cancel:${cancelled.requestId}:g${cancelled.generation}`,
+    requestId: cancelled.requestId,
+    turnId: cancelled.turnId,
+    generation: cancelled.generation,
+    traceId: cancelled.traceId,
+    causationId: 'cancel-event',
+    issuedAt: '2026-09-01T00:00:10.000Z',
+    source: {
+      adapterId: 'feishu',
+      accountRef: 'account-1',
+      eventType: 'message',
+      eventId: 'cancel-event',
+      messageId: 'cancel-message',
+    },
+    actor: {
+      provider: 'feishu',
+      tenantRef: 'tenant-1',
+      externalId: 'user-1',
+      provenance: 'verified_channel_actor',
+    },
+    mode: 'cooperative',
+    reason: 'user_requested',
+  });
+  const terminal = ledger.listEvents(cancelled.requestId).at(-1);
+  assert.equal(terminal.type, 'RunCancelled');
+  assert.throws(
+    () => replies.commitRunOutcome({
+      requestId: cancelled.requestId,
+      turnId: cancelled.turnId,
+      generation: cancelled.generation + 1,
+      traceId: cancelled.traceId,
+      causationId: terminal.eventId,
+      producer: 'runtime:shared',
+      idempotencyKey: `run:${cancelled.requestId}:completed`,
+      outcome: { kind: 'answer', content: { format: 'text', text: 'late answer' } },
+      reply: {
+        action: 'send',
+        route: { adapterId: 'feishu', targetRef: 'opaque:cancelled' },
+        disposition: 'send',
+      },
+    }),
+    error => error?.code === 'RUN_EVENT_FENCED',
+  );
+  const inspect = new Database(dbPath, { readonly: true });
+  assert.equal(inspect.prepare(`
+    SELECT COUNT(*) AS count FROM assistant_reply_outcomes WHERE request_id = ?
+  `).get(cancelled.requestId).count, 0);
+  assert.equal(inspect.prepare(`
+    SELECT COUNT(*) AS count FROM assistant_reply_intents WHERE request_id = ?
+  `).get(cancelled.requestId).count, 0);
+  inspect.close();
+});

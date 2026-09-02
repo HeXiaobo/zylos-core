@@ -100,6 +100,131 @@ function getColumnNames(database, tableName) {
   return new Set(database.prepare(`PRAGMA table_info(${tableName})`).all().map((column) => column.name));
 }
 
+function replaceCanonicalEventImmutabilityTriggers(database) {
+  const replace = database.transaction(() => database.exec(`
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_id_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_rowid_immutable;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_no_delete;
+    DROP TRIGGER IF EXISTS assistant_response_events_canonical_no_replace;
+    DROP TRIGGER IF EXISTS assistant_response_events_no_legacy_promotion;
+
+    CREATE TRIGGER assistant_response_events_canonical_immutable
+    BEFORE UPDATE OF
+      id, request_id, sequence, event_type, payload_json, idempotency_key,
+      event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_canonical_id_immutable
+    BEFORE UPDATE OF id ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_canonical_rowid_immutable
+    BEFORE UPDATE OF rowid ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_canonical_no_delete
+    BEFORE DELETE ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+
+    CREATE TRIGGER assistant_response_events_canonical_no_replace
+    BEFORE INSERT ON assistant_response_events
+    WHEN NEW.event_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM assistant_response_events AS existing
+      WHERE existing.event_id = NEW.event_id
+         OR (existing.request_id = NEW.request_id AND existing.sequence = NEW.sequence)
+         OR (NEW.idempotency_key IS NOT NULL
+             AND existing.request_id = NEW.request_id
+             AND existing.idempotency_key = NEW.idempotency_key)
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER assistant_response_events_no_legacy_promotion
+    BEFORE UPDATE OF event_id ON assistant_response_events
+    WHEN OLD.event_id IS NULL AND NEW.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'legacy assistant event cannot be promoted to canonical');
+    END;
+  `));
+  replace.immediate();
+}
+
+function ensureAssistantRequestsCancelledStatus(database) {
+  const definition = database.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'assistant_requests'
+  `).get()?.sql;
+  if (!definition || definition.includes("'cancelled'")) return;
+  const foreignKeysEnabled = database.pragma('foreign_keys', { simple: true }) === 1;
+  database.pragma('foreign_keys = OFF');
+  try {
+    const migrate = database.transaction(() => database.exec(`
+      CREATE TABLE assistant_requests_v2 (
+        request_id TEXT PRIMARY KEY,
+        conversation_id INTEGER UNIQUE,
+        route_channel TEXT NOT NULL,
+        route_endpoint TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        status TEXT NOT NULL
+          CHECK (status IN ('queued', 'started', 'completed', 'failed', 'cancelled')),
+        runtime_session_id TEXT,
+        next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
+        output_text TEXT NOT NULL DEFAULT '',
+        accepted_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        terminal_at INTEGER,
+        FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+      );
+
+      INSERT INTO assistant_requests_v2 (
+        request_id, conversation_id, route_channel, route_endpoint, source_id,
+        status, runtime_session_id, next_sequence, output_text,
+        accepted_at, updated_at, terminal_at
+      )
+      SELECT
+        request_id, conversation_id, route_channel, route_endpoint, source_id,
+        CASE
+          WHEN status = 'failed' AND EXISTS (
+            SELECT 1 FROM assistant_response_events AS event
+            WHERE event.request_id = assistant_requests.request_id
+              AND event.event_type = 'RunCancelled'
+          ) THEN 'cancelled'
+          ELSE status
+        END,
+        runtime_session_id, next_sequence, output_text,
+        accepted_at, updated_at, terminal_at
+      FROM assistant_requests;
+
+      DROP TABLE assistant_requests;
+      ALTER TABLE assistant_requests_v2 RENAME TO assistant_requests;
+      CREATE INDEX idx_assistant_requests_status_time
+        ON assistant_requests(status, accepted_at, request_id);
+      CREATE INDEX idx_assistant_requests_runtime
+        ON assistant_requests(runtime_session_id, status, updated_at);
+      CREATE INDEX idx_assistant_requests_route
+        ON assistant_requests(route_channel, route_endpoint, status, updated_at);
+    `));
+    migrate.immediate();
+  } finally {
+    if (foreignKeysEnabled) database.pragma('foreign_keys = ON');
+  }
+}
+
 function ensureConversationsSchema(database) {
   const columnNames = getColumnNames(database, 'conversations');
   if (!columnNames.has('delivery_action')) {
@@ -198,7 +323,7 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       route_endpoint TEXT NOT NULL,
       source_id TEXT NOT NULL,
       status TEXT NOT NULL
-        CHECK (status IN ('queued', 'started', 'completed', 'failed')),
+        CHECK (status IN ('queued', 'started', 'completed', 'failed', 'cancelled')),
       runtime_session_id TEXT,
       next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
       output_text TEXT NOT NULL DEFAULT '',
@@ -312,6 +437,8 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       ON assistant_final_output_candidates(request_id, id);
   `);
 
+  ensureAssistantRequestsCancelledStatus(database);
+
   const eventColumns = getColumnNames(database, 'assistant_response_events');
   if (!eventColumns.has('redrive_count')) {
     database.exec(`
@@ -406,6 +533,679 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
     SET lifecycle_observed_at_ms = ?
     WHERE status IN ('submitted', 'started') AND lifecycle_observed_at_ms IS NULL
   `).run(migrationObservedAtMs);
+}
+
+/**
+ * Additive storage for the Assistant Reply v1 Run Ledger.  The canonical
+ * request and event rows remain in assistant_requests and
+ * assistant_response_events; this schema only adds the identities, lane
+ * ordering, runtime fencing, and cancellation facts that those legacy tables
+ * cannot represent.
+ */
+export function ensureAssistantRunLedgerSchema(database, options = {}) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      direction TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      endpoint_id TEXT,
+      content TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      delivery_action TEXT,
+      priority INTEGER DEFAULT 3,
+      require_idle INTEGER DEFAULT 0,
+      retry_count INTEGER DEFAULT 0
+    )
+  `);
+  ensureAssistantResponseSchema(database, options);
+
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS assistant_run_ledger (
+      acceptance_order INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL UNIQUE,
+      conversation_lane_key TEXT NOT NULL,
+      lane_sequence INTEGER NOT NULL CHECK (lane_sequence >= 1),
+      payload_hash TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      causation_id TEXT NOT NULL,
+      request_class TEXT NOT NULL DEFAULT 'ordinary'
+        CHECK (request_class IN ('ordinary', 'maintenance', 'control')),
+      priority INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 3),
+      require_idle INTEGER NOT NULL DEFAULT 0 CHECK (require_idle IN (0, 1)),
+      reply_mode TEXT NOT NULL DEFAULT 'required'
+        CHECK (reply_mode IN ('required', 'optional', 'none')),
+      reply_route_json TEXT NOT NULL,
+      runtime_lane_id TEXT NOT NULL DEFAULT 'runtime:shared'
+        CHECK (runtime_lane_id = 'runtime:shared'),
+      turn_id TEXT NOT NULL,
+      generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+      status TEXT NOT NULL
+        CHECK (status IN (
+          'queued', 'active', 'cancel_requested',
+          'completed', 'failed', 'cancelled'
+        )),
+      accepted_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      terminal_at INTEGER,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+      UNIQUE (conversation_lane_key, lane_sequence)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_run_ledger_pending
+      ON assistant_run_ledger(status, priority, acceptance_order);
+    CREATE INDEX IF NOT EXISTS idx_assistant_run_ledger_lane
+      ON assistant_run_ledger(conversation_lane_key, lane_sequence, status);
+
+    CREATE TABLE IF NOT EXISTS assistant_source_receipts (
+      identity_kind TEXT NOT NULL
+        CHECK (identity_kind IN ('idempotency', 'transport', 'logical')),
+      identity_key TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (identity_kind, identity_key),
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_source_receipts_request
+      ON assistant_source_receipts(request_id);
+
+    CREATE TABLE IF NOT EXISTS assistant_cancel_requests (
+      idempotency_key TEXT PRIMARY KEY,
+      command_id TEXT,
+      request_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK (generation >= 1),
+      payload_hash TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      causation_id TEXT NOT NULL,
+      confirmation_causation_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('requested', 'confirmed')),
+      requested_at INTEGER NOT NULL,
+      confirmed_at INTEGER,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_cancel_requests_request
+      ON assistant_cancel_requests(request_id, generation);
+  `);
+
+  const cancelColumns = getColumnNames(database, 'assistant_cancel_requests');
+  if (!cancelColumns.has('command_id')) {
+    database.exec('ALTER TABLE assistant_cancel_requests ADD COLUMN command_id TEXT');
+  }
+  if (!cancelColumns.has('confirmation_causation_id')) {
+    database.exec(`
+      ALTER TABLE assistant_cancel_requests ADD COLUMN confirmation_causation_id TEXT
+    `);
+  }
+
+  const runLedgerColumns = getColumnNames(database, 'assistant_run_ledger');
+  if (!runLedgerColumns.has('reply_mode')) {
+    database.exec(`
+      ALTER TABLE assistant_run_ledger
+      ADD COLUMN reply_mode TEXT NOT NULL DEFAULT 'required'
+        CHECK (reply_mode IN ('required', 'optional', 'none'))
+    `);
+  }
+  if (!runLedgerColumns.has('reply_route_json')) {
+    database.exec('ALTER TABLE assistant_run_ledger ADD COLUMN reply_route_json TEXT');
+  }
+  database.prepare(`
+    UPDATE assistant_run_ledger
+    SET reply_route_json = json_object(
+      'adapterId', (
+        SELECT route_channel FROM assistant_requests
+        WHERE assistant_requests.request_id = assistant_run_ledger.request_id
+      ),
+      'targetRef', (
+        SELECT route_endpoint FROM assistant_requests
+        WHERE assistant_requests.request_id = assistant_run_ledger.request_id
+      )
+    )
+    WHERE reply_route_json IS NULL
+  `).run();
+
+  const eventColumns = getColumnNames(database, 'assistant_response_events');
+  const eventColumnDefinitions = {
+    event_id: 'TEXT',
+    turn_id: 'TEXT',
+    generation: 'INTEGER CHECK (generation IS NULL OR generation >= 1)',
+    trace_id: 'TEXT',
+    causation_id: 'TEXT',
+    producer: 'TEXT',
+  };
+  for (const [column, definition] of Object.entries(eventColumnDefinitions)) {
+    if (!eventColumns.has(column)) {
+      database.exec(`ALTER TABLE assistant_response_events ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_response_events_event_id
+      ON assistant_response_events(event_id)
+      WHERE event_id IS NOT NULL;
+  `);
+
+  const admissionColumns = getColumnNames(database, 'runtime_turn_admissions');
+  const admissionColumnDefinitions = {
+    turn_id: 'TEXT',
+    generation: 'INTEGER CHECK (generation IS NULL OR generation >= 1)',
+    runtime_lane_id: 'TEXT CHECK (runtime_lane_id IS NULL OR runtime_lane_id = \'runtime:shared\')',
+  };
+  for (const [column, definition] of Object.entries(admissionColumnDefinitions)) {
+    if (!admissionColumns.has(column)) {
+      database.exec(`ALTER TABLE runtime_turn_admissions ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  replaceCanonicalEventImmutabilityTriggers(database);
+}
+
+/**
+ * Additive Core-owned storage for canonical reply outcomes and delivery facts.
+ * Adapter-local network attempts remain outside this database; these tables
+ * only hold the durable intent, adapter observations, and Core settlement.
+ */
+export function ensureAssistantReplyReliabilitySchema(database, options = {}) {
+  ensureAssistantRunLedgerSchema(database, options);
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS assistant_reply_outcomes (
+      outcome_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL UNIQUE,
+      turn_id TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK (generation >= 1),
+      trace_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('answer', 'silent', 'failure')),
+      envelope_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS assistant_reply_intents (
+      intent_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      cause_kind TEXT NOT NULL CHECK (cause_kind IN ('run_terminal', 'task_effect')),
+      cause_event_id TEXT NOT NULL,
+      route_json TEXT NOT NULL,
+      route_hash TEXT NOT NULL,
+      disposition TEXT NOT NULL
+        CHECK (disposition IN ('send', 'failure_notice', 'task_receipt')),
+      payload_json TEXT NOT NULL,
+      envelope_json TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      canonical_hash TEXT NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (delivery_state IN (
+          'pending', 'sending', 'reconcile_required', 'retrying',
+          'accepted', 'unpresentable'
+        )),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      current_attempt_id TEXT,
+      claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0),
+      lease_owner TEXT,
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      available_at INTEGER NOT NULL,
+      redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
+      delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
+      generation_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK (generation_attempt_count >= 0),
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_reply_intents_ready
+      ON assistant_reply_intents(delivery_state, available_at, created_at, intent_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_reply_intents_request
+      ON assistant_reply_intents(request_id, created_at, intent_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_reply_intents_run_terminal
+      ON assistant_reply_intents(cause_event_id)
+      WHERE cause_kind = 'run_terminal';
+
+    CREATE TABLE IF NOT EXISTS assistant_verified_task_effects (
+      event_id TEXT PRIMARY KEY,
+      effect_id TEXT NOT NULL UNIQUE,
+      task_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      route_json TEXT NOT NULL,
+      disposition TEXT NOT NULL CHECK (disposition = 'task_receipt'),
+      payload_json TEXT NOT NULL,
+      fact_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      applied_at INTEGER NOT NULL,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS assistant_delivery_receipts (
+      receipt_id TEXT PRIMARY KEY,
+      intent_id TEXT NOT NULL,
+      delivery_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      claim_action TEXT NOT NULL CHECK (claim_action IN ('send', 'reconcile')),
+      claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+      delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
+      lease_token TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      adapter_id TEXT NOT NULL,
+      outcome TEXT NOT NULL
+        CHECK (outcome IN ('platform_accepted', 'unknown', 'reconciled', 'rejected')),
+      envelope_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (intent_id) REFERENCES assistant_reply_intents(intent_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_delivery_receipts_intent
+      ON assistant_delivery_receipts(intent_id, created_at, receipt_id);
+
+    CREATE TABLE IF NOT EXISTS assistant_delivery_settlements (
+      settlement_id TEXT PRIMARY KEY,
+      intent_id TEXT NOT NULL,
+      delivery_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      adapter_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('accepted', 'unpresentable')),
+      basis TEXT NOT NULL CHECK (basis IN ('platform_accepted', 'reconciled', 'retry_exhausted')),
+      presented INTEGER NOT NULL CHECK (presented IN (0, 1)),
+      delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0),
+      envelope_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (intent_id) REFERENCES assistant_reply_intents(intent_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_delivery_settlements_intent
+      ON assistant_delivery_settlements(intent_id, created_at, settlement_id);
+    CREATE TABLE IF NOT EXISTS assistant_event_consumers (
+      consumer_id TEXT PRIMARY KEY,
+      bootstrap_mode TEXT NOT NULL DEFAULT 'canonical_cutover'
+        CHECK (bootstrap_mode = 'canonical_cutover'),
+      start_event_row_id INTEGER NOT NULL DEFAULT 1 CHECK (start_event_row_id >= 1),
+      cutover_event_row_id INTEGER NOT NULL DEFAULT 0 CHECK (cutover_event_row_id >= 0),
+      legacy_skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (legacy_skipped_count >= 0),
+      health_status TEXT NOT NULL DEFAULT 'active'
+        CHECK (health_status IN ('active', 'degraded')),
+      degraded_reason TEXT,
+      degraded_event_row_id INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS assistant_event_deliveries (
+      consumer_id TEXT NOT NULL,
+      event_row_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'acknowledged')),
+      retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0),
+      available_at INTEGER NOT NULL,
+      lease_owner TEXT,
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      acknowledged_at INTEGER,
+      event_fingerprint TEXT NOT NULL,
+      PRIMARY KEY (consumer_id, event_row_id),
+      FOREIGN KEY (consumer_id) REFERENCES assistant_event_consumers(consumer_id) ON DELETE RESTRICT,
+      FOREIGN KEY (event_row_id) REFERENCES assistant_response_events(id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_event_deliveries_ready
+      ON assistant_event_deliveries(consumer_id, status, available_at, event_row_id);
+    CREATE INDEX IF NOT EXISTS idx_assistant_event_deliveries_stream
+      ON assistant_event_deliveries(consumer_id, event_row_id, status);
+
+    CREATE TABLE IF NOT EXISTS assistant_event_stream_health (
+      consumer_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      health_status TEXT NOT NULL DEFAULT 'active'
+        CHECK (health_status IN ('active', 'degraded')),
+      degraded_reason TEXT,
+      degraded_event_row_id INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (consumer_id, request_id),
+      FOREIGN KEY (consumer_id) REFERENCES assistant_event_consumers(consumer_id) ON DELETE RESTRICT,
+      FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assistant_event_stream_health_status
+      ON assistant_event_stream_health(consumer_id, health_status, request_id);
+
+    CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_immutable
+    BEFORE UPDATE OF
+      id, request_id, sequence, event_type, payload_json, idempotency_key,
+      event_id, turn_id, generation, trace_id, causation_id, producer, created_at
+    ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_id_immutable
+    BEFORE UPDATE OF id ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_response_events_canonical_no_delete
+    BEFORE DELETE ON assistant_response_events
+    WHEN OLD.event_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical assistant event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_reply_outcomes_immutable
+    BEFORE UPDATE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS assistant_reply_outcomes_no_delete
+    BEFORE DELETE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+  `);
+
+  const intentColumns = getColumnNames(database, 'assistant_reply_intents');
+  const migratedUnfencedIntentLeases = !intentColumns.has('claim_epoch');
+  if (migratedUnfencedIntentLeases) {
+    database.exec(`
+      ALTER TABLE assistant_reply_intents
+      ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0)
+    `);
+    database.prepare(`
+      UPDATE assistant_reply_intents
+      SET claim_epoch = 1
+    `).run();
+    database.prepare(`
+      UPDATE assistant_reply_intents
+      SET delivery_state = CASE
+            WHEN delivery_state = 'sending' THEN 'reconcile_required'
+            ELSE delivery_state
+          END,
+          lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+          last_error = 'LEGACY_LEASE_EPOCH_UNPROVEN'
+      WHERE delivery_state IN ('sending', 'reconcile_required')
+        OR lease_token IS NOT NULL OR lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL
+    `).run();
+  }
+
+  if (!intentColumns.has('delivery_generation')) {
+    database.exec(`
+      ALTER TABLE assistant_reply_intents
+      ADD COLUMN delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0)
+    `);
+    database.exec(`
+      UPDATE assistant_reply_intents SET delivery_generation = redrive_count
+    `);
+  }
+  if (!intentColumns.has('generation_attempt_count')) {
+    database.exec(`
+      ALTER TABLE assistant_reply_intents
+      ADD COLUMN generation_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK (generation_attempt_count >= 0)
+    `);
+    database.exec(`
+      UPDATE assistant_reply_intents
+      SET generation_attempt_count = CASE
+        WHEN redrive_count = 0 THEN attempt_count
+        WHEN current_attempt_id IS NOT NULL THEN 1
+        ELSE 0
+      END
+    `);
+  }
+
+  const receiptColumns = getColumnNames(database, 'assistant_delivery_receipts');
+  const receiptColumnDefinitions = {
+    claim_action: "TEXT CHECK (claim_action IN ('send', 'reconcile'))",
+    claim_epoch: 'INTEGER CHECK (claim_epoch >= 1)',
+    delivery_generation: 'INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0)',
+    lease_token: 'TEXT',
+  };
+  for (const [column, definition] of Object.entries(receiptColumnDefinitions)) {
+    if (!receiptColumns.has(column)) {
+      database.exec(`ALTER TABLE assistant_delivery_receipts ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  if (!receiptColumns.has('delivery_generation')) {
+    const migrateReceiptGenerations = database.transaction(() => database.exec(`
+      DROP TRIGGER IF EXISTS assistant_delivery_receipts_immutable;
+      UPDATE assistant_delivery_receipts AS receipt
+      SET delivery_generation = COALESCE((
+        SELECT CASE
+          WHEN intent.redrive_count = 0 THEN 0
+          WHEN CAST(substr(
+            receipt.attempt_id,
+            length('attempt:delivery:' || receipt.intent_id) + 2
+          ) AS INTEGER) > COALESCE((
+            SELECT MAX(CAST(substr(
+              prior.attempt_id,
+              length('attempt:delivery:' || prior.intent_id) + 2
+            ) AS INTEGER))
+            FROM assistant_delivery_receipts AS prior
+            WHERE prior.intent_id = receipt.intent_id AND prior.outcome = 'rejected'
+          ), 0) THEN intent.redrive_count
+          ELSE 0
+        END
+        FROM assistant_reply_intents AS intent
+        WHERE intent.intent_id = receipt.intent_id
+      ), 0)
+      ;
+      CREATE TRIGGER assistant_delivery_receipts_immutable
+      BEFORE UPDATE ON assistant_delivery_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+      END;
+    `));
+    migrateReceiptGenerations.immediate();
+  }
+
+  const settlementColumns = getColumnNames(database, 'assistant_delivery_settlements');
+  if (!settlementColumns.has('delivery_generation')) {
+    database.exec(`
+      ALTER TABLE assistant_delivery_settlements
+      ADD COLUMN delivery_generation INTEGER NOT NULL DEFAULT 0 CHECK (delivery_generation >= 0)
+    `);
+  }
+  database.exec(`
+    DROP INDEX IF EXISTS idx_assistant_delivery_settlements_one_terminal;
+    CREATE UNIQUE INDEX idx_assistant_delivery_settlements_one_terminal
+      ON assistant_delivery_settlements(intent_id, delivery_generation);
+  `);
+
+  // Trigger definitions are deliberately replaced, rather than guarded by
+  // IF NOT EXISTS. Older databases may already have a trigger with the same
+  // name but a narrower protected-column set.
+  const replaceCanonicalImmutabilityTriggers = database.transaction(() => database.exec(`
+    DROP TRIGGER IF EXISTS assistant_reply_outcomes_immutable;
+    DROP TRIGGER IF EXISTS assistant_reply_outcomes_no_delete;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_immutable;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_no_delete;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_rowid_immutable;
+    DROP TRIGGER IF EXISTS assistant_reply_intents_canonical_no_replace;
+    DROP TRIGGER IF EXISTS assistant_verified_task_effects_immutable;
+    DROP TRIGGER IF EXISTS assistant_verified_task_effects_no_delete;
+    DROP TRIGGER IF EXISTS assistant_delivery_receipts_immutable;
+    DROP TRIGGER IF EXISTS assistant_delivery_receipts_no_delete;
+    DROP TRIGGER IF EXISTS assistant_delivery_settlements_immutable;
+    DROP TRIGGER IF EXISTS assistant_delivery_settlements_no_delete;
+    DROP TRIGGER IF EXISTS assistant_reply_outcomes_no_replace;
+    DROP TRIGGER IF EXISTS assistant_verified_task_effects_no_replace;
+    DROP TRIGGER IF EXISTS assistant_delivery_receipts_no_replace;
+    DROP TRIGGER IF EXISTS assistant_delivery_settlements_no_replace;
+
+    CREATE TRIGGER assistant_reply_outcomes_immutable
+    BEFORE UPDATE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_outcomes_no_delete
+    BEFORE DELETE ON assistant_reply_outcomes
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_outcomes_no_replace
+    BEFORE INSERT ON assistant_reply_outcomes
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_reply_outcomes
+      WHERE outcome_id = NEW.outcome_id OR request_id = NEW.request_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyOutcome is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_intents_canonical_immutable
+    BEFORE UPDATE OF
+      intent_id, request_id, trace_id, cause_kind, cause_event_id,
+      route_json, route_hash, disposition, payload_json, envelope_json,
+      content_hash, idempotency_key, canonical_hash, created_at
+    ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_intents_canonical_no_delete
+    BEFORE DELETE ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_intents_canonical_rowid_immutable
+    BEFORE UPDATE OF rowid ON assistant_reply_intents
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_reply_intents_canonical_no_replace
+    BEFORE INSERT ON assistant_reply_intents
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_reply_intents
+      WHERE intent_id = NEW.intent_id OR idempotency_key = NEW.idempotency_key
+        OR (NEW.cause_kind = 'run_terminal' AND cause_kind = 'run_terminal'
+            AND cause_event_id = NEW.cause_event_id)
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical ReplyIntent is immutable');
+    END;
+
+    CREATE TRIGGER assistant_verified_task_effects_immutable
+    BEFORE UPDATE ON assistant_verified_task_effects
+    BEGIN
+      SELECT RAISE(ABORT, 'verified TaskEffect fact is immutable');
+    END;
+
+    CREATE TRIGGER assistant_verified_task_effects_no_delete
+    BEFORE DELETE ON assistant_verified_task_effects
+    BEGIN
+      SELECT RAISE(ABORT, 'verified TaskEffect fact is immutable');
+    END;
+
+    CREATE TRIGGER assistant_verified_task_effects_no_replace
+    BEFORE INSERT ON assistant_verified_task_effects
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_verified_task_effects
+      WHERE event_id = NEW.event_id OR effect_id = NEW.effect_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'verified TaskEffect fact is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_receipts_immutable
+    BEFORE UPDATE ON assistant_delivery_receipts
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_receipts_no_delete
+    BEFORE DELETE ON assistant_delivery_receipts
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_receipts_no_replace
+    BEFORE INSERT ON assistant_delivery_receipts
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_delivery_receipts WHERE receipt_id = NEW.receipt_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliveryReceipt is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_settlements_immutable
+    BEFORE UPDATE ON assistant_delivery_settlements
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_settlements_no_delete
+    BEFORE DELETE ON assistant_delivery_settlements
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');
+    END;
+
+    CREATE TRIGGER assistant_delivery_settlements_no_replace
+    BEFORE INSERT ON assistant_delivery_settlements
+    WHEN EXISTS (
+      SELECT 1 FROM assistant_delivery_settlements
+      WHERE settlement_id = NEW.settlement_id
+         OR (intent_id = NEW.intent_id AND delivery_generation = NEW.delivery_generation)
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'canonical DeliverySettlement is immutable');
+    END;
+  `));
+  replaceCanonicalImmutabilityTriggers.immediate();
+
+  const consumerColumns = getColumnNames(database, 'assistant_event_consumers');
+  const migratedUnprovenConsumers = !consumerColumns.has('bootstrap_mode');
+  const consumerColumnDefinitions = {
+    bootstrap_mode: "TEXT NOT NULL DEFAULT 'canonical_cutover' CHECK (bootstrap_mode = 'canonical_cutover')",
+    start_event_row_id: 'INTEGER NOT NULL DEFAULT 1 CHECK (start_event_row_id >= 1)',
+    cutover_event_row_id: 'INTEGER NOT NULL DEFAULT 0 CHECK (cutover_event_row_id >= 0)',
+    legacy_skipped_count: 'INTEGER NOT NULL DEFAULT 0 CHECK (legacy_skipped_count >= 0)',
+    health_status: "TEXT NOT NULL DEFAULT 'active' CHECK (health_status IN ('active', 'degraded'))",
+    degraded_reason: 'TEXT',
+    degraded_event_row_id: 'INTEGER',
+  };
+  for (const [column, definition] of Object.entries(consumerColumnDefinitions)) {
+    if (!consumerColumns.has(column)) {
+      database.exec(`ALTER TABLE assistant_event_consumers ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  if (migratedUnprovenConsumers) {
+    database.prepare(`
+      UPDATE assistant_event_consumers
+      SET health_status = 'degraded',
+          degraded_reason = 'LEGACY_SUBSCRIPTION_STATE_UNPROVEN'
+    `).run();
+  }
+
+  const deliveryColumns = getColumnNames(database, 'assistant_event_deliveries');
+  if (!deliveryColumns.has('claim_epoch')) {
+    database.exec(`
+      ALTER TABLE assistant_event_deliveries
+      ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0)
+    `);
+  }
+  if (!deliveryColumns.has('event_fingerprint')) {
+    database.exec('ALTER TABLE assistant_event_deliveries ADD COLUMN event_fingerprint TEXT');
+  }
 }
 
 function toCommitmentIntakeView(row) {

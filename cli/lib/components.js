@@ -11,6 +11,7 @@ import { loadRegistry, loadLocalRegistry } from './registry.js';
 import { fetchLatestTag } from './github.js';
 import { inspectLocalSource, resolveLocalPath } from './download.js';
 import { recoverUpgradeMetadataTransactions } from './upgrade-metadata.js';
+import { FULL_COMMIT_SHA } from './component-repo-override.js';
 
 const loadedSnapshots = new WeakMap();
 
@@ -193,6 +194,7 @@ function resolveGitHubTarget({
     : (version ? { version, fetchError: null } : tryFetchLatestTag(repo));
   const resolvedVersion = tag.version;
   const ref = branch || resolvedVersion;
+  const refType = FULL_COMMIT_SHA.test(ref) ? 'commit' : (branch ? 'branch' : 'tag');
   return {
     name,
     repo,
@@ -203,7 +205,7 @@ function resolveGitHubTarget({
       type: 'github-release',
       repo,
       ref,
-      refType: branch ? 'branch' : 'tag',
+      refType,
     } : null,
     sourceLabel: `https://github.com/${repo}`,
     sourceHeading: 'Repository:',

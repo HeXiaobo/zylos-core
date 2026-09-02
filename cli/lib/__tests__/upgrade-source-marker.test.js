@@ -7,6 +7,13 @@ import test from 'node:test';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-upgrade-source-marker-'));
 process.env.ZYLOS_DIR = path.join(root, 'zylos');
+const fakeToolDir = path.join(root, 'fake-tools');
+fs.mkdirSync(fakeToolDir, { recursive: true });
+fs.writeFileSync(
+  path.join(fakeToolDir, 'pm2'),
+  '#!/bin/sh\nif [ "$1" = "jlist" ]; then printf "[]"; fi\n',
+  { mode: 0o755 },
+);
 
 const { runUpgrade } = await import(new URL('../upgrade.js', import.meta.url));
 const { detectChanges, generateManifest, saveMergeBaseline } = await import(new URL('../manifest.js', import.meta.url));
@@ -28,6 +35,9 @@ const REGISTRY_DRIVER = path.join(
   '..', '..', '..',
   'test', 'helpers', 'update-components-registry-driver.mjs',
 );
+// Source-marker transactions do not need external tools.  Keep this fixture
+// hermetic so it never inspects, stops, or otherwise depends on host PM2.
+const NO_EXTERNAL_UPGRADE_TOOLS = { pm2: null, npm: null };
 
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
@@ -63,6 +73,7 @@ test('an exact-ref upgrade commits a truthful source marker and preserves instal
       ref: sha,
       refType: 'commit',
     },
+    tools: NO_EXTERNAL_UPGRADE_TOOLS,
   });
 
   assert.equal(result.success, true);
@@ -157,6 +168,7 @@ test('a final baseline failure restores the previous source marker', () => {
         ref: '182d7b3ed55fd758981c8edc7ae923e3bc03614b',
         refType: 'commit',
       },
+      tools: NO_EXTERNAL_UPGRADE_TOOLS,
     });
   } finally {
     fs.renameSync = realRename;
@@ -350,6 +362,7 @@ test('a crash at the baseline commit point rolls source metadata forward on the 
     env: {
       ...process.env,
       ZYLOS_DIR: process.env.ZYLOS_DIR,
+      PATH: `${fakeToolDir}${path.delimiter}${process.env.PATH}`,
       ZYLOS_TEST_UPGRADE_SOURCE: JSON.stringify(source),
       ZYLOS_TEST_UPGRADE_REGISTRY_ENTRY: JSON.stringify(registryEntry),
     },
@@ -404,6 +417,7 @@ test('a crash before the baseline commit retains a fail-closed recovery journal'
     env: {
       ...process.env,
       ZYLOS_DIR: process.env.ZYLOS_DIR,
+      PATH: `${fakeToolDir}${path.delimiter}${process.env.PATH}`,
       ZYLOS_TEST_UPGRADE_SOURCE: JSON.stringify(source),
       ZYLOS_TEST_UPGRADE_REGISTRY_ENTRY: JSON.stringify(registryEntry),
       ZYLOS_TEST_UPGRADE_CRASH_POINT: 'before-baseline-rename',
@@ -483,6 +497,7 @@ test('a transient registry commit failure is journaled and recovered without rol
         installedAt,
       },
       registryEntry,
+      tools: NO_EXTERNAL_UPGRADE_TOOLS,
     });
   } finally {
     fs.renameSync = realRename;
@@ -726,6 +741,7 @@ test('invalid source provenance is rejected before backup or mutation', () => {
       ref: 'not-a-full-sha',
       refType: 'commit',
     },
+    tools: NO_EXTERNAL_UPGRADE_TOOLS,
   });
 
   assert.equal(result.success, false);
