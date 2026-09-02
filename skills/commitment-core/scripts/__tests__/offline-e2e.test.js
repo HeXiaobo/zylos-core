@@ -76,7 +76,7 @@ test('offline Feishu-shaped intake survives replay and closes only after human a
     assert.equal(replayedBeforeWorker.action, 'already_pending');
     assert.equal(fs.existsSync(coreDbPath), false, 'C4 intake must not depend on Core availability');
 
-    core = openCommitmentCore(coreOptions);
+    core = openCommitmentCore({ ...coreOptions, dbPath: coreDbPath });
     const intakeResult = runCommitmentIntakeWorkerOnce({
       dbPath: c4DbPath,
       core,
@@ -147,6 +147,8 @@ test('offline Feishu-shaped intake survives replay and closes only after human a
     );
   } finally {
     core?.close();
+    assert.equal(path.dirname(zylosDir), os.tmpdir());
+    assert.equal(path.basename(zylosDir).startsWith('zylos-task-offline-e2e-'), true);
     fs.rmSync(zylosDir, { recursive: true, force: true });
   }
 });

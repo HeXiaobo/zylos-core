@@ -6,6 +6,18 @@ import test from 'node:test';
 
 import { openCommitmentCore } from '../core.js';
 
+const CORE_TEST_PREFIXES = [
+  'zylos-commitment-core-',
+  'zylos-core-options-',
+  'zylos-commitment-path-',
+];
+
+function removeCoreTestDirectory(directory) {
+  assert.equal(path.dirname(directory), os.tmpdir());
+  assert.equal(CORE_TEST_PREFIXES.some(prefix => path.basename(directory).startsWith(prefix)), true);
+  rmSync(directory, { recursive: true, force: true });
+}
+
 function createHarness() {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-commitment-core-'));
   const core = openCommitmentCore({
@@ -18,7 +30,7 @@ function createHarness() {
     core,
     cleanup() {
       core.close();
-      rmSync(directory, { recursive: true, force: true });
+      removeCoreTestDirectory(directory);
     },
   };
 }
@@ -65,6 +77,34 @@ test('replaying one source creates exactly one ready task', () => {
     });
   } finally {
     harness.cleanup();
+  }
+});
+
+test('unknown constructor options fail before the default database path is touched', () => {
+  const testPrefix = 'zylos-core-options-';
+  const directory = mkdtempSync(path.join(os.tmpdir(), testPrefix));
+  const isolatedDefaultRoot = path.join(directory, 'must-not-be-created');
+  const previousZylosDir = process.env.ZYLOS_DIR;
+  let unexpectedCore;
+
+  process.env.ZYLOS_DIR = isolatedDefaultRoot;
+  try {
+    assert.throws(
+      () => {
+        unexpectedCore = openCommitmentCore({
+          dbPath: path.join(directory, 'explicit.db'),
+          database: ':memory:',
+        });
+      },
+      /unsupported Commitment Core option: database/,
+    );
+    assert.equal(existsSync(isolatedDefaultRoot), false);
+    assert.equal(existsSync(path.join(directory, 'explicit.db')), false);
+  } finally {
+    unexpectedCore?.close();
+    if (previousZylosDir === undefined) delete process.env.ZYLOS_DIR;
+    else process.env.ZYLOS_DIR = previousZylosDir;
+    removeCoreTestDirectory(directory);
   }
 });
 
@@ -227,6 +267,6 @@ test('the default database lives under ZYLOS_DIR when it is configured', async (
     else process.env.HOME = previousHome;
     if (previousZylosDir === undefined) delete process.env.ZYLOS_DIR;
     else process.env.ZYLOS_DIR = previousZylosDir;
-    rmSync(directory, { recursive: true, force: true });
+    removeCoreTestDirectory(directory);
   }
 });

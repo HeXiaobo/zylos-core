@@ -2,7 +2,12 @@ import { describe, test, expect, beforeEach, afterEach } from '@jest/globals';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { smartSync, formatMergeResult } from '../cli/lib/smart-merge.js';
+import {
+  formatMergeResult,
+  planSmartSync,
+  reifySmartSyncPlan,
+  smartSync,
+} from '../cli/lib/smart-merge.js';
 import { generateManifest, saveManifest, saveOriginals, saveMergeBaseline, loadManifest, hashFile } from '../cli/lib/manifest.js';
 
 let tmpRoot;
@@ -25,6 +30,23 @@ function fileExists(dir, relPath) {
   return fs.existsSync(path.join(dir, relPath));
 }
 
+function normalizePlan(plan) {
+  return Object.fromEntries(Object.entries(plan.changes).map(([action, changes]) => [
+    action,
+    changes.map(({ file }) => file).toSorted(),
+  ]));
+}
+
+function normalizeResult(result) {
+  return {
+    create: result.added.toSorted(),
+    update: [...result.overwritten, ...result.merged].toSorted(),
+    delete: result.deleted.toSorted(),
+    preserve: [...result.kept, ...result.preserved].toSorted(),
+    conflict: result.conflicts.map(({ file }) => file).toSorted(),
+  };
+}
+
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-test-'));
 });
@@ -34,6 +56,480 @@ afterEach(() => {
 });
 
 describe('smartSync', () => {
+  test('dry-run plan matches reify changes for a 459-file references upgrade', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const backupDir = mkTmp();
+
+    writeFile(dest, 'stable.js', 'stable');
+    writeFile(dest, 'updated.js', 'old');
+    writeFile(dest, 'kept.js', 'base');
+    writeFile(dest, 'conflict.js', 'base\n');
+    writeFile(dest, 'merged.js', 'first\nmiddle\nlast\n');
+    for (let index = 0; index < 459; index += 1) {
+      writeFile(dest, `references/generated-${index}.md`, `reference ${index}\n`);
+    }
+    saveManifest(dest, generateManifest(dest));
+    saveOriginals(dest, dest);
+
+    writeFile(dest, 'kept.js', 'local');
+    writeFile(dest, 'conflict.js', 'local\n');
+    writeFile(dest, 'merged.js', 'first local\nmiddle\nlast\n');
+    writeFile(dest, 'user-added.md', 'user');
+
+    writeFile(src, 'stable.js', 'stable');
+    writeFile(src, 'updated.js', 'new');
+    writeFile(src, 'kept.js', 'base');
+    writeFile(src, 'conflict.js', 'upstream\n');
+    writeFile(src, 'merged.js', 'first\nmiddle\nlast upstream\n');
+    writeFile(src, 'created.js', 'created');
+
+    const plan = planSmartSync(src, dest, { backupDir });
+    const result = smartSync(src, dest, { backupDir });
+    const actual = normalizeResult(result);
+    const predicted = normalizePlan(plan);
+
+    expect(plan.errors).toEqual([]);
+    expect(predicted).toEqual(actual);
+    expect(predicted.delete).toHaveLength(459);
+    expect(result.merged).toEqual(['merged.js']);
+    expect(Object.values(plan.changes).flat().every(({ certainty, reason }) =>
+      certainty === 'exact' && typeof reason === 'string' && reason.length > 0
+    )).toBe(true);
+    expect(readFile(dest, 'user-added.md')).toBe('user');
+  });
+
+  test('dry-run plan matches reify when the baseline manifest is missing', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+
+    writeFile(dest, 'collision.js', 'local');
+    writeFile(dest, 'user-added.js', 'user');
+    writeFile(src, 'collision.js', 'incoming');
+    writeFile(src, 'created.js', 'created');
+
+    const beforePlan = generateManifest(dest);
+    const plan = planSmartSync(src, dest);
+    expect(generateManifest(dest).files).toEqual(beforePlan.files);
+
+    const result = smartSync(src, dest);
+    expect(normalizePlan(plan)).toEqual(normalizeResult(result));
+    expect(normalizePlan(plan)).toEqual({
+      create: ['created.js'],
+      update: ['collision.js'],
+      delete: [],
+      preserve: [],
+      conflict: [],
+    });
+    expect(readFile(dest, 'user-added.js')).toBe('user');
+  });
+
+  test('overwrite plan matches reify without merge-mode preservation', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const backupDir = mkTmp();
+
+    writeFile(dest, 'changed.js', 'base');
+    writeFile(dest, 'removed.js', 'base');
+    saveManifest(dest, generateManifest(dest));
+    saveOriginals(dest, dest);
+    writeFile(dest, 'changed.js', 'local');
+    writeFile(dest, 'removed.js', 'local');
+    writeFile(src, 'changed.js', 'upstream');
+
+    const plan = planSmartSync(src, dest, { mode: 'overwrite', backupDir });
+    const result = smartSync(src, dest, { mode: 'overwrite', backupDir });
+
+    expect(normalizePlan(plan)).toEqual(normalizeResult(result));
+    expect(normalizePlan(plan)).toEqual({
+      create: [],
+      update: ['changed.js'],
+      delete: ['removed.js'],
+      preserve: [],
+      conflict: [],
+    });
+  });
+
+  test('plan and reify stay in parity after committing and repeating the same upgrade', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const backupDir = mkTmp();
+
+    writeFile(dest, 'stable.js', 'stable');
+    writeFile(dest, 'removed.js', 'base');
+    writeFile(dest, 'preserved.js', 'base');
+    saveManifest(dest, generateManifest(dest));
+    saveOriginals(dest, dest);
+    writeFile(dest, 'preserved.js', 'local');
+    writeFile(src, 'stable.js', 'stable');
+
+    const firstPlan = planSmartSync(src, dest, { backupDir });
+    const firstResult = smartSync(src, dest, { backupDir });
+    expect(normalizePlan(firstPlan)).toEqual(normalizeResult(firstResult));
+    saveMergeBaseline(dest, src, firstResult.nextManifest);
+
+    const secondPlan = planSmartSync(src, dest, { backupDir });
+    const secondResult = smartSync(src, dest, { backupDir });
+    expect(normalizePlan(secondPlan)).toEqual(normalizeResult(secondResult));
+    expect(normalizePlan(secondPlan)).toEqual({
+      create: [], update: [], delete: [], preserve: [], conflict: [],
+    });
+    expect(readFile(dest, 'preserved.js')).toBe('local');
+  });
+
+  test('an outer rollback restores the same exact plan for a retry', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const backupDir = mkTmp();
+    const rollbackSnapshot = mkTmp();
+
+    writeFile(dest, 'updated.js', 'old');
+    writeFile(dest, 'removed.js', 'base');
+    saveManifest(dest, generateManifest(dest));
+    saveOriginals(dest, dest);
+    writeFile(dest, 'local-only.js', 'user');
+    writeFile(src, 'updated.js', 'new');
+    writeFile(src, 'created.js', 'created');
+    fs.cpSync(dest, rollbackSnapshot, { recursive: true });
+
+    const beforeRollback = planSmartSync(src, dest, { backupDir });
+    const applied = smartSync(src, dest, { backupDir });
+    expect(normalizePlan(beforeRollback)).toEqual(normalizeResult(applied));
+
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.cpSync(rollbackSnapshot, dest, { recursive: true });
+
+    const afterRollback = planSmartSync(src, dest, { backupDir });
+    expect(normalizePlan(afterRollback)).toEqual(normalizePlan(beforeRollback));
+    expect(Object.values(afterRollback.changes).flat()).toEqual(
+      Object.values(beforeRollback.changes).flat(),
+    );
+    expect(readFile(dest, 'local-only.js')).toBe('user');
+  });
+
+  test('dry-run leaves recovery residue untouched while execute keeps supported recovery semantics', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+
+    writeFile(dest, 'stable.js', 'stable');
+    saveManifest(dest, generateManifest(dest));
+    saveOriginals(dest, dest);
+    writeFile(dest, '.zylos/manifest.json.tmp', '{"files":{"bogus.js":"deadbeef"}}');
+    writeFile(dest, '.zylos/originals.new/bogus.js', 'staged');
+    writeFile(src, 'stable.js', 'stable');
+
+    const plan = planSmartSync(src, dest);
+    expect(plan.errors).toEqual([
+      'baseline recovery required before exact planning: manifest.json.tmp, originals.new',
+    ]);
+    expect(fileExists(dest, '.zylos/manifest.json.tmp')).toBe(true);
+    expect(fileExists(dest, '.zylos/originals.new/bogus.js')).toBe(true);
+
+    const result = smartSync(src, dest);
+    expect(result.errors).toEqual([]);
+    expect(fileExists(dest, '.zylos/manifest.json.tmp')).toBe(false);
+    expect(fileExists(dest, '.zylos/originals.new')).toBe(false);
+    expect(normalizeResult(result)).toEqual({
+      create: [], update: [], delete: [], preserve: [], conflict: [],
+    });
+  });
+
+  test('symlink collisions and manifest traversal fail closed without changing external files', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const outside = path.join(tmpRoot, 'outside.txt');
+
+    fs.writeFileSync(outside, 'outside');
+    writeFile(dest, 'linked.js', 'base');
+    saveManifest(dest, generateManifest(dest));
+    fs.unlinkSync(path.join(dest, 'linked.js'));
+    fs.symlinkSync(outside, path.join(dest, 'linked.js'));
+    writeFile(src, 'linked.js', 'incoming');
+
+    const symlinkPlan = planSmartSync(src, dest);
+    const symlinkResult = smartSync(src, dest);
+    expect(symlinkPlan.errors).toEqual([
+      'linked.js: destination path is a symlink',
+    ]);
+    expect(symlinkResult.errors).toEqual(symlinkPlan.errors);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('outside');
+
+    fs.unlinkSync(path.join(dest, 'linked.js'));
+    writeFile(dest, 'safe.js', 'safe');
+    saveManifest(dest, {
+      files: { '../outside.txt': hashFile(outside) },
+      generated_at: new Date().toISOString(),
+    });
+    fs.rmSync(src, { recursive: true, force: true });
+    fs.mkdirSync(src, { recursive: true });
+
+    const traversalPlan = planSmartSync(src, dest);
+    const traversalResult = smartSync(src, dest);
+    expect(traversalPlan.errors).toEqual(['../outside.txt: unsafe path in saved manifest']);
+    expect(traversalResult.errors).toEqual(traversalPlan.errors);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('outside');
+
+    const externalDir = path.join(tmpRoot, 'external-dir');
+    fs.mkdirSync(externalDir);
+    fs.symlinkSync(externalDir, path.join(dest, 'nested'));
+    writeFile(src, 'nested/created.js', 'incoming');
+    const nestedSymlinkPlan = planSmartSync(src, dest);
+    const nestedSymlinkResult = smartSync(src, dest);
+    expect(nestedSymlinkPlan.errors).toContain('nested: destination path is a symlink');
+    expect(nestedSymlinkResult.errors).toEqual(nestedSymlinkPlan.errors);
+    expect(fs.existsSync(path.join(externalDir, 'created.js'))).toBe(false);
+  });
+
+  test('a dangling destination symlink fails closed without creating its external target', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalDir = path.join(tmpRoot, 'dangling-external');
+    const externalTarget = path.join(externalDir, 'created.js');
+
+    fs.mkdirSync(externalDir);
+    fs.symlinkSync(externalTarget, path.join(dest, 'new.js'));
+    writeFile(src, 'new.js', 'INCOMING');
+
+    const plan = planSmartSync(src, dest);
+    const result = smartSync(src, dest);
+
+    expect(plan.errors).toEqual([
+      'new.js: destination path is a symlink',
+    ]);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(externalTarget)).toBe(false);
+    expect(fs.lstatSync(path.join(dest, 'new.js')).isSymbolicLink()).toBe(true);
+  });
+
+  test('an unrelated destination symlink is not silently omitted from safety checks', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalTarget = path.join(tmpRoot, 'unrelated-external.js');
+
+    fs.symlinkSync(externalTarget, path.join(dest, 'user-link.js'));
+    writeFile(src, 'safe.js', 'SAFE');
+
+    const plan = planSmartSync(src, dest);
+    const result = smartSync(src, dest);
+
+    expect(plan.errors).toEqual(['user-link.js: destination path is a symlink']);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(path.join(dest, 'safe.js'))).toBe(false);
+    expect(fs.existsSync(externalTarget)).toBe(false);
+  });
+
+  test('execute rejects a symlinked baseline directory before recovery can mutate it', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalMetadata = path.join(tmpRoot, 'external-metadata');
+
+    writeFile(src, 'safe.js', 'SAFE');
+    fs.mkdirSync(path.join(externalMetadata, 'originals.new'), { recursive: true });
+    fs.writeFileSync(path.join(externalMetadata, 'manifest.json.tmp'), '{}');
+    fs.writeFileSync(path.join(externalMetadata, 'originals.new', 'marker.js'), 'EXTERNAL');
+    fs.symlinkSync(externalMetadata, path.join(dest, '.zylos'));
+
+    const plan = planSmartSync(src, dest);
+    const result = smartSync(src, dest);
+
+    expect(plan.errors).toEqual(['.zylos: destination path is a symlink']);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(path.join(externalMetadata, 'manifest.json.tmp'))).toBe(true);
+    expect(readFile(externalMetadata, 'originals.new/marker.js')).toBe('EXTERNAL');
+    expect(fs.existsSync(path.join(dest, 'safe.js'))).toBe(false);
+  });
+
+  test('a source file symlink is reported instead of silently omitted from the plan', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalFile = path.join(tmpRoot, 'source-external.js');
+
+    fs.writeFileSync(externalFile, 'EXTERNAL');
+    fs.symlinkSync(externalFile, path.join(src, 'linked.js'));
+    writeFile(dest, '.zylos/manifest.json.tmp', '{}');
+    writeFile(dest, '.zylos/originals.new/marker.js', 'BASELINE');
+
+    const plan = planSmartSync(src, dest);
+    const result = smartSync(src, dest);
+
+    expect(plan.errors).toEqual(['linked.js: source path is a symlink']);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(path.join(dest, 'linked.js'))).toBe(false);
+    expect(fs.readFileSync(externalFile, 'utf8')).toBe('EXTERNAL');
+    expect(fileExists(dest, '.zylos/manifest.json.tmp')).toBe(true);
+    expect(readFile(dest, '.zylos/originals.new/marker.js')).toBe('BASELINE');
+  });
+
+  test('a source directory symlink is reported without traversing its external tree', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalDir = path.join(tmpRoot, 'source-external-dir');
+
+    fs.mkdirSync(externalDir);
+    fs.writeFileSync(path.join(externalDir, 'payload.js'), 'EXTERNAL');
+    fs.symlinkSync(externalDir, path.join(src, 'linked-dir'));
+
+    const plan = planSmartSync(src, dest);
+    const result = smartSync(src, dest);
+
+    expect(plan.errors).toEqual(['linked-dir: source path is a symlink']);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(path.join(dest, 'linked-dir'))).toBe(false);
+    expect(fs.readFileSync(path.join(externalDir, 'payload.js'), 'utf8')).toBe('EXTERNAL');
+  });
+
+  test('a source root symlink fails closed before manifest generation', () => {
+    const realSource = mkTmp();
+    const sourceLink = path.join(tmpRoot, 'source-root-link');
+    const dest = mkTmp();
+
+    writeFile(realSource, 'payload.js', 'EXTERNAL');
+    fs.symlinkSync(realSource, sourceLink);
+
+    const plan = planSmartSync(sourceLink, dest);
+    const result = smartSync(sourceLink, dest);
+
+    expect(plan.errors).toEqual([`source root is a symlink: ${sourceLink}`]);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(path.join(dest, 'payload.js'))).toBe(false);
+  });
+
+  test('a destination root symlink fails closed without writing through it', () => {
+    const src = mkTmp();
+    const realDestination = mkTmp();
+    const destinationLink = path.join(tmpRoot, 'destination-root-link');
+
+    writeFile(src, 'new.js', 'INCOMING');
+    fs.symlinkSync(realDestination, destinationLink);
+
+    const plan = planSmartSync(src, destinationLink);
+    const result = smartSync(src, destinationLink);
+
+    expect(plan.errors).toEqual([
+      `destination root is a symlink: ${destinationLink}`,
+    ]);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(path.join(realDestination, 'new.js'))).toBe(false);
+  });
+
+  test('a dangling destination root symlink is rejected without materializing its target', () => {
+    const src = mkTmp();
+    const destinationLink = path.join(tmpRoot, 'dangling-destination-root');
+    const externalTarget = path.join(tmpRoot, 'missing-destination-root');
+
+    writeFile(src, 'new.js', 'INCOMING');
+    fs.symlinkSync(externalTarget, destinationLink);
+
+    const plan = planSmartSync(src, destinationLink);
+    const result = smartSync(src, destinationLink);
+
+    expect(plan.errors).toEqual([
+      `destination root is a symlink: ${destinationLink}`,
+    ]);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(externalTarget)).toBe(false);
+    expect(fs.lstatSync(destinationLink).isSymbolicLink()).toBe(true);
+  });
+
+  test('a dangling destination symlink chain is detected in parent components', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalRoot = path.join(tmpRoot, 'missing-chain-target');
+
+    fs.symlinkSync(externalRoot, path.join(dest, 'hop'));
+    fs.symlinkSync('hop', path.join(dest, 'linked'));
+    writeFile(src, 'linked/new.js', 'INCOMING');
+
+    const plan = planSmartSync(src, dest);
+    const result = smartSync(src, dest);
+
+    expect(plan.errors).toEqual([
+      'hop: destination path is a symlink',
+      'linked: destination path is a symlink',
+    ]);
+    expect(result.errors).toEqual(plan.errors);
+    expect(fs.existsSync(externalRoot)).toBe(false);
+  });
+
+  test('reifier rejects a destination leaf replaced by a symlink after planning', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalDir = path.join(tmpRoot, 'toctou-external');
+    const externalTarget = path.join(externalDir, 'created.js');
+
+    fs.mkdirSync(externalDir);
+    writeFile(src, 'new.js', 'INCOMING');
+    const plan = planSmartSync(src, dest);
+    expect(plan.errors).toEqual([]);
+
+    fs.symlinkSync(externalTarget, path.join(dest, 'new.js'));
+    const result = reifySmartSyncPlan(plan);
+
+    expect(result.errors).toEqual([
+      'new.js: destination path is a symlink',
+    ]);
+    expect(fs.existsSync(externalTarget)).toBe(false);
+    expect(fs.lstatSync(path.join(dest, 'new.js')).isSymbolicLink()).toBe(true);
+  });
+
+  test('reifier rejects a destination root replaced by a symlink after planning', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const parkedDestination = path.join(tmpRoot, 'parked-destination');
+    const externalDestination = mkTmp();
+
+    writeFile(src, 'new.js', 'INCOMING');
+    const plan = planSmartSync(src, dest);
+    expect(plan.errors).toEqual([]);
+
+    fs.renameSync(dest, parkedDestination);
+    fs.symlinkSync(externalDestination, dest);
+    const result = reifySmartSyncPlan(plan);
+
+    expect(result.errors).toEqual([`destination root is a symlink: ${dest}`]);
+    expect(fs.existsSync(path.join(externalDestination, 'new.js'))).toBe(false);
+  });
+
+  test('reifier rejects a source root replaced by a symlink after planning', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const parkedSource = path.join(tmpRoot, 'parked-source');
+    const externalSource = mkTmp();
+
+    writeFile(src, 'new.js', 'INCOMING');
+    writeFile(externalSource, 'new.js', 'EXTERNAL');
+    const plan = planSmartSync(src, dest);
+    expect(plan.errors).toEqual([]);
+
+    fs.renameSync(src, parkedSource);
+    fs.symlinkSync(externalSource, src);
+    const result = reifySmartSyncPlan(plan);
+
+    expect(result.errors).toEqual([`source root is a symlink: ${src}`]);
+    expect(fs.existsSync(path.join(dest, 'new.js'))).toBe(false);
+    expect(readFile(externalSource, 'new.js')).toBe('EXTERNAL');
+  });
+
+  test('reifier rejects a destination parent replaced by a symlink chain after planning', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const externalRoot = path.join(tmpRoot, 'toctou-chain-target');
+
+    writeFile(src, 'nested/new.js', 'INCOMING');
+    const plan = planSmartSync(src, dest);
+    expect(plan.errors).toEqual([]);
+
+    fs.symlinkSync(externalRoot, path.join(dest, 'hop'));
+    fs.symlinkSync('hop', path.join(dest, 'nested'));
+    const result = reifySmartSyncPlan(plan);
+
+    expect(result.errors).toEqual([
+      'hop: destination path is a symlink',
+      'nested: destination path is a symlink',
+    ]);
+    expect(fs.existsSync(externalRoot)).toBe(false);
+  });
+
   test('new file: added to dest', () => {
     const src = mkTmp();
     const dest = mkTmp();

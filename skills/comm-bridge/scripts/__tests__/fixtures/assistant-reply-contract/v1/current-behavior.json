@@ -1,0 +1,105 @@
+{
+  "schema": "zylos.assistant-reply-current-behavior/v1",
+  "verifiedAt": "2026-09-01",
+  "verifiedAgainst": "0b0d6c86e80f42df6abf7e8d177f97601835317e",
+  "current": {
+    "tables": [
+      "assistant_requests",
+      "assistant_response_events",
+      "runtime_turn_admissions",
+      "assistant_final_output_candidates"
+    ],
+    "commands": [
+      "AcceptAssistantRequest",
+      "AppendOutputDelta",
+      "AppendPublicReasoningDelta",
+      "AppendRuntimeOutputDelta",
+      "AppendRuntimePublicReasoningDelta",
+      "BeginNextRun",
+      "BindNextRun",
+      "BindRun",
+      "BindTurn",
+      "CompleteRun",
+      "CompleteRuntimeRun",
+      "ExpireStaleRuns",
+      "FailRun",
+      "InvalidateFinalOutputCandidate",
+      "MarkFinalOutputCandidate",
+      "RecoverIdleRun",
+      "ReportProgress",
+      "ReportRequestToolProgress",
+      "ReportToolProgress",
+      "StartRun"
+    ],
+    "eventTypes": [
+      "AssistantRequestAccepted",
+      "RunQueued",
+      "RunStarted",
+      "ProgressUpdated",
+      "PublicReasoningDelta",
+      "OutputDelta",
+      "RunCompleted",
+      "RunFailed"
+    ],
+    "satisfies": [
+      "one singleton-key runtime admission can be active",
+      "request events receive monotonic per-request sequence values",
+      "one completed or failed terminal is replayed idempotently",
+      "trusted inbound wakes safely replay equal payload and reject changed payload",
+      "[SKIP] compatibility input suppresses the outbound conversation row"
+    ],
+    "accidentalCoupling": [
+      "CompleteRun writes a non-silent outbound conversation as status=delivered",
+      "assistant_response_events has one mutable delivery_status shared by every consumer",
+      "automatic final-output candidates participate in terminal selection",
+      "assistant-response-stream owns request, admission, candidate, event delivery and outbound audit concerns"
+    ]
+  },
+  "targetVocabulary": [
+    "RunAccepted",
+    "RunQueued",
+    "RunStarted",
+    "ProgressUpdated",
+    "RunCompleted",
+    "RunFailed",
+    "RunCancelled"
+  ],
+  "gaps": [
+    {
+      "id": "dual-source-identity-and-lane-sequence",
+      "targetBehavior": "dedupe transport and logical message keys before assigning one Conversation Lane sequence"
+    },
+    {
+      "id": "per-lane-head-scheduling",
+      "targetBehavior": "accept Conversation Lanes concurrently while exposing only each lane head to the shared priority/FIFO runtime"
+    },
+    {
+      "id": "cooperative-cancel-generation-fence",
+      "targetBehavior": "support idempotent CancelRequest, confirmed release, RunCancelled, and turnId+generation fencing"
+    },
+    {
+      "id": "immutable-context-snapshot",
+      "targetBehavior": "persist a watermarked, hashed and deterministically truncated ContextSnapshot reused by retry"
+    },
+    {
+      "id": "explicit-reply-outcome-and-intent",
+      "targetBehavior": "persist explicit answer/silent/failure Outcome and an atomic Reply Intent with a valid cause"
+    },
+    {
+      "id": "missing-visible-output",
+      "targetBehavior": "reject an empty visible answer with MISSING_OUTPUT while requiring silence to be explicit"
+    },
+    {
+      "id": "execution-delivery-separation",
+      "targetBehavior": "keep RunCompleted independent from platform acceptance, reconciliation, retry and dead letter"
+    },
+    {
+      "id": "per-consumer-progress-cursor",
+      "targetBehavior": "record progress ACK/high-watermark per consumer and route instead of one global event delivery_status"
+    },
+    {
+      "id": "task-command-authorization",
+      "targetBehavior": "require TaskCommand source, verified actor, capability and expectedVersion with Task Core authorization"
+    }
+  ]
+}

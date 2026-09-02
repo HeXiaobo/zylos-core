@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.23] - 2026-09-02
+
+### Added
+- Add a durable assistant Run Ledger, per-lane pending queue, canonical run
+  events, bounded context assembly, reply outcomes, reply intents, and
+  per-consumer event subscriptions.
+- Add durable Commitment task application and TaskEffect relay boundaries so
+  native task projections can reconcile without owning Core task truth.
+
+### Fixed
+- Separate runtime completion from external reply delivery, reject invisible
+  required output, and fence lease, replay, migration, and redrive identities.
+- Preserve immutable fork source provenance across upgrades, align dry-run
+  reification with execution, and make prerelease self-check selection
+  explicit.
+- Harden the global v2 publication and deployment gates with hash-bound owner
+  authorization, typed receipts, exact GitHub source identity, and fresh
+  runtime profile verification.
+
 ## [0.7.2-rc.22] - 2026-08-30
 
 ### Fixed

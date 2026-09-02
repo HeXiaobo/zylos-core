@@ -1,0 +1,108 @@
+{
+  "schema": "zylos.assistant-reply-upstream-control/v1",
+  "verifiedAt": "2026-09-01",
+  "officialControl": {
+    "repo": "zylos-ai/zylos-core",
+    "sha": "ec0b851c22cbb2dd57e461c4cb7229908a12d887",
+    "artifacts": [
+      {
+        "path": "README.md",
+        "blob": "ed84b78c04c5d82a93291311c9f9e1595bb78811"
+      },
+      {
+        "path": "skills/comm-bridge/scripts/c4-db.js",
+        "blob": "77befc8a20b7139013bd52ea2ca8238f0fc3247d"
+      },
+      {
+        "path": "skills/comm-bridge/scripts/c4-dispatcher.js",
+        "blob": "991d7aaecfc562d42566f5b07f0ef9612d7d3f75"
+      },
+      {
+        "path": "skills/comm-bridge/scripts/c4-receive.js",
+        "blob": "3b3294abd0430822c5e6199b9645e3d5f2c678b6"
+      },
+      {
+        "path": "skills/comm-bridge/scripts/c4-send.js",
+        "blob": "9d0f04b6692373cb24587699741117d6c0fceda2"
+      }
+    ]
+  },
+  "forkBaseline": {
+    "repo": "HeXiaobo/zylos-core",
+    "sha": "0b0d6c86e80f42df6abf7e8d177f97601835317e"
+  },
+  "relationship": {
+    "mergeBase": "ec0b851c22cbb2dd57e461c4cb7229908a12d887",
+    "forkCommitsAhead": 35
+  },
+  "facts": [
+    {
+      "id": "official-unified-sqlite-entry",
+      "classification": "retain",
+      "evidence": "Official README names C4 as the unified gateway with SQLite audit, and c4-db persists inbound/outbound conversations in the shared database.",
+      "replay": [
+        "git grep -n 'unified gateway.*SQLite audit' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- README.md",
+        "git show ec0b851c22cbb2dd57e461c4cb7229908a12d887:skills/comm-bridge/scripts/c4-db.js"
+      ]
+    },
+    {
+      "id": "official-priority-fifo",
+      "classification": "retain",
+      "evidence": "Official getNextPending orders by priority ascending and timestamp ascending; control work uses priority ascending and insertion id ascending.",
+      "replay": [
+        "git grep -n 'ORDER BY COALESCE(priority, 3) ASC' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- skills/comm-bridge/scripts/c4-db.js"
+      ]
+    },
+    {
+      "id": "official-single-dispatcher-shared-runtime",
+      "classification": "retain",
+      "evidence": "Official Core has one dispatcherLoop for the configured tmux runtime and describes one cross-channel conversation and memory.",
+      "replay": [
+        "git grep -n 'async function dispatcherLoop' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- skills/comm-bridge/scripts/c4-dispatcher.js",
+        "git grep -n 'one conversation, one memory, one personality' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- README.md"
+      ]
+    },
+    {
+      "id": "official-require-idle-opt-in",
+      "classification": "retain",
+      "evidence": "Official c4-receive initializes requireIdle=false; only explicit idle flags set it true.",
+      "replay": [
+        "git grep -n 'requireIdle: false' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- skills/comm-bridge/scripts/c4-receive.js"
+      ]
+    },
+    {
+      "id": "official-explicit-c4-send",
+      "classification": "retain",
+      "evidence": "Official c4-send records outbound audit then invokes the selected channel scripts/send.js explicitly.",
+      "replay": [
+        "git grep -n 'scripts.*send.js' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- skills/comm-bridge/scripts/c4-send.js"
+      ]
+    },
+    {
+      "id": "fork-only-assistant-request-lifecycle",
+      "classification": "fork_only",
+      "evidence": "assistant-response-stream.js and assistant_requests/assistant_response_events do not exist at the official control and were added after it.",
+      "replay": [
+        "git diff --name-status ec0b851c22cbb2dd57e461c4cb7229908a12d887..0b0d6c86e80f42df6abf7e8d177f97601835317e -- skills/comm-bridge/scripts/assistant-response-stream.js skills/comm-bridge/init-db.sql"
+      ]
+    },
+    {
+      "id": "fork-only-final-output-candidates",
+      "classification": "fork_only",
+      "evidence": "assistant_final_output_candidates and MarkFinalOutputCandidate are fork-only automatic-candidate mechanisms.",
+      "replay": [
+        "git grep -n 'assistant_final_output_candidates' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- skills/comm-bridge || true",
+        "git grep -n 'assistant_final_output_candidates' 0b0d6c86e80f42df6abf7e8d177f97601835317e -- skills/comm-bridge"
+      ]
+    },
+    {
+      "id": "fork-only-event-delivery-axis",
+      "classification": "fork_only",
+      "evidence": "The event-row delivery_status lease/retry/dead-letter axis is fork-only and is a single global ACK axis rather than per consumer/route.",
+      "replay": [
+        "git grep -n 'delivery_status' ec0b851c22cbb2dd57e461c4cb7229908a12d887 -- skills/comm-bridge || true",
+        "git grep -n 'delivery_status' 0b0d6c86e80f42df6abf7e8d177f97601835317e -- skills/comm-bridge/init-db.sql skills/comm-bridge/scripts/assistant-response-stream.js"
+      ]
+    }
+  ]
+}

@@ -175,6 +175,51 @@ exec "${process.execPath}" "$(dirname "$0")/curl.mjs" "$@"
     assert.equal(fs.readFileSync(path.join(skillDir, 'payload.txt'), 'utf8'), 'github-fixture payload\n');
   });
 
+  it('persists an exact --branch SHA as a commit source identity', () => {
+    const { root, zylosDir } = makeFixture();
+    const wrapper = path.join(root, 'github-wrapper');
+    const tarball = path.join(root, 'github-release.tar.gz');
+    const fakeBin = path.join(root, 'bin');
+    const sha = '0123456789abcdef0123456789abcdef01234567';
+    writeSkill(wrapper, { name: 'github-commit-fixture', version: '9.9.9' });
+    execFileSync('tar', ['czf', tarball, '-C', root, path.basename(wrapper)]);
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(fakeBin, 'curl.mjs'), `
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf('-o');
+if (outputIndex !== -1 && args.at(-1).includes('/archive/${sha}.tar.gz')) {
+  fs.copyFileSync(process.env.FAKE_GITHUB_TARBALL, args[outputIndex + 1]);
+  process.exit(0);
+}
+process.exit(22);
+`, 'utf8');
+    fs.writeFileSync(path.join(fakeBin, 'curl'), `#!/bin/sh
+exec "${process.execPath}" "$(dirname "$0")/curl.mjs" "$@"
+`, { mode: 0o755 });
+
+    const result = runCli({
+      cwd: root,
+      zylosDir,
+      args: ['add', 'example/zylos-github-commit-fixture', '--branch', sha, '--json'],
+      env: {
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+        FAKE_GITHUB_TARBALL: tarball,
+        GITHUB_TOKEN: '',
+        GH_TOKEN: '',
+      },
+    });
+
+    assert.equal(result.status, 0, `add failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    const { components } = readInstalled(zylosDir, 'github-commit-fixture');
+    assert.deepEqual(components['github-commit-fixture'].source, {
+      type: 'github-release',
+      repo: 'example/zylos-github-commit-fixture',
+      ref: sha,
+      refType: 'commit',
+    });
+  });
+
   it('rejects upgrade checks for locally installed components with reinstall guidance', () => {
     const { root, zylosDir } = makeFixture();
     const sourceDir = path.join(root, 'local-upgrade-source');
