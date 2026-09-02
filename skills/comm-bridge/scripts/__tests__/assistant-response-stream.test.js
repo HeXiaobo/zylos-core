@@ -1655,6 +1655,25 @@ test('leases deliveries with fencing and recovers stale requests as RunFailed', 
   stream.close();
 });
 
+test('never age-expires a queued request that still awaits runtime delivery', () => {
+  let now = 1_000;
+  const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });
+  accept(stream, {
+    requestId: 'assistant.feishu.queued-follow-up',
+    sourceId: 'om_queued_follow_up',
+  });
+
+  now = 100_000;
+  const expired = stream.execute({ type: 'ExpireStaleRuns', staleBefore: 99_000 });
+
+  assert.deepEqual(expired.events, []);
+  assert.equal(
+    stream.query({ requestId: 'assistant.feishu.queued-follow-up' }).request.status,
+    'queued',
+  );
+  stream.close();
+});
+
 test('recovers an unchanged started request after sustained runtime idle', () => {
   let now = 100;
   const stream = openAssistantResponseStream({ dbPath: ':memory:', clock: () => now });

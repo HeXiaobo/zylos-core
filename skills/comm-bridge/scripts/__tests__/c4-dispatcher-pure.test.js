@@ -42,8 +42,46 @@ const {
   projectPendingAssistantTurnBindings,
   runtimeTurnAdmissionsEnabled,
   readJsonFileWithRetry,
-  getDeliveryContent
+  getDeliveryContent,
+  getConversationRetryDelay,
+  handleConversationDeliveryFailure
 } = mod;
+
+describe('durable conversation dispatch retry', () => {
+  it('keeps a conversation pending after repeated transient runtime delivery failures', async () => {
+    const activityMonitorDirectory = path.join(tmpDir, 'activity-monitor');
+    fs.mkdirSync(activityMonitorDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(activityMonitorDirectory, 'agent-status.json'),
+      JSON.stringify({ state: 'idle', health: 'ok' }),
+    );
+
+    const database = await import('../c4-db.js');
+    const inserted = database.insertConversation(
+      'in',
+      'feishu',
+      'oc_follow_up',
+      '这是长任务执行期间补充的信息',
+    );
+
+    const delays = [];
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const pending = database.getNextPending();
+      assert.ok(pending, `attempt ${attempt + 1} must remain queued`);
+      assert.equal(database.claimConversation(pending.id), true);
+      await handleConversationDeliveryFailure(pending, {
+        channelHealthy: true,
+        wait: async delay => delays.push(delay),
+      });
+    }
+
+    const [persisted] = database.getConversationsByRange(inserted.id, inserted.id);
+    assert.equal(persisted.status, 'pending');
+    assert.equal(persisted.retry_count, 10);
+    assert.deepEqual(delays, [500, 1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000, 15_000, 15_000]);
+    assert.equal(getConversationRetryDelay(Number.MAX_SAFE_INTEGER), 15_000);
+  });
+});
 
 describe('runtime turn admission scope', () => {
   it('enables hook-fenced admissions only for Claude', () => {

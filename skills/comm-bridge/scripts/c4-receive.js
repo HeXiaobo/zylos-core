@@ -749,7 +749,7 @@ async function main() {
   // natural-language request to the task skill and create a second task.
   const dbStatus = isWorkIntakeTask
     ? 'delivered'
-    : route.recovered ? 'pending' : 'delivered';
+    : (route.recovered || assistantStreamEnabled) ? 'pending' : 'delivered';
   let cooldown = null;
   const recordInbound = (storedContent, deliveryAction = null) => {
     if (taskRecord) {
@@ -844,20 +844,12 @@ async function main() {
   try {
     const record = recordInbound(dbContent);
     if (!route.recovered && assistantResponse) {
-      const failed = assistantStream.execute({
-        type: 'FailRun',
-        requestId: assistantRequestId,
-        code: 'RUNTIME_UNAVAILABLE',
-        retryable: true,
-      });
-      emitSuccess(json, record.id, 'delivered', {
+      emitSuccess(json, record.id, 'queued', {
         ...successDetails,
         assistantResponse: {
-          requestId: failed.request.requestId,
+          requestId: assistantResponse.request.requestId,
           replayed: assistantResponse.replayed,
-          events: failed.replayed
-            ? assistantResponse.events
-            : [...assistantResponse.events, ...failed.events],
+          events: assistantResponse.events,
         },
       });
       return;

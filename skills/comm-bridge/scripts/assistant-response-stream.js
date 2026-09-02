@@ -1484,9 +1484,9 @@ export function openAssistantResponseStream({
 
       case 'ExpireStaleRuns': {
         const staleBefore = requireInteger(command.staleBefore, 'staleBefore');
-        // A started runtime turn has an independent heartbeat. Do not let a
-        // quiet assistant request expire while its bound runtime is still
-        // alive; queued work has no such heartbeat and keeps the request clock.
+        // Queued work remains durable until dispatcher submission. A started
+        // runtime turn has an independent heartbeat, so do not expire it while
+        // its bound runtime is still alive.
         const stale = database.prepare(`
           SELECT r.request_id
           FROM assistant_requests AS r
@@ -1494,7 +1494,7 @@ export function openAssistantResponseStream({
             ON a.request_id = r.request_id
             AND a.runtime_session_id = r.runtime_session_id
             AND a.status = 'started'
-          WHERE r.status IN ('queued', 'started')
+          WHERE r.status = 'started'
             AND (
               CASE
                 WHEN r.status = 'started' AND a.id IS NOT NULL

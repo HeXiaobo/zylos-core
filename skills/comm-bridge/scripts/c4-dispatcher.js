@@ -18,7 +18,6 @@ import {
   getPendingControlCount,
   close,
   incrementRetryCount,
-  markFailed,
   getNextPendingControl,
   claimControl,
   requeueControl,
@@ -33,8 +32,8 @@ import {
   DELIVERY_DELAY_BASE,
   DELIVERY_DELAY_PER_KB,
   DELIVERY_DELAY_MAX,
-  MAX_RETRIES,
   RETRY_BASE_MS,
+  CONVERSATION_RETRY_MAX_MS,
   CONTROL_MAX_RETRIES,
   CONTROL_RETENTION_DAYS,
   CONTROL_CLEANUP_INTERVAL_MS,
@@ -538,45 +537,33 @@ export function getDeliveryContent(item, activeRuntime = ACTIVE_RUNTIME) {
   return (item.type === 'control' && !isSlashCommand) ? `Meanwhile, ${rawContent}` : rawContent;
 }
 
-async function handleConversationDeliveryFailure(msg) {
-  const channelHealthy = isAgentStatusFresh();
+export function getConversationRetryDelay(retryCount) {
+  const safeRetryCount = Number.isSafeInteger(retryCount) && retryCount > 0
+    ? retryCount
+    : 1;
+  const exponent = Math.min(safeRetryCount - 1, 30);
+  return Math.min(RETRY_BASE_MS * 2 ** exponent, CONVERSATION_RETRY_MAX_MS);
+}
 
-  if (channelHealthy) {
-    const currentCount = msg.retry_count || 0;
-    const nextCount = currentCount + 1;
-    incrementRetryCount(msg.id);
-
-    if (nextCount >= MAX_RETRIES) {
-      markFailed(msg.id);
-      if (msg.assistant_request_id) {
-        try {
-          const responseStream = openAssistantResponseStream();
-          responseStream.execute({
-            type: 'FailRun',
-            requestId: msg.assistant_request_id,
-            code: 'RUNTIME_DISPATCH_FAILED',
-            retryable: true,
-          });
-          responseStream.close();
-        } catch (err) {
-          log(`Warning: failed to record assistant dispatch failure (${err.message})`);
-        }
-      }
-      log(`FAILED: conversation id=${msg.id} channel=${msg.channel} marked as failed after ${nextCount} retries`);
-      logDeliveryFailure('conversation', msg.id, 'MAX_RETRIES', { channel: msg.channel, retries: nextCount });
-      return;
-    }
-
-    requeueConversation(msg.id);
-    const backoff = RETRY_BASE_MS * 2 ** (nextCount - 1);
-    log(`Retry ${nextCount} for conversation id=${msg.id} after ${backoff}ms`);
-    await sleep(backoff);
-    return;
-  }
-
+export async function handleConversationDeliveryFailure(msg, options = {}) {
+  const wait = options.wait || sleep;
+  const channelHealthy = options.channelHealthy ?? isAgentStatusFresh();
+  const nextCount = incrementRetryCount(msg.id);
   requeueConversation(msg.id);
-  log(`Channel unhealthy; backing off for ${RETRY_BASE_MS}ms`);
-  await sleep(RETRY_BASE_MS);
+  const backoff = channelHealthy
+    ? getConversationRetryDelay(nextCount)
+    : RETRY_BASE_MS;
+  log(
+    `Deferred conversation id=${msg.id} channel=${msg.channel} after transient runtime delivery failure; `
+      + `durable retry ${nextCount} in ${backoff}ms`,
+  );
+  logDeliveryFailure('conversation', msg.id, 'RUNTIME_RETRY_DEFERRED', {
+    channel: msg.channel,
+    retries: nextCount,
+    backoff,
+  });
+  await wait(backoff);
+  return { status: 'pending', retryCount: nextCount, backoff };
 }
 
 async function handleControlDeliveryFailure(control, reason) {
