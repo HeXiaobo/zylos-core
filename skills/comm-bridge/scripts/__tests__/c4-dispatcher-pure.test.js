@@ -36,6 +36,7 @@ const {
   isRecoveryHeartbeatPhase,
   shouldAutoAckHeartbeat,
   findBlockingAssistantRun,
+  reconcileBlockingAssistantRun,
   shouldDeferConversationForRuntime,
   shouldRecoverRuntimeTurnAdmission,
   projectPendingAssistantTurnBindings,
@@ -48,6 +49,30 @@ describe('runtime turn admission scope', () => {
   it('enables hook-fenced admissions only for Claude', () => {
     assert.equal(runtimeTurnAdmissionsEnabled('claude'), true);
     assert.equal(runtimeTurnAdmissionsEnabled('codex'), false);
+  });
+
+  it('does not infer that a Codex assistant run was abandoned from monitor idle', () => {
+    const responseStream = {
+      findStartedRequest() {
+        throw new Error('Codex must not query the global started-run gate');
+      },
+      execute() {
+        throw new Error('Codex must not run idle recovery');
+      },
+    };
+
+    assert.deepEqual(reconcileBlockingAssistantRun({
+      type: 'conversation',
+      assistant_request_id: 'assistant.hxa.request-b',
+    }, {
+      state: 'idle',
+      health: 'ok',
+      healthy: true,
+      idleSeconds: 300,
+    }, responseStream, 30, 400, 'codex'), {
+      blockingRun: null,
+      recovered: null,
+    });
   });
 });
 
@@ -533,6 +558,21 @@ describe('getDeliveryContent', () => {
     assert.equal(result.includes('displayed assistant text is delivered automatically'), false);
   });
 
+  it('requires Codex to terminalize an intentionally silent assistant request', () => {
+    const result = getDeliveryContent({
+      type: 'conversation',
+      channel: 'hxa-connect',
+      endpoint_id: 'org:hxa|mylos|msg:message-1',
+      assistant_request_id: 'assistant.hxa.message-1',
+      content: '[HXA:hxa DM] mylos said: ACK',
+    }, 'codex');
+
+    assert.match(result, /before ending this runtime turn, use this command exactly once/i);
+    assert.match(result, /if no externally visible reply is needed/i);
+    assert.match(result, /pipe exactly \[SKIP\] through the same command/i);
+    assert.match(result, /--request-id "assistant\.hxa\.message-1"/);
+  });
+
   it('does not add reply routing for conversation items without endpoints', () => {
     assert.equal(getDeliveryContent({
       type: 'conversation',
@@ -714,7 +754,7 @@ describe('assistant turn admission', () => {
     assert.deepEqual(calls, [{ excludingRequestId: 'assistant.feishu.request-b' }]);
   });
 
-  it('recovers an unchanged Codex request after sustained healthy idle', () => {
+  it('recovers an unchanged lifecycle-fenced request after sustained healthy idle', () => {
     const calls = [];
     const responseStream = {
       findStartedRequest(options) {
@@ -748,7 +788,7 @@ describe('assistant turn admission', () => {
       health: 'ok',
       healthy: true,
       idleSeconds: 30,
-    }, responseStream, 30, 130);
+    }, responseStream, 30, 130, 'claude');
 
     assert.equal(result.blockingRun, null);
     assert.equal(result.recovered.request.requestId, 'assistant.hxa.request-a');

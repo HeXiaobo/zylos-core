@@ -657,7 +657,16 @@ export function reconcileBlockingAssistantRun(
   responseStream,
   minimumIdleSeconds = RUNTIME_TURN_RECOVERY_IDLE_SECONDS,
   currentSeconds = nowSeconds(),
+  activeRuntime = ACTIVE_RUNTIME,
 ) {
+  // Only runtimes with lifecycle-fenced turn admissions may use monitor-idle
+  // as recovery evidence. Codex has no equivalent completion boundary, so an
+  // idle monitor snapshot cannot prove that a started assistant run was
+  // abandoned.
+  if (!runtimeTurnAdmissionsEnabled(activeRuntime)) {
+    return { blockingRun: null, recovered: null };
+  }
+
   const blockingRun = findBlockingAssistantRun(item, responseStream);
   if (!shouldRecoverRuntimeTurnAdmission(
     blockingRun,
@@ -705,8 +714,8 @@ export function shouldRecoverRuntimeTurnAdmission(
 
 export function runtimeTurnAdmissionsEnabled(activeRuntime = ACTIVE_RUNTIME) {
   // Claude exposes synchronous prompt/pre-tool/Stop lifecycle fences. Codex
-  // has no MessageDisplay-equivalent completion boundary, so it retains the
-  // monitor gate and explicit c4-send response path.
+  // has no MessageDisplay-equivalent completion boundary, so it relies on
+  // runtime busy/idle dispatch plus the explicit c4-send response path.
   return activeRuntime === 'claude';
 }
 
@@ -735,7 +744,7 @@ export function projectPendingAssistantTurnBindings(
 }
 
 function blockingAssistantRun(item, agentState) {
-  if (item.type !== 'conversation') return null;
+  if (item.type !== 'conversation' || !runtimeTurnAdmissionsEnabled()) return null;
   const responseStream = openAssistantResponseStream();
   try {
     return reconcileBlockingAssistantRun(item, agentState, responseStream);

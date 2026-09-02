@@ -16,7 +16,10 @@ export function buildReplyViaSuffix(channel, endpointId, assistantRequestId = nu
   const requestOption = assistantRequestId
     ? ` --request-id "${assistantRequestId}"`
     : '';
-  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"${requestOption} (stdin only: pipe the complete reply body; do not append it as a message argument)`;
+  const terminalInstruction = assistantRequestId
+    ? ' Before ending this runtime turn, use this command exactly once. If no externally visible reply is needed, pipe exactly [SKIP] through the same command so the assistant request reaches an explicit silent terminal.'
+    : '';
+  return ` ---- reply via: node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${endpointId}"${requestOption} (stdin only: pipe the complete reply body; do not append it as a message argument).${terminalInstruction}`;
 }
 
 export function buildStreamedReplySuffix(assistantRequestId) {
