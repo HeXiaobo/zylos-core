@@ -255,6 +255,50 @@ describe('fork-pair upgrade target contract', () => {
     }
   });
 
+  it('excludes only the staged runtime node_modules symlink from a component plan', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-pair-reify-runtime-deps-'));
+    try {
+      const source = path.join(root, 'source');
+      const destination = path.join(root, 'destination');
+      const runtimeDependencies = path.join(root, 'runtime-node-modules');
+      fs.mkdirSync(source);
+      fs.mkdirSync(destination);
+      fs.mkdirSync(runtimeDependencies);
+      fs.writeFileSync(path.join(source, 'reply.js'), 'reply');
+      fs.symlinkSync(runtimeDependencies, path.join(source, 'node_modules'));
+
+      const plan = buildComponentReifyPlan({
+        sourceDir: source,
+        destinationDir: destination,
+        runtimeNodeModulesPath: runtimeDependencies,
+      });
+
+      assert.equal(plan.smartMerge.certainty, 'exact');
+      assert.deepEqual(plan.smartMerge.errors, []);
+      assert.deepEqual(plan.smartMerge.changes.create.map(({ file }) => file), ['reply.js']);
+
+      const unsafeSource = path.join(root, 'unsafe-source');
+      const unsafeDestination = path.join(root, 'unsafe-destination');
+      const externalFile = path.join(root, 'external.js');
+      fs.mkdirSync(unsafeSource);
+      fs.mkdirSync(unsafeDestination);
+      fs.writeFileSync(externalFile, 'external');
+      fs.symlinkSync(externalFile, path.join(unsafeSource, 'linked.js'));
+
+      const unsafePlan = buildComponentReifyPlan({
+        sourceDir: unsafeSource,
+        destinationDir: unsafeDestination,
+      });
+
+      assert.equal(unsafePlan.smartMerge.certainty, 'unavailable');
+      assert.deepEqual(unsafePlan.smartMerge.errors, [
+        'linked.js: source path is a symlink',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('recognizes a bootstrap entrypoint reached through a filesystem path alias', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-main-module-alias-'));
     try {

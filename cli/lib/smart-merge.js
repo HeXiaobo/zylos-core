@@ -65,11 +65,15 @@ function isBinaryFile(filePath) {
  * @param {object} [opts]
  * @param {string} [opts.backupDir] - Directory to store backed-up conflict files
  * @param {string} [opts.mode]     - 'merge' (default) or 'overwrite' (skip merge, overwrite all)
+ * @param {string} [opts.runtimeNodeModulesPath] - Expected runtime dependency target for a root source node_modules symlink
  * @returns {MergeResult}
  */
 export function smartSync(srcDir, destDir, opts = {}) {
+  const runtimeNodeModulesPath = opts.runtimeNodeModulesPath
+    ? path.resolve(opts.runtimeNodeModulesPath)
+    : null;
   const safetyErrors = [
-    ...sourceTreeErrors(path.resolve(srcDir)),
+    ...sourceTreeErrors(path.resolve(srcDir), { runtimeNodeModulesPath }),
     ...destinationTreeErrors(path.resolve(destDir)),
   ];
   if (safetyErrors.length > 0) return emptyMergeResult(safetyErrors);
@@ -85,7 +89,10 @@ export function smartSync(srcDir, destDir, opts = {}) {
     return emptyMergeResult([`baseline recovery failed: ${err.message}`]);
   }
 
-  const plan = planSmartSync(srcDir, destDir, opts);
+  const plan = planSmartSync(srcDir, destDir, {
+    ...opts,
+    runtimeNodeModulesPath,
+  });
   if (plan.errors.length > 0) return emptyMergeResult(plan.errors);
   return reifySmartSyncPlan(plan);
 }
@@ -123,7 +130,17 @@ function lstatIfPresent(filePath) {
 
 const SMART_SYNC_TREE_EXCLUDES = new Set(['.git', 'node_modules', '.backup']);
 
-function treeSymlinkErrors(rootDir, role) {
+function isRuntimeNodeModulesSymlink(rootDir, relativePath, runtimeNodeModulesPath) {
+  if (relativePath !== 'node_modules' || !runtimeNodeModulesPath) return false;
+  try {
+    return fs.realpathSync(path.join(rootDir, relativePath))
+      === fs.realpathSync(runtimeNodeModulesPath);
+  } catch {
+    return false;
+  }
+}
+
+function treeSymlinkErrors(rootDir, role, { runtimeNodeModulesPath = null } = {}) {
   const errors = [];
 
   function visit(dir) {
@@ -134,7 +151,9 @@ function treeSymlinkErrors(rootDir, role) {
       const relPath = path.relative(rootDir, entryPath);
       const stat = fs.lstatSync(entryPath);
       if (stat.isSymbolicLink()) {
-        errors.push(`${relPath}: ${role} path is a symlink`);
+        const runtimeOnly = role === 'source'
+          && isRuntimeNodeModulesSymlink(rootDir, relPath, runtimeNodeModulesPath);
+        if (!runtimeOnly) errors.push(`${relPath}: ${role} path is a symlink`);
       } else if (SMART_SYNC_TREE_EXCLUDES.has(entry.name)) {
         continue;
       } else if (stat.isDirectory()) {
@@ -147,12 +166,12 @@ function treeSymlinkErrors(rootDir, role) {
   return errors;
 }
 
-function sourceTreeErrors(rootDir) {
+function sourceTreeErrors(rootDir, options = {}) {
   const rootStat = lstatIfPresent(rootDir);
   if (rootStat === null) return [`source root does not exist: ${rootDir}`];
   if (rootStat.isSymbolicLink()) return [`source root is a symlink: ${rootDir}`];
   if (!rootStat.isDirectory()) return [`source root is not a directory: ${rootDir}`];
-  return treeSymlinkErrors(rootDir, 'source');
+  return treeSymlinkErrors(rootDir, 'source', options);
 }
 
 function destinationRootErrors(rootDir) {
@@ -232,7 +251,9 @@ function reifyPlanErrors(plan) {
   if (plan.errors.length > 0) return [...plan.errors];
 
   const errors = [
-    ...sourceTreeErrors(plan.sourceDir),
+    ...sourceTreeErrors(plan.sourceDir, {
+      runtimeNodeModulesPath: plan.runtimeNodeModulesPath,
+    }),
     ...destinationTreeErrors(plan.destinationDir),
   ];
   if (errors.length > 0) return errors;
@@ -270,12 +291,17 @@ function recoveryResidue(destDir) {
  * @param {object} [opts]
  * @param {string} [opts.backupDir]
  * @param {string} [opts.mode]
+ * @param {string} [opts.runtimeNodeModulesPath] - Expected runtime dependency target for a root source node_modules symlink
  * @returns {{schema: string, mode: string, sourceDir: string, destinationDir: string, changes: object, operations: object[], errors: string[], nextManifest: object|null}}
  */
 export function planSmartSync(srcDir, destDir, opts = {}) {
   const { backupDir = null, mode = 'merge' } = opts;
+  let { runtimeNodeModulesPath = null } = opts;
   srcDir = path.resolve(srcDir);
   destDir = path.resolve(destDir);
+  runtimeNodeModulesPath = runtimeNodeModulesPath
+    ? path.resolve(runtimeNodeModulesPath)
+    : null;
   const plan = {
     schema: 'zylos.smart-sync-plan/v1',
     mode,
@@ -285,6 +311,7 @@ export function planSmartSync(srcDir, destDir, opts = {}) {
     operations: [],
     errors: [],
     nextManifest: null,
+    runtimeNodeModulesPath,
   };
 
   if (mode !== 'merge' && mode !== 'overwrite') {
@@ -292,7 +319,7 @@ export function planSmartSync(srcDir, destDir, opts = {}) {
     return plan;
   }
 
-  plan.errors.push(...sourceTreeErrors(srcDir));
+  plan.errors.push(...sourceTreeErrors(srcDir, { runtimeNodeModulesPath }));
   plan.errors.push(...destinationTreeErrors(destDir));
   if (plan.errors.length > 0) return plan;
 

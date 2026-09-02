@@ -307,14 +307,20 @@ function clonePlanChanges(changes, prefix = '') {
  * The smart-merge scope is exact because execute consumes the same planner.
  * A later lifecycle hook makes the transaction-final tree conservative: an
  * arbitrary hook can recreate, remove, or rewrite files after smart merge.
+ * A staged runtime dependency symlink is ignored only when it resolves to the
+ * expected live dependency directory; all other source symlinks remain unsafe.
  */
 export function buildComponentReifyPlan({
   sourceDir,
   destinationDir,
   mode = 'merge',
   postUpgradeHookPresent = false,
+  runtimeNodeModulesPath = null,
 } = {}) {
-  const plan = planSmartSync(sourceDir, destinationDir, { mode });
+  const plan = planSmartSync(sourceDir, destinationDir, {
+    mode,
+    runtimeNodeModulesPath,
+  });
   const changes = clonePlanChanges(plan.changes);
   const smartMerge = {
     scope: 'smart_merge',
@@ -380,7 +386,10 @@ export function buildSkillSetReifyPlan({
       const skillPlan = planSmartSync(
         path.join(sourceSkillsDir, entry.name),
         path.join(destinationSkillsDir, entry.name),
-        { mode },
+        {
+          mode,
+          runtimeNodeModulesPath: path.join(destinationSkillsDir, entry.name, 'node_modules'),
+        },
       );
       const prefixed = clonePlanChanges(skillPlan.changes, `${entry.name}/`);
       for (const action of Object.keys(changes)) changes[action].push(...prefixed[action]);
@@ -2257,7 +2266,8 @@ export function preparePersistentStagedSources({
   }
 
   const liveFeishuDir = path.join(zylosDir, '.claude', 'skills', 'feishu');
-  ensureFeishuRuntimeDependencies(feishuDir, path.join(liveFeishuDir, 'node_modules'));
+  const liveFeishuNodeModules = path.join(liveFeishuDir, 'node_modules');
+  ensureFeishuRuntimeDependencies(feishuDir, liveFeishuNodeModules);
   if (args.nativeTaskCoreManifest) {
     const liveCommitmentCoreDir = path.join(zylosDir, '.claude', 'skills', 'commitment-core');
     ensureCommitmentCoreRuntimeDependencies(
@@ -2664,6 +2674,7 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
     const feishuSource = validateFeishuSource(stagedFeishuDir, args.feishuVersion);
     if (!feishuSource.ok) throw new HoldError(feishuSource.error, 'INVALID_FEISHU_SOURCE');
     const liveFeishuDir = path.join(zylosDir, '.claude', 'skills', 'feishu');
+    const liveFeishuNodeModules = path.join(liveFeishuDir, 'node_modules');
     summary.sources = { core: stagedSources.core, feishu: stagedSources.feishu };
     summary.stagedSources = {
       root: stagedSources.root,
@@ -2718,6 +2729,7 @@ export function runForkPairUpgrade(argv = process.argv.slice(2)) {
         destinationDir: liveFeishuDir,
         mode: 'merge',
         postUpgradeHookPresent: fileIsRegular(path.join(stagedFeishuDir, 'hooks', 'post-upgrade.js')),
+        runtimeNodeModulesPath: liveFeishuNodeModules,
       }),
     };
     const reifyPlanErrors = [

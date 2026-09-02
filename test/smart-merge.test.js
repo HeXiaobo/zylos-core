@@ -318,6 +318,46 @@ describe('smartSync', () => {
     expect(fs.existsSync(externalTarget)).toBe(false);
   });
 
+  test('excludes a root runtime node_modules symlink only when it matches the expected target', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const runtimeNodeModules = mkTmp();
+    writeFile(src, 'safe.js', 'SAFE');
+    fs.symlinkSync(runtimeNodeModules, path.join(src, 'node_modules'));
+
+    const plan = planSmartSync(src, dest, { runtimeNodeModulesPath: runtimeNodeModules });
+    const result = smartSync(src, dest, { runtimeNodeModulesPath: runtimeNodeModules });
+
+    expect(plan.errors).toEqual([]);
+    expect(result.errors).toEqual([]);
+    expect(plan.changes.create.map(({ file }) => file)).toEqual(['safe.js']);
+    expect(result.added).toEqual(['safe.js']);
+    expect(fs.lstatSync(path.join(src, 'node_modules')).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.join(dest, 'node_modules'))).toBe(false);
+
+    const wrongTarget = mkTmp();
+    const wrongSource = mkTmp();
+    const wrongDestination = mkTmp();
+    fs.symlinkSync(wrongTarget, path.join(wrongSource, 'node_modules'));
+
+    const wrongPlan = planSmartSync(wrongSource, wrongDestination, {
+      runtimeNodeModulesPath: runtimeNodeModules,
+    });
+
+    expect(wrongPlan.errors).toEqual(['node_modules: source path is a symlink']);
+
+    const nestedSource = mkTmp();
+    const nestedDestination = mkTmp();
+    fs.mkdirSync(path.join(nestedSource, 'nested'));
+    fs.symlinkSync(runtimeNodeModules, path.join(nestedSource, 'nested', 'node_modules'));
+
+    const nestedPlan = planSmartSync(nestedSource, nestedDestination, {
+      runtimeNodeModulesPath: runtimeNodeModules,
+    });
+
+    expect(nestedPlan.errors).toEqual(['nested/node_modules: source path is a symlink']);
+  });
+
   test('execute rejects a symlinked baseline directory before recovery can mutate it', () => {
     const src = mkTmp();
     const dest = mkTmp();
