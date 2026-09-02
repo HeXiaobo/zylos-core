@@ -368,6 +368,7 @@ describe('external release manifest gate', () => {
       mode: 'release',
       manifestPath,
       identityProbePath: path.join(tempRoot, 'probe-must-not-be-called.mjs'),
+      env: {},
     });
 
     expect(result.ok).toBe(true);
