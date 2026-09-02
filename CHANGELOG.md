@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.24] - 2026-09-02
+
+### Fixed
+- Allow the pair-upgrade planner to ignore only the verified root
+  `node_modules` runtime binding used by staged components, while all other
+  source symlinks continue to fail closed.
+
 ## [0.7.2-rc.23] - 2026-09-02
 
 ### Added
