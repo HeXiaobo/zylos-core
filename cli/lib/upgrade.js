@@ -764,6 +764,7 @@ function step4_smartMerge(ctx) {
     const mergeResult = smartSync(ctx.tempDir, ctx.skillDir, {
       backupDir: conflictBackupDir,
       mode: ctx.mode,
+      runtimeNodeModulesPath: path.join(ctx.skillDir, 'node_modules'),
     });
 
     // Store merge info on context for final result
