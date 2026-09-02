@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.26] - 2026-09-03
+
+### Fixed
+- Keep every accepted conversation message in the durable queue across
+  transient runtime delivery and verification failures, retrying with bounded
+  backoff instead of discarding the message after two attempts.
+- Keep assistant requests queued while the runtime is temporarily unavailable
+  and exclude not-yet-submitted work from stale-run terminalization.
+
 ## [0.7.2-rc.25] - 2026-09-02
 
 ### Fixed
