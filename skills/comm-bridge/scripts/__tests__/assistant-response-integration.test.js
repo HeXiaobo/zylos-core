@@ -98,7 +98,7 @@ fs.writeFileSync(path.join(process.env.ZYLOS_DIR, 'send-result.json'), JSON.stri
   }
 });
 
-test('unavailable runtime produces a durable failed terminal without a second channel send', () => {
+test('unavailable runtime keeps the durable assistant request queued for later delivery', () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-assistant-unavailable-'));
   try {
     const skillDirectory = path.join(temp, '.claude', 'skills', 'feishu');
@@ -126,21 +126,15 @@ test('unavailable runtime produces a durable failed terminal without a second ch
     assert.equal(replay.status, 0, replay.stderr || replay.stdout);
     const response = parseLastJson(result.stdout);
     const replayResponse = parseLastJson(replay.stdout);
-    assert.equal(response.action, 'delivered');
+    assert.equal(response.action, 'queued');
     assert.deepEqual(response.assistantResponse.events.map(item => item.type), [
       'AssistantRequestAccepted',
       'RunQueued',
-      'RunFailed',
     ]);
-    assert.deepEqual(response.assistantResponse.events.at(-1).payload, {
-      code: 'RUNTIME_UNAVAILABLE',
-      retryable: true,
-    });
     assert.equal(replayResponse.assistantResponse.replayed, true);
     assert.deepEqual(replayResponse.assistantResponse.events.map(item => item.type), [
       'AssistantRequestAccepted',
       'RunQueued',
-      'RunFailed',
     ]);
 
     const database = new Database(path.join(temp, 'comm-bridge', 'c4.db'));
@@ -159,17 +153,9 @@ test('unavailable runtime produces a durable failed terminal without a second ch
       WHERE direction = 'out' AND assistant_request_id = 'assistant.feishu.om_unavailable'
     `).get();
     database.close();
-    assert.equal(request.status, 'failed');
-    assert.equal(outbound, 1);
-    assert.deepEqual(outboundRecord, {
-      direction: 'out',
-      channel: 'feishu',
-      endpoint_id: 'oc_1|type:p2p|msg:om_unavailable',
-      content: '',
-      status: 'failed',
-      delivery_action: 'assistant-response-failed:RUNTIME_UNAVAILABLE',
-      assistant_request_id: 'assistant.feishu.om_unavailable',
-    });
+    assert.equal(request.status, 'queued');
+    assert.equal(outbound, 0);
+    assert.equal(outboundRecord, undefined);
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
