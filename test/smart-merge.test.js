@@ -114,12 +114,14 @@ describe('smartSync', () => {
 
     const result = smartSync(src, dest);
     expect(normalizePlan(plan)).toEqual(normalizeResult(result));
+    // Issue #55: without a baseline manifest a differing local file is a
+    // conflict (backup + report), not a silent overwrite.
     expect(normalizePlan(plan)).toEqual({
       create: ['created.js'],
-      update: ['collision.js'],
+      update: [],
       delete: [],
       preserve: [],
-      conflict: [],
+      conflict: ['collision.js'],
     });
     expect(readFile(dest, 'user-added.js')).toBe('user');
   });
@@ -581,15 +583,50 @@ describe('smartSync', () => {
     expect(readFile(dest, 'newfile.js')).toBe('new content');
   });
 
-  test('no manifest: overwrite all files', () => {
+  test('no manifest + local differs: conflict with durable backup (issue #55)', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+    const backupDir = mkTmp();
+
+    writeFile(dest, 'a.js', 'locally patched');
+    writeFile(src, 'a.js', 'new');
+
+    const result = smartSync(src, dest, { backupDir });
+    // Issue #55: a missing baseline manifest used to downgrade this to a
+    // plain overwrite, silently eating untracked local patches. The local
+    // content must now be backed up and surfaced as a conflict instead.
+    expect(result.conflicts.map(({ file }) => file)).toContain('a.js');
+    expect(result.overwritten).not.toContain('a.js');
+    expect(readFile(dest, 'a.js')).toBe('new');
+    const conflict = result.conflicts.find(({ file }) => file === 'a.js');
+    expect(conflict.backupPath).toBeTruthy();
+    expect(readFile(path.dirname(conflict.backupPath), path.basename(conflict.backupPath))).toBe('locally patched');
+  });
+
+  test('no manifest + byte-identical file: no-op without conflict noise', () => {
     const src = mkTmp();
     const dest = mkTmp();
 
-    writeFile(dest, 'a.js', 'old');
+    writeFile(dest, 'a.js', 'same content');
+    writeFile(src, 'a.js', 'same content');
+
+    const result = smartSync(src, dest);
+    expect(result.conflicts).toHaveLength(0);
+    expect(result.overwritten).not.toContain('a.js');
+    expect(result.added).not.toContain('a.js');
+    expect(readFile(dest, 'a.js')).toBe('same content');
+  });
+
+  test('no manifest + no backupDir: conflict recorded with null backupPath', () => {
+    const src = mkTmp();
+    const dest = mkTmp();
+
+    writeFile(dest, 'a.js', 'locally patched');
     writeFile(src, 'a.js', 'new');
 
     const result = smartSync(src, dest);
-    expect(result.overwritten).toContain('a.js');
+    expect(result.conflicts.map(({ file }) => file)).toContain('a.js');
+    expect(result.conflicts.find(({ file }) => file === 'a.js').backupPath).toBeNull();
     expect(readFile(dest, 'a.js')).toBe('new');
   });
 
