@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.28] - 2026-09-05
+
+### Added
+- Tasks created through work-intake now always carry a deadline: when no due
+  phrase is parsed, a localized default (next local 18:00 wall clock) is
+  applied instead of leaving dueAt unset.
+- New `PostponeTask` command (states ready/in_progress/review, same state):
+  moves `due_at` under optimistic concurrency and appends a `TaskDueUpdated`
+  event to the projection outbox. Wired for agents (task-application
+  `task.update` capability + intent/event mapping) and CLI
+  (`zylos task postpone <taskId> --due-at <RFC3339>`). This is the primitive
+  the upcoming due-time sweep uses to snooze a task to its next deadline.
+- Index `idx_commitment_tasks_open_due` on open-task due dates for the due
+  sweep. (#64, groundwork for #65 progress cards)
+
 ## [0.7.2-rc.27] - 2026-09-04
 
 ### Fixed
