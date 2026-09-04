@@ -230,7 +230,7 @@ function parseCliArgs(args) {
     }
     return { command: 'register', bootstrapPolicy: requireBootstrapPolicy(bootstrapPolicy) };
   }
-  if (args[0] === 'run') {
+  if (args[0] === 'run' || args.length === 0) {
     let once = false;
     for (let index = 1; index < args.length; index += 1) {
       if (args[index] === '--once' && !once) {
