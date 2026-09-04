@@ -253,7 +253,7 @@ describe('skill dependency pretest', () => {
     const calls = npmCalls(fixture);
     expect(calls).toHaveLength(1);
     expect(fs.realpathSync(calls[0].cwd)).toBe(fs.realpathSync(path.join(fixture.root, 'skills', 'runtime')));
-    expect(calls[0].args).toEqual(['ci', '--omit=dev']);
+    expect(calls[0].args).toEqual(['ci', '--omit=dev', '--no-audit', '--no-fund', '--fetch-timeout=120000', '--fetch-retries=2']);
     expect(fs.readFileSync(lockPath, 'utf8')).toBe(lockBefore);
     expect(git(fixture.root, ['status', '--porcelain'])).toBe('');
   });
