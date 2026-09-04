@@ -18,6 +18,7 @@ const CORE_SERVICE_NAMES = [
   'c4-dispatcher',
   'c4-intake-supervisor',
   'c4-response-stream-supervisor',
+  'feishu-task-stream-supervisor',
   'web-console',
 ];
 
@@ -241,6 +242,7 @@ export function startServices() {
     { name: 'c4-dispatcher', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-dispatcher.js') },
     { name: 'c4-intake-supervisor', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-intake-supervisor.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR}` },
     { name: 'c4-response-stream-supervisor', script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-response-stream-supervisor.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR} C4_RESPONSE_STREAM_AUTOSTART=1` },
+    { name: 'feishu-task-stream-supervisor', script: path.join(SKILLS_DIR, 'commitment-core', 'scripts', 'feishu-task-stream-worker.js'), env: `NODE_ENV=production ZYLOS_DIR=${ZYLOS_DIR} COMMITMENT_FEISHU_TASK_STREAM_AUTOSTART=1` },
     { name: 'web-console', script: path.join(SKILLS_DIR, 'web-console', 'server.js'), env: `WEB_CONSOLE_PORT=3456 ZYLOS_DIR=${ZYLOS_DIR}` },
   ];
 

@@ -28,6 +28,7 @@ describe('restartServicesWithDeps', () => {
         'c4-dispatcher',
         'c4-intake-supervisor',
         'c4-response-stream-supervisor',
+        'feishu-task-stream-supervisor',
         'web-console',
       ],
     );

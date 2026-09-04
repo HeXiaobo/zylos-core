@@ -68,7 +68,8 @@ try {
 // Core service names — components must not collide with these
 const CORE_SERVICE_NAMES = new Set([
   'scheduler', 'web-console', 'c4-dispatcher', 'c4-intake-supervisor',
-  'c4-response-stream-supervisor', 'activity-monitor', 'caddy',
+  'c4-response-stream-supervisor', 'feishu-task-stream-supervisor',
+  'activity-monitor', 'caddy',
 ]);
 
 // Parse SKILL.md YAML frontmatter service block.
@@ -255,6 +256,30 @@ module.exports = {
         NODE_ENV: 'production',
         ZYLOS_DIR,
         C4_RESPONSE_STREAM_AUTOSTART: '1',
+        // Task-driven streams (task status cards) can sit in_progress for
+        // hours while the agent works; only force-fail a genuinely abandoned
+        // run after a day. Interactive replies are completed far sooner.
+        C4_RESPONSE_STREAM_STALE_SECONDS: String(24 * 60 * 60),
+      },
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      kill_timeout: 5000,
+    },
+    {
+      // Bridges Commitment Core task lifecycle events into the originating
+      // Feishu conversation's assistant stream (task status card + completion
+      // notification). Self-registers its projection on boot.
+      name: 'feishu-task-stream-supervisor',
+      script: path.join(SKILLS_DIR, 'commitment-core', 'scripts', 'feishu-task-stream-worker.js'),
+      cwd: path.join(SKILLS_DIR, 'commitment-core', 'scripts'),
+      instances: 1,
+      exec_mode: 'fork',
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+        ZYLOS_DIR,
+        COMMITMENT_FEISHU_TASK_STREAM_AUTOSTART: '1',
       },
       autorestart: true,
       max_restarts: 10,
