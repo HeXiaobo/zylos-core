@@ -164,8 +164,6 @@ describe('late assistant_stream appends persist as dead letters (issue #52)', ()
   it('still delivers live appends with no dead-letter side effects', () => {
     const stream = completedStream();
     try {
-      // A late frame was already persisted in completedStream's setup? No —
-      // the helper only appends while started. Assert the baseline is clean.
       const dead = stream.queryDeliveries({
         requestId: 'assistant.feishu.late_1',
         status: 'dead_letter',
@@ -189,6 +187,61 @@ describe('late assistant_stream appends persist as dead letters (issue #52)', ()
       assert.equal(live.replayed, false);
       assert.equal(live.events.length, 1);
       assert.equal(live.events[0].type, 'OutputDelta');
+    } finally {
+      stream.close();
+    }
+  });
+
+  it('throws ASSISTANT_EVENT_CONFLICT when a late frame reuses a key with different payload', () => {
+    const stream = completedStream();
+    try {
+      // Same key as the live frame ('live:1' was appended in completedStream),
+      // different payload — parity with the live path's conflict detection.
+      assert.throws(
+        () => stream.execute({
+          type: 'AppendOutputDelta',
+          requestId: 'assistant.feishu.late_1',
+          delta: 'different straggler content',
+          idempotencyKey: 'live:1',
+        }),
+        /different payload/,
+      );
+      // No dead letter was created for the conflicting frame.
+      const dead = stream.queryDeliveries({
+        requestId: 'assistant.feishu.late_1',
+        status: 'dead_letter',
+      });
+      assert.equal(dead.length, 0);
+    } finally {
+      stream.close();
+    }
+  });
+
+  it('replays an identical late frame without a new dead letter and reports it', () => {
+    const stream = completedStream();
+    try {
+      const first = stream.execute({
+        type: 'AppendOutputDelta',
+        requestId: 'assistant.feishu.late_1',
+        delta: 'identical straggler',
+        idempotencyKey: 'late:identical',
+      });
+      const second = stream.execute({
+        type: 'AppendOutputDelta',
+        requestId: 'assistant.feishu.late_1',
+        delta: 'identical straggler',
+        idempotencyKey: 'late:identical',
+      });
+      assert.equal(first.lateAppended, true);
+      assert.equal(second.replayed, true);
+      assert.equal(second.lateAppended, false);
+      assert.equal(second.events.length, 1);
+      assert.equal(second.events[0].payload.delta, 'identical straggler');
+      const dead = stream.queryDeliveries({
+        requestId: 'assistant.feishu.late_1',
+        status: 'dead_letter',
+      });
+      assert.equal(dead.length, 1);
     } finally {
       stream.close();
     }

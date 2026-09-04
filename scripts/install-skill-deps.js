@@ -248,7 +248,15 @@ for (const name of readdirSync(skillsDir, { withFileTypes: true })) {
     if (existsSync(modules)) return;
     console.log(`[pretest] Installing deps for skills/${name.name}`);
     try {
-      execFileSync('npm', ['ci', '--omit=dev'], { cwd: dir, stdio: 'inherit' });
+      // --no-audit/--no-fund skip the extra registry round-trips that
+      // otherwise can hang for tens of minutes on flaky network (observed
+      // repeatedly in hosted CI). fetch-timeout bounds a dead connection so
+      // npm fails fast instead of idling, and the caller retries the job.
+      execFileSync('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund', '--fetch-timeout=120000', '--fetch-retries=2'], {
+        cwd: dir,
+        stdio: 'inherit',
+        timeout: 300_000,
+      });
     } catch (error) {
       rmSync(modules, { recursive: true, force: true });
       throw error;

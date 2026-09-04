@@ -111,6 +111,11 @@ export function getDb() {
         ensureAssistantResponseSchema(connection);
         ensureVoidChannelMigration(connection);
       },
+      {
+        // Make startup retries visible in pm2 logs; previously backoff only
+        // surfaced after all attempts failed, hiding transient lock races.
+        log: (event) => console.warn(`[C4-DB] ${event.event} attempt=${event.attempt} delayMs=${event.delayMs} error=${event.error}`),
+      },
     );
   }
   return db;
@@ -1325,6 +1330,9 @@ export function openCommitmentIntakeQueue({
         ensureStatusNoticeCooldownSchema(connection);
         ensureCommitmentIntakeSchema(connection);
         ensureVoidChannelMigration(connection);
+      },
+      {
+        log: (event) => console.warn(`[C4-DB] ${event.event} attempt=${event.attempt} delayMs=${event.delayMs} error=${event.error}`),
       },
     );
     ownsDatabase = true;
