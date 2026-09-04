@@ -352,7 +352,10 @@ export function openAssistantResponseStream({
     WHERE request_id = ? AND idempotency_key = ?
   `);
 
-  function appendEvent(requestRow, eventType, payload, idempotencyKey = null) {
+  function appendEvent(requestRow, eventType, payload, idempotencyKey = null, {
+    deliveryStatus = 'pending',
+    lastError = null,
+  } = {}) {
     if (!EVENT_TYPE_SET.has(eventType)) throw new TypeError(`unsupported event type: ${eventType}`);
     if (idempotencyKey) {
       const existing = selectEventByKey.get(requestRow.request_id, idempotencyKey);
@@ -363,14 +366,16 @@ export function openAssistantResponseStream({
     database.prepare(`
       INSERT INTO assistant_response_events (
         request_id, sequence, event_type, payload_json, idempotency_key,
-        delivery_status, retry_count, available_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+        delivery_status, last_error, retry_count, available_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
     `).run(
       requestRow.request_id,
       sequence,
       eventType,
       JSON.stringify(payload),
       idempotencyKey,
+      deliveryStatus,
+      lastError,
       current,
       current,
     );
@@ -1077,9 +1082,6 @@ export function openAssistantResponseStream({
         if (delta.length === 0) throw new TypeError('delta must not be empty');
         const request = selectRequest.get(requestId);
         if (!request) throw new Error(`assistant request not found: ${requestId}`);
-        if (request.status !== 'started') {
-          throw new Error(`cannot append public reasoning while assistant request is ${request.status}`);
-        }
         const scope = runtimeMutationScope(command, idempotencyKey);
         if (scope) {
           const ownership = verifyRuntimeMutationOwnership({ requestId, ...scope });
@@ -1091,6 +1093,23 @@ export function openAssistantResponseStream({
               reason: ownership.reason,
             };
           }
+        }
+        if (request.status !== 'started') {
+          // Issue #52: frames arriving after the request reached a terminal
+          // status used to be dropped with a thrown error — silent content
+          // loss the sender never learned about. Persist them as dead-letter
+          // events instead: auditable, redrivable, and never delivered as if
+          // the request were still live.
+          const emitted = appendEvent(request, 'PublicReasoningDelta', { delta }, idempotencyKey, {
+            deliveryStatus: 'dead_letter',
+            lastError: `late_append_after_terminal:${request.status}`,
+          });
+          return {
+            request: toRequest(selectRequest.get(requestId)),
+            events: [],
+            replayed: emitted.replayed,
+            lateAppended: !emitted.replayed,
+          };
         }
         const existing = selectEventByKey.get(requestId, idempotencyKey);
         if (existing) {
@@ -1147,9 +1166,6 @@ export function openAssistantResponseStream({
         if (delta.length === 0) throw new TypeError('delta must not be empty');
         let request = selectRequest.get(requestId);
         if (!request) throw new Error(`assistant request not found: ${requestId}`);
-        if (request.status !== 'started') {
-          throw new Error(`cannot append output while assistant request is ${request.status}`);
-        }
         const scope = runtimeMutationScope(command, idempotencyKey);
         if (scope) {
           const ownership = verifyRuntimeMutationOwnership({ requestId, ...scope });
@@ -1161,6 +1177,24 @@ export function openAssistantResponseStream({
               reason: ownership.reason,
             };
           }
+        }
+        if (request.status !== 'started') {
+          // Issue #52: frames arriving after the request reached a terminal
+          // status used to be dropped with a thrown error — silent content
+          // loss the sender never learned about. Persist them as dead-letter
+          // events instead: auditable, redrivable, and never delivered as if
+          // the request were still live. output_text is intentionally not
+          // extended — the terminal output stays frozen.
+          const emitted = appendEvent(request, 'OutputDelta', { delta }, idempotencyKey, {
+            deliveryStatus: 'dead_letter',
+            lastError: `late_append_after_terminal:${request.status}`,
+          });
+          return {
+            request: toRequest(selectRequest.get(requestId)),
+            events: [],
+            replayed: emitted.replayed,
+            lateAppended: !emitted.replayed,
+          };
         }
         const existing = selectEventByKey.get(requestId, idempotencyKey);
         if (existing) {
