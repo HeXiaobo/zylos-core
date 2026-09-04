@@ -20,6 +20,67 @@ const INIT_SQL_PATH = path.join(__dirname, '..', 'init-db.sql');
 let db = null;
 
 /**
+ * SQLITE_BUSY-class failures that busy_timeout alone may not absorb: WAL
+ * snapshot conflicts and schema-lock races between two processes opening the
+ * same database in the same second. This is the retryable class for cold-start
+ * schema initialization.
+ */
+export function isSqliteBusyError(error) {
+  const code = error?.code ?? '';
+  return code === 'SQLITE_BUSY'
+    || code === 'SQLITE_BUSY_SNAPSHOT'
+    || code === 'SQLITE_LOCKED'
+    || /SQLITE_(BUSY|LOCKED)/.test(String(error?.message ?? ''));
+}
+
+function sleepSync(ms) {
+  // better-sqlite3 is synchronous, so the schema-init backoff must be
+  // synchronous as well. Atomics.wait parks the thread without a busy loop.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Open a connection and run schema initialization with bounded backoff around
+ * SQLITE_BUSY-class failures. A schema race used to surface as a swallowed
+ * per-cycle error, leaving the worker process alive but non-functional; the
+ * retry discards the partially-initialized connection and reopens cleanly.
+ */
+export function openDatabaseWithSchemaRetry(openDatabase, initSchema, {
+  attempts = 3,
+  baseDelayMs = 250,
+  log = null,
+} = {}) {
+  if (!Number.isInteger(attempts) || attempts < 1) {
+    throw new TypeError('attempts must be a positive integer');
+  }
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let database = null;
+    try {
+      database = openDatabase();
+      if (initSchema) initSchema(database);
+      return database;
+    } catch (error) {
+      lastError = error;
+      try { database?.close(); } catch { /* already closed */ }
+      if (attempt < attempts && isSqliteBusyError(error)) {
+        const delayMs = baseDelayMs * 2 ** (attempt - 1);
+        log?.({
+          event: 'c4_db_schema_init_retry',
+          attempt,
+          delayMs,
+          error: error?.message || String(error),
+        });
+        sleepSync(delayMs);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
+}
+
+/**
  * Get database connection, initializing if needed
  */
 export function getDb() {
@@ -30,21 +91,27 @@ export function getDb() {
     }
 
     const isNew = !fs.existsSync(DB_PATH);
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');  // Better concurrent access
-    db.pragma('busy_timeout = 5000');
-    db.pragma('foreign_keys = ON');
+    db = openDatabaseWithSchemaRetry(
+      () => {
+        const connection = new Database(DB_PATH);
+        connection.pragma('journal_mode = WAL');  // Better concurrent access
+        connection.pragma('busy_timeout = 5000');
+        connection.pragma('foreign_keys = ON');
+        return connection;
+      },
+      (connection) => {
+        if (isNew) {
+          initSchema(connection);
+        }
 
-    if (isNew) {
-      initSchema();
-    }
-
-    ensureConversationsSchema(db);
-    ensureControlQueueSchema(db);
-    ensureStatusNoticeCooldownSchema(db);
-    ensureCommitmentIntakeSchema(db);
-    ensureAssistantResponseSchema(db);
-    ensureVoidChannelMigration(db);
+        ensureConversationsSchema(connection);
+        ensureControlQueueSchema(connection);
+        ensureStatusNoticeCooldownSchema(connection);
+        ensureCommitmentIntakeSchema(connection);
+        ensureAssistantResponseSchema(connection);
+        ensureVoidChannelMigration(connection);
+      },
+    );
   }
   return db;
 }
@@ -52,9 +119,9 @@ export function getDb() {
 /**
  * Initialize database schema from init-db.sql
  */
-function initSchema() {
+function initSchema(database) {
   const initSql = fs.readFileSync(INIT_SQL_PATH, 'utf8');
-  db.exec(initSql);
+  database.exec(initSql);
   console.log('[C4-DB] Database initialized');
 }
 
@@ -1243,17 +1310,24 @@ export function openCommitmentIntakeQueue({
       fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     }
     const isNew = dbPath === ':memory:' || !fs.existsSync(dbPath);
-    database = new Database(dbPath);
+    database = openDatabaseWithSchemaRetry(
+      () => {
+        const connection = new Database(dbPath);
+        connection.pragma('busy_timeout = 5000');
+        connection.pragma('foreign_keys = ON');
+        if (dbPath !== ':memory:') connection.pragma('journal_mode = WAL');
+        return connection;
+      },
+      (connection) => {
+        if (isNew) connection.exec(fs.readFileSync(INIT_SQL_PATH, 'utf8'));
+        ensureConversationsSchema(connection);
+        ensureControlQueueSchema(connection);
+        ensureStatusNoticeCooldownSchema(connection);
+        ensureCommitmentIntakeSchema(connection);
+        ensureVoidChannelMigration(connection);
+      },
+    );
     ownsDatabase = true;
-    database.pragma('busy_timeout = 5000');
-    database.pragma('foreign_keys = ON');
-    if (dbPath !== ':memory:') database.pragma('journal_mode = WAL');
-    if (isNew) database.exec(fs.readFileSync(INIT_SQL_PATH, 'utf8'));
-    ensureConversationsSchema(database);
-    ensureControlQueueSchema(database);
-    ensureStatusNoticeCooldownSchema(database);
-    ensureCommitmentIntakeSchema(database);
-    ensureVoidChannelMigration(database);
   } else {
     database = getDb();
   }

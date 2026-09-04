@@ -57,6 +57,27 @@ export const API_ACTIVITY_FILE = path.join(ACTIVITY_MONITOR_DIR, 'api-activity.j
 export const PENDING_CHANNELS_FILE = path.join(ACTIVITY_MONITOR_DIR, 'pending-channels.jsonl');
 export const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 export const SKILLS_DIR = path.join(ZYLOS_DIR, '.claude', 'skills');
+export const HEALTH_DIR = path.join(ZYLOS_DIR, '.zylos', 'health');
+
+/**
+ * Health markers let monitoring distinguish "process alive" from "worker
+ * actually initialized and completed work" (issue #54: a worker whose schema
+ * init failed stayed pm2-online for 11 hours while processing nothing).
+ * Supervisors write `<name>.ok` only after their first successful drain.
+ */
+export function healthMarkerPath(name) {
+  if (!/^[A-Za-z0-9._-]+$/.test(String(name))) {
+    throw new TypeError('health marker name must be a safe identifier');
+  }
+  return path.join(HEALTH_DIR, `${String(name)}.ok`);
+}
+
+export function writeHealthMarker(name, { clock = () => new Date().toISOString() } = {}) {
+  const markerPath = healthMarkerPath(name);
+  fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+  fs.writeFileSync(markerPath, `${JSON.stringify({ ok: true, at: clock(), pid: process.pid })}\n`);
+  return markerPath;
+}
 
 // Single source of truth for the Memory Sync checkpoint threshold (unsummarized
 // conversation count that triggers a sync). Imported by the activity-monitor
