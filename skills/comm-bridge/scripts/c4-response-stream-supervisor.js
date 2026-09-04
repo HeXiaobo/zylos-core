@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { SKILLS_DIR } from './c4-config.js';
+import { SKILLS_DIR, writeHealthMarker } from './c4-config.js';
 import { openAssistantResponseStream } from './assistant-response-stream.js';
 
 const DEFAULT_POLL_MS = 250;
@@ -153,8 +153,58 @@ export function createAssistantResponseDeliveryWorker({
 
 let shuttingDown = false;
 
+export const DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 20;
+
+/**
+ * Delivery loop extracted from main() so the failure policy is testable.
+ * Issue #54: per-drain errors used to be swallowed forever, so a worker whose
+ * database never initialized stayed "fake alive" while pm2 reported healthy.
+ * A sustained failure streak now stops the loop; main() exits non-zero and
+ * pm2 surfaces the broken deployment.
+ */
+export async function runAssistantResponseDeliveryLoop({
+  worker,
+  pollMs,
+  sleep: sleepFn = sleep,
+  shouldContinue,
+  failureLimit = DEFAULT_CONSECUTIVE_FAILURE_LIMIT,
+  logger = console,
+  onFirstSuccess = null,
+}) {
+  let consecutiveFailures = 0;
+  let firstSuccessReported = false;
+  while (shouldContinue()) {
+    try {
+      const result = await worker.drainOnce();
+      consecutiveFailures = 0;
+      if (!firstSuccessReported) {
+        firstSuccessReported = true;
+        try {
+          onFirstSuccess?.();
+        } catch (err) {
+          logger.error?.(`[C4] Response stream health marker write failed: ${err?.message || err}`);
+        }
+      }
+      if (result.claimed > 0 || result.expired > 0) {
+        logger.log(`[C4] Response stream drain ${JSON.stringify(result)}`);
+      }
+    } catch (err) {
+      consecutiveFailures += 1;
+      logger.error(`[C4] Response stream supervisor error (${consecutiveFailures}/${failureLimit}): ${err.stack || err.message}`);
+      if (Number.isInteger(failureLimit) && failureLimit > 0 && consecutiveFailures >= failureLimit) {
+        return { stopReason: 'consecutive_failures', consecutiveFailures };
+      }
+    }
+    if (shouldContinue()) await sleepFn(pollMs);
+  }
+  return { stopReason: 'stopped' };
+}
+
 async function main() {
   const pollMs = positiveInteger(process.env.C4_RESPONSE_STREAM_POLL_MS, DEFAULT_POLL_MS);
+  // The stream opens its database eagerly at worker creation: an init failure
+  // throws out of main() and exits non-zero, so pm2 restarts instead of the
+  // supervisor idling without a working database.
   const worker = createAssistantResponseDeliveryWorker({
     batchSize: positiveInteger(process.env.C4_RESPONSE_STREAM_BATCH_SIZE, DEFAULT_BATCH_SIZE),
     staleSeconds: positiveInteger(process.env.C4_RESPONSE_STREAM_STALE_SECONDS, DEFAULT_STALE_SECONDS),
@@ -166,16 +216,14 @@ async function main() {
   process.on('SIGTERM', shutdown);
 
   console.log('[C4] Assistant response stream supervisor started');
-  while (!shuttingDown) {
-    try {
-      const result = await worker.drainOnce();
-      if (result.claimed > 0 || result.expired > 0) {
-        console.log(`[C4] Response stream drain ${JSON.stringify(result)}`);
-      }
-    } catch (err) {
-      console.error(`[C4] Response stream supervisor error: ${err.stack || err.message}`);
-    }
-    await sleep(pollMs);
+  const result = await runAssistantResponseDeliveryLoop({
+    worker,
+    pollMs,
+    shouldContinue: () => !shuttingDown,
+    onFirstSuccess: () => writeHealthMarker('c4-response-stream-supervisor'),
+  });
+  if (result.stopReason === 'consecutive_failures') {
+    process.exitCode = 1;
   }
   worker.close();
 }
