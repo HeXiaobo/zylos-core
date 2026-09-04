@@ -189,6 +189,73 @@ test('requires a canonical deadline before accepting a reminder', () => {
   }
 });
 
+test('PostponeTask moves the deadline, appends a TaskDueUpdated event, and stays in state', () => {
+  const harness = createHarness();
+
+  try {
+    const ingest = harness.core.ingest({
+      idempotencyKey: 'lark:om_postpone:task-intent',
+      source: {
+        channel: 'lark',
+        externalId: 'om_postpone',
+        senderId: 'ou_owner',
+      },
+      task: {
+        title: '可改期的任务',
+        ownerId: 'ou_owner',
+        acceptorId: 'ou_owner',
+        dueAt: '2026-08-30T18:00:00+08:00',
+      },
+    });
+    const taskId = ingest.task.id;
+    const started = harness.core.command({
+      type: 'StartTask',
+      taskId,
+      actorId: 'ou_owner',
+      idempotencyKey: 'cmd:start:1',
+    }, 1);
+    assert.equal(started.task.state, 'in_progress');
+
+    const postponed = harness.core.command({
+      type: 'PostponeTask',
+      taskId,
+      actorId: 'ou_owner',
+      idempotencyKey: 'cmd:postpone:1',
+      dueAt: '2026-09-02T18:00:00+08:00',
+    }, 2);
+    assert.equal(postponed.task.state, 'in_progress', 'postpone does not change task state');
+    assert.equal(postponed.task.dueAt, '2026-09-02T10:00:00.000Z');
+    assert.equal(postponed.event.type, 'TaskDueUpdated');
+    assert.equal(postponed.event.fromState, 'in_progress');
+    assert.equal(postponed.event.toState, 'in_progress');
+
+    // Idempotent replay with the same key (and same expected version) returns
+    // the stored result without applying the command again.
+    const replay = harness.core.command({
+      type: 'PostponeTask',
+      taskId,
+      actorId: 'ou_owner',
+      idempotencyKey: 'cmd:postpone:1',
+      dueAt: '2026-09-02T18:00:00+08:00',
+    }, 2);
+    assert.equal(replay.task.dueAt, '2026-09-02T10:00:00.000Z');
+
+    // A different payload under the same key is a conflict.
+    assert.throws(() => harness.core.command({
+      type: 'PostponeTask',
+      taskId,
+      actorId: 'ou_owner',
+      idempotencyKey: 'cmd:postpone:1',
+      dueAt: '2026-09-03T18:00:00+08:00',
+    }, 2), /idempotency key already belongs to different content/);
+
+    const { events } = harness.core.query({ taskId, includeEvents: true });
+    assert.ok(events.map(event => event.type).includes('TaskDueUpdated'));
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('rejects a reminder that is not a non-negative integer', () => {
   const harness = createHarness();
 

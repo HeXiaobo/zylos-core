@@ -45,6 +45,7 @@ const EXISTING_TASK_INTENT_FIELDS = new Set([
   'command',
   'expectedVersion',
   'reminderMinutesBeforeDue',
+  'dueAt',
 ]);
 
 const COMMAND_CAPABILITIES = Object.freeze({
@@ -55,6 +56,7 @@ const COMMAND_CAPABILITIES = Object.freeze({
   CancelTask: 'task.cancel',
   ReopenTask: 'task.reopen',
   UpdateTaskReminder: 'task.update',
+  PostponeTask: 'task.update',
 });
 
 const EVENT_COMMANDS = Object.freeze({
@@ -65,6 +67,7 @@ const EVENT_COMMANDS = Object.freeze({
   TaskCancelled: 'CancelTask',
   TaskReopened: 'ReopenTask',
   TaskReminderUpdated: 'UpdateTaskReminder',
+  TaskDueUpdated: 'PostponeTask',
 });
 
 const DENIAL_CODES = new Set([
@@ -267,18 +270,35 @@ function normalizeCreateIntent(rawIntent) {
   return normalized;
 }
 
+function requireTimestamp(value, field) {
+  const text = requireText(value, field);
+  if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(text)
+    || !Number.isFinite(Date.parse(text))) {
+    throw new TypeError(`${field} must be an RFC 3339 timestamp`);
+  }
+  return new Date(Date.parse(text)).toISOString();
+}
+
 function normalizeTaskIntent(rawIntent) {
   const intent = requireRecord(rawIntent, 'task intent');
   if (intent.command === 'CreateTask') return normalizeCreateIntent(intent);
   rejectUnknownFields(intent, EXISTING_TASK_INTENT_FIELDS, 'task intent');
   const taskId = requireText(intent.taskId, 'task intent.taskId');
   const expectedVersion = normalizeExpectedVersion(intent.expectedVersion);
-  const command = intent.command === 'UpdateTaskReminder'
-    ? {
+  let command;
+  if (intent.command === 'UpdateTaskReminder') {
+    command = {
       type: 'UpdateTaskReminder',
       reminderMinutesBeforeDue: intent.reminderMinutesBeforeDue,
-    }
-    : requireText(intent.command, 'task intent.command');
+    };
+  } else if (intent.command === 'PostponeTask') {
+    command = {
+      type: 'PostponeTask',
+      dueAt: requireTimestamp(intent.dueAt, 'task intent.dueAt'),
+    };
+  } else {
+    command = requireText(intent.command, 'task intent.command');
+  }
   return { command, taskId, expectedVersion };
 }
 
@@ -291,6 +311,13 @@ function normalizeApplicationCommand(rawCommand) {
     return { type };
   }
   const command = requireRecord(rawCommand, 'command');
+  if (command.type === 'PostponeTask') {
+    rejectUnknownFields(command, new Set(['type', 'dueAt']), 'command');
+    return {
+      type: 'PostponeTask',
+      dueAt: requireTimestamp(command.dueAt, 'command.dueAt'),
+    };
+  }
   if (command.type !== 'UpdateTaskReminder') {
     rejectUnknownFields(command, new Set(['type']), 'command');
     const type = requireText(command.type, 'command.type');

@@ -424,6 +424,9 @@ test('the Commitment adapter accepts automatic create and explicit confirmation 
       ownerId: 'ou_sender',
       acceptorId: 'ou_sender',
       assigneeId: null,
+      // No explicit deadline phrase: default to the next 18:00 local wall
+      // clock (receivedAt is 2026-08-25T02:00Z = 10:00 Shanghai → same-day 18:00).
+      dueAt: '2026-08-25T10:00:00.000Z',
     },
   });
 
