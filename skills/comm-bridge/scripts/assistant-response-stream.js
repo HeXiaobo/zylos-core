@@ -10,7 +10,7 @@ import {
   SAFE_PROGRESS_STAGES,
   safeProgressStageForTool,
 } from './assistant-public-progress.js';
-import { ensureAssistantResponseSchema, getDb } from './c4-db.js';
+import { ensureAssistantResponseSchema, getDb, openDatabaseWithSchemaRetry } from './c4-db.js';
 
 export { SAFE_PROGRESS_STAGES, safeProgressStageForTool } from './assistant-public-progress.js';
 
@@ -180,38 +180,45 @@ function toFinalOutputCandidate(row) {
 function openDatabase(dbPath) {
   if (!dbPath) return { database: getDb(), ownsDatabase: false };
   if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  const database = new Database(dbPath);
-  database.pragma('busy_timeout = 5000');
-  database.pragma('foreign_keys = ON');
-  if (dbPath !== ':memory:') database.pragma('journal_mode = WAL');
-  // Standalone tests and adapters may open this Module without c4-db first.
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-      direction TEXT NOT NULL,
-      channel TEXT NOT NULL,
-      endpoint_id TEXT,
-      content TEXT NOT NULL,
-      assistant_request_id TEXT,
-      status TEXT DEFAULT 'pending',
-      delivery_action TEXT,
-      priority INTEGER DEFAULT 3,
-      require_idle INTEGER DEFAULT 0,
-      retry_count INTEGER DEFAULT 0
-    );
-  `);
-  const conversationColumns = new Set(
-    database.prepare('PRAGMA table_info(conversations)').all().map(column => column.name),
+  const database = openDatabaseWithSchemaRetry(
+    () => {
+      const connection = new Database(dbPath);
+      connection.pragma('busy_timeout = 5000');
+      connection.pragma('foreign_keys = ON');
+      if (dbPath !== ':memory:') connection.pragma('journal_mode = WAL');
+      return connection;
+    },
+    (connection) => {
+      // Standalone tests and adapters may open this Module without c4-db first.
+      connection.exec(`
+        CREATE TABLE IF NOT EXISTS conversations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+          direction TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          endpoint_id TEXT,
+          content TEXT NOT NULL,
+          assistant_request_id TEXT,
+          status TEXT DEFAULT 'pending',
+          delivery_action TEXT,
+          priority INTEGER DEFAULT 3,
+          require_idle INTEGER DEFAULT 0,
+          retry_count INTEGER DEFAULT 0
+        );
+      `);
+      const conversationColumns = new Set(
+        connection.prepare('PRAGMA table_info(conversations)').all().map(column => column.name),
+      );
+      if (!conversationColumns.has('assistant_request_id')) {
+        connection.exec('ALTER TABLE conversations ADD COLUMN assistant_request_id TEXT');
+      }
+      connection.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_assistant_request_out
+          ON conversations(assistant_request_id)
+          WHERE direction = 'out' AND assistant_request_id IS NOT NULL
+      `);
+    },
   );
-  if (!conversationColumns.has('assistant_request_id')) {
-    database.exec('ALTER TABLE conversations ADD COLUMN assistant_request_id TEXT');
-  }
-  database.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_assistant_request_out
-      ON conversations(assistant_request_id)
-      WHERE direction = 'out' AND assistant_request_id IS NOT NULL
-  `);
   return { database, ownsDatabase: true };
 }
 
