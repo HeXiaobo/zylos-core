@@ -380,10 +380,20 @@ export function planSmartSync(srcDir, destDir, opts = {}) {
       continue;
     }
 
-    // No manifest — can't tell if user modified; treat as overwrite
+    // No baseline manifest for this skill — the local file may carry manual
+    // patches that were never baselined (issue #55: upgrades used to eat them
+    // silently, because "can't tell if user modified" defaulted to plain
+    // overwrite). Treat any difference from the incoming package as a
+    // conflict: the executor backs the local file up, records it, and the
+    // operator sees it in the upgrade report. Byte-identical files are a
+    // no-op, so a missing baseline alone never manufactures conflict noise.
     if (!savedManifest) {
+      if (hashFile(destFile) === newHash) {
+        continue;
+      }
       addOperation(plan, {
-        action: 'update', outcome: 'overwritten', file: relPath, srcFile, destFile,
+        action: 'conflict', outcome: 'conflict', file: relPath, srcFile, destFile,
+        backupPath: backupDir ? path.join(backupDir, relPath) : null,
         reason: 'baseline_manifest_missing',
       });
       continue;
