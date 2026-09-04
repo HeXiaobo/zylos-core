@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.27] - 2026-09-04
+
+### Fixed
+- Fail closed when a comm-bridge worker cannot initialize its database:
+  schema setup now retries with bounded backoff across SQLITE_BUSY/LOCKED
+  startup races, and both the intake and response-stream supervisors exit
+  non-zero after a sustained failure streak instead of staying pm2-online
+  but non-functional. Supervisors also write a `.zylos/health/<name>.ok`
+  marker after their first successful drain so monitoring can check real
+  initialization instead of bare process liveness (#54, #56).
+- Persist assistant_stream output/reasoning frames that arrive after a
+  request reached a terminal status as dead-letter events instead of silently
+  dropping them; ownership is verified before the status check, the terminal
+  output stays frozen, and the existing redrive path can requeue them (#52,
+  #57).
+- Treat locally changed files on skills without a baseline manifest as
+  upgrade conflicts (durable backup + reported) rather than silently
+  overwriting them; byte-identical files remain a no-op (#55, #58).
+- Make schema-init retries visible in logs, reject a reused idempotency key
+  carrying different payloads on the late-frame path, and bound the
+  skill-dependency install with npm audit/fund/timeouts so flaky registry
+  connectivity fails the CI step fast instead of hanging (#59).
+
 ## [0.7.2-rc.26] - 2026-09-03
 
 ### Fixed
