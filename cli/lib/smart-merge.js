@@ -393,6 +393,10 @@ export function planSmartSync(srcDir, destDir, opts = {}) {
       }
       addOperation(plan, {
         action: 'conflict', outcome: 'conflict', file: relPath, srcFile, destFile,
+        // Production upgrade paths always pass a backupDir; when null (only
+        // possible for a direct library caller) the local content is
+        // overwritten with no backup copy — the conflict report remains, so
+        // the drift is still surfaced and visible, just not restorable here.
         backupPath: backupDir ? path.join(backupDir, relPath) : null,
         reason: 'baseline_manifest_missing',
       });

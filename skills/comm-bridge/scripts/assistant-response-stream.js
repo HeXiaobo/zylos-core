@@ -218,6 +218,10 @@ function openDatabase(dbPath) {
           WHERE direction = 'out' AND assistant_request_id IS NOT NULL
       `);
     },
+    {
+      // Surface startup retries in pm2 logs (issue #54 follow-up).
+      log: (event) => console.warn(`[C4] ${event.event} attempt=${event.attempt} delayMs=${event.delayMs} error=${event.error}`),
+    },
   );
   return { database, ownsDatabase: true };
 }
@@ -1107,6 +1111,23 @@ export function openAssistantResponseStream({
           // loss the sender never learned about. Persist them as dead-letter
           // events instead: auditable, redrivable, and never delivered as if
           // the request were still live.
+          const existing = selectEventByKey.get(requestId, idempotencyKey);
+          if (existing) {
+            // Parity with the live path: a reused idempotency key carrying
+            // different payloads is a caller bug, not a replay.
+            const persisted = toEvent(existing);
+            if (persisted.type !== 'PublicReasoningDelta' || persisted.payload.delta !== delta) {
+              const error = new Error('public reasoning idempotency key belongs to different payload');
+              error.code = 'ASSISTANT_EVENT_CONFLICT';
+              throw error;
+            }
+            return {
+              request: toRequest(selectRequest.get(requestId)),
+              events: [persisted],
+              replayed: true,
+              lateAppended: false,
+            };
+          }
           const emitted = appendEvent(request, 'PublicReasoningDelta', { delta }, idempotencyKey, {
             deliveryStatus: 'dead_letter',
             lastError: `late_append_after_terminal:${request.status}`,
@@ -1192,6 +1213,23 @@ export function openAssistantResponseStream({
           // events instead: auditable, redrivable, and never delivered as if
           // the request were still live. output_text is intentionally not
           // extended — the terminal output stays frozen.
+          const existing = selectEventByKey.get(requestId, idempotencyKey);
+          if (existing) {
+            // Parity with the live path: a reused idempotency key carrying
+            // different payloads is a caller bug, not a replay.
+            const persisted = toEvent(existing);
+            if (persisted.type !== 'OutputDelta' || persisted.payload.delta !== delta) {
+              const error = new Error('output delta idempotency key belongs to different payload');
+              error.code = 'ASSISTANT_EVENT_CONFLICT';
+              throw error;
+            }
+            return {
+              request: toRequest(selectRequest.get(requestId)),
+              events: [persisted],
+              replayed: true,
+              lateAppended: false,
+            };
+          }
           const emitted = appendEvent(request, 'OutputDelta', { delta }, idempotencyKey, {
             deliveryStatus: 'dead_letter',
             lastError: `late_append_after_terminal:${request.status}`,
