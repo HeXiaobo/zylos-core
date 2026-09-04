@@ -88,6 +88,15 @@ function optionalNonNegativeInteger(value, field) {
   return value;
 }
 
+// Channel-neutral backstop deadline (the work-intake path applies a localized
+// default instead): 24h after the supplied reference instant, in UTC.
+const DEFAULT_TASK_DUE_MS = 24 * 60 * 60 * 1000;
+function defaultDueAtFrom(referenceIso) {
+  const reference = Date.parse(requireText(referenceIso, 'dueAt reference'));
+  if (!Number.isFinite(reference)) throw new TypeError('dueAt reference is not a valid timestamp');
+  return new Date(reference + DEFAULT_TASK_DUE_MS).toISOString();
+}
+
 function rejectUnknownFields(value, allowedFields, field) {
   const unknown = Object.keys(value).find((key) => !allowedFields.has(key));
   if (unknown) throw new TypeError(`unsupported ${field} field: ${unknown}`);
@@ -124,12 +133,25 @@ function toEventView(row) {
   };
 }
 
-function normalizeTask(task) {
+// Due dates are guaranteed at the task-creation entry points (the work-intake
+// commitment adapter applies a localized default; CLI/agent creation applies a
+// channel-neutral fallback). Core stays tolerant of a null dueAt so legacy
+// rows and migrations keep replaying; supplyDefaultDueAt (a value or getter)
+// lets an entry point opt into the default when it wants one.
+function normalizeTask(task, supplyDefaultDueAt = null) {
   if (!task || typeof task !== 'object' || Array.isArray(task)) {
     throw new TypeError('task must be an object');
   }
   const ownerId = requireText(task.ownerId, 'task.ownerId');
-  const dueAt = optionalTimestamp(task.dueAt, 'task.dueAt');
+  let dueAt = optionalTimestamp(task.dueAt, 'task.dueAt');
+  if (dueAt === null && supplyDefaultDueAt !== null) {
+    const supplied = typeof supplyDefaultDueAt === 'function'
+      ? supplyDefaultDueAt()
+      : supplyDefaultDueAt;
+    if (supplied !== null && supplied !== undefined) {
+      dueAt = optionalTimestamp(supplied, 'task.dueAt');
+    }
+  }
   const reminderMinutesBeforeDue = optionalNonNegativeInteger(
     task.reminderMinutesBeforeDue,
     'task.reminderMinutesBeforeDue',
@@ -148,7 +170,7 @@ function normalizeTask(task) {
   };
 }
 
-function normalizeEnvelope(envelope) {
+function normalizeEnvelope(envelope, supplyDefaultDueAt = null) {
   if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
     throw new TypeError('envelope must be an object');
   }
@@ -164,13 +186,13 @@ function normalizeEnvelope(envelope) {
       externalId: requireText(source.externalId, 'source.externalId'),
       senderId: optionalText(source.senderId, 'source.senderId'),
     },
-    task: normalizeTask(envelope.task),
+    task: normalizeTask(envelope.task, supplyDefaultDueAt),
   };
 }
 
 const LEGACY_TASK_ADOPTION_BACKEND = 'feishu-task-v2';
 
-function normalizeLegacyTaskAdoption(rawRequest) {
+function normalizeLegacyTaskAdoption(rawRequest, supplyDefaultDueAt = null) {
   if (!rawRequest || typeof rawRequest !== 'object' || Array.isArray(rawRequest)) {
     throw new TypeError('legacy task adoption request must be an object');
   }
@@ -202,7 +224,7 @@ function normalizeLegacyTaskAdoption(rawRequest) {
     taskId: rawRequest.taskId === undefined || rawRequest.taskId === null
       ? null
       : requireText(rawRequest.taskId, 'taskId').trim(),
-    task: normalizeTask(rawRequest.task),
+    task: normalizeTask(rawRequest.task, supplyDefaultDueAt),
     mode,
   };
 }
@@ -212,15 +234,15 @@ function fingerprintEnvelope(envelope) {
 }
 
 function fingerprintLegacyEnvelopes(envelope) {
-  if (envelope?.task?.reminderMinutesBeforeDue !== null) return [];
-
-  const { reminderMinutesBeforeDue: _reminder, ...taskWithoutReminder } = envelope.task;
+  // Accept an older record that omitted a now-defaulted field (reminder
+  // offset, or — since dueAt became mandatory with a default — dueAt).
+  const { reminderMinutesBeforeDue: _reminder, dueAt: _due, ...taskCore } = envelope.task;
   const fingerprints = [
-    fingerprintEnvelope({ ...envelope, task: taskWithoutReminder }),
+    fingerprintEnvelope({ ...envelope, task: taskCore }),
   ];
-  if (taskWithoutReminder.dueAt === null) {
-    const { dueAt: _dueAt, ...taskWithoutDue } = taskWithoutReminder;
-    fingerprints.push(fingerprintEnvelope({ ...envelope, task: taskWithoutDue }));
+  if (envelope.task?.reminderMinutesBeforeDue === null) {
+    const { reminderMinutesBeforeDue: _r, ...withoutReminder } = envelope.task;
+    fingerprints.push(fingerprintEnvelope({ ...envelope, task: withoutReminder }));
   }
   return fingerprints;
 }
@@ -293,6 +315,16 @@ const COMMAND_DEFINITIONS = Object.freeze({
       return actorId === task.ownerId || actorId === task.acceptorId;
     },
   },
+  PostponeTask: {
+    // Same-state deadline change (no task-state transition, so no run coordination).
+    fromStates: ['ready', 'in_progress', 'review'],
+    eventType: 'TaskDueUpdated',
+    authorize(task, actorId) {
+      return actorId === task.ownerId
+        || actorId === task.acceptorId
+        || actorId === task.assigneeId;
+    },
+  },
 });
 
 const TASK_STATES = new Set(['ready', 'in_progress', 'review', 'done', 'cancelled']);
@@ -322,6 +354,13 @@ function normalizeCommand(command) {
       throw new TypeError('command.reminderMinutesBeforeDue must be a non-negative safe integer');
     }
     normalized.reminderMinutesBeforeDue = reminderMinutesBeforeDue;
+  }
+  if (type === 'PostponeTask') {
+    const dueAt = optionalTimestamp(command.dueAt, 'command.dueAt');
+    if (dueAt === null) {
+      throw new TypeError('command.dueAt must be an RFC 3339 timestamp');
+    }
+    normalized.dueAt = dueAt;
   }
   return normalized;
 }
@@ -502,6 +541,14 @@ function migrateTaskReminderSchema(database) {
   `);
 }
 
+// Note: open tasks created before dueAt became guaranteed may still have
+// due_at = NULL. They are intentionally NOT backfilled here — every task
+// creation entry point now supplies a deadline (the work-intake commitment
+// adapter applies a localized default), and the due-time sweep only selects
+// rows with a non-null due_at, so legacy null-due tasks are simply not swept.
+function migrateBackfillOpenDueDates(_database) {
+}
+
 function migrateLegacyEventSchema(database) {
   const fromState = database.pragma('table_info(commitment_events)')
     .find((column) => column.name === 'from_state');
@@ -606,6 +653,10 @@ function initializeSchema(database) {
     CREATE UNIQUE INDEX IF NOT EXISTS uq_commitment_events_task_version
       ON commitment_events(task_id, task_version);
 
+    CREATE INDEX IF NOT EXISTS idx_commitment_tasks_open_due
+      ON commitment_tasks(due_at)
+      WHERE state IN ('ready', 'in_progress', 'review');
+
     CREATE TABLE IF NOT EXISTS commitment_commands (
       idempotency_key TEXT PRIMARY KEY,
       request_fingerprint TEXT NOT NULL,
@@ -673,6 +724,7 @@ export function openCommitmentCore(options = {}) {
   migrateLegacyTaskStateSchema(database);
   migrateTaskDueAtSchema(database);
   migrateTaskReminderSchema(database);
+  migrateBackfillOpenDueDates(database);
   migrateLegacyEventSchema(database);
   database.pragma('foreign_keys = ON');
   initializeSchema(database);
@@ -744,6 +796,11 @@ export function openCommitmentCore(options = {}) {
   const updateTaskReminder = database.prepare(`
     UPDATE commitment_tasks
     SET reminder_minutes_before_due = ?, version = version + 1, updated_at = ?
+    WHERE id = ? AND version = ?
+  `);
+  const updateTaskDue = database.prepare(`
+    UPDATE commitment_tasks
+    SET due_at = ?, version = version + 1, updated_at = ?
     WHERE id = ? AND version = ?
   `);
   const insertEvent = database.prepare(`
@@ -861,6 +918,39 @@ export function openCommitmentCore(options = {}) {
     const event = {
       id: requireText(eventIdGenerator(), 'generated event id'),
       type: 'TaskReminderUpdated',
+      taskId: task.id,
+      actorId,
+      fromState: task.state,
+      toState: task.state,
+      version: updatedTask.version,
+      occurredAt: timestamp,
+    };
+    insertEvent.run(
+      event.id,
+      event.type,
+      event.taskId,
+      event.actorId,
+      event.fromState,
+      event.toState,
+      event.version,
+      event.occurredAt,
+    );
+    projectionOutboxModule.append(event);
+    return { task: updatedTask, event };
+  }
+
+  function updateDue({ task, dueAt, actorId, timestamp }) {
+    const updated = updateTaskDue.run(dueAt, timestamp, task.id, task.version);
+    if (updated.changes !== 1) {
+      throw domainError(
+        'VERSION_CONFLICT',
+        `task changed while updating dueAt: ${task.id}`,
+      );
+    }
+    const updatedTask = toTaskView(selectTask.get(task.id));
+    const event = {
+      id: requireText(eventIdGenerator(), 'generated event id'),
+      type: 'TaskDueUpdated',
       taskId: task.id,
       actorId,
       fromState: task.state,
@@ -1017,6 +1107,15 @@ export function openCommitmentCore(options = {}) {
         : updateReminder({
           task,
           reminderMinutesBeforeDue: command.reminderMinutesBeforeDue,
+          actorId: command.actorId,
+          timestamp,
+        });
+    } else if (command.type === 'PostponeTask') {
+      result = task.dueAt === command.dueAt
+        ? { task, event: null }
+        : updateDue({
+          task,
+          dueAt: command.dueAt,
           actorId: command.actorId,
           timestamp,
         });

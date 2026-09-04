@@ -118,3 +118,41 @@ export function resolveDueAt({ dueText, receivedAt, timeZone }) {
   if (!calendar) throw new TypeError(`unsupported deadline: ${dueText}`);
   return localDateTimeToIso({ ...calendar, ...resolveClock(dueText) }, timeZone);
 }
+
+// Default deadline for tasks with no explicit due phrase: the next 18:00 local
+// wall clock (today 18:00 if still in the future, otherwise tomorrow). Every
+// task must carry a due date; this keeps the channel-neutral default sensible
+// in the sender's timezone.
+export function defaultDueAt({ receivedAt, timeZone, hour = 18, minute = 0 } = {}) {
+  if (!receivedAt) {
+    throw new TypeError('receivedAt is required to resolve a default deadline');
+  }
+  const received = new Date(receivedAt);
+  if (Number.isNaN(received.getTime())) {
+    throw new TypeError('receivedAt must be a valid timestamp');
+  }
+  const zone = typeof timeZone === 'string' && timeZone.trim() !== '' ? timeZone : 'UTC';
+  const base = dateParts(received, zone);
+  const todayEighteen = localDateTimeToIso(
+    { year: base.year, month: base.month, day: base.day, hour, minute },
+    zone,
+  );
+  if (new Date(todayEighteen).getTime() > received.getTime()) {
+    return todayEighteen;
+  }
+  const tomorrow = addDays(base, 1);
+  return localDateTimeToIso(
+    { year: tomorrow.year, month: tomorrow.month, day: tomorrow.day, hour, minute },
+    zone,
+  );
+}
+
+// Backstop default for channel-neutral paths (CLI / agent intents) that have no
+// timezone: a fixed offset from the supplied reference instant.
+export function fallbackDueAt(referenceIso, offsetMs = 24 * 60 * 60 * 1000) {
+  const reference = new Date(referenceIso);
+  if (Number.isNaN(reference.getTime())) {
+    throw new TypeError('referenceIso must be a valid timestamp');
+  }
+  return new Date(reference.getTime() + offsetMs).toISOString();
+}

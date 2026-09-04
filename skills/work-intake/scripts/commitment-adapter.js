@@ -1,5 +1,5 @@
 import { validateInboundEnvelope } from './inbound-envelope.js';
-import { resolveDueAt } from './deadline.js';
+import { resolveDueAt, defaultDueAt } from './deadline.js';
 import { hasExplicitAgentAssignment } from './work-intake.js';
 
 const DECISION_FIELDS = new Set([
@@ -119,11 +119,19 @@ export function toCommitmentEnvelope(input, options = {}) {
       throw new TypeError(`${task.assigneeId} requires an explicit assignment or trusted default`);
     }
   }
-  const dueAt = resolveDueAt({
+  let dueAt = resolveDueAt({
     dueText: task.dueText,
     receivedAt: envelope.receivedAt,
     timeZone: envelope.timeZone,
   });
+  if (dueAt === null) {
+    // Every task must have a deadline. With no parsed due phrase, default to
+    // the next local 18:00 in the sender's timezone.
+    dueAt = defaultDueAt({
+      receivedAt: envelope.receivedAt ?? new Date().toISOString(),
+      timeZone: envelope.timeZone,
+    });
+  }
   const reminderMinutesBeforeDue = optionalNonNegativeInteger(
     task.reminderMinutesBeforeDue,
     'WorkIntake TaskDraft.reminderMinutesBeforeDue',
@@ -145,7 +153,7 @@ export function toCommitmentEnvelope(input, options = {}) {
       ownerId: requireText(task.ownerId, 'WorkIntake TaskDraft.ownerId'),
       acceptorId: requireText(task.acceptorId, 'WorkIntake TaskDraft.acceptorId'),
       assigneeId: optionalText(task.assigneeId, 'WorkIntake TaskDraft.assigneeId'),
-      ...(dueAt === null ? {} : { dueAt }),
+      dueAt,
       ...(reminderMinutesBeforeDue === null ? {} : { reminderMinutesBeforeDue }),
     },
   };
