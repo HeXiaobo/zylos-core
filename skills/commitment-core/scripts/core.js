@@ -752,6 +752,12 @@ export function openCommitmentCore(options = {}) {
     FROM commitment_sources
     WHERE idempotency_key = ?
   `);
+  const selectSourcesForTask = database.prepare(`
+    SELECT idempotency_key, channel, external_id, sender_id
+    FROM commitment_sources
+    WHERE task_id = ?
+    ORDER BY created_at, idempotency_key
+  `);
   const selectEventForTaskVersion = database.prepare(`
     SELECT id, event_type, task_id, actor_id, from_state, to_state,
            task_version, occurred_at
@@ -1334,6 +1340,18 @@ export function openCommitmentCore(options = {}) {
         task,
         events: selectEvents.all(normalized.taskId).map(toEventView),
       };
+    },
+    // Narrow read-only accessor for projection bridges that must correlate a
+    // task back to its originating channel message (e.g. the task-stream
+    // projection that drives the originating conversation's progress card).
+    queryTaskSources({ taskId } = {}) {
+      const id = requireText(taskId, 'taskId');
+      return selectSourcesForTask.all(id).map(row => ({
+        idempotencyKey: row.idempotency_key,
+        channel: row.channel,
+        externalId: row.external_id,
+        senderId: row.sender_id,
+      }));
     },
     close() {
       database.close();
