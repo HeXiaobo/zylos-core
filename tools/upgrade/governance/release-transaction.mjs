@@ -599,7 +599,7 @@ function atomicWriteBytes(filename, bytes, { exclusive = false } = {}) {
   return resolved;
 }
 
-function lockManifest(manifestPath) {
+export function lockManifest(manifestPath) {
   const lockPath = `${manifestPath}.lock`;
   let descriptor;
   try {
@@ -650,7 +650,7 @@ function scanUpgradeProcesses(runtimeRoot) {
   return matches;
 }
 
-function inspectRuntimeIsolation(runtimeRoot, lock) {
+export function inspectRuntimeIsolation(runtimeRoot, lock) {
   const lockRoot = path.join(runtimeRoot, '.zylos', 'locks');
   ensureRealDirectory(lockRoot);
   const entries = fs.readdirSync(lockRoot).sort();
@@ -675,7 +675,7 @@ function inspectRuntimeIsolation(runtimeRoot, lock) {
   };
 }
 
-function acquireRuntimeTransactionLock(runtimeRoot) {
+export function acquireRuntimeTransactionLock(runtimeRoot) {
   const lockRoot = path.join(runtimeRoot, '.zylos', 'locks');
   ensureRealDirectory(lockRoot);
   const existing = fs.readdirSync(lockRoot).sort();

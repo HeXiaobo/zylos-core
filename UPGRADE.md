@@ -53,3 +53,7 @@ Owner 的明确升级请求授权本次目标解析、准备、正常停服、�
 
 工具只在 Core 维护；Feishu/HXA 的入口指向这里并明确自己的 scope。下载 Core 工具不升级 Core。
 用户始终发送同一个仓库链接。升级前后报告范围、版本、完整 SHA、执行单、备份/回滚与验收结果。
+
+候选只有 `HOLD / deploymentAllowed=false` 而真实检查已齐备时，按 WORKFLOW.md 的
+`governance/promote-release.mjs` 正式放行；本机升级不需要等待上游 publicationAllowed。
+升级授权已包括这一步，Agent 自行完成，不让 Owner 再填台账或选发布角色。
