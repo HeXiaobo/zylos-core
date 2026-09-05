@@ -38,6 +38,24 @@ HXA 非目标版本时使用 pinned Core 的 `scripts/upgrade-hxa-connect.js` �
 不要把“允许升级”扩展为删除业务文件。按设计新建且身份验证通过的 GC_PENDING 是正常隔离保留，
 不是失败；不要为了获得“已删除”而手工清空它。未知旧 quarantine 或越界清理仍然阻塞。
 
+## 本机候选放行（无需另找发布人）
+
+prepare 生成的 HOLD / deploymentAllowed=false 表示准备未完成，不表示要等上游 publish。
+Owner 明确要求升级已包含本机候选准备及部署授权；publicationAllowed=false 不阻止本机升级。
+完成对应阶段真实证据后，运行正式放行入口，不要手改 READY，也不要重复向 Owner 要授权：
+
+```sh
+node governance/promote-release.mjs --manifest /absolute/control/governance/release-manifest.json --zylos-dir /absolute/runtime --stage pair
+```
+
+HXA 尚需安装时先用 `--stage hxa`；HXA 完成后再用 `--stage pair`。
+工具持有共享治理锁，在独立副本上运行完整原部署门及新鲜主机身份检查。
+仅全部通过才原子更新本机台账，并保留前后快照与门禁报告；任何失败保留原台账。
+它不修改来源、不生成 PASS 证据、不授予上游发布权限、不安装或重启服务。
+发现 RUNNING 或已有锁则跟踪原执行单，不能删除锁或重放。
+已有控制目录没有此入口时，从已审查的最新 Core 控制工具取得完整 governance 目录，
+保留原 manifest、registry 和 evidence；不要重跑 prepare 或重装 HXA 来获取工具。
+
 ## 2. 执行（按授权范围）
 
 先核对 `manifest.upgradeScope.components`。只含一个组件时按下面单组件流程；
@@ -54,7 +72,7 @@ HXA 非目标版本时使用 pinned Core 的 `scripts/upgrade-hxa-connect.js` �
    按真实证据记为保持现状，绝不假造 HXA 安装报告。
 3. 在独立 operatorTools Core 源码目录用 `npm ci --omit=dev --ignore-scripts --no-audit --no-fund`
    准备 CLI 依赖，不触发 postinstall，不安装到 runtime。
-   准备授权、身份、备份、通信及 source 证据，使本机台账 READY。
+   准备授权、身份、备份、通信及 source 证据，用上述 promote-release 入口将本机台账放行。
    Core/Feishu 单独执行用中央 `deploy --stage pair` 前置门；HXA 用 `deploy --stage hxa`。
    `pair` 是兼容性/前置门名称，不表示获准安装两组件。
 4. 使用执行目录内的命令生成器（仅生成，不启动服务操作）：
@@ -77,7 +95,7 @@ HXA 非目标版本时使用 pinned Core 的 `scripts/upgrade-hxa-connect.js` �
 
 ### 全部组件执行（仅 all）
 
-通过 HXA 前置、通信预检查和 pair dry-run 后，生成本次授权报告，将本机台账准备为 READY；
+通过 HXA 前置、通信预检查和 pair dry-run 后，生成本次授权报告，用上述 promote-release 入口将本机台账放行；
 保存已完成旧事务的快照，持共享治理锁切换，不能覆盖 RUNNING 事务。
 
 ```sh
