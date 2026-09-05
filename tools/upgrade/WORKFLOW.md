@@ -23,7 +23,7 @@
 
 旧台账已完成、新版未登记、验证依赖缺失、可修复的工具输出格式，不需要找 Owner 重新授权。
 Agent 自行准备或修复后重跑原门禁。不能把缺失证据写成 PASS，也不能从旧台账复制另一机器的 PASS。
-准备程序不会猜测本机旧版本，初始 stable 为空。Agent 自行读取本机升级前的三组件完整来源，
+单组件准备的 stable 来自 Agent 核验的 installed.json；all 未提供基线时 stable 为空。Agent 自行读取本机升级前的三组件完整来源，
 填入本次外部台账的 stable.core/feishu/hxa 并保存来源证据；不是要求 Owner 填表。
 无法验证的来源写 UNKNOWN，先做来源恢复取证，不虚构 stable 资格或通过部署门。
 登记与已验证源码不一致时先取证，使用支持的锁定/原子更新 API 做可审计修复，不手改源码来迎合版本号。
@@ -38,7 +38,44 @@ HXA 非目标版本时使用 pinned Core 的 `scripts/upgrade-hxa-connect.js` �
 不要把“允许升级”扩展为删除业务文件。按设计新建且身份验证通过的 GC_PENDING 是正常隔离保留，
 不是失败；不要为了获得“已删除”而手工清空它。未知旧 quarantine 或越界清理仍然阻塞。
 
-## 2. 执行（一次事务）
+## 2. 执行（按授权范围）
+
+先核对 `manifest.upgradeScope.components`。只含一个组件时按下面单组件流程；
+明确选 all 时才使用后面的 HXA + pair 事务。不得把未选组件填成 latest。
+准备程序下载的其他组件只是兼容性验证材料，operatorTools 只是控制工具，不代表部署授权。
+
+### 单组件执行
+
+1. 确认未选组件 candidate 与 stable 的 repo/version/SHA 完全一致；记录本机未选组件
+   的源码清单/hash、package 版本、组件注册来源和配置 hash，升级后逐项比较。
+   只比较版本号不够；运行日志和消息数据库等业务活动不当作源码变更。
+2. 在准备阶段跑 Core/Feishu 组合 dry-run 与兼容性检查，但不运行 pair --execute。
+   更新 HXA 时跑 HXA wrapper 的 check/dry-run；不更新 HXA 时验证其本机来源和通信，
+   按真实证据记为保持现状，绝不假造 HXA 安装报告。
+3. 在独立 operatorTools Core 源码目录用 `npm ci --omit=dev --ignore-scripts --no-audit --no-fund`
+   准备 CLI 依赖，不触发 postinstall，不安装到 runtime。
+   准备授权、身份、备份、通信及 source 证据，使本机台账 READY。
+   Core/Feishu 单独执行用中央 `deploy --stage pair` 前置门；HXA 用 `deploy --stage hxa`。
+   `pair` 是兼容性/前置门名称，不表示获准安装两组件。
+4. 使用执行目录内的命令生成器（仅生成，不启动服务操作）：
+
+   ```sh
+   node command.mjs --manifest /absolute/control/governance/release-manifest.json --zylos-dir /absolute/runtime
+   ```
+
+   HXA 另加 `--report-root /absolute/runtime/.zylos/upgrade-reports/NEW_EXECUTION_DIRECTORY`。
+   生成器再次校验固定源码和 scope，运行现有部署门并使用新鲜 HXA 身份；失败不输出执行命令。
+5. Agent 在共享事务管理下确认无并发升级，持有本次执行权，建立持久 RUNNING 执行单，
+   五分钟内按输出的 command/args/env 执行且仅执行一次。超过窗口或源码/身份变化时重跑前置。
+   保留 stdout、退出码和标准更新器的备份/回滚结果，重启后继续原单；不另起 pair 更新。
+   Core 使用原生 --self，Feishu 使用原生 upgrade feishu，HXA 使用已有 upgrade-hxa-connect wrapper。
+   Core 单独更新不运行 pair 备份清理器；保留已有备份，不以单组件报告冒充 pair 清理证明。
+6. 升级器退出成功仅表示安装完成。按下一节核验实际目标来源、通信、数据和未选组件不变，
+   然后运行中央 final 门。单组件记录独立执行报告，未运行的 pairExecute 标记未运行，
+   不捏造 coreUpgraded/feishuUpgraded 或全量 pair 成功。最终报告写清 selected、preserved。
+   失败只走该原生更新器的受支持回滚；未选组件发生意外变化时停止并报告，不能补装掩盖。
+
+### 全部组件执行（仅 all）
 
 通过 HXA 前置、通信预检查和 pair dry-run 后，生成本次授权报告，将本机台账准备为 READY；
 保存已完成旧事务的快照，持共享治理锁切换，不能覆盖 RUNNING 事务。
