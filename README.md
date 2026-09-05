@@ -398,3 +398,9 @@ Want a managed experience? [Coco](https://coco.xyz) gives you a ready-to-work AI
 ## License
 
 [MIT](./LICENSE)
+
+## Upgrading this fork with an Agent
+
+Ask your resident Agent to upgrade using this repository link. The [upgrade entrypoint](UPGRADE.md)
+contains version selection, portable preparation tools, and the host upgrade workflow.
+No separately transferred ZIP or owner-written release ledger is needed.

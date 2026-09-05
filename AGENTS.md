@@ -75,3 +75,12 @@ tests: <commands and results>
 For release-related work also report the manifest path, release ID, manifest
 status, deployment decision, and any canary or rollback evidence. If a field is
 unknown, say `unknown` and stop before release/deploy actions.
+
+## Owner-requested runtime upgrades
+
+For an explicit owner request to upgrade a runtime to latest or a named version,
+start at `UPGRADE.md`. The operator prepares evidence and an external candidate
+ledger using `tools/upgrade/prepare.mjs`; it must not write release metadata into
+this repository. Routine preparation needs no additional role handoff. Existing
+identity, compatibility, backup and deployment gates still apply. A repository
+link by itself is not deployment authorization.
