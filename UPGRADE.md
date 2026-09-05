@@ -16,7 +16,8 @@ Owner 的明确升级请求授权本次目标解析、准备、正常停服、�
 链接本身不是部署授权。只处理自己的 runtime，保留账号、模型、配置、技能和业务数据。
 先读本机 AGENTS.md；已有 RUNNING 事务则跟踪原单，不重复启动。
 
-1. 在独立目录取得可信 Core 仓库完整源码，读取 `tools/upgrade/WORKFLOW.md`。
+1. 在 runtime 的持久工作目录下取得可信 Core 仓库完整源码（例如 `~/zylos/workspace/ops/upgrade-<id>/operator`），
+   读取 `tools/upgrade/WORKFLOW.md`。控制目录、`--out`、源码和证据都不得放在会话 scratchpad 或自动清理的 `/tmp`。
    这是执行工具源码，不代表安装或升级 Core。记录工具完整 SHA，保持源码干净；不要在生产目录 git pull。
 2. Agent 自行核验本机三个组件的 repo、package version 和完整 SHA，写成本机 `installed.json`。
    格式为 `{ "core": { "repo": "HeXiaobo/zylos-core", "version": "…", "sha": "40位提交" },
