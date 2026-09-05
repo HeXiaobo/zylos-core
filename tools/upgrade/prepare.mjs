@@ -6,7 +6,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { prepareManifest } from './governance/prepare-release.mjs';
-import { selection, version as installedVersion } from './scope.mjs';
+import { selection, normalizeInstalled, version as installedVersion } from './scope.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
@@ -52,7 +52,7 @@ export function prepare(options) {
     const requested = options[`--${name}`] || 'latest';
     if (requested !== 'latest') parse(requested.replace(/^v/, ''));
   }
-  const installed = options['--installed'] ? JSON.parse(fs.readFileSync(options['--installed'], 'utf8')) : undefined;
+  const installed = options['--installed'] ? normalizeInstalled(JSON.parse(fs.readFileSync(options['--installed'], 'utf8'))) : undefined;
   const components = selection(options, installed);
   // mkdir is exclusive: never overwrite or reuse a partial/active transaction.
   fs.mkdirSync(output, { mode: 0o700 });

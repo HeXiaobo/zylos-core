@@ -10,6 +10,13 @@ export function validateInstalled(installed) {
   }
   return installed;
 }
+export function normalizeInstalled(installed) {
+  validateInstalled(installed);
+  return Object.fromEntries(COMPONENTS.map(name => [name, {
+    repo: installed[name].repo, branch: 'main', sha: installed[name].sha,
+    [name === 'hxa' ? 'packageVersion' : 'version']: version(installed[name]),
+  }]));
+}
 export function selection(options, installed) {
   const only = options['--only'] || 'core';
   if (![...COMPONENTS, 'all'].includes(only)) throw new Error('Scope must be core, feishu, hxa or all');

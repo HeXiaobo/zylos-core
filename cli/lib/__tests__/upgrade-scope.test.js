@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { COMPONENTS, repository, selection, assertScope, buildScopedCommand } from '../../../tools/upgrade/scope.mjs';
 import { prepare } from '../../../tools/upgrade/prepare.mjs';
 const baseline = Object.fromEntries(COMPONENTS.map((name, i) => [name, { repo: repository(name), version: '1.0.0', sha: String(i + 1).repeat(40) }]));
@@ -64,6 +64,12 @@ test('preparation updates only selected tag and preserves older companion SHAs',
     else assert.equal(m.candidate[name].sha, installed[name].sha);
    }
    for (const file of ['scope.mjs','command.mjs','WORKFLOW.md','UPGRADE.md']) assert.ok(fs.existsSync(path.join(output, file)));
+   const env = { ...process.env, GIT_CONFIG_COUNT: '0' };
+   const inspection = JSON.parse(execFileSync(process.execPath, [path.join(output, 'governance/agent-preflight.mjs'), 'inspect'], { encoding: 'utf8', env }));
+   assert.deepEqual(inspection.failures, []); assert.equal(inspection.deploymentAllowed, false);
+   const blocked = spawnSync(process.execPath, [path.join(output, 'command.mjs'), '--manifest', path.join(output, 'governance/release-manifest.json'), '--zylos-dir', path.join(root, 'not-a-runtime')], { encoding: 'utf8', env });
+   assert.notEqual(blocked.status, 0); assert.equal(blocked.stdout, '');
+   assert.match(blocked.stderr, /Preparation incomplete/); assert.equal(fs.existsSync(path.join(root, 'not-a-runtime')), false);
   }
  } finally {
   for (const key of Object.keys(process.env)) if (!(key in oldEnv)) delete process.env[key];
