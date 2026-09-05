@@ -1,3 +1,4 @@
+import { bindReport } from '../../../tools/upgrade/governance/bind-report.mjs';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -266,6 +267,29 @@ describe('local promotion through the real deployment gate', () => {
     assert.equal(receipt.gate.status, 'PASS');
     assert.equal(receipt.before.status, 'HOLD');
   });
+  for (const scenario of ['valid native reports', 'tampered raw', 'wrong native agent', 'wrong native profile']) {
+    it(`checks native bindings against raw files and fresh identity: ${scenario}`, () => {
+      const manifest = makePassV2Manifest();
+      manifest.status = 'HOLD'; manifest.deploymentAllowed = false;
+      const rawPair = writeEvidence('native-pair', { schema: 'zylos.fork-pair-upgrade/v1', status: 'PASS', mode: 'dry-run', result: 'PRECHECK_ONLY', transactionId: 'native-pair-uuid', agent: scenario === 'wrong native agent' ? 'another-agent' : 'any-agent', target: { core: manifest.candidate.core, feishu: manifest.candidate.feishu } });
+      manifest.evidence.pairReport.report = writeEvidence('bound-pair', bindReport({ manifest, rawPath: rawPair, kind: 'pair.dryRun', executionId: manifest.evidence.pairReport.executionId }));
+      for (const stage of ['dryRun','execute']) {
+        const raw = writeEvidence(`native-hxa-${stage}`, { schema: 'zylos.hxa-upgrade-preflight/v1', status: 'PASS', mode: stage === 'dryRun' ? 'dry-run' : 'execute', result: stage === 'dryRun' ? 'PRECHECK_ONLY' : 'EXECUTE_COMPLETE', executionId: `native-hxa-${stage}-uuid`, releaseId: manifest.releaseId, target: { repo: targets.hxa.repo, sha: targets.hxa.sha, version: targets.hxa.packageVersion, agent: 'any-agent', profileId: scenario === 'wrong native profile' ? 'wrong-profile' : 'profile-any-agent', hostname: os.hostname() } });
+        manifest.evidence.hxa[stage].report = writeEvidence(`bound-hxa-${stage}`, bindReport({ manifest, rawPath: raw, kind: `hxa.${stage}`, executionId: manifest.evidence.hxa.executionId }));
+      }
+      if (scenario === 'tampered raw') fs.appendFileSync(rawPair, '\n');
+      const filename = writeManifest(`native-promotion-${scenario}`, manifest);
+      const runtime = fs.mkdtempSync(path.join(tempRoot, 'runtime-'));
+      const before = fs.readFileSync(filename, 'utf8');
+      const result = promote(filename, runtime, writeIdentityCli());
+      if (scenario === 'valid native reports') assert.equal(result.status, 0, result.stdout + result.stderr);
+      else {
+        assert.equal(result.status, 2, result.stdout + result.stderr);
+        assert.match(result.stderr, /native report/);
+        assert.equal(fs.readFileSync(filename, 'utf8'), before);
+      }
+    });
+  }
   for (const failure of ['missing evidence', 'runtime lock', 'RUNNING', 'identity mismatch']) {
     it(`leaves the original untouched for ${failure}`, () => {
       const manifest = makePassV2Manifest();
@@ -280,7 +304,7 @@ describe('local promotion through the real deployment gate', () => {
       const before = fs.readFileSync(filename, 'utf8');
       const result = promote(filename, runtime, failure === 'identity mismatch' ? writeOrgScopedIdentityCli({ name: 'wrong', id: 'wrong', orgId: 'wrong' }) : writeIdentityCli());
       assert.equal(result.status, 2, result.stdout + result.stderr);
-      assert.match(result.stderr, /HOLD/);
+      assert.match(result.stderr, { 'missing evidence': /preDeployCanary/, 'runtime lock': /concurrent runtime lock/, 'RUNNING': /RUNNING transaction/, 'identity mismatch': /identity|profile/i }[failure]);
       assert.equal(fs.readFileSync(filename, 'utf8'), before);
     });
   }
