@@ -99,7 +99,8 @@ HXA 尚需安装时先用 `--stage hxa`；HXA 完成后再用 `--stage pair`。
    HXA 另加 `--report-root /absolute/runtime/.zylos/upgrade-reports/NEW_EXECUTION_DIRECTORY`。
    生成器再次校验固定源码和 scope，运行现有部署门并使用新鲜 HXA 身份；失败不输出执行命令。
 5. Agent 在共享事务管理下确认无并发升级，持有本次执行权，建立持久 RUNNING 执行单，
-   五分钟内按输出的 command/args/env 执行且仅执行一次。超过窗口或源码/身份变化时重跑前置。
+   五分钟内按输出的 command/args/env 在持久后台执行且仅执行一次；保存 PID、stdout 和退出码，
+   避免前台会话超时杀掉安装。超过窗口或源码/身份变化时重跑前置。
    保留 stdout、退出码和标准更新器的备份/回滚结果，重启后继续原单；不另起 pair 更新。
    Core 使用原生 --self，Feishu 使用原生 upgrade feishu，HXA 使用已有 upgrade-hxa-connect wrapper。
    Core 单独更新不运行 pair 备份清理器；保留已有备份，不以单组件报告冒充 pair 清理证明。
@@ -130,7 +131,8 @@ bash <PINNED_CORE_ARCHIVE>/scripts/upgrade-fork-pair.sh \
 
 PASS / PRECHECK_ONLY 且其他前置完成后，使用同一固定来源与目标替换为 --execute，
 给新的执行目录。不要重用 dry-run 目录。不得裸 npm install -g、git pull 或手工复制 skills 替代。
-本 Agent 自己将被重启时，使用能脱离当前会话存活的受控执行方式保留 stdout/exit/summary，
+所有安装默认使用能脱离当前会话超时和 Agent 重启的持久后台执行方式（例如受控 nohup 或服务任务），
+不要把安装挂在两分钟等短超时的前台工具调用上。持久保存 executionId、PID、stdout、exit/summary，
 恢复后读取同一个 executionId；不要因会话掉线重复启动升级。
 
 ## 3. 验收（完成后再汇报成功）
