@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { BINDING_SCHEMA, verifyBinding } from './bind-report.mjs';
 
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -841,6 +842,13 @@ function validateWorkspacePublishReceipt(manifest) {
   requireValue(freshIsoTimestamp(receipt.generatedAt), `${label}.report.generatedAt must be a fresh canonical ISO timestamp`);
 }
 
+const nativeRuntimeClaims = [];
+function validateNativeBinding(report, manifest, kind) {
+  if (report.schema !== BINDING_SCHEMA) return;
+  try { nativeRuntimeClaims.push(verifyBinding(report, manifest, kind)); }
+  catch (error) { failures.push(`deployment blocked: native report binding: ${error.message}`); }
+}
+
 function validateBoundReport(label, reportPath, manifest, executionId, expectedTarget, {
   dryRun = false,
   required = true,
@@ -857,6 +865,7 @@ function validateBoundReport(label, reportPath, manifest, executionId, expectedT
     `deployment blocked: ${label}.report is not an object`,
   );
   if (!report || typeof report !== 'object' || Array.isArray(report)) return null;
+  validateNativeBinding(report, manifest, label.replace(/^evidence\./, ''));
   requireValue(report.status === 'PASS', `deployment blocked: ${label}.report.status=${report.status || 'missing'}`);
   requireValue(report.releaseId === manifest.releaseId, `deployment blocked: ${label}.report.releaseId does not match releaseId`);
   requireValue(report.executionId === executionId, `deployment blocked: ${label}.report.executionId does not match evidence executionId`);
@@ -1030,6 +1039,7 @@ function validatePairEvidence(manifest, { deploy = false, requireDryRun = false 
     } else if (!report || typeof report !== 'object' || Array.isArray(report)) {
       failures.push('deployment blocked: evidence.pairReport.report is not an object');
     } else {
+      validateNativeBinding(report, manifest, 'pair.dryRun');
       requireValue(report.status === 'PASS', `deployment blocked: pairReport.status=${report.status || 'missing'}`);
       requireValue(report.releaseId === manifest.releaseId, 'deployment blocked: pairReport.releaseId does not match releaseId');
       requireValue(report.executionId === evidence.executionId, 'deployment blocked: pairReport.executionId does not match evidence.pairReport.executionId');
@@ -1228,6 +1238,12 @@ if (manifest) {
   } else if (manifest.status !== 'READY' || manifest.deploymentAllowed !== true) {
     warnings.push(`release ${manifest.releaseId} is ${manifest.status}; deployment remains blocked`);
   }
+}
+
+for (const claim of nativeRuntimeClaims) {
+  requireValue(claim.agent === runtimeIdentity?.name, 'deployment blocked: native report agent differs from fresh runtime identity');
+  if (claim.profileId) requireValue(claim.profileId === runtimeIdentityVerification?.deploymentProfileId, 'deployment blocked: native report profile differs from fresh runtime identity');
+  if (claim.hostname) requireValue(claim.hostname === os.hostname(), 'deployment blocked: native report hostname differs from current host');
 }
 
 const result = {

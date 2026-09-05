@@ -34,6 +34,21 @@ HXA 非目标版本时使用 pinned Core 的 `scripts/upgrade-hxa-connect.js` �
 准备它的依赖；不要触发 Core 的 postinstall 来修改 runtime。
 所有 stage 报告使用中央 gate 规定的 releaseId、executionId、target 和真实原始报告 hash。
 
+原生报告与台账的 ID 字段不同是正常的：HXA 每次调用有自己的 executionId，
+pair 原生输出 transactionId。不要覆盖原始 ID 或为统一 ID 重装。用以下绑定器产生新证据文件：
+
+```sh
+node governance/bind-report.mjs --manifest /absolute/control/governance/release-manifest.json --raw /absolute/original/summary.json --kind hxa.dryRun --execution-id EXISTING_HXA_PARENT_ID --out /absolute/evidence/hxa-dryrun-bound.json
+```
+
+支持 `hxa.dryRun`、`hxa.execute`、`pair.dryRun`、`pair.execute`。
+HXA 两阶段使用台账 evidence.hxa.executionId 的同一父 ID；pair 使用对应 evidence 执行 ID。
+首次建立父 ID 时生成一次并保存，恢复会话后沿用；原始调用 ID 保留在 rawReport.executionId。
+绑定器只接受已成功的对应原生阶段、相同 release（原生提供时）及固定来源，保留原文 hash。
+将新文件登记到对应证据 report 字段；gate 会重新核验原件 hash、字段映射和新鲜主机身份。
+它不生成 check、provenance 或 canary 的 PASS，不把 dry-run 当 execute，不修改原件。
+已完成的人工归一化报告可保留；不为采用新格式重跑安装。
+
 备份清理在执行前一次性列出本机精确来源路径。已有该路径的 Owner 授权则直接继续；没有则只问一次。
 不要把“允许升级”扩展为删除业务文件。按设计新建且身份验证通过的 GC_PENDING 是正常隔离保留，
 不是失败；不要为了获得“已删除”而手工清空它。未知旧 quarantine 或越界清理仍然阻塞。
