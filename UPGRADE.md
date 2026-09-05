@@ -1,52 +1,55 @@
 # 升级 Zylos fork：一个链接即可
 
-给本机 Agent 的请求示例：
+给本机 Agent 一句话即可：
 
-> 按这个仓库的 UPGRADE.md，把你自己的 Zylos 升级到最新版：https://github.com/HeXiaobo/zylos-core
+- “只升级 Core 到最新版：https://github.com/HeXiaobo/zylos-core”
+- “只升级 Feishu 到 0.3.7-rc.20：https://github.com/HeXiaobo/zylos-feishu”
+- “只升级 HXA 到最新版：https://github.com/HeXiaobo/zylos-hxa-connect”
+- “把 Zylos 三件套全部升级到最新版：https://github.com/HeXiaobo/zylos-core”
 
-也可以指定：`Core 升级到 0.7.2-rc.28，Feishu 到 0.3.7-rc.20，HXA 到 1.7.10`。
-不需要 Owner 上传工具包、填写台账或另外寻找 release manager。
+三个仓库都提供 UPGRADE.md。只说“升级这个仓库”时仅选择该仓库组件；只有明确要求全部时选择 all。
+Core 工具默认只选 Core，不再默认升级三个组件。指定一个版本仅作用于选定组件，不猜测其他组件版本。
 
-## Agent 收到请求后
+## Agent 执行约定
 
 Owner 的明确升级请求授权本次目标解析、准备、正常停服、备份、部署、通信验收及受支持回滚。
-单独看到链接或阅读此文不是部署授权。只处理自己所在 runtime；保留账号、模型提供商、配置、技能和业务数据。
-先读本机 AGENTS.md，检查现有升级事务；RUNNING 时继续跟踪原执行单。
+链接本身不是部署授权。只处理自己的 runtime，保留账号、模型、配置、技能和业务数据。
+先读本机 AGENTS.md；已有 RUNNING 事务则跟踪原单，不重复启动。
 
-1. 从上述可信 fork 仓库取得本说明和 `tools/upgrade/`，在独立源码目录工作。
-   不在生产安装目录执行 git pull。工具来自本次检查过的仓库提交，记录其完整 SHA。
-2. 自行运行准备命令（路径及消息引用由 Agent 填写，不交给 Owner 填）：
+1. 在独立目录取得可信 Core 仓库完整源码，读取 `tools/upgrade/WORKFLOW.md`。
+   这是执行工具源码，不代表安装或升级 Core。记录工具完整 SHA，保持源码干净；不要在生产目录 git pull。
+2. Agent 自行核验本机三个组件的 repo、package version 和完整 SHA，写成本机 `installed.json`。
+   格式为 `{ "core": { "repo": "HeXiaobo/zylos-core", "version": "…", "sha": "40位提交" },
+   "feishu": { "repo": "HeXiaobo/zylos-feishu", "version": "…", "sha": "40位提交" },
+   "hxa": { "repo": "HeXiaobo/zylos-hxa-connect", "packageVersion": "…", "sha": "40位提交" } }`。
+   不让 Owner 写这个文件，不用用户名或版本字符串推断 SHA。缺少来源时先自行取证。
+3. 按请求选择一个 scope，Agent 自行填写路径和消息引用：
 
    ```sh
-   node tools/upgrade/prepare.mjs --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
+   node tools/upgrade/prepare.mjs --only feishu --feishu latest --installed /absolute/installed.json --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
    ```
 
-   指定版本时加 `--core 0.7.2-rc.28 --feishu 0.3.7-rc.20 --hxa 1.7.10`。
-   `--channel stable` 只选正式版；默认 `fork` 包括 RC。未指定组件默认解析该通道最新发布标签。
-   Owner 只指定一个组件时，优先明确说明配套目标；若要求保持其他组件，传入其已验证版本，
-   不把“升级一个组件”解释为授权升级全部组件。
-3. 进入新执行目录，按 `WORKFLOW.md` 连续完成准备 → 执行 → 验收。
-   仓库随附全部控制工具；缺报告、旧台账、新版未登记属于 Agent 的准备工作。
-   解析出的三个最新标签只是候选组合，必须通过兼容性测试和部署门，不能称为已验证发布组合。
-4. 阶段变化简短汇报；结束交付版本、完整 SHA、执行单及验收结果。
-   真正缺登录、权限、必要的人类测试输入或尚未授权的删除时集中请求一次。
+   Core 用 `--only core --core VERSION`；HXA 用 `--only hxa --hxa VERSION`；三件套用 `--only all`。
+   `VERSION` 可为 latest 或精确版本。未选组件保持已装完整 SHA，不重新解析最新版。
+   准备程序只下载源码并生成 NOT_RUN 台账，不停止服务、不安装 runtime、不复用旧 PASS。
+4. 按输出目录的 WORKFLOW.md 连续完成准备、范围对应的执行及验收。
+   单组件使用 `command.mjs` 在现有部署门通过后生成唯一一个原生更新命令；不执行整套 pair 更新。
+   全部升级仍用现有 HXA + Core/Feishu pair 事务。
+5. 兼容性检查针对“新组件 + 另外两个已装组件”。不兼容时说明需要的最低配套版本，
+   不自动更新未授权组件，不宣称单组件升级成功。验收核对未选组件源码、版本及配置没有变化。
 
-## 版本解析规则
+只在真正缺权限、登录、必要的人类测试输入或尚未授权删除时集中请求一次。
+旧台账、缺报告、依赖准备由 Agent 处理，不要求 Owner 发 ZIP、Markdown 或另一段授权 prompt。
 
-“最新版”指可信 fork 仓库中按语义版本排序的最高发布标签；默认包括预发布版，不是 main 最新提交。
-显式版本必须精确匹配标签和 package.json。带注释标签解析到 commit，随后固定完整 40 位 SHA，
-验证其属于 origin/main；执行过程中不重新解析 latest。标签不等于兼容性或部署资格。
-同一 package 版本可能对应不同提交，不能仅凭版本相同跳过升级或复用资格报告。
-解析后先比较本机实际源码：若已安装提交比标签更新，默认“升级最新版”不能把它降回旧标签。
-Agent 应验证并保留较新已装组件，将本次候选及隔离源码固定到其实际完整 SHA 后重新检查配套兼容性；
-所有组件均已满足目标时，只做健康验证并报告已是目标或更新版本。显式旧版本会导致回退时，
-按降级处理，不能把一般升级授权扩大为降级授权。
-标签不存在、来源不符或兼容性失败时报告具体原因，不静默换版或强装。
+## 版本规则
 
-准备程序只下载源码、生成独立 NOT_RUN 台账，绝不停止服务、安装 runtime、复用旧 PASS 或自动授权删除。
-执行阶段沿用固定源码中的升级事务、身份核验、备份和回滚入口。正常隔离备份 GC_PENDING 不要求强删。
+最新版按可信 fork 的语义版本标签排序；默认 fork 通道包括 RC，`--channel stable` 排除预发布版。
+精确版本必须匹配标签和 package.json；带注释标签解析到完整 commit，并验证属于 origin/main。
+版本标签只是候选，不是兼容性或部署资格。执行前固定完整 SHA，不在执行中重新解析 latest。
+同一版本号可能对应不同提交。已装源码比标签更新时，latest 不得降级：验证后保留较新源码，
+同步本次候选及隔离源码再验证。显式旧版本会回退时按降级处理，不扩大一般升级授权。
 
-## 后续维护
+## 维护
 
-本说明和工具随 Core 仓库维护，用户始终使用同一仓库链接；每次升级由 Agent 自动解析新的版本。
-发布者需维护各组件版本标签及兼容性，不能用移动标签或更新此文替代源码测试。
+工具只在 Core 维护；Feishu/HXA 的入口指向这里并明确自己的 scope。下载 Core 工具不升级 Core。
+用户始终发送同一个仓库链接。升级前后报告范围、版本、完整 SHA、执行单、备份/回滚与验收结果。

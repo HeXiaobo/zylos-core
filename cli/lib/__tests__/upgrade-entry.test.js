@@ -26,7 +26,7 @@ test('cannot overwrite an existing transaction', () => {
  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'upgrade-entry-test-'));
  const marker = path.join(out, 'RUNNING'); fs.writeFileSync(marker, 'keep');
  try {
-  assert.throws(() => prepare({ '--out': out, '--authorization-ref': 'test' }), /EEXIST/);
+  assert.throws(() => prepare({ '--only': 'all', '--out': out, '--authorization-ref': 'test' }), /EEXIST/);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'keep');
  } finally { fs.rmSync(out, { recursive: true }); }
 });
@@ -34,7 +34,7 @@ test('invalid inputs do not create output', () => {
  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'upgrade-entry-input-')); const out = path.join(root, 'new');
  try {
   for (const overrides of [{ '--authorization-ref': '' }, { '--core': 'main' }, { '--channel': 'bad' }]) {
-   assert.throws(() => prepare({ '--out': out, '--authorization-ref': 'test', ...overrides }));
+   assert.throws(() => prepare({ '--only': 'all', '--out': out, '--authorization-ref': 'test', ...overrides }));
    assert.equal(fs.existsSync(out), false);
   }
  } finally { fs.rmSync(root, { recursive: true }); }

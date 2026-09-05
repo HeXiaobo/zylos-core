@@ -84,3 +84,10 @@ ledger using `tools/upgrade/prepare.mjs`; it must not write release metadata int
 this repository. Routine preparation needs no additional role handoff. Existing
 identity, compatibility, backup and deployment gates still apply. A repository
 link by itself is not deployment authorization.
+
+A request to upgrade this repository alone selects `--only core`; all three
+components require an explicit `--only all` request. Single-component operations
+use the scoped command entrypoint after the existing deployment gate and retain
+the other components at their verified installed SHAs. Never widen the requested
+scope to solve a compatibility failure. Fetching operator tools does not install
+the Core package. See UPGRADE.md for the three repository entrypoints.
