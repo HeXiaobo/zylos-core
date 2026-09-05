@@ -13,6 +13,8 @@
   验证；多组织按已验证的本机部署配置选择，身份矛盾必须停止。根据证据填写本执行目录控制平面的
   employee-runtime-registry.json（employees.<name>.host；identity.profileName、profileId、deploymentOrgLabel、deploymentProfileId）。
 - Core/Feishu/HXA 实际版本和完整来源，磁盘、PM2、数据库完整性、队列、技能与关键配置 hash。
+  按 UPGRADE.md 检查目标是否会降级。latest 遇到已装较新提交时保留该组件，
+  同步候选、隔离源码和证据到实际完整 SHA，再做配套验证；不得用旧标签覆盖较新的已装源码。
 - 共享 runtime `.zylos/locks` 和活动事务。发现 RUNNING 只跟踪原执行单，不启动第二笔、不杀旧进程。
 - HXA 若与固定 repo/version/SHA 完全相同，验证文件来源后记录 reinstall=NOT_APPLICABLE；不用重装。
 - 源码测试/版本资格只有 bundle、gateVersion、环境指纹、report/reference hash 都吻合才能复用。

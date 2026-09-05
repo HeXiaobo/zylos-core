@@ -72,6 +72,7 @@ export function prepare(options) {
   }
   fs.cpSync(path.join(HERE, 'governance'), path.join(output, 'governance'), { recursive: true });
   fs.copyFileSync(path.join(HERE, 'WORKFLOW.md'), path.join(output, 'WORKFLOW.md'));
+  fs.copyFileSync(path.join(HERE, '../../UPGRADE.md'), path.join(output, 'UPGRADE.md'));
   const releaseId = `ZYL-UPGRADE-${os.hostname().replace(/[^a-zA-Z0-9-]/g, '-')}-${Date.now()}`;
   const previous = { releaseId: null, owner: 'HeXiaobo', stable: {},
     sourcePolicy: { deployableBranch: 'main', immutableFullShaOnly: true, featureReleaseArchiveBranchesAreHistoryOnly: true },
