@@ -1525,7 +1525,12 @@ export function openAssistantResponseStream({
           code,
         );
         recordTerminalOutbound(request, {
-          content: '',
+          // Issue #79: the drafted reply (accumulated output deltas) used to
+          // be discarded here — failed runs wrote an empty outbound row, so a
+          // completed answer was unrecoverable. Persist the draft instead: a
+          // failed row with content is recoverable by an operator or a later
+          // sweep; an empty one is gone forever.
+          content: request.output_text ?? '',
           status: 'failed',
           deliveryAction: `assistant-response-failed:${code}`,
         });
@@ -2385,6 +2390,43 @@ export function openAssistantResponseStream({
         for (const row of rows) redriven += update.run(current, row.id).changes;
         return { requestId: safeRequestId, redriven };
       }).immediate();
+    },
+
+    queryFailedRuns({ limit = 50 } = {}) {
+      requireInteger(limit, 'limit', { minimum: 1 });
+      if (limit > 500) throw new TypeError('limit must be <= 500');
+      // Issue #79 recovery surface: failed runs whose drafted reply is now
+      // preserved in the outbound row. Retryable runs are safe to re-send by
+      // an operator (or a future sweep) because the draft is the agent's own
+      // completed answer, not a partial artifact.
+      const rows = database.prepare(`
+        SELECT r.request_id, r.route_channel, r.route_endpoint,
+               r.output_text, r.terminal_at, r.updated_at,
+               e.payload_json AS failure_payload
+        FROM assistant_requests r
+        LEFT JOIN assistant_response_events e
+          ON e.id = (
+            SELECT e2.id FROM assistant_response_events e2
+            WHERE e2.request_id = r.request_id AND e2.event_type = 'RunFailed'
+            ORDER BY e2.sequence DESC LIMIT 1
+          )
+        WHERE r.status = 'failed'
+        ORDER BY COALESCE(r.terminal_at, r.updated_at) DESC
+        LIMIT ?
+      `).all(limit);
+      return rows.map(row => {
+        const failure = row.failure_payload ? JSON.parse(row.failure_payload) : {};
+        return {
+          requestId: row.request_id,
+          route: { channel: row.route_channel, endpointId: row.route_endpoint },
+          code: failure.code ?? null,
+          retryable: failure.retryable === true,
+          outputChars: row.output_text ? Array.from(row.output_text).length : 0,
+          outputText: row.output_text ?? '',
+          terminalAt: row.terminal_at,
+          updatedAt: row.updated_at,
+        };
+      });
     },
 
     claimDeliveries({ limit = 50, leaseSeconds = 30 } = {}) {
