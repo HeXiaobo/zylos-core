@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.29] - 2026-09-06
+
+### Added
+- Stream Commitment Core task lifecycle events (created → started →
+  submitted for review → accepted/cancelled) into the assistant response
+  stream of the originating Feishu conversation, rendered as a task status
+  card with completion re-notifications (#67).
+- Let resident Agents upgrade from a single repository link, preserving
+  newer installed sources during latest resolution (#69).
+- Support explicitly scoped single-component repository upgrades, with the
+  installed baseline normalized for the deployment ledger (#70).
+
+### Fixed
+- Preserve the drafted reply when an assistant run fails: FailRun now
+  persists the accumulated output into the failed outbound row instead of
+  empty content, and `queryFailedRuns()` exposes a recovery listing of
+  failed runs with their drafted reply and retryable flag (#79, #80).
+- Default the task-stream worker to the supervise loop when invoked with
+  no arguments, instead of erroring on usage and restart-looping under
+  pm2 (#68).
+- Promote evidenced local candidates through the deployment gate (#75).
+- Bind native upgrade reports to release evidence without rewriting
+  execution identities (#76).
+
 ## [0.7.2-rc.28] - 2026-09-05
 
 ### Added
