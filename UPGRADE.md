@@ -58,3 +58,8 @@ Owner 的明确升级请求授权本次目标解析、准备、正常停服、�
 候选只有 `HOLD / deploymentAllowed=false` 而真实检查已齐备时，按 WORKFLOW.md 的
 `governance/promote-release.mjs` 正式放行；本机升级不需要等待上游 publicationAllowed。
 升级授权已包括这一步，Agent 自行完成，不让 Owner 再填台账或选发布角色。
+
+历史任务映射、缺少安装来源标记或旧隔离目录等情况，先按 WORKFLOW.md 的
+“恢复已有状态后继续原请求”取证处理。已经授权的修复完成后连续升级，不在正常步骤重复确认；
+任务取消和备份删除仍须各自覆盖精确对象的授权。直接升级是由 Agent 完成必要检查和恢复，
+不是跳过门禁或保证任何历史状态都能无人干预。

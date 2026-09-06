@@ -37,12 +37,13 @@ the repository contract; a task description cannot silently relax them.
   the Core candidate under `candidate.core` (or the stable target under
   `stable.core`); a single-repository manifest may place it under `core`,
   `target`, or `components` when the target repository is unambiguous.
-- Before any release/deploy command can be constructed, the manifest must also
-  freeze `target.agent`, `target.profileId`, and `target.hostname`. The gate
-  runs a fresh local HXA profile probe (`ZYLOS_HXA_PROFILE_CLI` or the standard
-  `~/zylos/.claude/skills/hxa-connect/scripts/cli.js profile`) and compares all
-  three identity fields exactly. A command-line `--agent` label is not identity
-  evidence; a mismatch is `HOLD` before backup or service shutdown.
+- Before any release/deploy command can be constructed, run a fresh local HXA
+  profile probe and verify the intended runtime's name, profile ID and hostname.
+  Record all three in the execution receipt. The portable global v2 gate does
+  not require a per-agent target in the release ledger; legacy or scoped gates
+  retain their own target requirements. Never remove a gate-required field.
+  A command-line `--agent` label is not identity evidence; an unknown identity
+  or target mismatch is `HOLD` before backup or service shutdown.
 - Never generate or update a manifest from inside this repository. In
   particular, do not write the current commit SHA into a tracked file: that
   would make the release metadata self-referential.
