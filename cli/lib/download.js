@@ -52,9 +52,11 @@ function curlDownloadOnce(repo, ref, refType, tarballPath) {
   // 1. Try public endpoint first (no auth needed for public repos)
   const publicUrl = refType === 'tag'
     ? `https://github.com/${repo}/archive/refs/tags/${ref}.tar.gz`
-    : refType === 'commit'
-      ? `https://github.com/${repo}/archive/${ref}.tar.gz`
-      : `https://github.com/${repo}/archive/refs/heads/${ref}.tar.gz`;
+    : refType === 'branch'
+      ? `https://github.com/${repo}/archive/refs/heads/${ref}.tar.gz`
+      // 'commit' and the ref-agnostic 'ref' share the generic archive form,
+      // which resolves branch names, tag names, and commit SHAs alike (#40).
+      : `https://github.com/${repo}/archive/${ref}.tar.gz`;
   let publicError;
   try {
     execFileSync('curl', ['-fsSL', '-o', tarballPath, publicUrl], {
@@ -262,6 +264,21 @@ registerSourceResolver('local-tarball', {
 export function downloadBranch(repo, branch, destDir) {
   const refType = FULL_COMMIT_SHA.test(branch) ? 'commit' : 'branch';
   return downloadGitHubRef(repo, branch, refType, destDir);
+}
+
+/**
+ * Download any GitHub ref (branch, tag, or commit SHA) through the
+ * ref-agnostic archive endpoint. Self-upgrade explicit --branch targets use
+ * this so pinning a tag or a commit SHA resolves the same way as a branch
+ * name (zylos-core#40).
+ *
+ * @param {string} repo - GitHub repo in "org/name" format
+ * @param {string} ref - Branch name, tag name, or commit SHA
+ * @param {string} destDir - Destination directory to extract into
+ * @returns {{ success: boolean, extractedDir: string, error?: string }}
+ */
+export function downloadRef(repo, ref, destDir) {
+  return downloadGitHubRef(repo, ref, 'ref', destDir);
 }
 
 /**

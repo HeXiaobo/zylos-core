@@ -367,10 +367,11 @@ export async function upgradeComponent(args) {
 
   // Handle --self: upgrade zylos-core itself
   if (upgradeSelf) {
+    const selfRepoOverride = repoOverride?.repo || null;
     if (checkOnly) {
-      return handleSelfCheckOnly({ jsonOutput, branch, beta });
+      return handleSelfCheckOnly({ jsonOutput, branch, beta, repo: selfRepoOverride });
     }
-    const ok = await upgradeSelfCore({ branch, beta, mode });
+    const ok = await upgradeSelfCore({ branch, beta, mode, repo: selfRepoOverride });
     if (!ok) process.exit(1);
     return;
   }
@@ -393,7 +394,7 @@ export async function upgradeComponent(args) {
     console.log('  --skip-eval    Skip upgrade analysis of local changes');
     console.log('  --beta         Include prerelease (beta) versions');
     console.log('  --branch <b>   Upgrade from a specific branch (e.g. feat/xxx)');
-    console.log('  --repo <owner/name>  Use a GitHub repo with --branch <40-hex-commit-sha>');
+    console.log('  --repo <owner/name>  Use a GitHub repo: components pin --branch <40-hex-commit-sha>, --self pins --branch <sha-or-tag>');
     console.log('  --mode <m>     Merge mode: "merge" (default, smart three-way) or "overwrite"');
     console.log('\nExamples:');
     console.log('  zylos upgrade telegram --check --json');
@@ -1113,8 +1114,8 @@ function formatSelfUpgradeSource(source) {
  * Handle --self --check: check for zylos-core updates only (no lock needed).
  * Downloads new version to temp dir for file comparison by Claude.
  */
-function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
-  const check = checkForCoreUpdates({ branch, beta });
+function handleSelfCheckOnly({ jsonOutput, branch, beta = false, repo = null }) {
+  const check = checkForCoreUpdates({ branch, beta, repo });
 
   if (!check.success) {
     if (jsonOutput) {
@@ -1136,7 +1137,7 @@ function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
     // Download new version to temp dir (for template/file comparison by Claude)
     let dlResult;
     try {
-      dlResult = downloadCoreToTemp(check.latest, branch, check.source);
+      dlResult = downloadCoreToTemp(check.latest, branch, check.source, { repo });
     } catch (err) {
       dlResult = { success: false, error: err.message };
     }
@@ -1211,7 +1212,7 @@ function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
  * Returns true on success, false on failure.
  * Does NOT call process.exit() — caller decides exit behavior.
  */
-async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
+async function upgradeSelfCore({ branch, beta = false, mode = 'merge', repo = null } = {}) {
   const jsonOutput = process.argv.includes('--json');
   const skipConfirm = process.argv.includes('--yes') || process.argv.includes('-y');
   let tempDir = null;
@@ -1231,7 +1232,7 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
 
   try {
     // 2. Check for updates (compare against branch when --branch is specified)
-    const check = checkForCoreUpdates({ branch, beta });
+    const check = checkForCoreUpdates({ branch, beta, repo });
 
     if (!check.success && !branch) {
       if (jsonOutput) {
@@ -1265,7 +1266,7 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
 
     let dlResult;
     try {
-      dlResult = downloadCoreToTemp(check.latest, branch, check.source);
+      dlResult = downloadCoreToTemp(check.latest, branch, check.source, { repo });
     } catch (err) {
       dlResult = { success: false, error: err.message };
     }

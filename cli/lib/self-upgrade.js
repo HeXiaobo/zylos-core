@@ -9,7 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execSync, spawnSync } from 'node:child_process';
 import { SKILLS_DIR, ZYLOS_DIR, getZylosConfig } from './config.js';
-import { downloadBranch, downloadTag } from './download.js';
+import { downloadRef, downloadTag } from './download.js';
 import { generateManifest, saveMergeBaseline } from './manifest.js';
 import {
   fetchRawFile,
@@ -96,7 +96,9 @@ export function resolveSelfUpgradeFinalizerTimeoutMs(processEnv = process.env) {
 const DEFAULT_CORE_REPOSITORY = 'HeXiaobo/zylos-core';
 
 // The fork upgrades from its own release repository by default. Operators may
-// still select another immutable release source via ZYLOS_SELF_UPGRADE_REPO.
+// still select another immutable release source via ZYLOS_SELF_UPGRADE_REPO,
+// or one-shot via `upgrade --self --repo <owner/repo> --branch <sha-or-tag>`
+// (#40), which never persists configuration.
 // The value is an `owner/repo` slug (for example `HeXiaobo/zylos-core`).
 //   NOTE — deliberately NOT named ZYLOS_REPO: scripts/install.sh already uses
 //   ZYLOS_REPO with a DIFFERENT meaning (a full URL, for fresh installs). Same
@@ -147,25 +149,27 @@ export function getCurrentVersion() {
  * @param {object} [opts]
  * @param {string} [opts.branch] - Branch to read from (reads package.json from branch)
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) tags
+ * @param {string|null} [opts.repo=null] - One-shot owner/repo override (#40)
  */
-function getLatestVersion({ branch, beta = false } = {}) {
+function getLatestVersion({ branch, beta = false, repo = null } = {}) {
+  const repoSlug = repo || REPO;
   // When --branch is specified, read package.json from that branch
   if (branch) {
     const source = {
-      repo: REPO,
+      repo: repoSlug,
       policy: 'explicit-ref',
       tag: null,
       ref: branch,
     };
     try {
-      const content = fetchRawFile(REPO, 'package.json', branch);
+      const content = fetchRawFile(repoSlug, 'package.json', branch);
       const pkg = JSON.parse(content);
       return { success: true, version: pkg.version, source };
     } catch (err) {
       return {
         success: false,
         error: 'remote_version_failed',
-        message: `Cannot fetch latest version from ${REPO} at ${branch}: ${sanitizeError(err.message)}`,
+        message: `Cannot fetch latest version from ${repoSlug} at ${branch}: ${sanitizeError(err.message)}`,
         source,
       };
     }
@@ -173,13 +177,13 @@ function getLatestVersion({ branch, beta = false } = {}) {
 
   // Default: tag-based detection (unified with component upgrades)
   const source = {
-    repo: REPO,
+    repo: repoSlug,
     policy: beta ? 'include-prerelease' : 'stable-only',
     tag: null,
     ref: null,
   };
   try {
-    const selection = fetchLatestTagSelection(REPO, { includePrerelease: beta });
+    const selection = fetchLatestTagSelection(repoSlug, { includePrerelease: beta });
     if (selection.selected) {
       return {
         success: true,
@@ -195,7 +199,7 @@ function getLatestVersion({ branch, beta = false } = {}) {
       return {
         success: false,
         error: 'no_repository_tags',
-        message: `No tags found in ${REPO}`,
+        message: `No tags found in ${repoSlug}`,
         source,
       };
     }
@@ -203,7 +207,7 @@ function getLatestVersion({ branch, beta = false } = {}) {
       return {
         success: false,
         error: 'no_semver_release_tags',
-        message: `No semantic release tags found in ${REPO} (${selection.tagCount} repository tag(s) inspected)`,
+        message: `No semantic release tags found in ${repoSlug} (${selection.tagCount} repository tag(s) inspected)`,
         source,
       };
     }
@@ -212,7 +216,7 @@ function getLatestVersion({ branch, beta = false } = {}) {
       return {
         success: false,
         error: 'prerelease_tags_excluded',
-        message: `No stable release tags found in ${REPO}; prerelease tag ${tag} (${ref}) was excluded by the stable-only policy. Re-run with --beta to include prerelease tags.`,
+        message: `No stable release tags found in ${repoSlug}; prerelease tag ${tag} (${ref}) was excluded by the stable-only policy. Re-run with --beta to include prerelease tags.`,
         source,
         availablePrerelease: { version, tag, ref },
       };
@@ -220,14 +224,14 @@ function getLatestVersion({ branch, beta = false } = {}) {
     return {
       success: false,
       error: 'no_matching_release_tags',
-      message: `No release tags match the ${source.policy} policy in ${REPO}`,
+      message: `No release tags match the ${source.policy} policy in ${repoSlug}`,
       source,
     };
   } catch (err) {
     return {
       success: false,
       error: 'remote_version_failed',
-      message: `Cannot fetch latest version from ${REPO}: ${sanitizeError(err.message)}`,
+      message: `Cannot fetch latest version from ${repoSlug}: ${sanitizeError(err.message)}`,
       source,
     };
   }
@@ -243,15 +247,16 @@ function getLatestVersion({ branch, beta = false } = {}) {
  * @param {object} [opts]
  * @param {string} [opts.branch] - Branch to compare against
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) versions
+ * @param {string|null} [opts.repo=null] - One-shot owner/repo override (#40)
  * @returns {object} { success, hasUpdate, current, latest }
  */
-export function checkForCoreUpdates({ branch, beta = false } = {}) {
+export function checkForCoreUpdates({ branch, beta = false, repo = null } = {}) {
   const current = getCurrentVersion();
   if (!current.success) {
     return { success: false, error: 'version_not_found', message: current.error };
   }
 
-  const latest = getLatestVersion({ branch, beta });
+  const latest = getLatestVersion({ branch, beta, repo });
   if (!latest.success) {
     return latest;
   }
@@ -279,6 +284,8 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
  * @param {string} version
  * @param {string|null} branch
  * @param {{ repo: string, policy: string, tag: string|null, ref: string, version?: string }} source
+ * @param {object} [opts]
+ * @param {string|null} [opts.repo=null] - One-shot owner/repo override (#40)
  * @returns {{ success: boolean, tempDir?: string, error?: string, source?: object }}
  */
 function getWritableTmpBase(prefix = 'zylos-self-upgrade-probe-') {
@@ -294,16 +301,19 @@ function getWritableTmpBase(prefix = 'zylos-self-upgrade-probe-') {
   return base;
 }
 
-export function downloadCoreToTemp(version, branch, source) {
+export function downloadCoreToTemp(version, branch, source, { repo = null } = {}) {
+  const repoSlug = repo || REPO;
   const base = getWritableTmpBase('zylos-self-upgrade-probe-');
   const tempDir = fs.mkdtempSync(path.join(base, 'zylos-self-upgrade-'));
 
   if (branch) {
-    if (source?.repo !== REPO || source?.ref !== branch || source?.tag !== null) {
+    if (source?.repo !== repoSlug || source?.ref !== branch || source?.tag !== null) {
       fs.rmSync(tempDir, { recursive: true, force: true });
-      return { success: false, error: `Invalid self-upgrade source for ${REPO}@${branch}`, source };
+      return { success: false, error: `Invalid self-upgrade source for ${repoSlug}@${branch}`, source };
     }
-    const branchResult = downloadBranch(REPO, branch, tempDir);
+    // Ref-agnostic download: an explicit --branch target may be a branch name,
+    // a tag, or a commit SHA (#40).
+    const branchResult = downloadRef(repoSlug, branch, tempDir);
     if (!branchResult.success) {
       fs.rmSync(tempDir, { recursive: true, force: true });
       return { success: false, error: branchResult.error, source };
@@ -311,16 +321,16 @@ export function downloadCoreToTemp(version, branch, source) {
     return { success: true, tempDir, source };
   }
 
-  if (source?.repo !== REPO
+  if (source?.repo !== repoSlug
       || typeof source?.tag !== 'string'
       || source.ref !== `refs/tags/${source.tag}`
       || source.tag.replace(/^v/, '') !== version
       || (source.version != null && source.version !== version)) {
     fs.rmSync(tempDir, { recursive: true, force: true });
-    return { success: false, error: `Invalid self-upgrade tag source for ${REPO}@${version}`, source };
+    return { success: false, error: `Invalid self-upgrade tag source for ${repoSlug}@${version}`, source };
   }
 
-  const result = downloadTag(REPO, source.tag, tempDir);
+  const result = downloadTag(repoSlug, source.tag, tempDir);
   if (!result.success) {
     fs.rmSync(tempDir, { recursive: true, force: true });
     return { success: false, error: result.error, source };

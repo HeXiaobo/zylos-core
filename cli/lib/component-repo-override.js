@@ -37,16 +37,26 @@ export function validateComponentRepoOverride({
   upgradeSelf = false,
   upgradeAll = false,
 } = {}) {
-  if (upgradeSelf || upgradeAll) {
-    throw new Error('--repo is only supported for a component target; --self/--all cannot use an override');
-  }
-
-  if (typeof target !== 'string' || target.length === 0 || target.startsWith('-')) {
-    throw new Error('--repo is only supported for a component target');
+  if (upgradeAll) {
+    throw new Error('--repo is only supported for a component target; --all cannot use an override');
   }
 
   if (!isValidGitHubRepository(repo)) {
     throw new Error('GitHub repository must be an owner/name slug (URL, empty, and injected values are not allowed)');
+  }
+
+  if (upgradeSelf) {
+    // Self-upgrade pins an explicit ref (branch, tag, or commit SHA) in the
+    // override repository (#40). --branch is mandatory so a --repo override
+    // can never silently fall back to moving-tag selection.
+    if (typeof branch !== 'string' || branch.length === 0) {
+      throw new Error('--repo with --self requires --branch <sha-or-tag>');
+    }
+    return { repo, branch };
+  }
+
+  if (typeof target !== 'string' || target.length === 0 || target.startsWith('-')) {
+    throw new Error('--repo is only supported for a component target');
   }
 
   if (typeof branch !== 'string' || !FULL_COMMIT_SHA.test(branch)) {

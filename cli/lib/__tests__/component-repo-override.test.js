@@ -128,21 +128,46 @@ test('metadata validation applies the same GitHub slug boundary', () => {
   }
 });
 
-test('allows overrides only for one installed component target', () => {
-  assert.throws(
-    () => validateComponentRepoOverride({
-      repo: 'HeXiaobo/zylos-hxa-connect',
+test('allows an explicit self override pinned to a sha-or-tag ref (#40)', () => {
+  assert.deepEqual(
+    validateComponentRepoOverride({
+      repo: 'HeXiaobo/zylos-core',
       branch: SHA,
-      target: 'hxa-connect',
+      target: null,
       upgradeSelf: true,
       upgradeAll: false,
     }),
-    /only supported for a component target/,
+    { repo: 'HeXiaobo/zylos-core', branch: SHA },
+  );
+  // A tag or branch name is a legitimate self pin; only components keep the
+  // stricter 40-hex contract.
+  assert.deepEqual(
+    validateComponentRepoOverride({
+      repo: 'HeXiaobo/zylos-core',
+      branch: 'v0.7.2-rc.18',
+      target: null,
+      upgradeSelf: true,
+      upgradeAll: false,
+    }),
+    { repo: 'HeXiaobo/zylos-core', branch: 'v0.7.2-rc.18' },
+  );
+});
+
+test('self overrides require --branch and --all overrides stay rejected', () => {
+  assert.throws(
+    () => validateComponentRepoOverride({
+      repo: 'HeXiaobo/zylos-core',
+      branch: null,
+      target: null,
+      upgradeSelf: true,
+      upgradeAll: false,
+    }),
+    /--repo with --self requires --branch <sha-or-tag>/,
   );
   assert.throws(
     () => validateComponentRepoOverride({
-      repo: 'HeXiaobo/zylos-hxa-connect',
-      branch: SHA,
+      repo: 'HeXiaobo/zylos-core',
+      branch: 'main',
       target: null,
       upgradeSelf: false,
       upgradeAll: true,
@@ -166,8 +191,8 @@ test('CLI rejects invalid overrides before loading or mutating component state',
         error: '40-hex-commit-sha',
       },
       {
-        args: ['--self', '--repo', 'HeXiaobo/zylos-hxa-connect', '--branch', SHA],
-        error: 'only supported for a component target',
+        args: ['--self', '--repo', 'HeXiaobo/zylos-hxa-connect'],
+        error: '--repo with --self requires --branch',
       },
       {
         args: ['--all', '--repo=HeXiaobo/zylos-hxa-connect', '--branch', SHA],
@@ -796,6 +821,98 @@ test('failed override execution rolls back code and leaves registry metadata unt
     assert.equal(
       fs.existsSync(path.join(zylosDir, '.zylos', 'upgrade-metadata-transactions', `${component}.json`)),
       false,
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('self --check pins the override repository and downloads the tagged ref (#40)', () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-self-repo-override-'));
+  const fakeBin = path.join(fixtureRoot, 'bin');
+  const archiveRoot = path.join(fixtureRoot, 'core-fixture');
+  const tarball = path.join(fixtureRoot, 'core.tar.gz');
+  const urlLog = path.join(fixtureRoot, 'urls.log');
+  const overrideRepo = 'HeXiaobo/zylos-core-fixture';
+  const tagRef = 'v9.9.9-fixture';
+
+  try {
+    fs.mkdirSync(archiveRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(archiveRoot, 'package.json'),
+      JSON.stringify({ name: 'zylos', version: '9.9.9' }),
+    );
+    execFileSync('tar', ['czf', tarball, '-C', fixtureRoot, path.basename(archiveRoot)]);
+
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(path.join(fakeBin, 'curl.mjs'), [
+      "import fs from 'node:fs';",
+      "const args = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.ZYLOS_TEST_URL_LOG, `${args.at(-1)}\n`);",
+      "const outputIndex = args.indexOf('-o');",
+      'if (outputIndex !== -1) {',
+      '  fs.copyFileSync(process.env.ZYLOS_TEST_TARBALL, args[outputIndex + 1]);',
+      '  process.exit(0);',
+      '}',
+      "if (args.at(-1).includes('raw.githubusercontent.com')) {",
+      "  process.stdout.write(JSON.stringify({ name: 'zylos', version: '9.9.9' }));",
+      '  process.exit(0);',
+      '}',
+      "process.stdout.write(JSON.stringify([]));",
+    ].join('\n'));
+    fs.writeFileSync(
+      path.join(fakeBin, 'curl'),
+      `#!/bin/sh\nexec "${process.execPath}" "\${0%/*}/curl.mjs" "$@"\n`,
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(path.join(fakeBin, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+
+    const child = spawnSync(process.execPath, [
+      CLI,
+      'upgrade',
+      '--self',
+      '--repo',
+      overrideRepo,
+      '--branch',
+      tagRef,
+      '--check',
+      '--json',
+    ], {
+      cwd: fixtureRoot,
+      env: {
+        ...process.env,
+        HOME: fixtureRoot,
+        ZYLOS_DIR: path.join(fixtureRoot, 'zylos-home'),
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+        GITHUB_TOKEN: '',
+        GH_TOKEN: '',
+        ZYLOS_TEST_URL_LOG: urlLog,
+        ZYLOS_TEST_TARBALL: tarball,
+      },
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+
+    assert.equal(child.status, 0, `stdout:\n${child.stdout}\nstderr:\n${child.stderr}`);
+    const output = JSON.parse(child.stdout);
+    assert.equal(output.success, true);
+    assert.equal(output.source.repo, overrideRepo);
+    assert.equal(output.source.policy, 'explicit-ref');
+    assert.equal(output.source.ref, tagRef);
+    assert.equal(output.latest, '9.9.9');
+    const urls = fs.readFileSync(urlLog, 'utf8').trim().split('\n').filter(Boolean);
+    assert.ok(
+      urls.includes(`https://raw.githubusercontent.com/${overrideRepo}/${tagRef}/package.json`),
+      `version lookup URLs:\n${urls.join('\n')}`,
+    );
+    assert.ok(
+      urls.includes(`https://github.com/${overrideRepo}/archive/${tagRef}.tar.gz`),
+      `download URLs:\n${urls.join('\n')}`,
+    );
+    assert.equal(
+      urls.some((url) => url.includes('refs/heads/')),
+      false,
+      `a tagged pin must not use the branch archive form:\n${urls.join('\n')}`,
     );
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
