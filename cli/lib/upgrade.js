@@ -153,10 +153,14 @@ function requireToolSuccess(result, label) {
 function parsePm2Processes(result) {
   requireToolSuccess(result, 'pm2 jlist');
   let processes;
+  const stdout = String(result.stdout || '');
   try {
-    processes = JSON.parse(result.stdout || '[]');
+    processes = JSON.parse(stdout || '[]');
   } catch (err) {
-    throw new Error(`pm2 jlist returned invalid JSON: ${err.message}`);
+    // Carry the offending bytes in the error: without them a parse failure is
+    // undebuggable — "position 26" says nothing about what was actually parsed
+    // (e.g. daemon-spawn noise from a stray real pm2 vs. a broken stub) (#74).
+    throw new Error(`pm2 jlist returned invalid JSON: ${err.message}; stdout head: ${JSON.stringify(stdout.slice(0, 200))}`);
   }
   if (!Array.isArray(processes)) throw new Error('pm2 jlist returned a non-array');
   return processes;

@@ -17,6 +17,46 @@ const CLI = path.join(import.meta.dirname, '..', '..', 'zylos.js');
 // user-owned and non-world-writable.
 const FIXTURE_BASE = path.join(import.meta.dirname, '..', '..', '..', 'test', 'integration', 'runtime');
 
+// Resolve a host executable for a fixture stub to delegate to. Used only by
+// the test process while building fixtures, never inside the upgrade child.
+function resolveHostExecutable(name) {
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      if (!fs.statSync(candidate).isFile()) continue;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // keep scanning
+    }
+  }
+  throw new Error(`required host tool not found on PATH: ${name}`);
+}
+
+// The child-process upgrade tests below pin the child's PATH to fakeBin ONLY
+// (#74): the child resolves npm/pm2 from PATH through an ownership trust-walk
+// that rejects executables under group/world-writable ancestors. On umask-002
+// checkouts the fixture stubs themselves get rejected, and resolution used to
+// fall through to the HOST pm2 — whose daemon-spawn output then broke jlist
+// parsing only under the full suite (isolated HOME → no daemon → spawn noise).
+// With no host entry reachable, pm2/npm resolve to the stub or to nothing;
+// both are deterministic and the host daemon is untouchable.
+//
+// The pipeline also execs a few binaries by plain name with no trust-walk
+// (curl, tar via download.js; ps via process-identity.js). curl has a real
+// stub; tar, ps and gzip (GNU tar shells out to it for .gz) cannot be faked,
+// so their stubs delegate to the host binaries resolved at fixture time. The
+// delegations are unaffected by checkout permission bits because plain
+// execFileSync resolves by PATH order and never runs the trust-walk.
+function writeDelegatingStub(fakeBin, name) {
+  fs.writeFileSync(
+    path.join(fakeBin, name),
+    `#!/bin/sh\nexec "${resolveHostExecutable(name)}" "$@"\n`,
+    { mode: 0o755 },
+  );
+}
+
 test('accepts a GitHub owner/name override pinned to a full commit SHA', () => {
   assert.deepEqual(
     validateComponentRepoOverride({
@@ -272,7 +312,7 @@ test('check-only downloads the exact ref from the explicit repository', () => {
     ].join('\n'));
     fs.writeFileSync(
       path.join(fakeBin, 'curl'),
-      `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/curl.mjs" "$@"\n`,
+      `#!/bin/sh\nexec "${process.execPath}" "\${0%/*}/curl.mjs" "$@"\n`,
       { mode: 0o755 },
     );
 
@@ -529,10 +569,9 @@ test('execute commits override provenance consistently in marker and registry', 
     );
 
     fs.mkdirSync(archiveRoot, { recursive: true });
-    fs.writeFileSync(
-      path.join(archiveRoot, 'package.json'),
-      JSON.stringify({ name: 'zylos-hxa-connect', version: '1.7.5' }),
-    );
+    // No package.json in the fixture archive: npm_install then skips
+    // deterministically ("no package.json") on every machine instead of
+    // depending on whether the npm stub passes the ownership trust-walk (#74).
     fs.writeFileSync(
       path.join(archiveRoot, 'SKILL.md'),
       '---\nname: hxa-connect\nversion: 1.7.5\n---\n',
@@ -551,7 +590,7 @@ test('execute commits override provenance consistently in marker and registry', 
     ].join('\n'));
     fs.writeFileSync(
       path.join(fakeBin, 'curl'),
-      `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/curl.mjs" "$@"\n`,
+      `#!/bin/sh\nexec "${process.execPath}" "\${0%/*}/curl.mjs" "$@"\n`,
       { mode: 0o755 },
     );
     fs.writeFileSync(
@@ -559,7 +598,9 @@ test('execute commits override provenance consistently in marker and registry', 
       '#!/bin/sh\nif [ "$1" = "jlist" ]; then printf \'[]\'; fi\n',
       { mode: 0o755 },
     );
-    fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeDelegatingStub(fakeBin, 'tar');
+    writeDelegatingStub(fakeBin, 'gzip');
+    writeDelegatingStub(fakeBin, 'ps');
 
     const child = spawnSync(process.execPath, [
       CLI,
@@ -577,7 +618,9 @@ test('execute commits override provenance consistently in marker and registry', 
       env: {
         ...process.env,
         ZYLOS_DIR: zylosDir,
-        PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+        // fakeBin ONLY — see writeTarStub(): keeps the child away from the
+        // host pm2/npm regardless of the checkout's permission bits (#74).
+        PATH: fakeBin,
         ZYLOS_TEST_URL_LOG: urlLog,
         ZYLOS_TEST_TARBALL: tarball,
         GITHUB_TOKEN: '',
@@ -662,10 +705,10 @@ test('failed override execution rolls back code and leaves registry metadata unt
     );
 
     fs.mkdirSync(path.join(archiveRoot, 'hooks'), { recursive: true });
-    fs.writeFileSync(
-      path.join(archiveRoot, 'package.json'),
-      JSON.stringify({ name: 'zylos-hxa-connect', version: '1.7.5' }),
-    );
+    // No package.json in the fixture archive: npm_install then skips
+    // deterministically ("no package.json") on every machine, so the failure
+    // that triggers the rollback is always the post-upgrade hook — never a
+    // machine-dependent npm resolution outcome (#74).
     fs.writeFileSync(
       path.join(archiveRoot, 'SKILL.md'),
       [
@@ -693,7 +736,7 @@ test('failed override execution rolls back code and leaves registry metadata unt
     ].join('\n'));
     fs.writeFileSync(
       path.join(fakeBin, 'curl'),
-      `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/curl.mjs" "$@"\n`,
+      `#!/bin/sh\nexec "${process.execPath}" "\${0%/*}/curl.mjs" "$@"\n`,
       { mode: 0o755 },
     );
     fs.writeFileSync(
@@ -701,7 +744,9 @@ test('failed override execution rolls back code and leaves registry metadata unt
       '#!/bin/sh\nif [ "$1" = "jlist" ]; then printf \'[]\'; fi\n',
       { mode: 0o755 },
     );
-    fs.writeFileSync(path.join(fakeBin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeDelegatingStub(fakeBin, 'tar');
+    writeDelegatingStub(fakeBin, 'gzip');
+    writeDelegatingStub(fakeBin, 'ps');
 
     const child = spawnSync(process.execPath, [
       CLI,
@@ -719,7 +764,9 @@ test('failed override execution rolls back code and leaves registry metadata unt
       env: {
         ...process.env,
         ZYLOS_DIR: zylosDir,
-        PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+        // fakeBin ONLY — see writeTarStub(): keeps the child away from the
+        // host pm2/npm regardless of the checkout's permission bits (#74).
+        PATH: fakeBin,
         ZYLOS_TEST_TARBALL: tarball,
         GITHUB_TOKEN: '',
         GH_TOKEN: '',

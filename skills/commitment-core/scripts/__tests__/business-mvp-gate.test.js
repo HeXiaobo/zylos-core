@@ -11,6 +11,36 @@ import { runBusinessMvpGate } from '../business-mvp-gate.js';
 const GATE_CLI = fileURLToPath(new URL('../business-mvp-gate.js', import.meta.url));
 const TEST_AGENT_ID = 'agent:yueran';
 
+// The gate reads agent identity from the environment. Real Zylos hosts export
+// ZYLOS_AGENT_ID / ZYLOS_AGENT_PROFILE, so inheriting `process.env` wholesale
+// would leak host identity into these tests: identity-selection cases would
+// conflict, and the fail-closed cases would pass through a path they exist to
+// reject — green or red, neither would mean anything (#73). Strip the
+// identity class explicitly instead of relying on the host to be clean.
+function gateCliEnv(overrides = {}) {
+  const env = { ...process.env };
+  delete env.ZYLOS_AGENT_ID;
+  delete env.ZYLOS_AGENT_PROFILE;
+  return { ...env, ...overrides };
+}
+
+function withoutHostAgentIdentity(fn) {
+  const previous = {
+    ZYLOS_AGENT_ID: process.env.ZYLOS_AGENT_ID,
+    ZYLOS_AGENT_PROFILE: process.env.ZYLOS_AGENT_PROFILE,
+  };
+  delete process.env.ZYLOS_AGENT_ID;
+  delete process.env.ZYLOS_AGENT_PROFILE;
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 function runTestBusinessMvpGate(options = {}) {
   return runBusinessMvpGate({ agentId: TEST_AGENT_ID, ...options });
 }
@@ -58,10 +88,10 @@ function createInjectedProjectionAdapter({ failures = 1 } = {}) {
 }
 
 test('the business MVP gate fails closed without an explicit Agent identity', async () => {
-  await assert.rejects(
+  await withoutHostAgentIdentity(() => assert.rejects(
     () => runBusinessMvpGate(),
     { code: 'AGENT_ID_REQUIRED' },
-  );
+  ));
 });
 
 test('the business MVP gate derives its logical Agent from an explicit Agent Profile', async () => {
@@ -278,6 +308,7 @@ test('the CLI emits and optionally persists the same machine-readable gate repor
       '--output', outputPath,
     ], {
       encoding: 'utf8',
+      env: gateCliEnv(),
     });
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -294,7 +325,7 @@ test('the CLI emits and optionally persists the same machine-readable gate repor
 });
 
 test('the CLI fails closed when no Agent ID or Agent Profile is selected', () => {
-  const result = spawnSync(process.execPath, [GATE_CLI], { encoding: 'utf8' });
+  const result = spawnSync(process.execPath, [GATE_CLI], { encoding: 'utf8', env: gateCliEnv() });
 
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
@@ -315,6 +346,7 @@ test('the CLI rejects a symlink output without modifying its target', () => {
       '--output', outputPath,
     ], {
       encoding: 'utf8',
+      env: gateCliEnv(),
     });
 
     assert.equal(result.status, 1);
