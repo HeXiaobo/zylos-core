@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { openAssistantResponseStream } from '../assistant-response-stream.js';
+
 const CLI_PATH = fileURLToPath(new URL('../c4-session-init.js', import.meta.url));
 const RECEIVE_PATH = fileURLToPath(new URL('../c4-receive.js', import.meta.url));
 const CHECKPOINT_PATH = fileURLToPath(new URL('../c4-checkpoint.js', import.meta.url));
@@ -30,6 +32,37 @@ function checkpoint(args, env = {}) {
     env: { ...process.env, ...env },
     encoding: 'utf8'
   });
+}
+
+function createAssistantRequest(tmpDir, {
+  requestId,
+  content,
+  status = 'pending',
+  start = false,
+}) {
+  const stream = openAssistantResponseStream({
+    dbPath: path.join(tmpDir, 'comm-bridge', 'c4.db'),
+  });
+  try {
+    const accepted = stream.execute({
+      type: 'AcceptAssistantRequest',
+      requestId,
+      sourceId: `${requestId}:source`,
+      route: { channel: 'telegram', endpointId: '123' },
+      conversation: {
+        content,
+        status,
+        priority: 3,
+        requireIdle: false,
+      },
+    });
+    if (start) {
+      stream.execute({ type: 'StartRun', requestId });
+    }
+    return accepted.request;
+  } finally {
+    stream.close();
+  }
 }
 
 function withTmpDir(fn) {
@@ -190,6 +223,100 @@ describe('c4-session-init', () => {
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
       assert.equal((stdout.match(/reply via:/g) || []).length, 1);
+    });
+  });
+
+  it('keeps queued assistant requests out of startup context across a restart', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      receive(['--channel', 'system', '--no-reply', '--content', 'ordinary history'], env);
+      const requestId = 'assistant.telegram.queued-startup';
+      createAssistantRequest(tmpDir, {
+        requestId,
+        content: 'queued assistant request must wait for dispatcher',
+      });
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const { stdout, status } = cli([], env);
+        assert.equal(status, 0);
+        assert.ok(stdout.includes('ordinary history'));
+        assert.ok(!stdout.includes('queued assistant request must wait for dispatcher'));
+        assert.ok(!stdout.includes(requestId));
+      }
+
+      const stream = openAssistantResponseStream({
+        dbPath: path.join(tmpDir, 'comm-bridge', 'c4.db'),
+      });
+      try {
+        assert.equal(stream.query({ requestId }).request.status, 'queued');
+      } finally {
+        stream.close();
+      }
+    });
+  });
+
+  it('keeps a started assistant request request-bound after a session restart', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const requestId = 'assistant.telegram.started-startup';
+      createAssistantRequest(tmpDir, {
+        requestId,
+        content: 'started assistant request must be resumable',
+        status: 'delivered',
+        start: true,
+      });
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const { stdout, status } = cli([], env);
+        assert.equal(status, 0);
+        assert.ok(stdout.includes('started assistant request must be resumable'));
+        assert.match(stdout, new RegExp(`--request-id "${requestId}"`));
+        assert.ok(!stdout.includes('history and do not reply'));
+      }
+    });
+  });
+
+  it('keeps an active started request visible after its conversation is checkpointed', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const requestId = 'assistant.telegram.started-checkpoint';
+      const request = createAssistantRequest(tmpDir, {
+        requestId,
+        content: 'started request must survive Memory Sync checkpointing',
+        status: 'delivered',
+        start: true,
+      });
+      checkpoint(['create', String(request.conversationId), '--summary', 'Synced active request'], env);
+
+      const { stdout, status } = cli([], env);
+      assert.equal(status, 0);
+      assert.ok(stdout.includes('started request must survive Memory Sync checkpointing'));
+      assert.match(stdout, new RegExp(`--request-id "${requestId}"`));
+      assert.ok(!stdout.includes('No new conversations since last checkpoint'));
+    });
+  });
+
+  it('keeps a delivered queued request request-bound after a restart', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const requestId = 'assistant.telegram.delivered-queued-startup';
+      const request = createAssistantRequest(tmpDir, {
+        requestId,
+        content: 'submitted request must recover when StartRun was not recorded',
+        status: 'delivered',
+      });
+      checkpoint(['create', String(request.conversationId), '--summary', 'Synced submitted request'], env);
+
+      const { stdout, status } = cli([], env);
+      assert.equal(status, 0);
+      assert.ok(stdout.includes('submitted request must recover when StartRun was not recorded'));
+      assert.match(stdout, new RegExp(`--request-id "${requestId}"`));
+      assert.ok(!stdout.includes('history and do not reply'));
+
+      const stream = openAssistantResponseStream({
+        dbPath: path.join(tmpDir, 'comm-bridge', 'c4.db'),
+      });
+      try {
+        assert.equal(stream.query({ requestId }).request.status, 'queued');
+      } finally {
+        stream.close();
+      }
     });
   });
 

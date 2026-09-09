@@ -77,31 +77,33 @@ export async function emitC4Checkpoint() {
  * shard budget does that message fall back to the preview + pointer form —
  * a compressed newest message plus intact section structure beats the
  * orchestrator's blind tail-trim. Without a budget (legacy single-stdout
- * path, no packer to bound the output) behavior is unchanged: per-message
- * spill applies as before and the output is byte-identical to before.
+ * path, no packer to bound the output) per-message spill applies as before.
+ * Active assistant requests remain visible even when a Memory Sync checkpoint
+ * has already covered their inbound conversation row.
  */
 export async function emitC4Conversations(_payload, budget = null) {
   return withC4Db('c4 conversations init', async ({
     getUnsummarizedRange,
-    getUnsummarizedConversations,
+    getSessionInitConversations,
     formatConversationsForAgent,
   }) => {
     const { CHECKPOINT_THRESHOLD, SESSION_INIT_RECENT_COUNT } = await import('./c4-config.js');
 
     const range = getUnsummarizedRange();
-    if (range.count === 0) {
-      return formatSection('RECENT CONVERSATIONS', 'No new conversations since last checkpoint.');
-    }
-
     const needsSync = range.count > CHECKPOINT_THRESHOLD;
     const profileDirective = needsSync
       ? createMemorySyncProfileDirective()
       : null;
 
-    // Get conversations: all if under threshold, last N if over
+    // Active assistant requests are eligible for recovery even when their
+    // inbound conversation is already covered by the latest checkpoint.
     const conversations = needsSync
-      ? getUnsummarizedConversations(SESSION_INIT_RECENT_COUNT)
-      : getUnsummarizedConversations();
+      ? getSessionInitConversations(SESSION_INIT_RECENT_COUNT)
+      : getSessionInitConversations();
+
+    if (range.count === 0 && conversations.length === 0) {
+      return formatSection('RECENT CONVERSATIONS', 'No new conversations since last checkpoint.');
+    }
 
     const assemble = (kept, { spill = true } = {}) => {
       // Informational only — no file to read. Kept within the section so it
@@ -109,7 +111,18 @@ export async function emitC4Conversations(_payload, budget = null) {
       const note = kept.length < conversations.length
         ? `(showing the newest ${kept.length} of ${range.count} unsummarized messages inline; older ones are covered by the next Memory Sync checkpoint)\n\n`
         : '';
-      const sections = [formatSection('RECENT CONVERSATIONS', note + formatConversationsForAgent(kept, { spill }))];
+      const formatted = formatConversationsForAgent(kept, {
+        spill,
+        // Terminal assistant requests are retained as history. An active
+        // started request keeps its request-bound recovery route so a new
+        // runtime session can finish it safely.
+        suppressDispatchedAssistantReply: true,
+      });
+      const body = formatted || (
+        'No delivered conversations are available in startup context; '
+        + 'queued assistant requests remain pending for dispatcher delivery.'
+      );
+      const sections = [formatSection('RECENT CONVERSATIONS', note + body)];
 
       // If over threshold, append Memory Sync instruction
       if (needsSync) {
@@ -123,7 +136,7 @@ export async function emitC4Conversations(_payload, budget = null) {
     };
 
     // Legacy single-stdout path: no packer bounds the output, so keep the
-    // per-message spill exactly as before (byte-identical).
+    // per-message spill policy as before.
     if (!budget) return assemble(conversations);
 
     // Budgeted shard path: original content, whole-message packing.
