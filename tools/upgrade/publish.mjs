@@ -95,12 +95,14 @@ export function preparePublication(options) {
   const manifestPath = path.resolve(options['--manifest'] || '');
   const publicationManifestPath = path.resolve(options['--publication-manifest'] || '');
   const output = options['--out'];
-  if (!options['--manifest'] || !options['--publication-manifest'] || !options['--qualifications']
-      || !path.isAbsolute(output || '') || !options['--tag']) throw new Error('External deployment/publication ledgers, qualification index, --tag and new absolute --out required');
+  if (!options['--manifest'] || !options['--publication-manifest'] || !options['--qualifications'] || !options['--notes-file']
+      || !path.isAbsolute(output || '') || !options['--tag']) throw new Error('External deployment/publication ledgers, qualification index, reviewed --notes-file, --tag and new absolute --out required');
   const repositoryRoot = path.resolve(HERE, '../..');
   for (const value of [manifestPath, publicationManifestPath, output]) {
     if (value === repositoryRoot || value.startsWith(repositoryRoot + path.sep)) throw new Error('Release metadata and publication output must be outside the source repository');
   }
+  const reviewedNotes = fs.readFileSync(options['--notes-file'], 'utf8');
+  if (!reviewedNotes.trim()) throw new Error('Reviewed release notes must document the tested functional configuration');
   const manifest = read(manifestPath), publication = read(publicationManifestPath);
   if (publication.releaseId !== manifest.releaseId || canonical(canonicalBundle(publication.candidate)) !== canonical(canonicalBundle(manifest.candidate))) throw new Error('Publication authorization belongs to another release');
   const index = read(options['--qualifications']);
@@ -117,7 +119,7 @@ export function preparePublication(options) {
   fs.mkdirSync(output, { mode: 0o700 });
   const assetPath = path.join(output, RELEASE_ASSET), notesPath = path.join(output, 'release-notes.md');
   fs.writeFileSync(assetPath, JSON.stringify(document, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-  fs.writeFileSync(notesPath, `Qualified ${document.channel} release.\n\n` + Object.entries(document.bundle).map(([name, value]) => `- ${name}: ${value.version} (${value.sha})`).join('\n') + '\n\nInstall or upgrade using the repository link and UPGRADE.md. Host backups and health checks still run locally.\n', { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(notesPath, `Qualified ${document.channel} release.\n\n` + Object.entries(document.bundle).map(([name, value]) => `- ${name}: ${value.version} (${value.sha})`).join('\n') + '\n\nInstall or upgrade using the repository link and UPGRADE.md. Host backups and health checks still run locally.\n\n' + reviewedNotes + '\n', { flag: 'wx', mode: 0o600 });
   fs.writeFileSync(path.join(output, 'publication-gate.json'), gateBytes, { flag: 'wx', mode: 0o600 });
   return { document, assetPath, notesPath };
 }
@@ -126,11 +128,11 @@ if (process.argv[1] && fs.existsSync(process.argv[1]) && import.meta.url === pat
   try {
     const args = process.argv.slice(2), options = {};
     if (args.includes('--help')) {
-      console.log('node tools/upgrade/publish.mjs --manifest DEPLOYMENT_LEDGER --publication-manifest AUTHORIZED_PUBLICATION_LEDGER --qualifications EVIDENCE_INDEX --tag BUNDLE_TAG --out NEW_ABSOLUTE_DIRECTORY [--execute]');
+      console.log('node tools/upgrade/publish.mjs --manifest DEPLOYMENT_LEDGER --publication-manifest AUTHORIZED_PUBLICATION_LEDGER --qualifications EVIDENCE_INDEX --notes-file REVIEWED_NOTES --tag BUNDLE_TAG --out NEW_ABSOLUTE_DIRECTORY [--execute]');
     } else {
       for (let i = 0; i < args.length; i++) {
         if (args[i] === '--execute') { options[args[i]] = true; continue; }
-        if (!['--manifest', '--publication-manifest', '--qualifications', '--tag', '--out'].includes(args[i]) || !args[i + 1] || args[i + 1].startsWith('--') || options[args[i]]) throw new Error('Invalid arguments; use --help');
+        if (!['--manifest', '--publication-manifest', '--qualifications', '--notes-file', '--tag', '--out'].includes(args[i]) || !args[i + 1] || args[i + 1].startsWith('--') || options[args[i]]) throw new Error('Invalid arguments; use --help');
         options[args[i]] = args[++i];
       }
       const prepared = preparePublication(options);

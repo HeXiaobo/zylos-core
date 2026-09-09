@@ -26,12 +26,14 @@ unqualified historical releases are excluded from the default channel.
    account configuration or copy a publisher fingerprint onto an unverified host.
    `release-channel.mjs` exports `canonical`, `sha256`, and
    `qualificationFingerprint` for both publisher and consumer.
-4. Create an external JSON array of `{ "report": "/absolute/report.json",
+4. Write reviewed public notes with the functional-configuration recipe from step 3.
+   The publisher carries this file unchanged into the generated release notes.
+   Create an external JSON array of `{ "report": "/absolute/report.json",
    "finalGate": "/absolute/final-gate.json" }` entries. Retain the authorized
    external publication ledger for the same bundle. Prepare the public asset:
 
    ```sh
-   node tools/upgrade/publish.mjs --manifest /absolute/deployment-ledger.json --publication-manifest /absolute/publication-ledger.json --qualifications /absolute/index.json --tag bundle-RELEASE_ID --out /absolute/new-publication-directory
+   node tools/upgrade/publish.mjs --manifest /absolute/deployment-ledger.json --publication-manifest /absolute/publication-ledger.json --qualifications /absolute/index.json --notes-file /absolute/reviewed-notes.md --tag bundle-RELEASE_ID --out /absolute/new-publication-directory
    ```
 
    The tag must already exist and resolve to the qualified Core SHA. It is a
