@@ -205,8 +205,70 @@ to hash the governed region after it moved out of the default skill.
    the final scan. The scan works; the generating side had no guard. A ban's
    own examples are its most likely leak — the writer skips them because they
    look like the rule rather than a violation.
-   Then run the scan and require **0 hits** before step 8:
-   `grep -rn "<char from 01-banned-words.md>" ~/zylos/memory/` → expect exit 1.
+   🔴 **Resolve the list BEFORE scanning, and make absence loud (2026-09-09,
+   #78).** The gate's character list comes from
+   `custom-hooks/session-start/01-banned-words.md` (operator-placed — some
+   machines deliberately do not install it) or from an explicit code-point
+   list supplied by the invoking brief. If neither is available, this gate is
+   **NOT EXECUTED**, and that outcome is a **failure of the sync**: raise the
+   EXIT flag with the literal wording `7b NOT EXECUTED — banned-character list
+   unavailable`. It must never surface as "0 hits", never as a clean scan, and
+   the sync must not proceed to step 8 as if the gate had passed — a gate whose
+   failure is indistinguishable from its pass is worse than no gate ("没测出
+   问题" and "测不出问题" must not look the same on the board). Do NOT create
+   the operator file yourself: `custom-hooks/session-start/` is
+   operator-placed, not agent-managed.
+   🔴 **Scan by code point, and require a positive control — then require
+   0 hits before step 8.** The raw-grep form this step used to give
+   (`grep -rn "<char from 01-banned-words.md>" ~/zylos/memory/` → expect
+   exit 1) contradicted the write-side rule by telling the agent to paste the
+   literal character into the pattern, and a clean repo and a broken scanner
+   both produced the same green. Instead: derive the code points from the
+   resolved list programmatically (machine-read, never hand-typed), run the
+   scanner below, and pass each character's hex code point as an argument:
+
+   ```sh
+   # <hex-code-point>: the resolved list's characters as hex code points,
+   # e.g. ZYLOS_7B_CODEPOINTS="4e00 9521" (machine-decoded, never hand-typed).
+   ZYLOS_7B_CODEPOINTS="<hex-code-point> [<hex-code-point> ...]" node -e '
+   const fs = require("fs"), os = require("os"), path = require("path");
+   const cps = String(process.env.ZYLOS_7B_CODEPOINTS || "")
+     .trim().split(/\s+/).filter(Boolean).map(v => parseInt(v, 16));
+   if (!cps.length || cps.some(Number.isNaN)) {
+     console.error("7b NOT EXECUTED — banned-character list unavailable");
+     process.exit(3);
+   }
+   const hit = s => cps.some(cp => s.includes(String.fromCodePoint(cp)));
+   // Positive control: a scanner that cannot see the character when it IS
+   // there must not be trusted to report 0 hits when it is not (#78).
+   if (!hit("7b-positive-control:" + cps.map(cp => String.fromCodePoint(cp)).join(""))) {
+     console.error("7b FAIL — positive control missed; scanner unusable");
+     process.exit(3);
+   }
+   const files = [];
+   const scan = dir => { for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+     const p = path.join(dir, entry.name);
+     if (entry.isDirectory()) scan(p);
+     else { try { if (hit(fs.readFileSync(p, "utf8"))) files.push(p); } catch {} }
+   } };
+   const memoryDir = path.join(os.homedir(), "zylos", "memory");
+   if (!fs.existsSync(memoryDir)) {
+     console.error("7b NOT EXECUTED — memory directory not found: " + memoryDir);
+     process.exit(3);
+   }
+   scan(memoryDir);
+   if (files.length) {
+     console.error(`7b: ${files.length} file(s) with hits:\n${files.join("\n")}`);
+     process.exit(1);
+   }
+   console.log("7b: 0 hits (positive control passed)");
+   '
+   ```
+
+   Exit 0 = gate passed (0 hits, positive control seen). Exit 1 = hits — a
+   violation of the standing ban, not a scanner error. Exit 3 = gate NOT
+   executed (list unavailable) or the scanner failed its own positive control;
+   report it as the loud failure above, never as a green.
    🔴 **Scope is NOT limited to `memory/` — it explicitly includes the step-8
    checkpoint summary (2026-08-04, SS; third occurrence, same shape as the two
    above).** Observed: a sync wrote a clean audit line for every file in
