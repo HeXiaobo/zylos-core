@@ -83,7 +83,7 @@ export async function emitC4Checkpoint() {
 export async function emitC4Conversations(_payload, budget = null) {
   return withC4Db('c4 conversations init', async ({
     getUnsummarizedRange,
-    getUnsummarizedConversations,
+    getSessionInitConversations,
     formatConversationsForAgent,
   }) => {
     const { CHECKPOINT_THRESHOLD, SESSION_INIT_RECENT_COUNT } = await import('./c4-config.js');
@@ -100,8 +100,8 @@ export async function emitC4Conversations(_payload, budget = null) {
 
     // Get conversations: all if under threshold, last N if over
     const conversations = needsSync
-      ? getUnsummarizedConversations(SESSION_INIT_RECENT_COUNT)
-      : getUnsummarizedConversations();
+      ? getSessionInitConversations(SESSION_INIT_RECENT_COUNT)
+      : getSessionInitConversations();
 
     const assemble = (kept, { spill = true } = {}) => {
       // Informational only — no file to read. Kept within the section so it
@@ -109,7 +109,18 @@ export async function emitC4Conversations(_payload, budget = null) {
       const note = kept.length < conversations.length
         ? `(showing the newest ${kept.length} of ${range.count} unsummarized messages inline; older ones are covered by the next Memory Sync checkpoint)\n\n`
         : '';
-      const sections = [formatSection('RECENT CONVERSATIONS', note + formatConversationsForAgent(kept, { spill }))];
+      const formatted = formatConversationsForAgent(kept, {
+        spill,
+        // Terminal assistant requests are retained as history. An active
+        // started request keeps its request-bound recovery route so a new
+        // runtime session can finish it safely.
+        suppressDispatchedAssistantReply: true,
+      });
+      const body = formatted || (
+        'No delivered conversations are available in startup context; '
+        + 'queued assistant requests remain pending for dispatcher delivery.'
+      );
+      const sections = [formatSection('RECENT CONVERSATIONS', note + body)];
 
       // If over threshold, append Memory Sync instruction
       if (needsSync) {

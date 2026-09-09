@@ -17,6 +17,12 @@ const __dirname = path.dirname(__filename);
 
 const INIT_SQL_PATH = path.join(__dirname, '..', 'init-db.sql');
 
+const TERMINAL_ASSISTANT_REQUEST_STATUSES = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+]);
+
 let db = null;
 
 /**
@@ -2247,6 +2253,52 @@ export function getUnsummarizedConversations(limit = null) {
 }
 
 /**
+ * Get the conversations that are safe to expose in session-start context.
+ *
+ * A durable assistant request is accepted before the dispatcher has delivered
+ * its conversation row.  While the request is still queued, including that
+ * row in startup context gives the runtime a second way to process it; a
+ * request-scoped c4-send could even terminalize it before the dispatcher
+ * emits RunStarted.  The dispatcher is the only owner of that transition, so
+ * queued assistant requests stay out of this view until they are dispatched.
+ *
+ * This is deliberately separate from getUnsummarizedConversations(): Memory
+ * Sync must continue to see every unsummarized row, including requests that
+ * are waiting for delivery.
+ *
+ * Rows whose assistant request has already been dispatched remain visible with
+ * linked request metadata. Active started requests retain a request-bound
+ * recovery route; terminal requests are rendered as history.
+ *
+ * @param {number|null} limit - if set, return only the most recent N eligible records
+ * @returns {array} - session-safe conversation records in chronological order
+ */
+export function getSessionInitConversations(limit = null) {
+  const db = getDb();
+  const lastCheckpoint = db.prepare(
+    'SELECT end_conversation_id FROM checkpoints ORDER BY id DESC LIMIT 1'
+  ).get();
+  const afterId = lastCheckpoint?.end_conversation_id || 0;
+  const projection = `
+    SELECT c.*, ar.request_id AS linked_assistant_request_id,
+           ar.status AS assistant_request_status,
+           datetime(c.timestamp, 'localtime') AS timestamp_local
+    FROM conversations c
+    LEFT JOIN assistant_requests ar ON ar.conversation_id = c.id
+    WHERE c.id > ?
+      AND (ar.request_id IS NULL OR ar.status IS NULL OR ar.status <> 'queued')
+  `;
+
+  if (limit) {
+    return db.prepare(
+      `SELECT * FROM (${projection} ORDER BY c.id DESC LIMIT ?) ORDER BY id ASC`
+    ).all(afterId, limit);
+  }
+
+  return db.prepare(`${projection} ORDER BY c.id ASC`).all(afterId);
+}
+
+/**
  * Get conversations by id range (inclusive)
  * @param {number} beginId - start conversation id
  * @param {number} endId - end conversation id
@@ -2292,6 +2344,16 @@ function renderStamp(conv) {
 }
 
 /**
+ * Remove a previously stored plain c4-send suffix before rendering a row as
+ * session history or replacing it with a request-bound recovery route.
+ */
+function stripLegacyReplyViaSuffix(content) {
+  return String(content || '')
+    .replace(/[ \t]*---- reply via: node\b[^\r\n]*/g, '')
+    .trimEnd();
+}
+
+/**
  * Format conversation records into readable text
  * @param {array} conversations - array of conversation records
  * @returns {string} - formatted text
@@ -2324,9 +2386,15 @@ export function formatConversations(conversations) {
  *   pointer (dispatch-style). Pass false when a caller has its own size
  *   control (e.g. the session-start shard's whole-message budget packer)
  *   and wants original content inline (#724).
+ * @param {boolean} [options.suppressDispatchedAssistantReply=false] - in
+ *   session-start context, render terminal assistant requests as history and
+ *   keep active started requests on a request-bound recovery route.
  * @returns {string} - formatted text for agent delivery/session init
  */
-export function formatConversationsForAgent(conversations, { spill = true } = {}) {
+export function formatConversationsForAgent(conversations, {
+  spill = true,
+  suppressDispatchedAssistantReply = false,
+} = {}) {
   if (!conversations || conversations.length === 0) {
     return '';
   }
@@ -2336,15 +2404,64 @@ export function formatConversationsForAgent(conversations, { spill = true } = {}
     const dir = conv.direction === 'in' ? 'IN' : 'OUT';
     const endpoint = conv.endpoint_id ? `:${conv.endpoint_id}` : '';
     const content = conv.content || '';
+    const linkedAssistantRequestId = conv.linked_assistant_request_id || conv.assistant_request_id || null;
+    const hasQueuedAssistantRequest = (
+      conv.direction === 'in'
+      && linkedAssistantRequestId
+      && suppressDispatchedAssistantReply
+      && conv.assistant_request_status === 'queued'
+    );
+    const hasTerminalAssistantRequest = (
+      conv.direction === 'in'
+      && linkedAssistantRequestId
+      && suppressDispatchedAssistantReply
+      && TERMINAL_ASSISTANT_REQUEST_STATUSES.has(conv.assistant_request_status)
+    );
+    const hasStartedAssistantRequest = (
+      conv.direction === 'in'
+      && linkedAssistantRequestId
+      && suppressDispatchedAssistantReply
+      && conv.assistant_request_status === 'started'
+    );
+    const hasUnresolvedAssistantRequest = (
+      conv.direction === 'in'
+      && linkedAssistantRequestId
+      && suppressDispatchedAssistantReply
+      && !hasTerminalAssistantRequest
+      && !hasStartedAssistantRequest
+      && !hasQueuedAssistantRequest
+    );
+    // Older rows may already contain a plain c4-send suffix. In a session
+    // history block that suffix must not remain executable, and an active
+    // started request must be upgraded to the request-bound recovery route.
+    const shouldStripLegacyReplyVia = (
+      hasTerminalAssistantRequest
+      || hasUnresolvedAssistantRequest
+      || hasStartedAssistantRequest
+      || hasQueuedAssistantRequest
+    );
+    const safeContent = shouldStripLegacyReplyVia
+      ? stripLegacyReplyViaSuffix(content)
+      : content;
     const replyViaSuffix = (
       conv.direction === 'in' &&
       conv.endpoint_id &&
-      !hasLegacyReplyViaSuffix(content)
-    ) ? buildReplyViaSuffix(conv.channel, conv.endpoint_id) : '';
+      !hasLegacyReplyViaSuffix(safeContent) &&
+      !hasQueuedAssistantRequest &&
+      !hasTerminalAssistantRequest &&
+      !hasUnresolvedAssistantRequest
+    ) ? buildReplyViaSuffix(
+      conv.channel,
+      conv.endpoint_id,
+      hasStartedAssistantRequest ? linkedAssistantRequestId : null,
+    ) : '';
+    const historySuffix = hasTerminalAssistantRequest || hasUnresolvedAssistantRequest
+      ? ` [C4] Assistant request "${linkedAssistantRequestId}" was already dispatched; treat this message as history and do not reply.`
+      : '';
     lines.push(`[${renderStamp(conv)}] ${dir} (${conv.channel}${endpoint}):`);
     lines.push(spill
-      ? truncateForDelivery(content, replyViaSuffix, conv.id)
-      : content + replyViaSuffix);
+      ? truncateForDelivery(safeContent, replyViaSuffix + historySuffix, conv.id)
+      : safeContent + replyViaSuffix + historySuffix);
     lines.push('');
   }
 

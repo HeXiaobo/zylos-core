@@ -280,4 +280,36 @@ describe('formatConversationsForAgent', () => {
     assert.ok(result.includes('"telegram" "123"'));
     assert.equal((result.match(/reply via:/g) || []).length, 2);
   });
+
+  it('keeps a started assistant request request-bound for session recovery', () => {
+    const result = mod.formatConversationsForAgent([{
+      timestamp_local: '2025-01-15 10:00:00',
+      direction: 'in',
+      channel: 'telegram',
+      endpoint_id: '123',
+      content: 'resume this request',
+      linked_assistant_request_id: 'assistant.telegram.resume-1',
+      assistant_request_status: 'started',
+    }], { suppressDispatchedAssistantReply: true });
+
+    assert.match(result, /reply via: node/);
+    assert.match(result, /--request-id "assistant\.telegram\.resume-1"/);
+    assert.doesNotMatch(result, /history and do not reply/);
+  });
+
+  it('renders terminal assistant requests as history and strips legacy plain routes', () => {
+    const result = mod.formatConversationsForAgent([{
+      timestamp_local: '2025-01-15 10:00:00',
+      direction: 'in',
+      channel: 'telegram',
+      endpoint_id: '123',
+      content: 'already handled ---- reply via: node /tmp/c4-send.js "telegram" "123"',
+      linked_assistant_request_id: 'assistant.telegram.completed-1',
+      assistant_request_status: 'completed',
+    }], { suppressDispatchedAssistantReply: true });
+
+    assert.match(result, /history and do not reply/);
+    assert.doesNotMatch(result, /reply via:/);
+    assert.doesNotMatch(result, /c4-send\.js/);
+  });
 });
