@@ -31,10 +31,15 @@ Supports Claude Code (Anthropic) and Codex (OpenAI). Fully compatible with the [
 
 ## Quick Start
 
+This fork installs the latest **qualified stable release**. Preview builds require
+`--channel preview` (or an exact `--version`); source tags alone are not releases.
+For an existing employee runtime, give its Agent this repository link and ask it
+to upgrade; see [UPGRADE.md](UPGRADE.md). Publishers follow [PUBLISH.md](tools/upgrade/PUBLISH.md).
+
 **Prerequisites:** A Linux server (or Mac), a [Claude](https://claude.ai) subscription (or [OpenAI Codex](https://github.com/openai/codex) as an alternative runtime — Codex CLI v0.129.0+ required, 0.146+ recommended).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash
 ```
 
 This installs everything you need (git, tmux, Node.js, zylos CLI) and automatically runs `zylos init` to set up your agent.
@@ -47,7 +52,7 @@ All `zylos init` flags can be passed directly through the install script. The sc
 **Full example:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- \
   -y \
   --setup-token sk-ant-oat01-xxx \
   --timezone Asia/Shanghai \
@@ -109,7 +114,7 @@ configuration examples and fallback behavior.
 <summary>Install without running init</summary>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- --no-init
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- --no-init
 ```
 
 Installs dependencies and the zylos CLI, but skips `zylos init`. Run `zylos init` separately when ready.
@@ -120,7 +125,7 @@ Installs dependencies and the zylos CLI, but skips `zylos init`. Run `zylos init
 <summary>Install from a specific branch (for testing)</summary>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
 ```
 
 </details>
@@ -129,7 +134,7 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 <summary>Manual install (if you already have Node.js >= 20)</summary>
 
 ```bash
-npm install -g --install-links https://github.com/zylos-ai/zylos-core
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- --no-init
 zylos init
 ```
 
@@ -144,7 +149,7 @@ docker run -d --name zylos \
   -p 3456:3456 \
   -v zylos-data:/home/zylos/zylos \
   -v claude-config:/home/zylos/.claude \
-  ghcr.io/zylos-ai/zylos-core:latest
+  ghcr.io/hexiaobo/zylos-core:latest
 ```
 
 Open `http://localhost:3456` to access the web console. Find your password with `docker logs zylos | grep -A2 "Web Console"`. See the [Docker Deployment Guide](docs/docker.md) for Docker Compose setup, environment variables, Synology NAS instructions, and more.
@@ -170,7 +175,7 @@ Once connected, Claude is running on the remote machine. Ask it to install Zylos
 Or run the installer directly in the SSH session:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash
 ```
 
 This works from Windows, ChromeOS, or any platform that can run Claude Code locally. The AI handles the setup on the remote server — no need for native platform support.

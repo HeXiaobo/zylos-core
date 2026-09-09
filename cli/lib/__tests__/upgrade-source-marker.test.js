@@ -188,7 +188,7 @@ test('the CLI persists commit, branch, and tag provenance in both registries', (
   const fixtureRoot = path.join(root, 'cli-exact-ref');
   const zylosDir = path.join(fixtureRoot, 'zylos-home');
   const component = 'hxa-connect';
-  const repo = 'HeXiaobo/zylos-hxa-connect';
+  const repo = 'example/zylos-hxa-connect';
   const oldSha = '58c99e990e5d4a1d7dc0d0ffb371f285f46ea2f3';
   const newSha = '182d7b3ed55fd758981c8edc7ae923e3bc03614b';
   const installedAt = '2026-01-02T03:04:05.000Z';

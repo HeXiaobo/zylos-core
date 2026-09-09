@@ -535,12 +535,20 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false, re
     if (repo) {
       let dlResult;
       try {
-        dlResult = downloadToTemp(repo, result.latest, branch);
+        dlResult = downloadToTemp(repo, result.latest, branch || result.ref);
       } catch (err) {
         dlResult = { success: false, error: err.message };
       }
       if (dlResult.success) {
         tempDir = dlResult.tempDir;
+        if (!branch && result.source?.policy?.startsWith('verified-')
+            && readDownloadedComponentVersion(tempDir) !== result.latest) {
+          result.success = false; result.hasUpdate = false;
+          result.error = 'qualified_source_version_mismatch';
+          result.message = 'Downloaded component does not match the qualified release version';
+          cleanupTemp(tempDir);
+          printCheckFailure(component, result, jsonOutput);
+        }
 
         // When using --branch, read version from the downloaded package.json
         if (branch) {
@@ -567,7 +575,7 @@ async function handleCheckOnly(component, { jsonOutput, branch, beta = false, re
         // Read changelog from downloaded package (more reliable than remote fetch)
         const fullChangelog = readChangelog(tempDir);
         changelog = filterChangelog(fullChangelog, result.current);
-      } else if (exactRef) {
+      } else if (exactRef || result.source?.policy?.startsWith('verified-')) {
         result.success = false;
         result.hasUpdate = false;
         result.error = 'exact_ref_download_failed';
@@ -745,7 +753,7 @@ async function handleUpgradeFlow(component, {
 
     let dlResult;
     try {
-      dlResult = downloadToTemp(repo, check.latest, branch);
+      dlResult = downloadToTemp(repo, check.latest, branch || check.ref);
     } catch (err) {
       dlResult = { success: false, error: err.message };
     }
@@ -769,6 +777,13 @@ async function handleUpgradeFlow(component, {
       return false;
     }
     tempDir = dlResult.tempDir;
+
+    if (!branch && check.source?.policy?.startsWith('verified-')
+        && readDownloadedComponentVersion(tempDir) !== check.latest) {
+      printUpgradeFailure(component, { jsonOutput, errorCode: 'qualified_source_version_mismatch',
+        message: 'Downloaded component does not match the qualified release version' });
+      return false;
+    }
 
     // A commit override has no tag to provide a version. Resolve the version
     // from the downloaded artifact before presenting the plan and creating
@@ -797,7 +812,7 @@ async function handleUpgradeFlow(component, {
     if (!jsonOutput) {
       console.log(`\n${bold(component)}: ${dim(check.current)} → ${bold(check.latest)}`);
       const targetVersion = check.latest || (branch ? `branch:${branch}` : 'unknown');
-      const targetRef = branch ? `branch:${branch}` : `tag:v${check.latest}`;
+      const targetRef = check.ref || (branch ? `branch:${branch}` : `tag:v${check.latest}`);
       console.log(dim(`Target package: ${targetVersion} (${targetRef})`));
 
       // Show local modifications (compared to manifest)
@@ -868,9 +883,9 @@ async function handleUpgradeFlow(component, {
     const source = {
       type: 'github-release',
       repo,
-      ref: branch || check.latest,
-      refType: branch
-        ? (/^[0-9a-f]{40}$/i.test(branch) ? 'commit' : 'branch')
+      ref: branch || check.ref || check.latest,
+      refType: (branch || check.ref)
+        ? (/^[0-9a-f]{40}$/i.test(branch || check.ref) ? 'commit' : 'branch')
         : 'tag',
       ...(installedComponent.installedAt
         ? { installedAt: installedComponent.installedAt }

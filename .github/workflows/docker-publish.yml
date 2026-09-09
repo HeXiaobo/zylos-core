@@ -1,9 +1,9 @@
 name: Docker Publish
 
 on:
+  release:
+    types: [published]
   push:
-    tags:
-      - "v*"
     branches:
       - main
     paths:
@@ -15,6 +15,11 @@ on:
       - "cli/**"
       - "package.json"
       - ".github/workflows/docker-publish.yml"
+
+# Serialize pushes; an older delayed release must not replace a newer latest.
+concurrency:
+  group: docker-publication-${{ github.repository }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -28,8 +33,29 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout
+      - name: Check out trusted publication tools
         uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify published qualification and immutable source
+        if: github.event_name == 'release'
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: node tools/upgrade/verify-published.mjs "$RELEASE_ID"
+
+      - name: Check out the verified release source
+        if: github.event_name == 'release'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -50,18 +76,17 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # Tag event: v1.2.3 → :1.2.3, :1.2, :latest
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-            # Push to main → :main (dev/testing)
-            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=${{ steps.release.outputs.version }},enable=${{ github.event_name == 'release' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && steps.release.outputs.stable == 'true' }}
+            type=raw,value=main,enable=${{ github.event_name == 'push' }}
+          flavor: |
+            latest=false
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ steps.release.outputs.platforms || 'linux/amd64,linux/arm64' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

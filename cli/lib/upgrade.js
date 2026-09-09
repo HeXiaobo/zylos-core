@@ -17,6 +17,7 @@ import {
 } from './manifest.js';
 import { downloadArchive, downloadBranch } from './download.js';
 import { fetchLatestTag, fetchRawFile, compareSemverDesc, sanitizeError } from './github.js';
+import { componentForRepository, resolveQualifiedRelease, readReleaseHost } from '../../tools/upgrade/release-channel.mjs';
 import { copyTree, syncTree } from './fs-utils.js';
 import { applyCaddyRoutes, removeCaddyRoutes } from './caddy.js';
 import { smartSync, formatMergeResult } from './smart-merge.js';
@@ -274,6 +275,14 @@ export function getLocalSourceUpgradeError(component, installed = loadComponents
 function getLatestVersion(component, repo, { beta = false } = {}) {
   if (!repo) return { success: false, error: 'No repo configured for component' };
 
+  const forkComponent = componentForRepository(repo);
+  if (forkComponent) {
+    try {
+      const release = resolveQualifiedRelease({ component: forkComponent, channel: beta ? 'preview' : 'stable', host: readReleaseHost() });
+      return { success: true, version: release.target.version, ref: release.target.sha, source: release.source };
+    } catch (error) { return { success: false, error: error.message }; }
+  }
+
   // Primary: fetch latest tag from GitHub
   try {
     const tagVersion = fetchLatestTag(repo, { includePrerelease: beta });
@@ -388,6 +397,7 @@ export function checkForUpdates(component, {
     current: localVersion.version,
     latest: latest.version,
     repo,
+    ...(latest.ref ? { ref: latest.ref, source: latest.source } : {}),
   };
 }
 
@@ -447,6 +457,10 @@ export function downloadToTemp(repo, version, branch) {
 
   const result = downloadArchive(repo, version, tempDir);
   if (!result.success) {
+    if (componentForRepository(repo)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return { success: false, error: result.error };
+    }
     // Fallback: try downloading main branch
     const branchResult = downloadBranch(repo, 'main', tempDir);
     if (!branchResult.success) {

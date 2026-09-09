@@ -48,6 +48,7 @@ import {
   verifyCommunicationContinuity,
 } from './communication-continuity.js';
 import { readEnvFile } from './env.js';
+import { componentForRepository, resolveQualifiedRelease, readReleaseHost } from '../../tools/upgrade/release-channel.mjs';
 import {
   assertExactSkillsInventory,
   captureExactSkillsInventory,
@@ -175,7 +176,19 @@ function getLatestVersion({ branch, beta = false, repo = null } = {}) {
     }
   }
 
-  // Default: tag-based detection (unified with component upgrades)
+  // Fork consumers use the publisher's qualified bundle channel. Explicit
+  // refs remain the separate release-operator path, with its existing gates.
+  if (componentForRepository(repoSlug) === 'core') {
+    try {
+      const release = resolveQualifiedRelease({ component: 'core', channel: beta ? 'preview' : 'stable', host: readReleaseHost() });
+      return { success: true, version: release.target.version, source: release.source };
+    } catch (error) {
+      return { success: false, error: error.code || 'remote_version_failed', message: error.message,
+        source: { repo: repoSlug, policy: beta ? 'verified-preview' : 'verified-stable', tag: null, ref: null } };
+    }
+  }
+
+  // Non-fork repositories retain their existing tag protocol.
   const source = {
     repo: repoSlug,
     policy: beta ? 'include-prerelease' : 'stable-only',
@@ -305,6 +318,24 @@ export function downloadCoreToTemp(version, branch, source, { repo = null } = {}
   const repoSlug = repo || REPO;
   const base = getWritableTmpBase('zylos-self-upgrade-probe-');
   const tempDir = fs.mkdtempSync(path.join(base, 'zylos-self-upgrade-'));
+
+  if (!branch && ['verified-stable', 'verified-preview'].includes(source?.policy)) {
+    if (source.repo !== repoSlug || source.version !== version || !/^[a-f0-9]{40}$/.test(source.ref || '')
+        || !/^[a-f0-9]{64}$/.test(source.qualificationAssetSha256 || '')) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return { success: false, error: 'Invalid qualified self-upgrade source', source };
+    }
+    const acquired = downloadRef(repoSlug, source.ref, tempDir);
+    try {
+      if (!acquired.success) throw new Error(acquired.error);
+      const pkg = JSON.parse(fs.readFileSync(path.join(tempDir, 'package.json'), 'utf8'));
+      if (pkg.name !== 'zylos' || pkg.version !== version) throw new Error('Qualified source package mismatch');
+      return { success: true, tempDir, source };
+    } catch (error) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return { success: false, error: error.message, source };
+    }
+  }
 
   if (branch) {
     if (source?.repo !== repoSlug || source?.ref !== branch || source?.tag !== null) {

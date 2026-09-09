@@ -8,6 +8,30 @@
 重新验证完整 SHA、文件 hash 和门禁；不得只复制目录却继续引用即将消失的旧路径。
 先检查已有活动事务，RUNNING 时跟踪原执行单，不重复准备或执行。
 
+## 公开版本资格
+
+prepare 已验证 GitHub Release 的资格 asset、digest、tag 与完整 bundle，并保存在 evidence/published-release.json。
+本机 Agent 核验平台、架构、Node 主版本、runtime 及功能配置后生成 environment.json：
+
+```json
+{"platform":"linux","arch":"x64","nodeMajor":22,"runtime":"claude","functionalConfigSha256":"<64位SHA256>"}
+```
+
+functionalConfigSha256 是与发布者相同规范的功能配置 JSON 的 canonical SHA256，涵盖启用功能及影响
+飞书/HXA/task 路由行为的非敏感选项；不包含账号、profile、hostname、凭证或业务消息。
+使用 release-channel.mjs 的 canonical/sha256 计算；必须从本机配置读取，不能复制报告指纹冒充一致。
+发布者须在发行说明记录该非敏感配置的字段和规范，Agent 自行核对，无需 Owner 填写。
+可在 prepare 时传 `--environment /absolute/environment.json`，或准备后执行：
+
+```sh
+node qualification.mjs --manifest /absolute/control/governance/release-manifest.json --environment /absolute/environment.json
+```
+
+导入匹配资格后自动生成 FLEET reuse plan：版本功能测试为 REUSED，本机 smoke 为 RUN。
+它不会将台账改为 READY，也不会把本机身份、dry-run、备份或通信写成 PASS。
+部署门重新检查 asset、bundle、环境与 reuse plan；未导入、文件变动或环境不匹配一律停止。
+公开版本缺少匹配资格时由发布者补齐，不要求 Owner 重新授权、拷贝旧 PASS 或手填台账。
+
 ## 准备
 
 在 actual runtime 下确认以下事实，保存只读证据：
@@ -16,12 +40,12 @@
   验证；多组织按已验证的本机部署配置选择，身份矛盾必须停止。根据证据填写本执行目录控制平面的
   employee-runtime-registry.json（employees.<name>.host；identity.profileName、profileId、deploymentOrgLabel、deploymentProfileId）。
 - Core/Feishu/HXA 实际版本和完整来源，磁盘、PM2、数据库完整性、队列、技能与关键配置 hash。
-  按 UPGRADE.md 检查目标是否会降级。latest 遇到已装较新提交时保留该组件，
-  同步候选、隔离源码和证据到实际完整 SHA，再做配套验证；不得用旧标签覆盖较新的已装源码。
+  按 UPGRADE.md 检查目标是否会降级。latest 遇到已装较新提交时保持原状；只能选择公开验收覆盖的实际来源组合，
+  不得手改公开 bundle 或用旧发布覆盖较新的已装源码。
 - 共享 runtime `.zylos/locks` 和活动事务。发现 RUNNING 只跟踪原执行单，不启动第二笔、不杀旧进程。
 - HXA 若与固定 repo/version/SHA 完全相同，验证文件来源后记录 reinstall=NOT_APPLICABLE；不用重装。
 - 源码测试/版本资格只有 bundle、gateVersion、环境指纹、report/reference hash 都吻合才能复用。
-  若另有资格报告，它仅证明报告中对应环境；不能证明当前主机已通过。环境不能证明一致时重跑；
+  若另有资格报告，它仅证明报告中对应环境；不能证明当前主机已通过。环境不能证明一致时由发布者补充资格，消费者不得临时充当版本 canary；
   每台主机都必须有新鲜身份/来源/磁盘/队列/dry-run 和真实 host smoke。
 
 旧台账已完成、新版未登记、验证依赖缺失、可修复的工具输出格式，不需要找 Owner 重新授权。

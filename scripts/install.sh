@@ -32,6 +32,10 @@ _main() {
 
 # ── Parse Arguments ───────────────────────────────────────────
 BRANCH=""
+RELEASE_VERSION="latest"
+RELEASE_CHANNEL="stable"
+UPGRADED_EXISTING=false
+KEEP_EXISTING=false
 NO_INIT=false
 INIT_ARGS=()
 while [ $# -gt 0 ]; do
@@ -42,6 +46,14 @@ while [ $# -gt 0 ]; do
         exit 1
       fi
       BRANCH="$2"
+      shift 2
+      ;;
+    --version|--channel)
+      if [ -z "${2:-}" ]; then
+        echo "[zylos] Error: $1 requires a value" >&2
+        exit 1
+      fi
+      if [ "$1" = "--version" ]; then RELEASE_VERSION="$2"; else RELEASE_CHANNEL="$2"; fi
       shift 2
       ;;
     --no-init)
@@ -103,18 +115,63 @@ ok()    { printf "${GREEN}[zylos]${NC} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[zylos]${NC} %s\n" "$*"; }
 fail()  { printf "${RED}[zylos]${NC} %s\n" "$*" >&2; exit 1; }
 
-# ── Resolve install ref ───────────────────────────────────────
-if [ -z "$BRANCH" ]; then
-  # No --branch specified: resolve latest release tag (stable version).
-  # Uses GitHub API (curl is available; git may not be installed yet).
-  LATEST_TAG="$(curl -fsSL "https://api.github.com/repos/${ZYLOS_REPO_SLUG}/releases/latest" 2>/dev/null \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
-  if [ -n "$LATEST_TAG" ]; then
-    BRANCH="$LATEST_TAG"
-  else
-    fail "Could not resolve latest release. GitHub API may be rate-limited or unreachable. Retry later or use: --branch main"
-  fi
+# Release selection is performed after Node is available, using the same
+# standalone resolver as all three repository-linked upgrade entrypoints.
+# --branch is an explicit developer/operator path, never a failure fallback.
+if [ "$RELEASE_CHANNEL" != "stable" ] && [ "$RELEASE_CHANNEL" != "preview" ]; then
+  fail "--channel must be stable or preview"
 fi
+if [ -n "$BRANCH" ] && { [ "$RELEASE_VERSION" != "latest" ] || [ "$RELEASE_CHANNEL" != "stable" ]; }; then
+  fail "Do not combine an explicit developer --branch with release selection"
+fi
+
+resolve_install_release() {
+  if [ -n "$BRANCH" ]; then
+    warn "Explicit developer source selected; this is not the verified release channel."
+    # Freeze even an explicitly selected branch/tag before the npm operation.
+    local ref_dir
+    (umask 077; mkdir -p "${HOME}/.cache/zylos")
+    ref_dir="$(mktemp -d "${HOME}/.cache/zylos/install-ref.XXXXXX")"
+    git -C "$ref_dir" init -q
+    git -C "$ref_dir" fetch -q --depth=1 -- "$ZYLOS_REPO" "$BRANCH"
+    BRANCH="$(git -C "$ref_dir" rev-parse FETCH_HEAD)"
+    return
+  fi
+  if [ "$ZYLOS_REPO_SLUG" != "HeXiaobo/zylos-core" ]; then
+    fail "The verified fork channel belongs to HeXiaobo/zylos-core; use the selected repository's documented installer."
+  fi
+  local operator_sha control_dir
+  local runtime_args=()
+  local argument_index
+  for ((argument_index=0; argument_index<${#INIT_ARGS[@]}; argument_index++)); do
+    if [ "${INIT_ARGS[$argument_index]}" = "--runtime" ]; then
+      runtime_args=(--runtime "${INIT_ARGS[$((argument_index + 1))]}")
+    fi
+  done
+  operator_sha="$(git ls-remote "$ZYLOS_REPO" refs/heads/main | awk '$2 == "refs/heads/main" { print $1 }')"
+  if [[ ! "$operator_sha" =~ ^[a-f0-9]{40}$ ]]; then fail "Cannot pin trusted installer tools"; fi
+  control_dir="${HOME}/.cache/zylos/install-$(date +%s)-$$"
+  (umask 077; mkdir -p "$control_dir")
+  printf '%s\n' "$operator_sha" > "$control_dir/operator-sha.txt"
+  curl -fsSL "https://raw.githubusercontent.com/${ZYLOS_REPO_SLUG}/${operator_sha}/tools/upgrade/release-channel.mjs" -o "$control_dir/release-channel.mjs"
+  BRANCH="$(node "$control_dir/release-channel.mjs" --component core --version "$RELEASE_VERSION" --channel "$RELEASE_CHANNEL" --out "$control_dir/selection.json" ${runtime_args[@]+"${runtime_args[@]}"} --sha-only)"
+  if [[ ! "$BRANCH" =~ ^[a-f0-9]{40}$ ]]; then fail "No verified install source selected"; fi
+  if command -v zylos &>/dev/null; then
+    local current_version
+    current_version="$(zylos --version)"
+    local comparison
+    comparison="$(node --input-type=module - "$control_dir/release-channel.mjs" "$control_dir/selection.json" "$current_version" <<'NODE'
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const { compareVersions } = await import(pathToFileURL(process.argv[2]).href);
+const selected = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+console.log(compareVersions(process.argv[4].trim().replace(/^v/, ''), selected.target.version));
+NODE
+)"
+    if [ "$comparison" -ge 0 ]; then KEEP_EXISTING=true; fi
+  fi
+  info "Verified source: ${BRANCH}; receipt: $control_dir/selection.json"
+}
 
 # ── OS Detection ──────────────────────────────────────────────
 detect_os() {
@@ -300,10 +357,18 @@ FISH_EOF
 
 # ── Install Zylos ─────────────────────────────────────────────
 install_zylos() {
+  if [ "$KEEP_EXISTING" = true ]; then
+    info "Installed Core is at the selected version or newer; preserving its source without reinstalling."
+    UPGRADED_EXISTING=true
+    return
+  fi
   if command -v zylos &>/dev/null; then
     local current_version
     current_version="$(zylos --version 2>/dev/null || echo 'unknown')"
-    warn "zylos is already installed (${current_version}). Upgrading..."
+    info "zylos is already installed (${current_version}); using its backup/rollback upgrader..."
+    zylos upgrade --self --repo "$ZYLOS_REPO_SLUG" --branch "$BRANCH" --yes
+    UPGRADED_EXISTING=true
+    return
   fi
 
   local install_url="${ZYLOS_REPO}#${BRANCH}"
@@ -352,7 +417,7 @@ fi
 
 detect_os
 
-if [ "$BRANCH" != "main" ]; then
+if [ -n "$BRANCH" ]; then
   info "Branch: ${BRANCH}"
 fi
 
@@ -423,9 +488,11 @@ ensure_curl
 ensure_git
 ensure_tmux
 ensure_node
+resolve_install_release
 
 echo ""
 install_zylos
+if [ "$UPGRADED_EXISTING" = true ]; then return 0; fi
 
 echo ""
 _ensure_path_in_profile
