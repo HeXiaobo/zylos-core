@@ -45,10 +45,10 @@ function resolveHostExecutable(name) {
 //
 // The pipeline also execs a few binaries by plain name with no trust-walk
 // (curl, tar via download.js; ps via process-identity.js). curl has a real
-// stub; tar and ps cannot be faked, so their stubs delegate to the host
-// binaries resolved at fixture time. The delegations are unaffected by
-// checkout permission bits because plain execFileSync resolves by PATH order
-// and never runs the trust-walk.
+// stub; tar, ps and gzip (GNU tar shells out to it for .gz) cannot be faked,
+// so their stubs delegate to the host binaries resolved at fixture time. The
+// delegations are unaffected by checkout permission bits because plain
+// execFileSync resolves by PATH order and never runs the trust-walk.
 function writeDelegatingStub(fakeBin, name) {
   fs.writeFileSync(
     path.join(fakeBin, name),
@@ -599,6 +599,7 @@ test('execute commits override provenance consistently in marker and registry', 
       { mode: 0o755 },
     );
     writeDelegatingStub(fakeBin, 'tar');
+    writeDelegatingStub(fakeBin, 'gzip');
     writeDelegatingStub(fakeBin, 'ps');
 
     const child = spawnSync(process.execPath, [
@@ -744,6 +745,7 @@ test('failed override execution rolls back code and leaves registry metadata unt
       { mode: 0o755 },
     );
     writeDelegatingStub(fakeBin, 'tar');
+    writeDelegatingStub(fakeBin, 'gzip');
     writeDelegatingStub(fakeBin, 'ps');
 
     const child = spawnSync(process.execPath, [
