@@ -216,15 +216,19 @@ describe('split instruction assembler', () => {
   it('rejects an active launch boundary until the generation is prepared', () => {
     const root = fixture();
     activateFreshSplitInstructions({ zylosDir: root, templatesDir: TEMPLATES_DIR });
-    const userPath = instructionPaths('codex', { zylosDir: root }).userPath;
+    const { userPath, outputPath } = instructionPaths('codex', { zylosDir: root });
     fs.appendFileSync(userPath, '\nchanged\n');
-    const future = new Date(Date.now() + 5000);
-    fs.utimesSync(userPath, future, future);
+    // Keep both explicit timestamps in the past. Linux filesystem write times
+    // can lag Date.now() slightly; a synthetic future input stays stale even
+    // after a correct rebuild and makes the launch assertion nondeterministic.
+    const previousOutput = new Date('2000-01-01T00:00:00Z');
+    const changedInput = new Date('2000-01-01T00:00:01Z');
+    fs.utimesSync(outputPath, previousOutput, previousOutput);
+    fs.utimesSync(userPath, changedInput, changedInput);
     assert.throws(() => assertInstructionReady('codex', { zylosDir: root }), /not prepared before launch/);
-    const current = new Date();
-    fs.utimesSync(userPath, current, current);
     buildInstructionFile('codex', { zylosDir: root });
     assert.equal(assertInstructionReady('codex', { zylosDir: root }), true);
+    assert.match(fs.readFileSync(outputPath, 'utf8'), /\nchanged\n/);
     fs.rmSync(root, { recursive: true, force: true });
   });
 });
