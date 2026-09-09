@@ -404,3 +404,33 @@ Want a managed experience? [Coco](https://coco.xyz) gives you a ready-to-work AI
 Ask your resident Agent to upgrade using this repository link. The [upgrade entrypoint](UPGRADE.md)
 contains version selection, portable preparation tools, and the host upgrade workflow.
 No separately transferred ZIP or owner-written release ledger is needed.
+
+### Pinning a manual self-upgrade to an exact ref (#40)
+
+```bash
+zylos upgrade --self --repo <owner/repo> --branch <sha-or-tag>
+```
+
+`--branch` accepts a branch name, a tag, or a commit SHA (short SHAs work too);
+`--repo` is a one-shot override of `ZYLOS_SELF_UPGRADE_REPO` and always requires
+`--branch`. Without `--repo`, the repository comes from `ZYLOS_SELF_UPGRADE_REPO`
+(`.env` or environment).
+
+### Raw `npm install -g git+…#<sha>` can fail with ENOTEMPTY (#41)
+
+On npm 9.2.0 (Debian, Node 22), installing a git ref globally while the same
+package name is already installed globally fails reliably with `ENOTEMPTY`
+(errno -39) during the git dependency `prepare` reify step — even after the old
+global directory is removed. This is an npm upstream issue. Zylos's own
+self-upgrade avoids it by always running pack-then-install
+(`npm pack` → `npm install -g <tarball>`). For manual git installs, use the
+same fallback:
+
+```bash
+git clone https://github.com/<owner>/<repo>.git /tmp/zylos-src && cd /tmp/zylos-src
+git checkout <full-or-short-sha>
+npm pack --pack-destination .
+rm -rf "$(npm root -g)/<package-name>"
+npm install -g <package-name>-<version>.tgz
+```
+
