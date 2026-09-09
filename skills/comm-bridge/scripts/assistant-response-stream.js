@@ -2258,6 +2258,27 @@ export function openAssistantResponseStream({
       };
     },
 
+    /**
+     * Issue #26: an explicit c4-send without --request-id used to fall back
+     * to a plain send while an assistant request for the same route stayed
+     * open with no observable trace. Surface the open request so the send
+     * path can say so out loud instead of silently decoupling the reply from
+     * its request.
+     */
+    queryOpenRequestByRoute({ channel, endpointId } = {}) {
+      const safeChannel = requireText(channel, 'channel');
+      const safeEndpointId = requireText(endpointId, 'endpointId');
+      const row = database.prepare(`
+        SELECT request_id, status
+        FROM assistant_requests
+        WHERE route_channel = ? AND route_endpoint = ?
+          AND status IN ('queued', 'started')
+        ORDER BY updated_at DESC, accepted_at DESC
+        LIMIT 1
+      `).get(safeChannel, safeEndpointId);
+      return row ? { requestId: row.request_id, status: row.status } : null;
+    },
+
     queryFinalOutputCandidates({ requestId } = {}) {
       const id = requireIdentifier(requestId, 'requestId');
       return selectFinalOutputCandidates.all(id).map(toFinalOutputCandidate);
@@ -2320,7 +2341,7 @@ export function openAssistantResponseStream({
     queryDeliveries({ requestId = null, status = 'dead_letter', limit = 50 } = {}) {
       const safeRequestId = requestId === null ? null : requireIdentifier(requestId, 'requestId');
       const safeStatus = requireText(status, 'status', 32);
-      if (!['pending', 'processing', 'delivered', 'dead_letter'].includes(safeStatus)) {
+      if (!['pending', 'processing', 'delivered', 'dead_letter', 'suppressed'].includes(safeStatus)) {
         throw new TypeError('status is not a supported delivery status');
       }
       requireInteger(limit, 'limit', { minimum: 1 });
@@ -2450,7 +2471,7 @@ export function openAssistantResponseStream({
               FROM assistant_response_events prior
               WHERE prior.request_id = candidate.request_id
                 AND prior.sequence < candidate.sequence
-                AND prior.delivery_status != 'delivered'
+                AND prior.delivery_status NOT IN ('delivered', 'suppressed')
                 AND (
                   prior.delivery_status != 'pending'
                   OR prior.available_at > ?
@@ -2489,9 +2510,20 @@ export function openAssistantResponseStream({
       }).immediate();
     },
 
-    acknowledgeDeliveries(deliveries) {
+    /**
+     * Acknowledge leased events with an explicit terminal outcome.
+     * Issue #778: a mode=off adapter answering `{status:"suppressed"}` used to
+     * be recorded as 'delivered' — an intentional silent terminal must stay
+     * distinguishable from a real delivery, so the outcome is caller-declared
+     * instead of assumed.
+     */
+    acknowledgeDeliveries(deliveries, { status = 'delivered' } = {}) {
       if (!Array.isArray(deliveries) || deliveries.length === 0) {
         throw new TypeError('deliveries must be a non-empty array');
+      }
+      const safeStatus = requireText(status, 'status', 32);
+      if (!['delivered', 'suppressed'].includes(safeStatus)) {
+        throw new TypeError('status is not a supported acknowledgement outcome');
       }
       const current = clock();
       return database.transaction(() => deliveries.map(item => {
@@ -2500,10 +2532,10 @@ export function openAssistantResponseStream({
         const token = requireText(item.leaseToken, 'leaseToken');
         const updated = database.prepare(`
           UPDATE assistant_response_events
-          SET delivery_status = 'delivered', delivered_at = ?, lease_token = NULL,
+          SET delivery_status = ?, delivered_at = ?, lease_token = NULL,
               lease_expires_at = NULL, last_error = NULL
           WHERE id = ? AND delivery_status = 'processing' AND lease_token = ?
-        `).run(current, deliveryId, token);
+        `).run(safeStatus, current, deliveryId, token);
         return { deliveryId, acknowledged: updated.changes === 1 };
       }))();
     },

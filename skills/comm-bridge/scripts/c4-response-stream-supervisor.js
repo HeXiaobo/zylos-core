@@ -33,6 +33,28 @@ function groupDeliveries(deliveries) {
   ));
 }
 
+/**
+ * Issue #778: a mode=off adapter answers `{status:"suppressed"}` on stdout —
+ * an intentional silent terminal, not a delivery. Parse the last JSON object
+ * the adapter printed so the acknowledgement can record the distinction;
+ * adapters that print nothing (or only human-readable lines) keep mapping to
+ * 'delivered', preserving the legacy contract.
+ */
+function parseAdapterOutcome(stdout) {
+  const lines = stdout.split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trim();
+    if (!line) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // Not JSON — keep scanning; only a JSON object carries the outcome.
+    }
+  }
+  return null;
+}
+
 function deliverToAdapter(adapterPath, payload, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('node', [adapterPath], {
@@ -41,6 +63,11 @@ function deliverToAdapter(adapterPath, payload, { signal } = {}) {
       signal,
     });
     let stderr = '';
+    let stdout = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      if (stdout.length < 16_384) stdout += chunk;
+    });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', chunk => {
       if (stderr.length < 16_384) stderr += chunk;
@@ -48,7 +75,7 @@ function deliverToAdapter(adapterPath, payload, { signal } = {}) {
     child.on('error', reject);
     child.on('close', code => {
       if (code === 0) {
-        resolve();
+        resolve(parseAdapterOutcome(stdout));
         return;
       }
       reject(new Error(stderr.trim() || `stream adapter exited ${code}`));
@@ -99,6 +126,7 @@ export function createAssistantResponseDeliveryWorker({
       const deliveries = responseStream.claimDeliveries({ limit: batchSize });
       const groups = groupDeliveries(deliveries);
       let acknowledged = 0;
+      let suppressed = 0;
       let retried = 0;
       let deadLettered = 0;
 
@@ -109,17 +137,33 @@ export function createAssistantResponseDeliveryWorker({
           if (!adapterExists(adapterPath)) {
             throw new Error(`response stream adapter not found for channel ${route.channel}`);
           }
-          await deliverWithinDeadline(deliver, adapterPath, {
+          const adapterOutcome = await deliverWithinDeadline(deliver, adapterPath, {
             schemaVersion: 1,
             requestId: event.requestId,
             route,
             events: group.map(item => item.event),
           }, deliveryTimeoutMs);
+          // Issue #778: the adapter's own stdout decides whether this group
+          // settled as a real delivery or as an intentional silent terminal;
+          // the two must never share one delivery_status.
+          const terminalStatus = adapterOutcome?.status === 'suppressed'
+            ? 'suppressed'
+            : 'delivered';
           const results = responseStream.acknowledgeDeliveries(group.map(item => ({
             deliveryId: item.deliveryId,
             leaseToken: item.leaseToken,
-          })));
-          acknowledged += results.filter(item => item.acknowledged).length;
+          })), { status: terminalStatus });
+          const settled = results.filter(item => item.acknowledged).length;
+          if (terminalStatus === 'suppressed') {
+            suppressed += settled;
+            logger.warn?.('assistant response stream events acknowledged as suppressed', {
+              channel: route.channel,
+              requestId: event.requestId,
+              count: settled,
+            });
+          } else {
+            acknowledged += settled;
+          }
         } catch (err) {
           const results = responseStream.retryDeliveries(group.map(item => ({
             deliveryId: item.deliveryId,
@@ -141,6 +185,7 @@ export function createAssistantResponseDeliveryWorker({
         claimed: deliveries.length,
         groups: groups.length,
         acknowledged,
+        suppressed,
         retried,
         deadLettered,
       };
