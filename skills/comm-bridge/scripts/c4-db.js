@@ -2256,11 +2256,13 @@ export function getUnsummarizedConversations(limit = null) {
  * Get the conversations that are safe to expose in session-start context.
  *
  * A durable assistant request is accepted before the dispatcher has delivered
- * its conversation row.  While the request is still queued, including that
- * row in startup context gives the runtime a second way to process it; a
- * request-scoped c4-send could even terminalize it before the dispatcher
- * emits RunStarted.  The dispatcher is the only owner of that transition, so
- * queued assistant requests stay out of this view until they are dispatched.
+ * its conversation row. While the request is queued and that row is still
+ * pending or running, including it in startup context gives the runtime a
+ * second way to process it; a request-scoped c4-send could even terminalize it
+ * before the dispatcher emits RunStarted. The dispatcher is the only owner of
+ * that transition, so those queued rows stay out of this view. If delivery was
+ * recorded but the RunStarted write was interrupted, the delivered queued row
+ * is safe to recover through its request-bound route.
  *
  * This is deliberately separate from getUnsummarizedConversations(): Memory
  * Sync must continue to see every unsummarized row, including requests that
@@ -2285,13 +2287,48 @@ export function getSessionInitConversations(limit = null) {
            datetime(c.timestamp, 'localtime') AS timestamp_local
     FROM conversations c
     LEFT JOIN assistant_requests ar ON ar.conversation_id = c.id
-    WHERE c.id > ?
-      AND (ar.request_id IS NULL OR ar.status IS NULL OR ar.status <> 'queued')
+    WHERE (
+      ar.status = 'started'
+      OR (ar.status = 'queued' AND c.status = 'delivered')
+      OR (
+        c.id > ?
+        AND (
+          ar.request_id IS NULL
+          OR ar.status IS NULL
+          OR ar.status <> 'queued'
+          OR c.status = 'delivered'
+        )
+      )
+    )
   `;
 
   if (limit) {
     return db.prepare(
-      `SELECT * FROM (${projection} ORDER BY c.id DESC LIMIT ?) ORDER BY id ASC`
+      `WITH eligible AS (${projection}),
+             active AS (
+               SELECT * FROM eligible
+               WHERE assistant_request_status = 'started'
+                  OR (assistant_request_status = 'queued' AND status = 'delivered')
+             ),
+             recent AS (
+               SELECT * FROM eligible
+               WHERE assistant_request_status IS NULL
+                  OR (
+                    assistant_request_status <> 'started'
+                    AND (
+                      assistant_request_status <> 'queued'
+                      OR status <> 'delivered'
+                      OR status IS NULL
+                    )
+                  )
+               ORDER BY id DESC
+               LIMIT ?
+             )
+       SELECT * FROM (
+         SELECT * FROM active
+         UNION ALL
+         SELECT * FROM recent
+       ) ORDER BY id ASC`
     ).all(afterId, limit);
   }
 
@@ -2410,6 +2447,7 @@ export function formatConversationsForAgent(conversations, {
       && linkedAssistantRequestId
       && suppressDispatchedAssistantReply
       && conv.assistant_request_status === 'queued'
+      && conv.status !== 'delivered'
     );
     const hasTerminalAssistantRequest = (
       conv.direction === 'in'
@@ -2421,7 +2459,13 @@ export function formatConversationsForAgent(conversations, {
       conv.direction === 'in'
       && linkedAssistantRequestId
       && suppressDispatchedAssistantReply
-      && conv.assistant_request_status === 'started'
+      && (
+        conv.assistant_request_status === 'started'
+        || (
+          conv.assistant_request_status === 'queued'
+          && conv.status === 'delivered'
+        )
+      )
     );
     const hasUnresolvedAssistantRequest = (
       conv.direction === 'in'

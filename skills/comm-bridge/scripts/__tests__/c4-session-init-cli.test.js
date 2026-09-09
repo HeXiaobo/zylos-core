@@ -274,6 +274,52 @@ describe('c4-session-init', () => {
     });
   });
 
+  it('keeps an active started request visible after its conversation is checkpointed', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const requestId = 'assistant.telegram.started-checkpoint';
+      const request = createAssistantRequest(tmpDir, {
+        requestId,
+        content: 'started request must survive Memory Sync checkpointing',
+        status: 'delivered',
+        start: true,
+      });
+      checkpoint(['create', String(request.conversationId), '--summary', 'Synced active request'], env);
+
+      const { stdout, status } = cli([], env);
+      assert.equal(status, 0);
+      assert.ok(stdout.includes('started request must survive Memory Sync checkpointing'));
+      assert.match(stdout, new RegExp(`--request-id "${requestId}"`));
+      assert.ok(!stdout.includes('No new conversations since last checkpoint'));
+    });
+  });
+
+  it('keeps a delivered queued request request-bound after a restart', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const requestId = 'assistant.telegram.delivered-queued-startup';
+      const request = createAssistantRequest(tmpDir, {
+        requestId,
+        content: 'submitted request must recover when StartRun was not recorded',
+        status: 'delivered',
+      });
+      checkpoint(['create', String(request.conversationId), '--summary', 'Synced submitted request'], env);
+
+      const { stdout, status } = cli([], env);
+      assert.equal(status, 0);
+      assert.ok(stdout.includes('submitted request must recover when StartRun was not recorded'));
+      assert.match(stdout, new RegExp(`--request-id "${requestId}"`));
+      assert.ok(!stdout.includes('history and do not reply'));
+
+      const stream = openAssistantResponseStream({
+        dbPath: path.join(tmpDir, 'comm-bridge', 'c4.db'),
+      });
+      try {
+        assert.equal(stream.query({ requestId }).request.status, 'queued');
+      } finally {
+        stream.close();
+      }
+    });
+  });
+
   it('triggers Memory Sync with the mechanically resolved Deployment Profile', () => {
     withTmpDir(({ tmpDir, env }) => {
       fs.mkdirSync(path.join(tmpDir, '.zylos'), { recursive: true });
