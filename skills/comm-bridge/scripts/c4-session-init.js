@@ -51,7 +51,10 @@ export async function emitC4Checkpoint() {
     }
     return formatSection(
       'LAST CHECKPOINT',
-      `(no summary — checkpoint #${checkpoint.id}, ${checkpoint.timestamp})`,
+      // timestamp_local is the query-layer local-clock projection (#60); the
+      // raw timestamp is UTC. `??` keeps this safe with any reader that does
+      // not project it, but a local-clock block must not mix in a UTC line (#61).
+      `(no summary — checkpoint #${checkpoint.id}, ${checkpoint.timestamp_local ?? checkpoint.timestamp})`,
     );
   });
 }

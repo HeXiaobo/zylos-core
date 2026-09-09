@@ -44,6 +44,25 @@ function withTmpDir(fn) {
   }
 }
 
+// Render a stored UTC stamp ('YYYY-MM-DD HH:MM:SS') as the wall-clock string a
+// process pinned to `timeZone` must show. Derived via Intl so the expectation
+// does not reuse the code under test (#61).
+function localFromUtc(utcStamp, timeZone) {
+  const iso = `${utcStamp.replace(' ', 'T')}Z`;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(iso));
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;
+}
+
 // -- basic behavior --
 
 describe('c4-session-init', () => {
@@ -84,6 +103,25 @@ describe('c4-session-init', () => {
       assert.ok(stdout.includes('no summary'));
       // And it must NOT masquerade as a summary block.
       assert.ok(!stdout.includes('=== LAST CHECKPOINT SUMMARY ==='));
+    });
+  });
+
+  it('prints the no-summary fallback line in local time, not UTC (#61)', () => {
+    withTmpDir(({ env }) => {
+      receive(['--channel', 'system', '--no-reply', '--content', 'msg1'], env);
+      // Checkpoint created without --summary → summary is null.
+      checkpoint(['create', '1'], env);
+
+      const latest = JSON.parse(checkpoint(['latest'], env).stdout);
+      const expectedLocal = localFromUtc(latest.timestamp, 'Asia/Shanghai');
+      assert.notEqual(expectedLocal, latest.timestamp);
+
+      const { stdout, status } = cli([], { ...env, TZ: 'Asia/Shanghai' });
+      assert.equal(status, 0);
+      assert.ok(stdout.includes('=== LAST CHECKPOINT ==='));
+      assert.ok(stdout.includes(`no summary — checkpoint #${latest.id}, ${expectedLocal})`));
+      // The UTC clock must not leak into the startup block.
+      assert.ok(!stdout.includes(latest.timestamp));
     });
   });
 
