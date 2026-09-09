@@ -13,9 +13,14 @@ const execFileAsync = promisify(execFile);
 const PROJECTION = 'feishu-task-stream';
 
 // Task lifecycle events that map onto a visible task status card.
+// TaskChangesRequested / TaskReopened return a task to execution (rework /
+// reopen, zylos-core#87) and stream the same "back to executing" signals as
+// TaskStarted so the status card leaves the review phase.
 const STREAMED_EVENT_TYPES = new Set([
   'TaskCreated',
   'TaskStarted',
+  'TaskChangesRequested',
+  'TaskReopened',
   'TaskSubmittedForReview',
   'TaskAccepted',
   'TaskCancelled',
@@ -110,6 +115,13 @@ export function commandsForTaskEvent({ event, title }) {
       commands.push({ kind: 'accept' });
       break;
     case 'TaskStarted':
+    // Rework (review → in_progress) and reopen (done/cancelled → ready) both
+    // put the task back into execution (zylos-core#87): re-stream the same
+    // start signals as TaskStarted. On a request that is already 'started'
+    // StartRun replays harmlessly and the tool progress carries the visible
+    // "back to executing" update; a terminal request acks both as no-ops.
+    case 'TaskChangesRequested':
+    case 'TaskReopened':
       // The agent has claimed the task — start the run (stream "执行中").
       commands.push({ kind: 'start' });
       commands.push({

@@ -10,6 +10,7 @@ import {
   openAssistantResponseStream,
   safeProgressStageForTool,
 } from '../assistant-response-stream.js';
+import { publicProgressForRuntimeTool } from '../assistant-public-progress.js';
 import { createAssistantResponseDeliveryWorker } from '../c4-response-stream-supervisor.js';
 
 function accept(stream, overrides = {}) {
@@ -1397,6 +1398,29 @@ test('maps actual tool names to a fixed public stage without carrying parameters
   assert.equal(safeProgressStageForTool('mcp__lark__calendar_get'), 'querying');
   assert.equal(safeProgressStageForTool('Bash'), 'executing');
   assert.equal(safeProgressStageForTool('Bash', { failed: true }), 'recovering');
+});
+
+test('a task review submission gets a public action distinct from a real message send', () => {
+  const review = publicProgressForRuntimeTool({
+    toolName: 'task-review-notify',
+    status: 'completed',
+  });
+  assert.deepEqual(review, {
+    stage: 'communicating',
+    action: 'task_review',
+    status: 'completed',
+    summary: 'Task submitted for review',
+  });
+
+  const message = publicProgressForRuntimeTool({
+    toolName: 'message-send',
+    status: 'completed',
+  });
+  assert.notEqual(message.action, review.action, 'a real send must stay distinguishable');
+  assert.equal(message.action, 'communicate');
+
+  // Raw tool names still never cross the public Interface.
+  assert.equal(JSON.stringify(review).includes('task-review-notify'), false);
 });
 
 test('turns an observed tool start into a fixed public progress summary', () => {

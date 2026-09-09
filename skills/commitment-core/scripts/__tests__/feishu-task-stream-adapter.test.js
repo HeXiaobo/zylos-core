@@ -30,6 +30,15 @@ test('commandsForTaskEvent maps task lifecycle to assistant-stream commands', ()
   assert.equal(review[0].payload.toolName, 'task-review-notify');
   assert.equal(review[0].payload.status, 'completed');
 
+  // Rework/reopen stream the same "back to executing" signals as TaskStarted
+  // (zylos-core#87) so the status card leaves the review phase.
+  for (const type of ['TaskChangesRequested', 'TaskReopened']) {
+    const rework = commandsForTaskEvent({ event: { type } });
+    assert.deepEqual(rework.map(c => c.kind), ['start', 'tool']);
+    assert.equal(rework[1].payload.toolName, 'task-execution');
+    assert.equal(rework[1].payload.status, 'started');
+  }
+
   const accepted = commandsForTaskEvent({ event: { type: 'TaskAccepted' }, title: '写周报' });
   assert.equal(accepted[0].kind, 'complete');
   assert.match(accepted[0].payload.output, /已完成/);
