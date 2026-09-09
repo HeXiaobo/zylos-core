@@ -30,10 +30,15 @@ Zylos 给它一个生命。跨重启的持久记忆。你睡觉时自动工作�
 
 ## 快速开始
 
+本 fork 默认安装**已验收的最新 stable 版本**；预发布需显式 `--channel preview`
+（或指定 `--version`），源码标签本身不代表可安装发布。
+升级已有员工 runtime，只需把仓库链接发给它并要求升级，见 [UPGRADE.md](UPGRADE.md)。
+发布者按 [PUBLISH.md](tools/upgrade/PUBLISH.md) 先验收再发布。
+
 **前置条件：** 一台 Linux 服务器（或 Mac）、[Claude](https://claude.ai) 订阅（或以 [OpenAI Codex](https://github.com/openai/codex) 作为替代运行时）。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash
 ```
 
 一键安装所有依赖（git、tmux、Node.js、zylos CLI），并自动运行 `zylos init` 完成初始化。
@@ -46,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 **完整示例：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- \
   -y \
   --setup-token sk-ant-oat01-xxx \
   --timezone Asia/Shanghai \
@@ -102,7 +107,7 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 <summary>仅安装环境，不运行 init</summary>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- --no-init
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- --no-init
 ```
 
 安装依赖和 zylos CLI，但跳过 `zylos init`。之后手动运行 `zylos init` 即可。
@@ -113,7 +118,7 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 <summary>从指定分支安装（用于测试）</summary>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- --branch <branch-name>
 ```
 
 </details>
@@ -122,7 +127,7 @@ curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/in
 <summary>手动安装（如果你已有 Node.js >= 20）</summary>
 
 ```bash
-npm install -g --install-links https://github.com/zylos-ai/zylos-core
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash -s -- --no-init
 zylos init
 ```
 
@@ -137,7 +142,7 @@ docker run -d --name zylos \
   -p 3456:3456 \
   -v zylos-data:/home/zylos/zylos \
   -v claude-config:/home/zylos/.claude \
-  ghcr.io/zylos-ai/zylos-core:latest
+  ghcr.io/hexiaobo/zylos-core:latest
 ```
 
 打开 `http://localhost:3456` 访问 Web 控制台。通过 `docker logs zylos | grep -A2 "Web Console"` 查看密码。更多配置（Docker Compose、环境变量、群晖 NAS 等）请参阅 [Docker 部署指南](docs/docker.md)。
@@ -163,7 +168,7 @@ claude --ssh user@your-linux-server
 或者在 SSH 会话中直接运行安装脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zylos-ai/zylos-core/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/HeXiaobo/zylos-core/main/scripts/install.sh | bash
 ```
 
 这适用于 Windows、ChromeOS 或任何能本地运行 Claude Code 的平台。AI 会在远程服务器上完成安装 — 无需原生平台支持。

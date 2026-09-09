@@ -261,7 +261,7 @@ export function runCli(args = process.argv.slice(2)) {
   });
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     process.stdout.write(`${JSON.stringify(runCli(), null, 2)}\n`);
   } catch (error) {

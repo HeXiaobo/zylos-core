@@ -5,6 +5,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { COMPONENTS, repository, selection, assertScope, buildScopedCommand } from '../../../tools/upgrade/scope.mjs';
+import { distribution, catalog } from './helpers/qualified-release-fixture.js';
+import { resolveQualifiedRelease } from '../../../tools/upgrade/release-channel.mjs';
 import { prepare } from '../../../tools/upgrade/prepare.mjs';
 const baseline = Object.fromEntries(COMPONENTS.map((name, i) => [name, { repo: repository(name), version: '1.0.0', sha: String(i + 1).repeat(40) }]));
 function manifest(selected) {
@@ -37,7 +39,7 @@ test('HXA rejects missing fresh identity', () => {
 test('preparation updates only selected tag and preserves older companion SHAs', () => {
  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-scope-fixture-')), oldEnv = { ...process.env };
  try {
-  const installed = {}; process.env.GIT_CONFIG_COUNT = '0';
+  const installed = {}, latest = {}; process.env.GIT_CONFIG_COUNT = '0'; process.env.ZYLOS_DIR = path.join(root, 'runtime');
   for (const [i, name] of COMPONENTS.entries()) {
    const dir = path.join(root, name); fs.mkdirSync(dir);
    const git = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }).trim();
@@ -47,6 +49,7 @@ test('preparation updates only selected tag and preserves older companion SHAs',
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: pkgName, version }));
     git('add', 'package.json'); git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', version);
     if (version === '1.0.0') installed[name] = { repo: repository(name), version, sha: git('rev-parse', 'HEAD') };
+    latest[name] = { repo: repository(name), version, sha: git('rev-parse', 'HEAD') };
     git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'tag', '-a', `v${version}`, '-m', version);
    }
    process.env[`GIT_CONFIG_KEY_${i}`] = `url.${dir}.insteadOf`; process.env[`GIT_CONFIG_VALUE_${i}`] = `https://github.com/${repository(name)}.git`;
@@ -55,7 +58,8 @@ test('preparation updates only selected tag and preserves older companion SHAs',
   const input = path.join(root, 'installed.json'); fs.writeFileSync(input, JSON.stringify(installed));
   for (const selected of COMPONENTS) {
    const output = path.join(root, `out-${selected}`);
-   const result = prepare({ '--out': output, '--authorization-ref': 'fixture-only', '--only': selected, '--installed': input });
+   const fixture = catalog([distribution({ target: { ...installed, [selected]: latest[selected] } })]);
+   const result = prepare({ '--out': output, '--authorization-ref': 'fixture-only', '--only': selected, '--installed': input }, { resolveRelease: options => resolveQualifiedRelease({ ...options, request: fixture.request }) });
    const m = JSON.parse(fs.readFileSync(path.join(output, 'governance/release-manifest.json')));
    assert.equal(result.runtimeMutation, false); assert.equal(m.deploymentAllowed, false); assert.equal(m.status, 'HOLD');
    assert.deepEqual(m.upgradeScope.components, [selected]); assert.equal(assertScope(m), selected);

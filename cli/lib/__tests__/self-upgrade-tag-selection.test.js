@@ -46,7 +46,7 @@ exit 2
     PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
     HOME: tempDir,
     ZYLOS_DIR: path.join(tempDir, 'zylos'),
-    ZYLOS_SELF_UPGRADE_REPO: 'HeXiaobo/zylos-core',
+    ZYLOS_SELF_UPGRADE_REPO: 'example/zylos-core',
     FAKE_TAGS_JSON: JSON.stringify(tags),
     FAKE_CURL_CALLS: callsPath,
     NO_COLOR: '1',
@@ -115,7 +115,7 @@ exit 2
       PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
       HOME: tempDir,
       ZYLOS_DIR: path.join(tempDir, 'zylos'),
-      ZYLOS_SELF_UPGRADE_REPO: 'HeXiaobo/zylos-core',
+      ZYLOS_SELF_UPGRADE_REPO: 'example/zylos-core',
       FAKE_ARCHIVE: archivePath,
       FAKE_CURL_CALLS: callsPath,
       ZYLOS_GH_RETRY_DELAY_MS: '',
@@ -130,7 +130,7 @@ exit 2
   };
 }
 
-describe('self-upgrade tag selection', () => {
+describe('legacy third-party self-upgrade tag selection', () => {
   it('explains when stable-only policy excludes every prerelease tag in the fork', () => {
     const result = checkWithTags([
       { name: 'v0.7.2-rc.18' },
@@ -140,7 +140,7 @@ describe('self-upgrade tag selection', () => {
     assert.equal(result.success, false);
     assert.equal(result.error, 'prerelease_tags_excluded');
     assert.deepEqual(result.source, {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       tag: null,
       ref: null,
@@ -166,7 +166,7 @@ describe('self-upgrade tag selection', () => {
     assert.equal(result.current, '0.7.2-rc.30');
     assert.equal(result.latest, '0.7.2-rc.22');
     assert.deepEqual(result.source, {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'include-prerelease',
       tag: 'v0.7.2-rc.22',
       ref: 'refs/tags/v0.7.2-rc.22',
@@ -178,9 +178,9 @@ describe('self-upgrade tag selection', () => {
 
     assert.equal(result.success, false);
     assert.equal(result.error, 'no_repository_tags');
-    assert.equal(result.message, 'No tags found in HeXiaobo/zylos-core');
+    assert.equal(result.message, 'No tags found in example/zylos-core');
     assert.deepEqual(result.source, {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       tag: null,
       ref: null,
@@ -209,7 +209,7 @@ describe('self-upgrade tag selection', () => {
     assert.equal(result.hasUpdate, true);
     assert.equal(result.latest, '0.8.0');
     assert.deepEqual(result.source, {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       tag: '0.8.0',
       ref: 'refs/tags/0.8.0',
@@ -221,10 +221,10 @@ describe('self-upgrade tag selection', () => {
 
     assert.equal(result.success, false);
     assert.equal(result.error, 'remote_version_failed');
-    assert.match(result.message, /Cannot fetch latest version from HeXiaobo\/zylos-core/);
+    assert.match(result.message, /Cannot fetch latest version from example\/zylos-core/);
     assert.match(result.message, /500/);
     assert.deepEqual(result.source, {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       tag: null,
       ref: null,
@@ -241,7 +241,7 @@ describe('self-upgrade tag selection', () => {
     assert.equal(result.error, 'remote_version_failed');
     assert.match(result.message, /Invalid GitHub tags response/);
     assert.deepEqual(result.source, {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       tag: null,
       ref: null,
@@ -261,7 +261,7 @@ describe('self-upgrade tag selection', () => {
     assert.equal(result.status, 0, result.stderr);
     assert.match(
       result.stdout,
-      /Source: HeXiaobo\/zylos-core @ refs\/tags\/v0\.7\.2-rc\.22 \(tag v0\.7\.2-rc\.22; include-prerelease\)/,
+      /Source: example\/zylos-core @ refs\/tags\/v0\.7\.2-rc\.22 \(tag v0\.7\.2-rc\.22; include-prerelease\)/,
     );
   });
 
@@ -276,7 +276,7 @@ describe('self-upgrade tag selection', () => {
     });
 
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /HeXiaobo\/zylos-core/);
+    assert.match(result.stderr, /example\/zylos-core/);
     assert.match(result.stderr, /v0\.7\.2-rc\.22 \(refs\/tags\/v0\.7\.2-rc\.22\)/);
     assert.match(result.stderr, /--beta/);
     assert.doesNotMatch(result.stderr, /No release tags found/);
@@ -284,7 +284,7 @@ describe('self-upgrade tag selection', () => {
 
   it('downloads the exact selected tag without inventing a v prefix', () => {
     const source = {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       version: '0.8.0',
       tag: '0.8.0',
@@ -301,7 +301,7 @@ describe('self-upgrade tag selection', () => {
 
   it('fails closed when the selected immutable tag cannot be downloaded', () => {
     const source = {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       version: '0.8.0',
       tag: '0.8.0',
@@ -312,14 +312,14 @@ describe('self-upgrade tag selection', () => {
 
     assert.equal(acquisition.result.success, false);
     assert.deepEqual(acquisition.result.source, source);
-    assert.match(acquisition.result.error, /HeXiaobo\/zylos-core@0\.8\.0/);
+    assert.match(acquisition.result.error, /example\/zylos-core@0\.8\.0/);
     assert.match(acquisition.calls, /archive\/refs\/tags\/0\.8\.0\.tar\.gz/);
     assert.doesNotMatch(acquisition.calls, /archive\/refs\/heads\/main\.tar\.gz/);
   });
 
   it('rejects a selected tag whose version disagrees with the checked version', () => {
     const source = {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       version: '0.8.0',
       tag: '0.8.1',
@@ -346,7 +346,7 @@ describe('self-upgrade tag selection', () => {
     const calls = fs.readFileSync(env.FAKE_CURL_CALLS, 'utf8');
 
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /HeXiaobo\/zylos-core@0\.8\.0/);
+    assert.match(result.stderr, /example\/zylos-core@0\.8\.0/);
     assert.match(calls, /archive\/refs\/tags\/0\.8\.0\.tar\.gz/);
     assert.doesNotMatch(calls, /archive\/refs\/heads\/main\.tar\.gz/);
   });
@@ -365,7 +365,7 @@ describe('self-upgrade tag selection', () => {
     assert.equal(result.status, 1);
     assert.equal(output.error, 'self_upgrade_download_failed');
     assert.deepEqual(output.source, {
-      repo: 'HeXiaobo/zylos-core',
+      repo: 'example/zylos-core',
       policy: 'stable-only',
       tag: '0.8.0',
       ref: 'refs/tags/0.8.0',

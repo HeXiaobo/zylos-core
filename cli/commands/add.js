@@ -184,12 +184,12 @@ export async function addComponent(args) {
     process.exit(1);
   }
 
-  if (!resolved.repo && !resolved.source) {
+  if (resolved.resolutionError || (!resolved.repo && !resolved.source)) {
     const message = resolved.resolutionError || `Unknown component: ${target}`;
     if (jsonOutput) {
       console.log(JSON.stringify({
         action: 'add_check', component: target, success: false,
-        error: resolved.resolutionError ? 'invalid_local_source' : 'not_found', message,
+        error: resolved.resolutionErrorCode || (resolved.resolutionError ? 'invalid_local_source' : 'not_found'), message,
         reply: resolved.resolutionError
           ? message
           : `Component "${target}" not found. Use "search <keyword>" to find available components.`,

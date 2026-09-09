@@ -12,6 +12,7 @@ import { fetchLatestTag } from './github.js';
 import { inspectLocalSource, resolveLocalPath } from './download.js';
 import { recoverUpgradeMetadataTransactions } from './upgrade-metadata.js';
 import { FULL_COMMIT_SHA } from './component-repo-override.js';
+import { componentForRepository, readReleaseHost, resolveQualifiedRelease } from '../../tools/upgrade/release-channel.mjs';
 
 const loadedSnapshots = new WeakMap();
 
@@ -189,6 +190,21 @@ function resolveGitHubTarget({
   installTarget,
   isThirdParty = !repo.startsWith('zylos-ai/'),
 }) {
+  const forkComponent = componentForRepository(repo);
+  if (forkComponent && !branch) {
+    try {
+      const selected = resolveQualifiedRelease({ component: forkComponent, requested: version || 'latest', host: readReleaseHost() });
+      return {
+        name, repo, version: selected.target.version, fetchError: null, isThirdParty,
+        source: { type: 'github-release', repo, ref: selected.target.sha, refType: 'commit' },
+        release: selected.source, sourceLabel: `https://github.com/${repo}`,
+        sourceHeading: 'Repository:', sourceReplyLabel: 'Repo', installTarget,
+      };
+    } catch (error) {
+      return { name, repo, version: null, source: null, isThirdParty, installTarget,
+        resolutionError: error.message, resolutionErrorCode: 'unqualified_release' };
+    }
+  }
   const tag = branch
     ? { version: null, fetchError: null }
     : (version ? { version, fetchError: null } : tryFetchLatestTag(repo));

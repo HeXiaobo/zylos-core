@@ -1193,6 +1193,12 @@ if (manifest) {
   }
 
   if (mode === 'deploy') {
+    if (manifest.distribution) {
+      try {
+        const { assertImportedQualification } = await import('../qualification.mjs');
+        assertImportedQualification(manifest);
+      } catch (error) { requireValue(false, `deployment blocked: ${error.message}`); }
+    }
     requireValue(manifest.status === 'READY', `deployment blocked: status=${manifest.status}`);
     requireValue(manifest.deploymentAllowed === true, 'deployment blocked: deploymentAllowed is not true');
     if (manifest.schema === SCHEMA_V1) {
