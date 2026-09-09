@@ -249,14 +249,17 @@ to hash the governed region after it moved out of the default skill.
    const scan = dir => { for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
      const p = path.join(dir, entry.name);
      if (entry.isDirectory()) scan(p);
-     else { try { if (hit(fs.readFileSync(p, "utf8"))) files.push(p); } catch {} }
+     else if (hit(fs.readFileSync(p, "utf8"))) files.push(p);
    } };
    const memoryDir = path.join(os.homedir(), "zylos", "memory");
    if (!fs.existsSync(memoryDir)) {
      console.error("7b NOT EXECUTED — memory directory not found: " + memoryDir);
      process.exit(3);
    }
-   scan(memoryDir);
+   try { scan(memoryDir); } catch (error) {
+     console.error("7b FAIL — memory scan incomplete: " + error.message);
+     process.exit(3);
+   }
    if (files.length) {
      console.error(`7b: ${files.length} file(s) with hits:\n${files.join("\n")}`);
      process.exit(1);
@@ -267,7 +270,8 @@ to hash the governed region after it moved out of the default skill.
 
    Exit 0 = gate passed (0 hits, positive control seen). Exit 1 = hits — a
    violation of the standing ban, not a scanner error. Exit 3 = gate NOT
-   executed (list unavailable) or the scanner failed its own positive control;
+   executed (list unavailable), the scanner failed its own positive control,
+   or a file/directory could not be read (the scan is incomplete);
    report it as the loud failure above, never as a green.
    🔴 **Scope is NOT limited to `memory/` — it explicitly includes the step-8
    checkpoint summary (2026-08-04, SS; third occurrence, same shape as the two
