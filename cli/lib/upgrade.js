@@ -524,6 +524,49 @@ export function filterChangelog(changelog, fromVersion) {
 }
 
 // ---------------------------------------------------------------------------
+// Public: backup retention
+// ---------------------------------------------------------------------------
+
+// Pipeline-created component backups use the ISO timestamp rendered by
+// `new Date().toISOString().replace(/[:.]/g, '-')`.
+const UPGRADE_BACKUP_DIR_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/;
+
+/**
+ * Retain only the newest pipeline-created .backup/ directory.
+ *
+ * Only ISO-timestamp directories are managed: unrelated entries under
+ * .backup/ (manual recovery snapshots such as `card-readback-*`) are never
+ * touched, and the backup created by the running upgrade (keepBackupDir) is
+ * never removed. Sorting every entry lexicographically and keeping the last
+ * one used to delete the fresh timestamped backup whenever any unrelated
+ * entry sorted after it — reporting a backupDir that no longer existed (#72).
+ *
+ * @param {string} skillDir - Installed component directory
+ * @param {string|null} [keepBackupDir=null] - Backup dir created by this run
+ */
+export function cleanOldBackups(skillDir, keepBackupDir = null) {
+  const backupRoot = path.join(skillDir, '.backup');
+  if (!fs.existsSync(backupRoot)) return;
+
+  try {
+    const keepName = keepBackupDir ? path.basename(keepBackupDir) : null;
+    const entries = fs.readdirSync(backupRoot, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .filter(name => UPGRADE_BACKUP_DIR_RE.test(name))
+      .sort();
+    // Keep the newest timestamped backup (and the backup of the running
+    // upgrade); remove every older one.
+    for (const name of entries.slice(0, -1)) {
+      if (name === keepName) continue;
+      fs.rmSync(path.join(backupRoot, name), { recursive: true, force: true });
+    }
+  } catch {
+    // Backup retention is best-effort; never fail the upgrade for it.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public: cleanupTemp
 // ---------------------------------------------------------------------------
 
@@ -714,6 +757,11 @@ function step1_backup(ctx) {
 
   try {
     copyTree(ctx.skillDir, backupDir, { excludes: ['node_modules', '.backup', '.zylos'] });
+    // A reported backup must exist. Fail before any mutation rather than
+    // returning a PASS whose backupDir points nowhere (#72).
+    if (!fs.existsSync(backupDir)) {
+      throw new Error(`backup directory missing after copy: ${backupDir}`);
+    }
 
     ctx.backupDir = backupDir;
     ctx.dataBackupRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-component-state-backup-'));
@@ -779,6 +827,23 @@ function step4_smartMerge(ctx) {
     ctx.mergeAdded = mergeResult.added;
     ctx.mergeDeleted = mergeResult.deleted;
     ctx.mergePreserved = mergeResult.preserved;
+
+    // Every backup path that will be reported must exist on disk before the
+    // upgrade proceeds; a reported-but-missing conflict backup is silent
+    // local-change loss (#72). This still runs pre-commit, so the ordinary
+    // rollback path remains available.
+    const missingBackups = [...mergeResult.conflicts, ...mergeResult.preserved]
+      .filter(entry => entry?.backupPath && !fs.existsSync(entry.backupPath))
+      .map(entry => entry.backupPath);
+    if (missingBackups.length > 0) {
+      return {
+        step: 4,
+        name: 'smart_merge',
+        status: 'failed',
+        error: `reported backup path does not exist: ${missingBackups.join('; ')}`,
+        duration: Date.now() - startTime,
+      };
+    }
 
     const msg = formatMergeResult(mergeResult);
 
@@ -1520,7 +1585,8 @@ export function runUpgrade(component, {
       from: ctx.from,
       to: ctx.to,
       steps: ctx.steps,
-      backupDir: ctx.backupDir,
+      // Never report a backup path that is not on disk (#72).
+      backupDir: ctx.backupDir && fs.existsSync(ctx.backupDir) ? ctx.backupDir : null,
       source: ctx.sourceMarker,
       targetRegistryEntry: ctx.targetRegistryEntry,
       metadataRecoveryPending: ctx.metadataRecoveryPending,

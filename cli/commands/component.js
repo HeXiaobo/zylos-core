@@ -9,7 +9,7 @@ import { ZYLOS_DIR, SKILLS_DIR, COMPONENTS_DIR, getZylosConfig } from '../lib/co
 import { bold, dim, green, red, yellow, cyan, success, error, warn, heading } from '../lib/colors.js';
 import { loadRegistry } from '../lib/registry.js';
 import { loadComponents, saveComponents } from '../lib/components.js';
-import { checkForUpdates, getLocalSourceUpgradeError, getRepo, runUpgrade, downloadToTemp, readChangelog, filterChangelog, cleanupTemp } from '../lib/upgrade.js';
+import { checkForUpdates, getLocalSourceUpgradeError, getRepo, runUpgrade, downloadToTemp, readChangelog, filterChangelog, cleanOldBackups, cleanupTemp } from '../lib/upgrade.js';
 import {
   CORE_REPO, checkForCoreUpdates, runSelfUpgrade,
   downloadCoreToTemp, readChangelog as readCoreChangelog,
@@ -907,8 +907,8 @@ async function handleUpgradeFlow(component, {
         saveComponents(components);
       }
 
-      // Clean old backups (keep only the latest)
-      cleanOldBackups(skillDir);
+      // Clean old backups (keep the newest, and never this run's backup)
+      cleanOldBackups(skillDir, result.backupDir);
     }
 
     // Output result
@@ -943,24 +943,6 @@ async function handleUpgradeFlow(component, {
     // Always: cleanup temp + release lock
     cleanupTemp(tempDir);
     releaseLock(component);
-  }
-}
-
-/**
- * Clean old .backup/ directories, keeping only the latest.
- */
-function cleanOldBackups(skillDir) {
-  const backupRoot = path.join(skillDir, '.backup');
-  if (!fs.existsSync(backupRoot)) return;
-
-  try {
-    const entries = fs.readdirSync(backupRoot).sort();
-    // Keep the last one, remove the rest
-    for (let i = 0; i < entries.length - 1; i++) {
-      fs.rmSync(path.join(backupRoot, entries[i]), { recursive: true, force: true });
-    }
-  } catch {
-    // Non-critical, ignore
   }
 }
 
