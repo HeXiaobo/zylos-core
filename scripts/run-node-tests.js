@@ -54,6 +54,13 @@ console.log(`Running ${testFiles.length} Node test files`);
 const isolatedHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-node-tests-home-'));
 const isolatedZylosDir = path.join(isolatedHomeDir, 'zylos');
 fs.mkdirSync(isolatedZylosDir, { recursive: true });
+// Agent identity must never leak from the host into the test process: on real
+// Zylos hosts the runtime exports ZYLOS_AGENT_ID / ZYLOS_AGENT_PROFILE, and
+// suites that exercise identity selection (business-mvp-gate) would otherwise
+// fail — or worse, pass through a path they were meant to reject (#73).
+const HOST_AGENT_IDENTITY_KEYS = ['ZYLOS_AGENT_ID', 'ZYLOS_AGENT_PROFILE'];
+const sanitizedEnv = { ...process.env };
+for (const key of HOST_AGENT_IDENTITY_KEYS) delete sanitizedEnv[key];
 let result;
 try {
   result = spawnSync(
@@ -62,7 +69,7 @@ try {
     {
       stdio: 'inherit',
       env: {
-        ...process.env,
+        ...sanitizedEnv,
         HOME: isolatedHomeDir,
         ZYLOS_DIR: isolatedZylosDir,
         ZYLOS_TEST_ISOLATED: '1',
