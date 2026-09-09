@@ -98,6 +98,7 @@ test('StartTask moves ready to in_progress and records one domain event', () => 
       toState: 'in_progress',
       version: 2,
       occurredAt: '2026-08-25T10:00:00.000Z',
+      payload: null,
     });
     const history = harness.core.query({ taskId: 'task-001', includeEvents: true });
     assert.deepEqual(history.task, result.task);
@@ -142,6 +143,7 @@ test('UpdateTaskReminder changes the canonical reminder and projects one Task ev
       toState: 'ready',
       version: 2,
       occurredAt: '2026-08-25T10:00:00.000Z',
+      payload: null,
     });
     assert.deepEqual(
       harness.core.query({ taskId: 'task-001', includeEvents: true })
@@ -483,6 +485,235 @@ test('UpdateTaskReminder rolls Task, Event, receipt, and Outbox back together', 
   }
 });
 
+test('ReportTaskProgress appends a TaskProgressReported event and keeps the state', () => {
+  const harness = createHarness({ eventIds: ['event-start-1', 'event-progress-1'] });
+
+  try {
+    harness.core.outbox.register({
+      projection: 'test-progress',
+      bootstrapPolicy: 'from_beginning',
+      actorId: 'test-operator',
+      idempotencyKey: 'register:test-progress',
+    });
+    ingestReadyTask(harness.core);
+    harness.core.command({
+      type: 'StartTask',
+      taskId: 'task-001',
+      actorId: 'assignee-1',
+      idempotencyKey: 'command:start:progress',
+    }, 1);
+
+    const result = harness.core.command({
+      type: 'ReportTaskProgress',
+      taskId: 'task-001',
+      actorId: 'assignee-1',
+      message: '完成一半，剩余联调',
+      idempotencyKey: 'command:progress:1',
+    }, 2);
+    assert.equal(result.task.state, 'in_progress', 'progress does not change task state');
+    assert.equal(result.task.version, 3);
+    assert.deepEqual(result.event, {
+      id: 'event-progress-1',
+      type: 'TaskProgressReported',
+      taskId: 'task-001',
+      actorId: 'assignee-1',
+      fromState: 'in_progress',
+      toState: 'in_progress',
+      version: 3,
+      occurredAt: '2026-08-25T10:00:00.000Z',
+      payload: { message: '完成一半，剩余联调' },
+    });
+
+    const history = harness.core.query({ taskId: 'task-001', includeEvents: true });
+    assert.equal(history.task.state, 'in_progress');
+    assert.equal(history.task.version, 3);
+    const reported = history.events.find((event) => event.type === 'TaskProgressReported');
+    assert.deepEqual(reported?.payload, { message: '完成一半，剩余联调' });
+
+    // Projection adapters read the progress message from the Outbox event
+    // payload together with taskId, reporter, and occurrence time.
+    const deliveries = harness.core.outbox.query({ projection: 'test-progress', limit: 10 });
+    const progressDelivery = deliveries.find((delivery) => delivery.event.type === 'TaskProgressReported');
+    assert.ok(progressDelivery);
+    assert.equal(progressDelivery.event.taskId, 'task-001');
+    assert.equal(progressDelivery.event.actorId, 'assignee-1');
+    assert.equal(progressDelivery.event.occurredAt, '2026-08-25T10:00:00.000Z');
+    assert.deepEqual(progressDelivery.event.payload, { message: '完成一半，剩余联调' });
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('ReportTaskProgress replays receipts, conflicts on changed content, and no-ops duplicate messages', () => {
+  const harness = createHarness({ eventIds: ['event-progress-a', 'event-progress-b'] });
+
+  try {
+    harness.core.outbox.register({
+      projection: 'test-progress-idempotency',
+      bootstrapPolicy: 'from_beginning',
+      actorId: 'test-operator',
+      idempotencyKey: 'register:test-progress-idempotency',
+    });
+    ingestReadyTask(harness.core);
+    const first = harness.core.command({
+      type: 'ReportTaskProgress',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      message: '阶段一完成',
+      idempotencyKey: 'command:progress:a',
+    }, 1);
+    assert.equal(first.task.version, 2);
+
+    // An exact replay with the same key (and same expected version) returns
+    // the stored result.
+    const replay = harness.core.command({
+      type: 'ReportTaskProgress',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      message: '阶段一完成',
+      idempotencyKey: 'command:progress:a',
+    }, 1);
+    assert.deepEqual(replay, first);
+
+    // A different message under the same key is a conflict.
+    assert.throws(
+      () => harness.core.command({
+        type: 'ReportTaskProgress',
+        taskId: 'task-001',
+        actorId: 'owner-1',
+        message: '阶段二完成',
+        idempotencyKey: 'command:progress:a',
+      }, 2),
+      (error) => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+
+    // Re-submitting the latest reported message with a fresh key is a
+    // recorded no-op: no event, no version bump, no projection work.
+    const noOp = harness.core.command({
+      type: 'ReportTaskProgress',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      message: '阶段一完成',
+      idempotencyKey: 'command:progress:noop',
+    }, 2);
+    assert.deepEqual(noOp, { task: first.task, event: null });
+
+    // A genuinely new message appends the next event.
+    const second = harness.core.command({
+      type: 'ReportTaskProgress',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      message: '阶段二完成',
+      idempotencyKey: 'command:progress:b',
+    }, 2);
+    assert.equal(second.task.version, 3);
+    assert.equal(second.event.id, 'event-progress-b');
+
+    const history = harness.core.query({ taskId: 'task-001', includeEvents: true });
+    assert.deepEqual(
+      history.events.map((event) => `${event.type}@v${event.version}`),
+      ['TaskCreated@v1', 'TaskProgressReported@v2', 'TaskProgressReported@v3'],
+    );
+    assert.deepEqual(
+      harness.core.outbox.query({ projection: 'test-progress-idempotency', limit: 10 })
+        .map((delivery) => delivery.event.version),
+      [1, 2, 3],
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('ReportTaskProgress allows task participants and rejects actors outside the policy', () => {
+  const harness = createHarness({ eventIds: ['event-progress-acceptor'] });
+
+  try {
+    ingestReadyTask(harness.core);
+    const accepted = harness.core.command({
+      type: 'ReportTaskProgress',
+      taskId: 'task-001',
+      actorId: 'acceptor-1',
+      message: '验收方同步：样机已收到',
+      idempotencyKey: 'command:progress:acceptor',
+    }, 1);
+    assert.equal(accepted.event.actorId, 'acceptor-1');
+
+    assert.throws(
+      () => harness.core.command({
+        type: 'ReportTaskProgress',
+        taskId: 'task-001',
+        actorId: 'outsider-1',
+        message: '无关人员汇报',
+        idempotencyKey: 'command:progress:outsider',
+      }, 2),
+      (error) => error?.code === 'FORBIDDEN',
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('ReportTaskProgress requires an existing open task and a non-empty bounded message', () => {
+  const harness = createHarness();
+
+  try {
+    ingestReadyTask(harness.core);
+
+    assert.throws(
+      () => harness.core.command({
+        type: 'ReportTaskProgress',
+        taskId: 'task-missing',
+        actorId: 'owner-1',
+        message: '不存在',
+        idempotencyKey: 'command:progress:missing',
+      }, 1),
+      (error) => error?.code === 'TASK_NOT_FOUND',
+    );
+
+    harness.core.command({
+      type: 'CancelTask',
+      taskId: 'task-001',
+      actorId: 'owner-1',
+      idempotencyKey: 'command:cancel:progress',
+    }, 1);
+    assert.throws(
+      () => harness.core.command({
+        type: 'ReportTaskProgress',
+        taskId: 'task-001',
+        actorId: 'owner-1',
+        message: '已取消的任务不再汇报',
+        idempotencyKey: 'command:progress:cancelled',
+      }, 2),
+      (error) => error?.code === 'INVALID_TRANSITION',
+    );
+
+    for (const message of ['', '   ']) {
+      assert.throws(
+        () => harness.core.command({
+          type: 'ReportTaskProgress',
+          taskId: 'task-missing',
+          actorId: 'owner-1',
+          message,
+          idempotencyKey: 'command:progress:blank',
+        }, 1),
+        /command\.message must be a non-empty string/,
+      );
+    }
+    assert.throws(
+      () => harness.core.command({
+        type: 'ReportTaskProgress',
+        taskId: 'task-001',
+        actorId: 'owner-1',
+        message: '长'.repeat(20_001),
+        idempotencyKey: 'command:progress:too-long',
+      }, 1),
+      /command\.message exceeds 20000 characters/,
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('ingest records one TaskCreated event and source replay does not duplicate it', () => {
   const harness = createHarness();
 
@@ -502,6 +733,7 @@ test('ingest records one TaskCreated event and source replay does not duplicate 
       toState: 'ready',
       version: 1,
       occurredAt: '2026-08-25T10:00:00.000Z',
+      payload: null,
     }]);
   } finally {
     harness.cleanup();
@@ -1055,6 +1287,7 @@ test('opening a database with non-null event origins enables TaskCreated backfil
         toState: 'ready',
         version: 1,
         occurredAt: '2026-08-24T00:00:00.000Z',
+        payload: null,
       }],
     );
     core.close();

@@ -233,6 +233,15 @@ function currentInstant(clock) {
   return { timestamp: new Date(milliseconds).toISOString(), milliseconds };
 }
 
+function parseEventPayload(raw) {
+  if (raw === null || raw === undefined) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw domainError('PERSISTED_DATA_CORRUPT', 'commitment event payload is not valid JSON');
+  }
+}
+
 function toEventView(row) {
   return {
     id: row.event_id,
@@ -243,6 +252,7 @@ function toEventView(row) {
     toState: row.to_state,
     version: row.task_version,
     occurredAt: row.occurred_at,
+    payload: parseEventPayload(row.event_payload),
   };
 }
 
@@ -483,6 +493,7 @@ export function createProjectionOutboxModule({ database, clock }) {
   const selectDelivery = database.prepare(`
     SELECT o.event_id, o.task_id, o.task_version, o.created_at,
            e.event_type, e.actor_id, e.from_state, e.to_state, e.occurred_at,
+           e.payload AS event_payload,
            d.projection, d.status AS delivery_status,
            d.attempt_count, d.version AS delivery_version, d.worker_id,
            d.lease_expires_at, d.next_attempt_at, d.last_error,
@@ -885,6 +896,7 @@ export function createProjectionOutboxModule({ database, clock }) {
           const row = database.prepare(`
             SELECT o.event_id, o.task_id, o.task_version, o.created_at,
                    e.event_type, e.actor_id, e.from_state, e.to_state, e.occurred_at,
+                   e.payload AS event_payload,
                    ? AS requested_projection, d.projection,
                    d.status AS delivery_status, d.attempt_count,
                    d.version AS delivery_version, d.worker_id,
@@ -929,6 +941,7 @@ export function createProjectionOutboxModule({ database, clock }) {
         return database.prepare(`
           SELECT o.event_id, o.task_id, o.task_version, o.created_at,
                  e.event_type, e.actor_id, e.from_state, e.to_state, e.occurred_at,
+                 e.payload AS event_payload,
                  ? AS requested_projection, d.projection,
                  d.status AS delivery_status, d.attempt_count,
                  d.version AS delivery_version, d.worker_id,

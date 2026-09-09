@@ -556,7 +556,7 @@ export function createTaskApplicationModule({
   `);
   const selectEvent = database.prepare(`
     SELECT id, event_type, task_id, actor_id, from_state, to_state,
-           task_version, occurred_at
+           task_version, occurred_at, payload
     FROM commitment_events
     WHERE task_id = ? AND task_version = ?
   `);

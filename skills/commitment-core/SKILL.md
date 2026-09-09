@@ -711,6 +711,17 @@ PM2 ecosystem and does not run until an operator explicitly invokes it.
 | `RequestChanges` | `review → ready` | acceptor |
 | `CancelTask` | `ready/in_progress/review → cancelled` | owner or acceptor |
 | `ReopenTask` | `done → ready` | owner or acceptor |
+| `ReportTaskProgress` | same state (no transition) | owner, acceptor, or assignee |
+
+`ReportTaskProgress` appends a `TaskProgressReported` event whose payload
+carries the progress message (`{ message }`) and advances only the Task
+version; the Task state never changes. Like reminder and deadline updates,
+the command applies from open states (`ready`/`in_progress`/`review`), and
+re-submitting the latest reported message is a recorded no-op
+(`event: null`), while a different payload under a used idempotency key fails
+with `IDEMPOTENCY_CONFLICT`. The `progress` notification kind still produces
+no direct-message delivery; projections consume the event and its payload
+through `core.outbox`.
 
 Initial Task, Source receipt, and `TaskCreated` event commit in one SQLite
 transaction. The creation event has `fromState: null`, `toState: ready`, and

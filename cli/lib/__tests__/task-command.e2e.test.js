@@ -241,6 +241,145 @@ test('zylos task set-reminder exposes help and rejects invalid reminder argument
   }
 });
 
+test('zylos task progress reports progress without changing the task state', () => {
+  const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-progress-cli-'));
+
+  try {
+    installTaskCore(zylosDir);
+    const task = json(runTask(zylosDir, [
+      'create',
+      '--title', 'CLI 汇报进度',
+      '--owner', 'owner-1',
+      '--acceptor', 'acceptor-1',
+      '--assignee', 'agent-1',
+      '--due-at', '2026-08-28T18:00:00+08:00',
+      '--json',
+    ])).task;
+    assert.equal(json(runTask(zylosDir, [
+      'start', task.id, '--actor', 'agent-1', '--expected-version', '1', '--json',
+    ])).task.state, 'in_progress');
+
+    const progressResult = runTask(zylosDir, [
+      'progress', task.id,
+      '--actor', 'agent-1',
+      '--expected-version', '2',
+      '--message', '完成一半，剩余联调',
+      '--idempotency-key', 'cli:progress:1',
+      '--json',
+    ]);
+    assert.equal(progressResult.status, 0, progressResult.stderr);
+    const progress = json(progressResult);
+    assert.equal(progress.task.state, 'in_progress', 'progress keeps the task state');
+    assert.equal(progress.task.version, 3);
+    assert.equal(progress.event.type, 'TaskProgressReported');
+    assert.equal(progress.event.fromState, 'in_progress');
+    assert.equal(progress.event.toState, 'in_progress');
+    assert.deepEqual(progress.event.payload, { message: '完成一半，剩余联调' });
+
+    const shown = json(runTask(zylosDir, ['show', task.id, '--events', '--json']));
+    assert.equal(shown.task.state, 'in_progress');
+    assert.deepEqual(
+      shown.events.map((event) => event.type),
+      ['TaskCreated', 'TaskStarted', 'TaskProgressReported'],
+    );
+    const reported = shown.events.find((event) => event.type === 'TaskProgressReported');
+    assert.equal(reported.actorId, 'agent-1');
+    assert.deepEqual(reported.payload, { message: '完成一半，剩余联调' });
+
+    // Replaying the same key returns the stored result without a new event.
+    const replay = runTask(zylosDir, [
+      'progress', task.id,
+      '--actor', 'agent-1',
+      '--expected-version', '2',
+      '--message', '完成一半，剩余联调',
+      '--idempotency-key', 'cli:progress:1',
+      '--json',
+    ]);
+    assert.equal(replay.status, 0, replay.stderr);
+    assert.deepEqual(json(replay), progress);
+    assert.deepEqual(
+      json(runTask(zylosDir, ['show', task.id, '--events', '--json']))
+        .events.map((event) => event.type),
+      ['TaskCreated', 'TaskStarted', 'TaskProgressReported'],
+    );
+
+    // A different message appends the next progress event.
+    const second = runTask(zylosDir, [
+      'progress', task.id,
+      '--actor', 'agent-1',
+      '--expected-version', '3',
+      '--message', '联调完成，待提交验收',
+      '--json',
+    ]);
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(json(second).task.version, 4);
+    assert.deepEqual(
+      json(runTask(zylosDir, ['show', task.id, '--events', '--json']))
+        .events.map((event) => event.type),
+      ['TaskCreated', 'TaskStarted', 'TaskProgressReported', 'TaskProgressReported'],
+    );
+  } finally {
+    rmSync(zylosDir, { recursive: true, force: true });
+  }
+});
+
+test('zylos task progress exposes help and rejects denied actors, unknown tasks, and blank messages', () => {
+  const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-progress-cli-errors-'));
+
+  try {
+    const help = runTask(zylosDir, ['progress', '--help']);
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /progress <taskId>/);
+    assert.match(help.stdout, /--message <text>/);
+
+    installTaskCore(zylosDir);
+    const task = json(runTask(zylosDir, [
+      'create', '--title', 'CLI 进度权限', '--owner', 'owner-1',
+      '--acceptor', 'acceptor-1', '--assignee', 'agent-1',
+      '--due-at', '2026-08-28T18:00:00+08:00', '--json',
+    ])).task;
+
+    const denied = runTask(zylosDir, [
+      'progress', task.id,
+      '--actor', 'outsider-1',
+      '--expected-version', '1',
+      '--message', '无关人员汇报',
+      '--json',
+    ]);
+    assert.equal(denied.status, 1, denied.stderr);
+    assert.equal(json(denied).error.code, 'FORBIDDEN');
+
+    const unknownTask = runTask(zylosDir, [
+      'progress', 'task-missing',
+      '--actor', 'owner-1',
+      '--expected-version', '1',
+      '--message', '不存在的任务',
+      '--json',
+    ]);
+    assert.equal(unknownTask.status, 1, unknownTask.stderr);
+    assert.equal(json(unknownTask).error.code, 'TASK_NOT_FOUND');
+
+    const blankMessage = runTask(zylosDir, [
+      'progress', task.id,
+      '--actor', 'owner-1',
+      '--expected-version', '1',
+      '--json',
+    ]);
+    assert.equal(blankMessage.status, 2, blankMessage.stderr);
+    assert.equal(json(blankMessage).error.code, 'INVALID_ARGUMENT');
+
+    // Rejected attempts leave the task untouched.
+    assert.deepEqual(
+      json(runTask(zylosDir, ['show', task.id, '--events', '--json']))
+        .events.map((event) => event.type),
+      ['TaskCreated'],
+    );
+    assert.equal(json(runTask(zylosDir, ['show', task.id, '--json'])).version, 1);
+  } finally {
+    rmSync(zylosDir, { recursive: true, force: true });
+  }
+});
+
 test('zylos task exposes the Task Run lease lifecycle without treating completion as acceptance', () => {
   const zylosDir = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-run-cli-'));
 

@@ -120,6 +120,15 @@ function toTaskView(row) {
   };
 }
 
+function parseEventPayload(raw) {
+  if (raw === null || raw === undefined) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw domainError('PERSISTED_DATA_CORRUPT', 'commitment event payload is not valid JSON');
+  }
+}
+
 function toEventView(row) {
   return {
     id: row.id,
@@ -130,6 +139,7 @@ function toEventView(row) {
     toState: row.to_state,
     version: row.task_version,
     occurredAt: row.occurred_at,
+    payload: parseEventPayload(row.payload),
   };
 }
 
@@ -325,9 +335,23 @@ const COMMAND_DEFINITIONS = Object.freeze({
         || actorId === task.assigneeId;
     },
   },
+  ReportTaskProgress: {
+    // Same-state progress report: appends a TaskProgressReported event whose
+    // payload carries the progress message. No task-state transition, so no
+    // run coordination.
+    fromStates: ['ready', 'in_progress', 'review'],
+    eventType: 'TaskProgressReported',
+    authorize(task, actorId) {
+      return actorId === task.ownerId
+        || actorId === task.acceptorId
+        || actorId === task.assigneeId;
+    },
+  },
 });
 
 const TASK_STATES = new Set(['ready', 'in_progress', 'review', 'done', 'cancelled']);
+// Progress messages are bounded like Task conversation comment bodies.
+const MAX_PROGRESS_MESSAGE_LENGTH = 20_000;
 const DEFAULT_QUERY_LIMIT = 50;
 const MAX_QUERY_LIMIT = 100;
 
@@ -361,6 +385,13 @@ function normalizeCommand(command) {
       throw new TypeError('command.dueAt must be an RFC 3339 timestamp');
     }
     normalized.dueAt = dueAt;
+  }
+  if (type === 'ReportTaskProgress') {
+    const message = requireText(command.message, 'command.message').trim();
+    if (Array.from(message).length > MAX_PROGRESS_MESSAGE_LENGTH) {
+      throw new TypeError(`command.message exceeds ${MAX_PROGRESS_MESSAGE_LENGTH} characters`);
+    }
+    normalized.message = message;
   }
   return normalized;
 }
@@ -466,6 +497,7 @@ const EVENT_TABLE_COLUMNS = `
   to_state TEXT NOT NULL,
   task_version INTEGER NOT NULL,
   occurred_at TEXT NOT NULL,
+  payload TEXT,
   FOREIGN KEY (task_id) REFERENCES commitment_tasks(id) ON DELETE RESTRICT
 `;
 
@@ -580,6 +612,15 @@ function migrateLegacyEventSchema(database) {
   } finally {
     database.pragma('foreign_keys = ON');
   }
+}
+
+// Legacy rows predate event payloads; the column stays NULL for them and the
+// event views surface payload: null.
+function migrateEventPayloadSchema(database) {
+  const hasPayload = database.pragma('table_info(commitment_events)')
+    .some((column) => column.name === 'payload');
+  if (hasPayload) return;
+  database.exec('ALTER TABLE commitment_events ADD COLUMN payload TEXT');
 }
 
 function backfillCreationEvents(database, eventIdGenerator, appendProjectionRecord) {
@@ -728,6 +769,7 @@ export function openCommitmentCore(options = {}) {
   migrateLegacyEventSchema(database);
   database.pragma('foreign_keys = ON');
   initializeSchema(database);
+  migrateEventPayloadSchema(database);
   initializeProjectionOutboxSchema(database);
   initializeTaskRunSchema(database);
   initializeEvidenceSchema(database);
@@ -760,16 +802,23 @@ export function openCommitmentCore(options = {}) {
   `);
   const selectEventForTaskVersion = database.prepare(`
     SELECT id, event_type, task_id, actor_id, from_state, to_state,
-           task_version, occurred_at
+           task_version, occurred_at, payload
     FROM commitment_events
     WHERE task_id = ? AND task_version = ?
   `);
   const selectEvents = database.prepare(`
     SELECT id, event_type, task_id, actor_id, from_state, to_state,
-           task_version, occurred_at
+           task_version, occurred_at, payload
     FROM commitment_events
     WHERE task_id = ?
     ORDER BY task_version, id
+  `);
+  const selectLatestTaskProgressMessage = database.prepare(`
+    SELECT payload
+    FROM commitment_events
+    WHERE task_id = ? AND event_type = 'TaskProgressReported'
+    ORDER BY task_version DESC
+    LIMIT 1
   `);
   const selectCommand = database.prepare(`
     SELECT request_fingerprint, result_json
@@ -809,11 +858,18 @@ export function openCommitmentCore(options = {}) {
     SET due_at = ?, version = version + 1, updated_at = ?
     WHERE id = ? AND version = ?
   `);
+  // Progress reports advance the Task version (one event per version is
+  // unique-indexed) without changing any Task field, including state.
+  const bumpTaskVersion = database.prepare(`
+    UPDATE commitment_tasks
+    SET version = version + 1, updated_at = ?
+    WHERE id = ? AND version = ?
+  `);
   const insertEvent = database.prepare(`
     INSERT INTO commitment_events (
       id, event_type, task_id, actor_id, from_state, to_state,
-      task_version, occurred_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      task_version, occurred_at, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertCommand = database.prepare(`
     INSERT INTO commitment_commands (
@@ -853,6 +909,7 @@ export function openCommitmentCore(options = {}) {
       toState: task.state,
       version: task.version,
       occurredAt: timestamp,
+      payload: null,
     };
     insertEvent.run(
       event.id,
@@ -863,6 +920,7 @@ export function openCommitmentCore(options = {}) {
       event.toState,
       event.version,
       event.occurredAt,
+      null,
     );
     projectionOutboxModule.append(event);
     return event;
@@ -892,6 +950,7 @@ export function openCommitmentCore(options = {}) {
       toState: updatedTask.state,
       version: updatedTask.version,
       occurredAt: timestamp,
+      payload: null,
     };
     insertEvent.run(
       event.id,
@@ -902,6 +961,7 @@ export function openCommitmentCore(options = {}) {
       event.toState,
       event.version,
       event.occurredAt,
+      null,
     );
     projectionOutboxModule.append(event);
     return { task: updatedTask, event };
@@ -930,6 +990,7 @@ export function openCommitmentCore(options = {}) {
       toState: task.state,
       version: updatedTask.version,
       occurredAt: timestamp,
+      payload: null,
     };
     insertEvent.run(
       event.id,
@@ -940,6 +1001,7 @@ export function openCommitmentCore(options = {}) {
       event.toState,
       event.version,
       event.occurredAt,
+      null,
     );
     projectionOutboxModule.append(event);
     return { task: updatedTask, event };
@@ -963,6 +1025,7 @@ export function openCommitmentCore(options = {}) {
       toState: task.state,
       version: updatedTask.version,
       occurredAt: timestamp,
+      payload: null,
     };
     insertEvent.run(
       event.id,
@@ -973,6 +1036,42 @@ export function openCommitmentCore(options = {}) {
       event.toState,
       event.version,
       event.occurredAt,
+      null,
+    );
+    projectionOutboxModule.append(event);
+    return { task: updatedTask, event };
+  }
+
+  function reportProgress({ task, message, actorId, timestamp }) {
+    const updated = bumpTaskVersion.run(timestamp, task.id, task.version);
+    if (updated.changes !== 1) {
+      throw domainError(
+        'VERSION_CONFLICT',
+        `task changed while reporting progress: ${task.id}`,
+      );
+    }
+    const updatedTask = toTaskView(selectTask.get(task.id));
+    const event = {
+      id: requireText(eventIdGenerator(), 'generated event id'),
+      type: 'TaskProgressReported',
+      taskId: task.id,
+      actorId,
+      fromState: task.state,
+      toState: task.state,
+      version: updatedTask.version,
+      occurredAt: timestamp,
+      payload: { message },
+    };
+    insertEvent.run(
+      event.id,
+      event.type,
+      event.taskId,
+      event.actorId,
+      event.fromState,
+      event.toState,
+      event.version,
+      event.occurredAt,
+      JSON.stringify(event.payload),
     );
     projectionOutboxModule.append(event);
     return { task: updatedTask, event };
@@ -1122,6 +1221,22 @@ export function openCommitmentCore(options = {}) {
         : updateDue({
           task,
           dueAt: command.dueAt,
+          actorId: command.actorId,
+          timestamp,
+        });
+    } else if (command.type === 'ReportTaskProgress') {
+      // Re-submitting the latest progress message is a no-op: no event, no
+      // version bump, no projection work (same convention as re-applying an
+      // unchanged reminder or deadline).
+      const latestPayload = selectLatestTaskProgressMessage.get(command.taskId)?.payload ?? null;
+      const latestMessage = latestPayload === null
+        ? null
+        : parseEventPayload(latestPayload)?.message ?? null;
+      result = latestMessage === command.message
+        ? { task, event: null }
+        : reportProgress({
+          task,
+          message: command.message,
           actorId: command.actorId,
           timestamp,
         });
