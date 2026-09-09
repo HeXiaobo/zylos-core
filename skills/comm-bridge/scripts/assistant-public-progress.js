@@ -48,6 +48,17 @@ const PUBLIC_TOOL_PROGRESS = Object.freeze({
 });
 
 const PUBLIC_SPECIAL_TOOL_PROGRESS = Object.freeze([
+  // Task review submission (commitment-core task-stream, zylos-core#87) needs
+  // a public action distinct from a real agent message send so the status card
+  // can render a dedicated "awaiting review" phase. The raw tool name still
+  // never leaves this Interface.
+  Object.freeze({
+    pattern: /task-review/,
+    stage: 'communicating',
+    action: 'task_review',
+    started: 'Submitting the task for review',
+    completed: 'Task submitted for review',
+  }),
   Object.freeze({
     pattern: /(agent|delegate|subagent)/,
     stage: 'organizing',
