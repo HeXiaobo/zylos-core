@@ -107,6 +107,7 @@ const WRITE_COMMANDS = Object.freeze({
 });
 const REMINDER_COMMAND = 'set-reminder';
 const POSTPONE_COMMAND = 'postpone';
+const PROGRESS_COMMAND = 'progress';
 const RUN_COMMANDS = new Set(['claim', 'heartbeat', 'complete-run', 'release-run', 'runs']);
 
 function argumentError(message) {
@@ -223,6 +224,7 @@ Subcommands:
   reopen <taskId>        done → ready
   set-reminder <taskId>  Update minutes-before-due reminder
   postpone <taskId>      Move the deadline (same state); appends TaskDueUpdated
+  progress <taskId>      Report progress (same state); appends TaskProgressReported
   claim <taskId>         Claim a Task Run lease and start ready work
   heartbeat <taskId>     Renew an active Task Run lease
   complete-run <taskId>  End a Run and submit the Task for review
@@ -267,6 +269,13 @@ Postpone command options:
   --actor <id>           Required owner, acceptor, or assignee identity
   --expected-version <n> Required positive Task version
   --due-at <timestamp>   Required RFC 3339 new deadline
+  --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
+  --json                 JSON output
+
+Progress command options:
+  --actor <id>           Required owner, acceptor, or assignee identity
+  --expected-version <n> Required positive Task version
+  --message <text>       Required non-empty progress description
   --idempotency-key <k>  Stable caller-provided key (otherwise a UUID is used)
   --json                 JSON output
 
@@ -451,6 +460,29 @@ function postponeTask(core, args, makeIdempotencyKey) {
   else printTask(result.task);
 }
 
+function reportTaskProgress(core, args, makeIdempotencyKey) {
+  const { options, positionals } = parseArgs(args, {
+    valueFlags: [
+      'actor', 'expected-version', 'message', 'idempotency-key',
+    ],
+    booleanFlags: ['json'],
+    positionalCount: 1,
+  });
+  const message = requireValue(options.message, '--message');
+  const result = core.command({
+    type: 'ReportTaskProgress',
+    taskId: requireValue(positionals[0], 'taskId'),
+    actorId: requireValue(options.actor, '--actor'),
+    message,
+    idempotencyKey: options['idempotency-key']
+      ? requireValue(options['idempotency-key'], '--idempotency-key')
+      : makeIdempotencyKey(PROGRESS_COMMAND),
+  }, parsePositiveInteger(options['expected-version'], '--expected-version'));
+
+  if (options.json) printJson(result);
+  else printTask(result.task);
+}
+
 function claimRun(core, args, makeIdempotencyKey) {
   const { options, positionals } = parseArgs(args, {
     valueFlags: ['actor', 'worker', 'lease-ms', 'expected-version', 'idempotency-key'],
@@ -576,6 +608,12 @@ export async function taskCommand(args, {
     showTaskHelp();
     return;
   }
+  if (subcommand === PROGRESS_COMMAND
+      && args.length === 2
+      && ['--help', '-h'].includes(args[1])) {
+    showTaskHelp();
+    return;
+  }
 
   const jsonMode = args.includes('--json');
   let core;
@@ -584,6 +622,7 @@ export async function taskCommand(args, {
       && !WRITE_COMMANDS[subcommand]
       && subcommand !== REMINDER_COMMAND
       && subcommand !== POSTPONE_COMMAND
+      && subcommand !== PROGRESS_COMMAND
       && !RUN_COMMANDS.has(subcommand)) {
       throw argumentError(`unknown task subcommand: ${subcommand}`);
     }
@@ -600,6 +639,9 @@ export async function taskCommand(args, {
     }
     else if (subcommand === POSTPONE_COMMAND) {
       postponeTask(core, args.slice(1), makeIdempotencyKey);
+    }
+    else if (subcommand === PROGRESS_COMMAND) {
+      reportTaskProgress(core, args.slice(1), makeIdempotencyKey);
     }
     else if (subcommand === 'claim') claimRun(core, args.slice(1), makeIdempotencyKey);
     else if (subcommand === 'heartbeat') heartbeatRun(core, args.slice(1), makeIdempotencyKey);
