@@ -6,12 +6,12 @@ import { describe, it } from 'node:test';
 const ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 
 describe('fork release metadata', () => {
-  it('identifies the runtime-neutral release candidate consistently', () => {
+  it('identifies the runtime-neutral release consistently', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
     const capabilities = JSON.parse(fs.readFileSync(path.join(ROOT, 'capabilities.json'), 'utf8'));
 
-    assert.equal(pkg.version, '0.7.2-rc.30');
+    assert.equal(pkg.version, '0.7.2');
     assert.equal(lock.version, pkg.version);
     assert.equal(lock.packages[''].version, pkg.version);
     assert.equal(capabilities.release, pkg.version);

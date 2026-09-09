@@ -163,7 +163,7 @@ describe('legacy third-party self-upgrade tag selection', () => {
 
     assert.equal(result.success, true);
     assert.equal(result.hasUpdate, false);
-    assert.equal(result.current, '0.7.2-rc.30');
+    assert.equal(result.current, '0.7.2');
     assert.equal(result.latest, '0.7.2-rc.22');
     assert.deepEqual(result.source, {
       repo: 'example/zylos-core',

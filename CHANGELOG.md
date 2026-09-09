@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-10
+
+### Added
+- Route fork installs and upgrades through qualified releases with immutable source selection and publication verification (#95).
+
+### Fixed
+- Keep queued assistant requests out of startup replay so restart context cannot trigger an unbound duplicate delivery (#96).
+
 ## [0.7.2-rc.30] - 2026-09-09
 
 ### Added
