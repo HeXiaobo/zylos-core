@@ -297,6 +297,91 @@ function ensureAssistantRequestsCancelledStatus(database) {
   }
 }
 
+/**
+ * Issue #778: mode=off stream adapters answer `{status:"suppressed"}` on
+ * stdout and the supervisor used to acknowledge those events as 'delivered',
+ * conflating an intentional silent terminal with a real delivery — watchdogs
+ * reading assistant_response_events could not tell the two apart.
+ * 'suppressed' therefore becomes a first-class terminal delivery_status.
+ * SQLite cannot alter a CHECK constraint in place, so legacy tables are
+ * rebuilt (same pattern as ensureAssistantRequestsCancelledStatus). Canonical
+ * columns added by the reply-reliability schema are carried over when present
+ * and stay NULL otherwise; its later ALTER calls skip existing columns.
+ */
+function ensureAssistantResponseEventsSuppressedStatus(database) {
+  const definition = database.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'assistant_response_events'
+  `).get()?.sql;
+  if (!definition || definition.includes("'suppressed'")) return;
+  const legacyColumns = new Set(
+    database.prepare('PRAGMA table_info(assistant_response_events)').all().map(column => column.name),
+  );
+  const canonicalColumns = ['event_id', 'turn_id', 'generation', 'trace_id', 'causation_id', 'producer'];
+  const carried = canonicalColumns.filter(column => legacyColumns.has(column));
+  const foreignKeysEnabled = database.pragma('foreign_keys', { simple: true }) === 1;
+  database.pragma('foreign_keys = OFF');
+  try {
+    const migrate = database.transaction(() => database.exec(`
+      CREATE TABLE assistant_response_events_v2 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence >= 1),
+        event_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        idempotency_key TEXT,
+        delivery_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter', 'suppressed')),
+        retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+        redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
+        available_at INTEGER NOT NULL,
+        lease_token TEXT,
+        lease_expires_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        event_id TEXT,
+        turn_id TEXT,
+        generation INTEGER CHECK (generation IS NULL OR generation >= 1),
+        trace_id TEXT,
+        causation_id TEXT,
+        producer TEXT,
+        FOREIGN KEY (request_id) REFERENCES assistant_requests(request_id) ON DELETE RESTRICT,
+        UNIQUE (request_id, sequence),
+        UNIQUE (request_id, idempotency_key)
+      );
+
+      INSERT INTO assistant_response_events_v2 (
+        id, request_id, sequence, event_type, payload_json, idempotency_key,
+        delivery_status, retry_count, redrive_count, available_at,
+        lease_token, lease_expires_at, last_error, created_at, delivered_at
+        ${carried.length > 0 ? `, ${carried.join(', ')}` : ''}
+      )
+      SELECT
+        id, request_id, sequence, event_type, payload_json, idempotency_key,
+        delivery_status, retry_count, redrive_count, available_at,
+        lease_token, lease_expires_at, last_error, created_at, delivered_at
+        ${carried.length > 0 ? `, ${carried.join(', ')}` : ''}
+      FROM assistant_response_events;
+
+      DROP TABLE assistant_response_events;
+      ALTER TABLE assistant_response_events_v2 RENAME TO assistant_response_events;
+      CREATE INDEX idx_assistant_response_events_delivery
+        ON assistant_response_events(delivery_status, available_at, id);
+      CREATE INDEX idx_assistant_response_events_request
+        ON assistant_response_events(request_id, sequence);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_response_events_event_id
+        ON assistant_response_events(event_id)
+        WHERE event_id IS NOT NULL;
+    `));
+    migrate.immediate();
+  } finally {
+    if (foreignKeysEnabled) database.pragma('foreign_keys = ON');
+  }
+  // Dropping the legacy table dropped its canonical immutability triggers
+  // with it; recreate them so the reliability schema's guarantees survive.
+  replaceCanonicalEventImmutabilityTriggers(database);
+}
+
 function ensureConversationsSchema(database) {
   const columnNames = getColumnNames(database, 'conversations');
   if (!columnNames.has('delivery_action')) {
@@ -420,7 +505,7 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
       payload_json TEXT NOT NULL,
       idempotency_key TEXT,
       delivery_status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+        CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter', 'suppressed')),
       retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
       redrive_count INTEGER NOT NULL DEFAULT 0 CHECK (redrive_count >= 0),
       available_at INTEGER NOT NULL,
@@ -519,6 +604,9 @@ export function ensureAssistantResponseSchema(database, { observationClock = Dat
         CHECK (redrive_count >= 0)
     `);
   }
+  // Must run after the redrive_count ALTER above: the rebuild's SELECT
+  // references that column even on tables predating it.
+  ensureAssistantResponseEventsSuppressedStatus(database);
 
   const finalOutputColumns = getColumnNames(database, 'assistant_final_output_candidates');
   if (!finalOutputColumns.has('observed_at_ms')) {

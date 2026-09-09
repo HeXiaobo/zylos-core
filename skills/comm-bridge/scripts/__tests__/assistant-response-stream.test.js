@@ -1794,6 +1794,7 @@ test('delivery worker coalesces one request batch and retries adapter failure', 
     claimed: 2,
     groups: 1,
     acknowledged: 2,
+    suppressed: 0,
     retried: 0,
     deadLettered: 0,
   });

@@ -317,6 +317,32 @@ async function main() {
     }
   }
 
+  // Issue #26: a send without --request-id used to silently decouple itself
+  // from an assistant request that was still open on the same route — the
+  // channel adapter then writes no delivery ledger and nothing terminates
+  // the request through this path. The send itself stays legitimate (it is
+  // the documented workaround for a broken stream), but the decoupling must
+  // be observable, never silent. Deliberately placed after the outbound
+  // policy gate: a rejected send performs no delivery, so there is nothing
+  // to decouple, and the store must not be opened before policy evaluation.
+  if (!assistantRequestId && endpoint) {
+    try {
+      const responseStream = openAssistantResponseStream();
+      const open = responseStream.queryOpenRequestByRoute({ channel, endpointId: endpoint });
+      responseStream.close();
+      if (open) {
+        console.error(
+          `[C4] Warning: assistant request ${open.requestId} is still ${open.status} for `
+          + `${channel}/${endpoint}, but this send carries no --request-id. The adapter will not `
+          + `write its delivery ledger and this send will not terminate the request.`,
+        );
+      }
+    } catch {
+      // Observability only: a stream-store problem must never block an
+      // explicit send.
+    }
+  }
+
   if (assistantRequestId && isSilentAssistantOutput(message)) {
     try {
       const responseStream = openAssistantResponseStream();
