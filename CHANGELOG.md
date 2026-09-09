@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2-rc.30] - 2026-09-09
+
+### Added
+- Add `ReportTaskProgress` and `zylos task progress` for durable task progress events (#85).
+
+### Fixed
+- Expose suppressed deliveries, missing request IDs, and open runs; project local timestamps at the query layer (#84, #86).
+- Stream task rework/reopen events and publish a distinct task review progress action (#89).
+- Preserve fresh component backups and verify returned backup paths; support explicit fork selection for self-upgrade (#90, #91).
+- Fail the banned-character gate when its list is missing or memory files cannot be read (#92, #93).
+- Isolate host identity and PM2 discovery in regression tests (#88).
+
 ## [0.7.2-rc.29] - 2026-09-06
 
 ### Added
