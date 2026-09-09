@@ -2178,13 +2178,28 @@ export function createCheckpoint(endConversationId, summary = null) {
 }
 
 /**
+ * Query-layer projection of a human-readable local timestamp (#60).
+ *
+ * Stored `timestamp` columns are UTC (SQLite CURRENT_TIMESTAMP). Every reader
+ * that surfaces a time to a human projects this column alongside the raw UTC
+ * value, so callers never re-derive local time themselves. The offset comes
+ * from SQLite's 'localtime' modifier — i.e. the deployment host's TZ — never
+ * a hardcoded literal.
+ *
+ * Declared above its first reference: this constant must never move below the
+ * readers that interpolate it, or module-level const TDZ turns a wrong order
+ * into a ReferenceError.
+ */
+export const TS_LOCAL_SQL = "datetime(timestamp, 'localtime') AS timestamp_local";
+
+/**
  * Get the most recent checkpoint
  * @returns {object|null} - checkpoint record or null
  */
 export function getLastCheckpoint() {
   const db = getDb();
   return db.prepare(
-    'SELECT id, timestamp, summary, start_conversation_id, end_conversation_id FROM checkpoints ORDER BY id DESC LIMIT 1'
+    `SELECT id, timestamp, summary, start_conversation_id, end_conversation_id, ${TS_LOCAL_SQL} FROM checkpoints ORDER BY id DESC LIMIT 1`
   ).get() || null;
 }
 
@@ -2222,12 +2237,12 @@ export function getUnsummarizedConversations(limit = null) {
 
   if (limit) {
     return db.prepare(
-      'SELECT * FROM (SELECT * FROM conversations WHERE id > ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC'
+      `SELECT *, ${TS_LOCAL_SQL} FROM (SELECT * FROM conversations WHERE id > ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC`
     ).all(afterId, limit);
   }
 
   return db.prepare(
-    'SELECT * FROM conversations WHERE id > ? ORDER BY id ASC'
+    `SELECT *, ${TS_LOCAL_SQL} FROM conversations WHERE id > ? ORDER BY id ASC`
   ).all(afterId);
 }
 
@@ -2240,7 +2255,7 @@ export function getUnsummarizedConversations(limit = null) {
 export function getConversationsByRange(beginId, endId) {
   const db = getDb();
   return db.prepare(
-    'SELECT * FROM conversations WHERE id >= ? AND id <= ? ORDER BY id ASC'
+    `SELECT *, ${TS_LOCAL_SQL} FROM conversations WHERE id >= ? AND id <= ? ORDER BY id ASC`
   ).all(beginId, endId);
 }
 
@@ -2252,7 +2267,7 @@ export function getConversationsByRange(beginId, endId) {
 export function getRecentConversations(limit = 20) {
   const db = getDb();
   return db.prepare(
-    'SELECT * FROM (SELECT * FROM conversations ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp ASC, id ASC'
+    `SELECT *, ${TS_LOCAL_SQL} FROM (SELECT * FROM conversations ORDER BY timestamp DESC LIMIT ?) ORDER BY timestamp ASC, id ASC`
   ).all(limit);
 }
 
@@ -2263,6 +2278,17 @@ export function getRecentConversations(limit = 20) {
 export function getCheckpoints() {
   const db = getDb();
   return db.prepare('SELECT * FROM checkpoints ORDER BY timestamp DESC').all();
+}
+
+/**
+ * Human-facing timestamp for a conversation/checkpoint row. Prefers the
+ * query-layer `timestamp_local` projection (#60); rows that skipped the
+ * projection render a loud marker instead of silently showing UTC.
+ */
+function renderStamp(conv) {
+  const tsLocal = conv.timestamp_local;
+  if (tsLocal == null) return `TZ-ERROR: missing timestamp_local (id=${conv.id ?? '?'})`;
+  return tsLocal;
 }
 
 /**
@@ -2279,7 +2305,7 @@ export function formatConversations(conversations) {
   for (const conv of conversations) {
     const dir = conv.direction === 'in' ? 'IN' : 'OUT';
     const endpoint = conv.endpoint_id ? `:${conv.endpoint_id}` : '';
-    lines.push(`[${conv.timestamp}] ${dir} (${conv.channel}${endpoint}):`);
+    lines.push(`[${renderStamp(conv)}] ${dir} (${conv.channel}${endpoint}):`);
     lines.push(conv.content);
     lines.push('');
   }
@@ -2315,7 +2341,7 @@ export function formatConversationsForAgent(conversations, { spill = true } = {}
       conv.endpoint_id &&
       !hasLegacyReplyViaSuffix(content)
     ) ? buildReplyViaSuffix(conv.channel, conv.endpoint_id) : '';
-    lines.push(`[${conv.timestamp}] ${dir} (${conv.channel}${endpoint}):`);
+    lines.push(`[${renderStamp(conv)}] ${dir} (${conv.channel}${endpoint}):`);
     lines.push(spill
       ? truncateForDelivery(content, replyViaSuffix, conv.id)
       : content + replyViaSuffix);
