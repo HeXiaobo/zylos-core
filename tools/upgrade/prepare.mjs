@@ -126,7 +126,14 @@ export function prepare(options, { resolveRelease = resolveQualifiedRelease } = 
   write('governance/release-manifest.json', manifest);
   write('governance/employee-runtime-registry.json', { schema: 'zylos.employee-runtime-registry/v1', employees: {} });
   const environmentVerified = published.environmentVerified;
-  return { status: 'PREPARED', directory: output, releaseId, candidate, upgradeScope: manifest.upgradeScope, deploymentAllowed: false, runtimeMutation: false, environmentVerified, distribution: manifest.distribution, next: environmentVerified
+  // A repeated component version label is reported, never silently absorbed: the
+  // resolved commit is always the most recently published qualified bundle.
+  const versionConflicts = published.versionConflicts || [];
+  if (versionConflicts.length) {
+    console.error(`Note: ${selector} ${published.target.version} is published for more than one commit; using the most recently published bundle ${published.target.sha}.`);
+    for (const conflict of versionConflicts) console.error(`- ${conflict.releaseTag} (${conflict.publishedAt}) pins ${conflict.sha}`);
+  }
+  return { status: 'PREPARED', directory: output, releaseId, candidate, upgradeScope: manifest.upgradeScope, deploymentAllowed: false, runtimeMutation: false, environmentVerified, distribution: manifest.distribution, versionConflicts, next: environmentVerified
     ? 'Read WORKFLOW.md; import matching published qualification, then run local host checks and supported upgrade.'
     : 'Read WORKFLOW.md; this host environment has no published qualification, so no published evidence may be reused. Run the complete local evidence workflow (identity, backup, source, dry run, canary) before deployment.' };
 }

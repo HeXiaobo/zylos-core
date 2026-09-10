@@ -229,7 +229,16 @@ export function resolveQualifiedRelease({ component = 'core', requested = 'lates
     throw error;
   }
   const chosen = eligible[0], target = chosen.document.bundle[component];
-  if (eligible.some(x => x.document.bundle[component].version === target.version && x.document.bundle[component].sha !== target.sha)) throw new Error('Conflicting qualified commits for the same component version');
+  // A component version can reappear on a newer qualified bundle: the release
+  // identity is the release id plus the full commit IDs, and the version label is
+  // not an identity. The eligible list is ordered by version and then by
+  // publication time, so the resolved commit is the most recently published
+  // qualified bundle. The other commits that share the version label are
+  // reported instead of refused: refusing them closes the channel for every
+  // consumer of that component while leaving the catalog just as ambiguous.
+  const versionConflicts = eligible
+    .filter(x => x.document.bundle[component].version === target.version && x.document.bundle[component].sha !== target.sha)
+    .map(x => ({ releaseId: x.document.releaseId, releaseTag: x.document.releaseTag, publishedAt: x.publishedAt, sha: x.document.bundle[component].sha }));
   // The chosen release is always a published, fully qualified bundle. Whether it
   // covers the consumer's own environment is reported separately: an uncovered
   // environment may still use the bundle, but only through complete local evidence.
@@ -237,7 +246,7 @@ export function resolveQualifiedRelease({ component = 'core', requested = 'lates
     ? chosen.document.qualifications.find(q => Object.entries(host).every(([key, value]) => q.environment[key] === value)) : null;
   const qualification = fingerprint ? chosen.document.qualifications.find(q => q.environmentFingerprint === fingerprint) : null;
   return { ...chosen, component, target, skipped, environmentVerified: Boolean(hostQualification) && (!fingerprint || Boolean(qualification)),
-    qualifiedEnvironments: chosen.document.qualifications.map(q => q.environment), environmentPolicy, qualification,
+    qualifiedEnvironments: chosen.document.qualifications.map(q => q.environment), environmentPolicy, qualification, versionConflicts,
     source: {
     repo: target.repo, version: target.version, ref: target.sha,
     tag: chosen.document.releaseTag, policy: chosen.document.channel === 'preview' ? 'verified-preview' : 'verified-stable',
