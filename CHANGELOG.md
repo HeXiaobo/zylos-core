@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-11
+
+### Added
+- Append a newly qualified host environment to an already published release while keeping the release identity, the bundle and every published qualification unchanged (#100).
+- Let a host whose platform, architecture, Node major and runtime are covered use the verified bundle even when the published qualification matrix does not yet match its functional configuration (#101).
+
+### Fixed
+- Resolve a repeated component version to the most recently published qualified bundle and report the other commits that share the label, instead of refusing every consumer of that component (#111).
+- Refuse a new release identity that reuses a published component version for a different commit, so a version label can no longer become ambiguous (#111).
+- Keep the request-scoped explicit `c4-send` for channels without terminal delivery, so an HXA direct-message reply is actually delivered (#109).
+- Ship the authoritative functional-configuration probe with the repository and accept its result as the environment descriptor (#102, #103, #106).
+- Distinguish a covered host from an unsupported one on fingerprint mismatch, report why preparation found no qualified release, and resume a draft release after a tag lookup miss (#98, #99, #104).
+
 ## [0.7.2] - 2026-09-10
 
 ### Added
