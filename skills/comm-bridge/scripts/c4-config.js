@@ -79,6 +79,7 @@ export function requiresExplicitReply(channel, activeRuntime = ACTIVE_RUNTIME) {
   const name = typeof channel === 'string' ? channel.trim() : '';
   return EXPLICIT_REPLY_CHANNELS.has(name);
 }
+
 export const DATA_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 export const DB_PATH = path.join(DATA_DIR, 'c4.db');
 export const ACTIVITY_MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
