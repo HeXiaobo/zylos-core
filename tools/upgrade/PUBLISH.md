@@ -51,6 +51,30 @@ unqualified historical releases are excluded from the default channel.
    evidence recognizes the existing release; conflicting evidence is never
    overwritten. Do not manually publish a failed draft.
 
+## Adding a host environment to a published release
+
+The qualification matrix grows as hosts appear; a release identity and its bundle never
+change. When a host environment is not yet in the matrix, qualify it on that host, keep
+its qualification report and its successful `deploy --stage final` receipt for the same
+release, add the entry to the external index, and re-run the same publication command
+with the same tag plus `--append-qualifications`:
+
+```sh
+node tools/upgrade/publish.mjs --manifest /absolute/deployment-ledger.json \
+  --publication-manifest /absolute/publication-ledger.json \
+  --qualifications /absolute/index.json --notes-file /absolute/reviewed-notes.md \
+  --tag bundle-RELEASE_ID --out /absolute/new-publication-directory \
+  --append-qualifications [--execute]
+```
+
+The tag already exists, so the tool replaces the asset instead of creating a release.
+Replacement is accepted only when the new asset keeps the same release ID, tag and bundle
+and still contains every already-published qualification byte-identical, and adds at
+least one new environment. Anything else is refused and the published asset is left
+untouched; the strict overwrite rule still applies without the flag. Update the reviewed
+notes in the same call so they describe the enlarged matrix, and keep one index entry per
+qualified environment.
+
 The channel defaults to stable, requiring all bundle versions to be stable.
 Preview requires explicit `--channel preview`, CLI `--beta`, or an exact RC
 version. Preview still requires qualification. Consumers verify GitHub's asset
