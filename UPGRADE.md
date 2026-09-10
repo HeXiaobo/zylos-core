@@ -56,7 +56,20 @@ Owner 的明确升级请求授权本次目标解析、准备、正常停服、�
 发布者在发布前完成版本验收并附上凭证，见 [发布流程](tools/upgrade/PUBLISH.md)。
 消费者导入凭证后只执行本机身份、备份、来源、兼容性、数据及通信 smoke；
 Owner 不需要填写发布台账，也不需要重复为同一个版本做完整版本验收。
-当前环境或来源组合未覆盖时由发布者补验收，不能把它包装成消费者缺少授权。
+当前环境或来源组合未覆盖时，先看公开资格矩阵里是不是已经覆盖；没有覆盖也不要伪造指纹、
+不要让 Owner 补授权、更不要回退到 main。按发布说明里的配方生成本机环境描述符，然后加
+`--environment-policy newest-qualified`：
+
+```sh
+node tools/upgrade/prepare.mjs --only core --core latest --installed /absolute/installed.json \
+  --environment /absolute/environment.json --environment-policy newest-qualified \
+  --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
+```
+
+来源仍然是已验收 bundle，但发布方的功能验收不可复用：本机必须完整跑身份、备份、来源、
+dry-run 与 canary，`deploy --stage final` 才会通过。`prepare.mjs` 的返回值里
+`environmentVerified` 为 `false` 时即为此路径。反过来，只要某个环境已经被发布方验收，
+就不要用这个开关绕过矩阵。
 
 ## 维护
 

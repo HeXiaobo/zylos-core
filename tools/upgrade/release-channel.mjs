@@ -11,6 +11,10 @@ import { pathToFileURL } from 'node:url';
 export const CATALOG_REPOSITORY = 'HeXiaobo/zylos-core';
 export const RELEASE_ASSET = 'zylos-release.json';
 export const QUALIFICATION_GATE_VERSION = 'functional-canary-v2';
+// 'matched' selects only a release qualified for this exact host environment.
+// 'newest-qualified' also serves a host environment the matrix does not cover yet;
+// the consumer must then run its own complete local evidence workflow.
+export const ENVIRONMENT_POLICIES = Object.freeze(['matched', 'newest-qualified']);
 export const REPOSITORIES = Object.freeze({
   core: CATALOG_REPOSITORY,
   feishu: 'HeXiaobo/zylos-feishu',
@@ -155,14 +159,16 @@ export function readPublishedDistribution(release, { request = githubRequest, al
 }
 
 export function resolveQualifiedRelease({ component = 'core', requested = 'latest', channel = 'stable', installed, environment, host,
-  components = [component], versions = {}, request = githubRequest } = {}) {
+  components = [component], versions = {}, environmentPolicy = 'matched', request = githubRequest } = {}) {
   if (!REPOSITORIES[component] || !['stable', 'preview'].includes(channel)
+      || !ENVIRONMENT_POLICIES.includes(environmentPolicy)
       || !Array.isArray(components) || !components.length || components.some(x => !REPOSITORIES[x])) throw new Error('Invalid release selection scope/channel');
   const exact = requested === 'latest' ? null : requested.replace(/^v/, '');
   if (exact) parseVersion(exact);
   const allowPreview = channel === 'preview' || Boolean(exact && parseVersion(exact).pre);
   const baseline = installed ? canonicalBundle(installed) : null;
   const fingerprint = environment ? qualificationFingerprint(environment) : null;
+  const requireMatchedEnvironment = environmentPolicy === 'matched';
   const skipped = [], eligible = [];
   const releases = readReleaseCatalog({ request });
   for (const release of releases) {
@@ -181,11 +187,11 @@ export function resolveQualifiedRelease({ component = 'core', requested = 'lates
     const environments = entry.document.qualifications.map(q => q.environment);
     if (host && !entry.document.qualifications.some(q => Object.entries(host).every(([key, value]) => q.environment[key] === value))) {
       skipped.push({ tag: release.tag_name, reason: 'Host platform/Node/runtime is outside the published qualification matrix', environments });
-      continue;
+      if (requireMatchedEnvironment) continue;
     }
     if (fingerprint && !entry.document.qualifications.some(q => q.environmentFingerprint === fingerprint)) {
       skipped.push({ tag: release.tag_name, reason: 'Environment is outside the published qualification matrix', environments });
-      continue;
+      if (requireMatchedEnvironment) continue;
     }
     if (exact && bundle[component].version !== exact) continue;
     if (Object.entries(versions).some(([name, value]) => value !== 'latest' && bundle[name]?.version !== value.replace(/^v/, ''))) continue;
@@ -206,8 +212,14 @@ export function resolveQualifiedRelease({ component = 'core', requested = 'lates
   }
   const chosen = eligible[0], target = chosen.document.bundle[component];
   if (eligible.some(x => x.document.bundle[component].version === target.version && x.document.bundle[component].sha !== target.sha)) throw new Error('Conflicting qualified commits for the same component version');
-  return { ...chosen, component, target, skipped,
-    qualification: fingerprint ? chosen.document.qualifications.find(q => q.environmentFingerprint === fingerprint) : null,
+  // The chosen release is always a published, fully qualified bundle. Whether it
+  // covers the consumer's own environment is reported separately: an uncovered
+  // environment may still use the bundle, but only through complete local evidence.
+  const hostQualification = host
+    ? chosen.document.qualifications.find(q => Object.entries(host).every(([key, value]) => q.environment[key] === value)) : null;
+  const qualification = fingerprint ? chosen.document.qualifications.find(q => q.environmentFingerprint === fingerprint) : null;
+  return { ...chosen, component, target, skipped, environmentVerified: Boolean(hostQualification) && (!fingerprint || Boolean(qualification)),
+    qualifiedEnvironments: chosen.document.qualifications.map(q => q.environment), environmentPolicy, qualification,
     source: {
     repo: target.repo, version: target.version, ref: target.sha,
     tag: chosen.document.releaseTag, policy: chosen.document.channel === 'preview' ? 'verified-preview' : 'verified-stable',

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { compareVersions, prepare, describeResolutionFailure } from '../../../tools/upgrade/prepare.mjs';
+import { resolveQualifiedRelease } from '../../../tools/upgrade/release-channel.mjs';
 import { bundle, distribution, catalog, environment } from './helpers/qualified-release-fixture.js';
 const root = path.resolve('.');
 test('semantic ordering handles numeric RCs and stable versions', () => {
@@ -74,4 +75,29 @@ test('resolution failures keep their diagnosis and terminal guidance', () => {
   assert.ok(text.includes(expected), expected);
  }
  assert.equal(describeResolutionFailure(new Error('plain failure')), 'plain failure');
+});
+
+test('an uncovered host environment needs the explicit newest-qualified policy and is never reported as verified', () => {
+ const document = distribution({ target: bundle('8.0.0') });
+ const fixture = catalog([document]);
+ // The catalog qualifies the fixture environment; this host differs in runtime only.
+ const uncovered = { ...environment, runtime: environment.runtime === 'claude' ? 'codex' : 'claude' };
+ let blocked;
+ try { resolveQualifiedRelease({ component: 'core', host: uncovered, request: fixture.request }); }
+ catch (error) { blocked = error; }
+ assert.equal(blocked?.code, 'NO_QUALIFIED_RELEASE', 'the default policy must stay fail-closed');
+ const relaxed = resolveQualifiedRelease({ component: 'core', host: uncovered, request: fixture.request, environmentPolicy: 'newest-qualified' });
+ assert.equal(relaxed.environmentVerified, false);
+ assert.equal(relaxed.target.sha, document.bundle.core.sha);
+ assert.equal(relaxed.qualification, null);
+ assert.deepEqual(relaxed.qualifiedEnvironments.map(x => x.runtime), [environment.runtime]);
+ const covered = resolveQualifiedRelease({ component: 'core', host: environment, request: fixture.request, environmentPolicy: 'newest-qualified' });
+ assert.equal(covered.environmentVerified, true);
+ assert.throws(() => resolveQualifiedRelease({ component: 'core', host: uncovered, request: fixture.request, environmentPolicy: 'anything' }), /Invalid release selection scope\/channel/);
+});
+test('the blocked-preparation guidance names the supported way forward for an uncovered host', () => {
+ const text = describeResolutionFailure(Object.assign(new Error('No verified stable release matches core latest.'), {
+  code: 'NO_QUALIFIED_RELEASE', host: environment, skipped: [] }));
+ assert.match(text, /--environment-policy newest-qualified/);
+ assert.match(text, /complete local canary/);
 });

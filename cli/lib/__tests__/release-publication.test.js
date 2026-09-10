@@ -205,3 +205,30 @@ test('an appended qualification replaces the published asset and notes without t
   assert.throws(() => publishDistribution(published, { assetPath: basePath, appendQualifications: true, gh, readDistribution }), /reviewed notes/);
  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+test('an uncovered host environment may deploy only through its own complete local evidence', () => {
+ const uncovered = { ...environment, runtime: environment.runtime === 'claude' ? 'codex' : 'claude' };
+ const document = distribution();
+ const candidate = structuredClone(document.bundle); candidate.hxa.packageVersion = candidate.hxa.version; delete candidate.hxa.version;
+ const base = () => ({ releaseId: 'uncovered-rollout', candidate, status: 'READY', deploymentAllowed: true,
+  evidence: { canary: 'NOT_RUN' }, deploymentContract: { rolloutMode: 'CANARY' },
+  distribution: { qualificationImported: false, environmentVerified: false, localEvidenceRequired: 'fully-local-canary',
+   hostEnvironment: uncovered, hostEnvironmentFingerprint: qualificationFingerprint(uncovered) } });
+ assert.throws(() => assertImportedQualification(base(), { host: uncovered }), /own local canary/);
+ const ready = base(); ready.evidence.canary = 'PASS';
+ assert.doesNotThrow(() => assertImportedQualification(ready, { host: uncovered }));
+ for (const mutate of [
+  x => { x.deploymentContract.rolloutMode = 'FLEET'; },
+  x => { x.distribution.qualificationImported = true; },
+  x => { x.distribution.localEvidenceRequired = 'published-version-evidence'; },
+  x => { x.distribution.hostEnvironmentFingerprint = `sha256:${'a'.repeat(64)}`; },
+  x => { x.distribution.hostEnvironment = environment; },
+  x => { delete x.distribution.hostEnvironment; },
+ ]) {
+  const bad = base(); bad.evidence.canary = 'PASS'; mutate(bad);
+  assert.throws(() => assertImportedQualification(bad, { host: uncovered }));
+ }
+ // A covered environment still has to import the published qualification first.
+ const covered = base();
+ covered.distribution = { releaseId: document.releaseId, qualificationImported: false, environmentVerified: true };
+ assert.throws(() => assertImportedQualification(covered, { host: environment }), /must be imported before deployment/);
+});

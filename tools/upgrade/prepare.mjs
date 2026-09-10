@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { prepareManifest } from './governance/prepare-release.mjs';
 import { selection, normalizeInstalled, version as installedVersion } from './scope.mjs';
-import { resolveQualifiedRelease, parseVersion, compareVersions, readReleaseHost } from './release-channel.mjs';
+import { resolveQualifiedRelease, parseVersion, compareVersions, readReleaseHost, qualificationFingerprint, ENVIRONMENT_POLICIES } from './release-channel.mjs';
 import { attachQualification } from './qualification.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +27,7 @@ export function describeResolutionFailure(error) {
   }
   if (error.code === 'NO_QUALIFIED_RELEASE') {
     lines.push('Next: qualify and publish a release for this host environment, or run preparation on a host that matches a published qualification.');
+    lines.push('If no release is qualified for this environment yet, prepare with --environment plus --environment-policy newest-qualified. That keeps the verified bundle but forbids reusing published evidence: this host must run its own complete local canary before deployment.');
   }
   return lines.join('\n');
 }
@@ -47,9 +48,12 @@ export function prepare(options, { resolveRelease = resolveQualifiedRelease } = 
   const selector = components.length === 3 ? 'core' : components[0];
   const versions = Object.fromEntries(components.map(name => [name, options[`--${name}`] || 'latest']));
   const explicitPreview = Object.values(versions).some(value => value !== 'latest' && parseVersion(value.replace(/^v/, '')).pre);
+  const environmentPolicy = options['--environment-policy'] || 'matched';
+  if (!ENVIRONMENT_POLICIES.includes(environmentPolicy)) throw new Error('Invalid arguments; use --help');
   const environment = options['--environment'] ? JSON.parse(fs.readFileSync(options['--environment'], 'utf8')) : undefined;
+  if (environmentPolicy === 'newest-qualified' && !environment) throw new Error('--environment-policy newest-qualified needs --environment so the uncovered host can be bound to this preparation');
   const published = resolveRelease({ component: selector, components, installed, versions, environment, host: readReleaseHost(),
-    requested: versions[selector], channel: options['--channel'] || (explicitPreview ? 'preview' : 'stable') });
+    environmentPolicy, requested: versions[selector], channel: options['--channel'] || (explicitPreview ? 'preview' : 'stable') });
   // Preserve newer installed versions. A named downgrade needs its own
   // explicit workflow; ordinary latest preparation must never do one.
   for (const name of components) {
@@ -98,21 +102,34 @@ export function prepare(options, { resolveRelease = resolveQualifiedRelease } = 
   fs.writeFileSync(assetPath, published.assetBytes, { flag: 'wx', mode: 0o600 });
   manifest.distribution = { releaseId: published.document.releaseId, channel: published.document.channel,
     assetPath, assetSha256: published.assetSha256, qualificationImported: false };
-  if (environment) manifest = attachQualification(manifest, { assetPath, assetSha256: published.assetSha256,
-    environment, evidenceDirectory: path.join(output, 'evidence') });
+  if (environment && published.environmentVerified) {
+    manifest = attachQualification(manifest, { assetPath, assetSha256: published.assetSha256,
+      environment, evidenceDirectory: path.join(output, 'evidence') });
+  } else if (environment) {
+    // The chosen release is qualified, but not for this host environment. Nothing
+    // from the publisher can be reused here, so the deployment contract stays at
+    // the local CANARY workflow and the host must produce its own full evidence.
+    manifest.distribution = { ...manifest.distribution, qualificationImported: false, environmentVerified: false,
+      localEvidenceRequired: 'fully-local-canary', hostEnvironment: environment,
+      hostEnvironmentFingerprint: qualificationFingerprint(environment),
+      unverifiedReason: `no published qualification covers ${describeHost(environment)}` };
+  }
   write('bundle.json', { ...previous, releaseId, candidate, upgradeScope: manifest.upgradeScope });
   write('governance/release-manifest.json', manifest);
   write('governance/employee-runtime-registry.json', { schema: 'zylos.employee-runtime-registry/v1', employees: {} });
-  return { status: 'PREPARED', directory: output, releaseId, candidate, upgradeScope: manifest.upgradeScope, deploymentAllowed: false, runtimeMutation: false, distribution: manifest.distribution, next: 'Read WORKFLOW.md; import matching published qualification, then run local host checks and supported upgrade.' };
+  const environmentVerified = published.environmentVerified;
+  return { status: 'PREPARED', directory: output, releaseId, candidate, upgradeScope: manifest.upgradeScope, deploymentAllowed: false, runtimeMutation: false, environmentVerified, distribution: manifest.distribution, next: environmentVerified
+    ? 'Read WORKFLOW.md; import matching published qualification, then run local host checks and supported upgrade.'
+    : 'Read WORKFLOW.md; this host environment has no published qualification, so no published evidence may be reused. Run the complete local evidence workflow (identity, backup, source, dry run, canary) before deployment.' };
 }
 if (process.argv[1] && fs.existsSync(process.argv[1]) && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   try {
     const args = process.argv.slice(2), options = {};
     if (args.includes('--help')) {
-      console.log('node tools/upgrade/prepare.mjs --out NEW_ABSOLUTE_DIR --authorization-ref MESSAGE_ID [--only core|feishu|hxa|all] [--installed VERIFIED_BASELINE_JSON] [--core latest|VERSION] [--feishu latest|VERSION] [--hxa latest|VERSION] [--channel stable|preview] [--environment VERIFIED_HOST_ENVIRONMENT_JSON]');
+      console.log('node tools/upgrade/prepare.mjs --out NEW_ABSOLUTE_DIR --authorization-ref MESSAGE_ID [--only core|feishu|hxa|all] [--installed VERIFIED_BASELINE_JSON] [--core latest|VERSION] [--feishu latest|VERSION] [--hxa latest|VERSION] [--channel stable|preview] [--environment VERIFIED_HOST_ENVIRONMENT_JSON] [--environment-policy matched|newest-qualified]');
     } else {
       for (let i = 0; i < args.length; i += 2) {
-        if (!['--out', '--authorization-ref', '--core', '--feishu', '--hxa', '--channel', '--only', '--installed', '--environment'].includes(args[i]) || !args[i + 1] || args[i + 1].startsWith('--') || options[args[i]]) throw new Error('Invalid arguments; use --help');
+        if (!['--out', '--authorization-ref', '--core', '--feishu', '--hxa', '--channel', '--only', '--installed', '--environment', '--environment-policy'].includes(args[i]) || !args[i + 1] || args[i + 1].startsWith('--') || options[args[i]]) throw new Error('Invalid arguments; use --help');
         options[args[i]] = args[i + 1];
       }
       console.log(JSON.stringify(prepare(options), null, 2));
