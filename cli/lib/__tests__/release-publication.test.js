@@ -28,16 +28,63 @@ test('publisher requires complete qualification and strips host/private report f
   const bad = evidence(); mutate(bad); assert.throws(() => buildDistribution(bad));
  }
 });
+test('publisher discovers a draft hidden from the tag endpoint without creating a duplicate', () => {
+ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-publish-draft-fixture-'));
+ try {
+  const document = buildDistribution(evidence()), assetPath = path.join(root, 'zylos-release.json'), notesPath = path.join(root, 'notes.md');
+  const assetBytes = JSON.stringify(document); fs.writeFileSync(assetPath, assetBytes); fs.writeFileSync(notesPath, 'Fixture');
+  const release = { id: 7, tag_name: document.releaseTag, draft: true, assets: [] }; const calls = [];
+  const gh = args => {
+   calls.push(args);
+   if (args[0] === 'api' && args[1].includes('/releases/tags/')) throw new Error('HTTP 404');
+   if (args[0] === 'api' && args[1].includes('/releases?')) return JSON.stringify([release]);
+   if (args[0] === 'release' && args[1] === 'edit') { release.draft = false; return ''; }
+   throw new Error(`unexpected gh call: ${args.join(' ')}`);
+  };
+  const readDistribution = () => ({ document, assetSha256: sha256(assetBytes) });
+  assert.equal(publishDistribution(document, { assetPath, notesPath, gh, readDistribution }).status, 'PUBLISHED');
+  assert.equal(calls.filter(args => args[0] === 'release' && args[1] === 'create').length, 0);
+ } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+test('publisher continues bounded release pagination before editing the exact draft tag', () => {
+ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-publish-pagination-fixture-'));
+ try {
+  const document = buildDistribution(evidence()), assetPath = path.join(root, 'zylos-release.json'), notesPath = path.join(root, 'notes.md');
+  const assetBytes = JSON.stringify(document); fs.writeFileSync(assetPath, assetBytes); fs.writeFileSync(notesPath, 'Fixture');
+  const target = { id: 8, tag_name: document.releaseTag, draft: true }; const firstPage = Array.from({ length: 100 }, (_, i) => ({ id: i + 100, tag_name: `other-${i}`, draft: true }));
+  const listPages = []; const editedTags = []; let creates = 0;
+  const gh = args => {
+   if (args[0] === 'api' && args[1].includes('/releases/tags/')) throw new Error('HTTP 404');
+   if (args[0] === 'api' && args[1].includes('/releases?')) {
+    listPages.push(args[1]);
+    return args[1].endsWith('page=1') ? JSON.stringify(firstPage) : JSON.stringify([target]);
+   }
+   if (args[0] === 'release' && args[1] === 'edit') { editedTags.push(args[2]); target.draft = false; return ''; }
+   if (args[0] === 'release' && args[1] === 'create') { creates++; throw new Error('unexpected create'); }
+   throw new Error(`unexpected gh call: ${args.join(' ')}`);
+  };
+  const readDistribution = () => ({ document, assetSha256: sha256(assetBytes) });
+  assert.equal(publishDistribution(document, { assetPath, notesPath, gh, readDistribution }).status, 'PUBLISHED');
+  assert.equal(creates, 0);
+  assert.deepEqual(editedTags, [document.releaseTag]);
+  assert.equal(listPages.filter(endpoint => endpoint.endsWith('page=1')).length, 2);
+  assert.equal(listPages.filter(endpoint => endpoint.endsWith('page=2')).length, 2);
+ } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 test('uncertain draft creation and publish are inspected, never submitted twice; conflict is preserved', () => {
  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-publish-fixture-'));
  try {
   const document = buildDistribution(evidence()), assetPath = path.join(root, 'zylos-release.json'), notesPath = path.join(root, 'notes.md');
   const assetBytes = JSON.stringify(document); fs.writeFileSync(assetPath, assetBytes); fs.writeFileSync(notesPath, 'Fixture');
-  let release = null; const mutations = [];
+  let release = null; const mutations = []; const lookups = [];
   const gh = args => {
-   if (args[0] === 'api') { if (!release) throw new Error('HTTP 404'); return JSON.stringify(release); }
+   if (args[0] === 'api') {
+    lookups.push(args[1]);
+    if (args[1].includes('/releases/tags/')) throw new Error('HTTP 404');
+    if (args[1].includes('/releases?')) return JSON.stringify(release ? [release] : []);
+   }
    mutations.push(args[1]);
-   if (args[1] === 'create') { release = { id: 1, draft: true }; throw new Error('uncertain connection'); }
+   if (args[1] === 'create') { release = { id: 1, tag_name: document.releaseTag, draft: true }; throw new Error('uncertain connection'); }
    if (args[1] === 'edit') { release.draft = false; throw new Error('uncertain connection'); }
   };
   const readDistribution = () => ({ document, assetSha256: sha256(assetBytes) });
@@ -45,8 +92,33 @@ test('uncertain draft creation and publish are inspected, never submitted twice;
   assert.deepEqual(mutations, ['create', 'edit']);
   assert.equal(publishDistribution(document, { assetPath, notesPath, gh, readDistribution }).status, 'PUBLISHED');
   assert.deepEqual(mutations, ['create', 'edit']);
+  assert.ok(lookups.some(endpoint => endpoint.includes('/releases?')));
   assert.throws(() => publishDistribution(document, { assetPath, notesPath, gh, readDistribution: () => ({ document, assetSha256: 'f'.repeat(64) }) }), /not overwritten/);
   assert.deepEqual(mutations, ['create', 'edit']);
+ } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+test('publisher refuses to create when exact-tag draft discovery fails or conflicts', () => {
+ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-publish-list-fixture-'));
+ try {
+  const document = buildDistribution(evidence()), assetPath = path.join(root, 'asset'), bytes = JSON.stringify(document); fs.writeFileSync(assetPath, bytes);
+  let creates = 0; const tag404 = () => { throw new Error('HTTP 404'); };
+  const listingFailure = args => {
+   if (args[0] === 'api' && args[1].includes('/releases/tags/')) throw new Error('HTTP 404');
+   if (args[0] === 'api' && args[1].includes('/releases?')) throw new Error('HTTP 503');
+   if (args[0] === 'release' && args[1] === 'create') creates++;
+   throw new Error('unexpected gh call');
+  };
+  assert.throws(() => publishDistribution(document, { assetPath, gh: listingFailure, readDistribution: () => ({ document, assetSha256: sha256(bytes) }) }), /no publication attempted/);
+  const conflictingListing = args => {
+   if (args[0] === 'api' && args[1].includes('/releases/tags/')) return tag404();
+   if (args[0] === 'api' && args[1].includes('/releases?')) return JSON.stringify([
+    { id: 1, tag_name: document.releaseTag, draft: true }, { id: 2, tag_name: document.releaseTag, draft: true },
+   ]);
+   if (args[0] === 'release' && args[1] === 'create') creates++;
+   throw new Error('unexpected gh call');
+  };
+  assert.throws(() => publishDistribution(document, { assetPath, gh: conflictingListing, readDistribution: () => ({ document, assetSha256: sha256(bytes) }) }), /Multiple GitHub releases/);
+  assert.equal(creates, 0);
  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 test('publication left as draft reports pending without retrying the mutation', () => {
@@ -54,7 +126,7 @@ test('publication left as draft reports pending without retrying the mutation', 
  try {
   const document = distribution(), assetPath = path.join(root, 'asset'), bytes = JSON.stringify(document); fs.writeFileSync(assetPath, bytes);
   let edits = 0;
-  const gh = args => { if (args[0] === 'api') return JSON.stringify({ id: 9, draft: true }); edits++; throw new Error('offline'); };
+  const gh = args => { if (args[0] === 'api') return JSON.stringify({ id: 9, tag_name: document.releaseTag, draft: true }); edits++; throw new Error('offline'); };
   const result = publishDistribution(document, { assetPath, gh, readDistribution: () => ({ document, assetSha256: sha256(bytes) }) });
   assert.equal(result.status, 'PUBLICATION_PENDING'); assert.equal(result.releaseId, 9); assert.equal(edits, 1);
  } finally { fs.rmSync(root, { recursive: true, force: true }); }
