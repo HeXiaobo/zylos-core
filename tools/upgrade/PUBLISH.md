@@ -25,8 +25,16 @@ unqualified historical releases are excluded from the default channel.
    derive the same descriptor from actual configuration. Do not hash whole
    account configuration or copy a publisher fingerprint onto an unverified host.
    `release-channel.mjs` exports `canonical`, `sha256`, and
-   `qualificationFingerprint` for both publisher and consumer.
-4. Write reviewed public notes with the functional-configuration recipe from step 3.
+   `qualificationFingerprint` for both publisher and consumer. The descriptor
+   itself is produced by `tools/upgrade/functional-config-probe.mjs`, which ships
+   in this repository so a consumer can reproduce the published digest. Publish
+   the command and the probe's repository path in the reviewed notes; do not paste
+   a copy of the probe into the notes, because a consumer that runs a stale copy
+   computes a different digest and loses the environment match. When the probe's
+   descriptor schema changes, the digests change with it, so re-run the probe on
+   each already-qualified host before the next publication.
+4. Write reviewed public notes with the functional-configuration recipe from step 3,
+   referencing `tools/upgrade/functional-config-probe.mjs` instead of embedding a copy.
    The publisher carries this file unchanged into the generated release notes.
    Create an external JSON array of `{ "report": "/absolute/report.json",
    "finalGate": "/absolute/final-gate.json" }` entries. Retain the authorized
@@ -87,3 +95,24 @@ The first release after adopting this workflow must actually complete these
 checks and publish an asset. Installing this code does not certify old releases
 or turn an existing HOLD into PASS. Repository versions are changed only by the
 existing authorized release workflow.
+
+## Correcting published release notes
+
+The published body is documentation; the qualification asset is the contract. When a
+published note is wrong — for example it embeds a probe that no longer reproduces the
+published digests — correct the body without touching the release asset:
+
+```sh
+node tools/upgrade/publish.mjs --manifest /absolute/deployment-ledger.json \
+  --publication-manifest /absolute/publication-ledger.json \
+  --qualifications /absolute/index.json --notes-file /absolute/corrected-notes.md \
+  --tag bundle-RELEASE_ID --out /absolute/new-publication-directory \
+  --correct-notes [--execute]
+```
+
+The command rebuilds the same asset from the same evidence and requires it to stay
+byte-identical to the published one; a correction can never add or change a
+qualification, and `--correct-notes` cannot be combined with
+`--append-qualifications`. Identical notes are refused as a no-op, and the body is read
+back and compared before success is reported, so an unapplied edit is never reported as
+done. Record the corrected notes hash with the release evidence.

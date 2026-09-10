@@ -232,3 +232,54 @@ test('an uncovered host environment may deploy only through its own complete loc
  covered.distribution = { releaseId: document.releaseId, qualificationImported: false, environmentVerified: true };
  assert.throws(() => assertImportedQualification(covered, { host: environment }), /must be imported before deployment/);
 });
+
+test('a published notes correction rewrites only the release body and keeps the asset frozen', () => {
+ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-notes-correction-fixture-'));
+ try {
+  const published = distribution();
+  const assetPath = path.join(root, 'zylos-release.json'), notesPath = path.join(root, 'release-notes.md');
+  const assetBytes = JSON.stringify(published) + '\n';
+  const corrected = 'Corrected notes: the authoritative probe lives in tools/upgrade/functional-config-probe.mjs\n';
+  fs.writeFileSync(assetPath, assetBytes); fs.writeFileSync(notesPath, corrected);
+  const release = { id: 11, tag_name: published.releaseTag, draft: false, body: 'Original published notes\n' };
+  const calls = [];
+  const gh = args => {
+   calls.push(args.join(' '));
+   if (args[0] === 'api' && args[1].includes('/releases/tags/')) return JSON.stringify(release);
+   if (args[0] === 'release' && args[1] === 'edit') { release.body = fs.readFileSync(args[args.indexOf('--notes-file') + 1], 'utf8'); return ''; }
+   throw new Error(`unexpected gh call: ${args.join(' ')}`);
+  };
+  const readDistribution = () => ({ document: published, assetSha256: sha256(assetBytes) });
+  const result = publishDistribution(published, { assetPath, notesPath, notesCorrection: true, gh, readDistribution });
+  assert.equal(result.status, 'PUBLISHED');
+  assert.equal(result.notesCorrected, true);
+  assert.equal(result.notesCorrectedSha256, sha256(corrected));
+  assert.equal(release.body, corrected);
+  assert.deepEqual(calls, [`api repos/HeXiaobo/zylos-core/releases/tags/${published.releaseTag}`,
+   `release edit ${published.releaseTag} --repo HeXiaobo/zylos-core --notes-file ${notesPath}`,
+   `api repos/HeXiaobo/zylos-core/releases/tags/${published.releaseTag}`]);
+  for (const call of calls) assert.ok(!call.startsWith('release upload'), 'a notes correction must never rewrite the asset');
+  // The same body is not a correction, and both metadata changes never combine.
+  fs.writeFileSync(notesPath, release.body);
+  assert.throws(() => publishDistribution(published, { assetPath, notesPath, notesCorrection: true, gh, readDistribution }),
+   /identical to the published notes/);
+  fs.writeFileSync(notesPath, corrected);
+  assert.throws(() => publishDistribution(published, { assetPath, notesPath, appendQualifications: true, notesCorrection: true, gh, readDistribution }),
+   /cannot add a qualification/);
+  assert.throws(() => publishDistribution(published, { assetPath, notesCorrection: true, gh, readDistribution }), /reviewed notes/);
+  // Conflicting evidence is still refused before any mutation.
+  const conflicting = structuredClone(published);
+  conflicting.qualifications[0].sourceReportSha256 = sha256('another qualification report');
+  conflicting.qualificationsSha256 = sha256(canonical(conflicting.qualifications));
+  const conflictPath = path.join(root, 'conflict.json'); fs.writeFileSync(conflictPath, JSON.stringify(conflicting));
+  const before = calls.length;
+  assert.throws(() => publishDistribution(conflicting, { assetPath: conflictPath, notesPath, notesCorrection: true, gh, readDistribution }),
+   /does not match prepared evidence/);
+  assert.equal(calls.length, before + 1);
+  // An unapplied correction is reported instead of a false success.
+  release.body = 'Original published notes\n';
+  const inert = args => (args[0] === 'api' ? JSON.stringify(release) : '');
+  assert.throws(() => publishDistribution(published, { assetPath, notesPath, notesCorrection: true, gh: inert, readDistribution }),
+   /do not match the reviewed correction/);
+ } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
