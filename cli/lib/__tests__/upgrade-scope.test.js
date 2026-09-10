@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { COMPONENTS, repository, selection, assertScope, buildScopedCommand } from '../../../tools/upgrade/scope.mjs';
-import { distribution, catalog } from './helpers/qualified-release-fixture.js';
+import { distribution, catalog, environment } from './helpers/qualified-release-fixture.js';
 import { resolveQualifiedRelease } from '../../../tools/upgrade/release-channel.mjs';
 import { prepare } from '../../../tools/upgrade/prepare.mjs';
 const baseline = Object.fromEntries(COMPONENTS.map((name, i) => [name, { repo: repository(name), version: '1.0.0', sha: String(i + 1).repeat(40) }]));
@@ -56,10 +56,13 @@ test('preparation updates only selected tag and preserves older companion SHAs',
   }
   process.env.GIT_CONFIG_COUNT = '3';
   const input = path.join(root, 'installed.json'); fs.writeFileSync(input, JSON.stringify(installed));
+  // The publishable flow always carries the host environment descriptor: a covered host
+  // that omits it cannot import the published qualification and therefore cannot deploy.
+  const descriptor = path.join(root, 'environment.json'); fs.writeFileSync(descriptor, JSON.stringify({ environment }));
   for (const selected of COMPONENTS) {
    const output = path.join(root, `out-${selected}`);
    const fixture = catalog([distribution({ target: { ...installed, [selected]: latest[selected] } })]);
-   const result = prepare({ '--out': output, '--authorization-ref': 'fixture-only', '--only': selected, '--installed': input }, { resolveRelease: options => resolveQualifiedRelease({ ...options, request: fixture.request }) });
+   const result = prepare({ '--out': output, '--authorization-ref': 'fixture-only', '--only': selected, '--installed': input, '--environment': descriptor }, { resolveRelease: options => resolveQualifiedRelease({ ...options, request: fixture.request }) });
    const m = JSON.parse(fs.readFileSync(path.join(output, 'governance/release-manifest.json')));
    assert.equal(result.runtimeMutation, false); assert.equal(m.deploymentAllowed, false); assert.equal(m.status, 'HOLD');
    assert.deepEqual(m.upgradeScope.components, [selected]); assert.equal(assertScope(m), selected);

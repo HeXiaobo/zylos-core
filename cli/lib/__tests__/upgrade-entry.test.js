@@ -31,6 +31,18 @@ test('invalid inputs do not create output', () => {
  } finally { fs.rmSync(root, { recursive: true }); }
 });
 
+test('a covered host cannot prepare without the environment descriptor', () => {
+ // The deployment gate rejects a covered host whose qualification was not imported, so
+ // preparation must not hand out a manifest that can never deploy.
+ const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'upgrade-entry-covered-'));
+ const out = path.join(directory, 'new');
+ try {
+  assert.throws(() => prepare({ '--only': 'all', '--out': out, '--authorization-ref': 'test' },
+   { resolveRelease: () => ({ document: distribution(), assetBytes: Buffer.from('{}\n'), assetSha256: 'stub', environmentVerified: true }) }),
+  /covered by the published qualification matrix, so the published qualification must be imported/);
+  assert.equal(fs.existsSync(out), true, 'the transaction directory is created before resolution and stays reserved');
+ } finally { fs.rmSync(directory, { recursive: true }); }
+});
 test('a blocked preparation reports the host environment and the published qualification matrix', () => {
  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-prepare-diag-'));
  const bin = path.join(directory, 'bin'); fs.mkdirSync(bin);

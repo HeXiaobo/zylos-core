@@ -55,6 +55,13 @@ export function prepare(options, { resolveRelease = resolveQualifiedRelease } = 
   if (environmentPolicy === 'newest-qualified' && !environment) throw new Error('--environment-policy newest-qualified needs --environment so the uncovered host can be bound to this preparation');
   const published = resolveRelease({ component: selector, components, installed, versions, environment, host: readReleaseHost(),
     environmentPolicy, requested: versions[selector], channel: options['--channel'] || (explicitPreview ? 'preview' : 'stable') });
+  // A host the published matrix covers must import the published qualification: the
+  // deployment gate rejects a covered host whose qualification was not imported, so a
+  // preparation without --environment could only ever produce an undeployable manifest.
+  // Fail here with the exact command instead of leaving the consumer at that dead end.
+  if (!environment && published.environmentVerified) {
+    throw new Error('This host environment is covered by the published qualification matrix, so the published qualification must be imported before deployment. Generate the descriptor with tools/upgrade/functional-config-probe.mjs and pass its output file as --environment.');
+  }
   // Preserve newer installed versions. A named downgrade needs its own
   // explicit workflow; ordinary latest preparation must never do one.
   for (const name of components) {
