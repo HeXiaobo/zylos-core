@@ -77,6 +77,23 @@ test('resolution failures keep their diagnosis and terminal guidance', () => {
  assert.equal(describeResolutionFailure(new Error('plain failure')), 'plain failure');
 });
 
+test('a covered host with an unmatched configuration is reported as a configuration mismatch, not an unsupported host', () => {
+ const document = distribution();
+ const fixture = catalog([document]);
+ const other = { ...environment, functionalConfigSha256: 'f'.repeat(64) };
+ assert.throws(() => resolveQualifiedRelease({ component: 'core', host: environment, environment: other, request: fixture.request }), error => {
+  assert.equal(error.code, 'NO_QUALIFIED_RELEASE');
+  assert.match(error.skipped[0].reason, /Host platform\/Node\/runtime is covered, but the supplied functional configuration matches no published qualification/);
+  return true;
+ });
+ // An unsupported host keeps the original wording.
+ const unsupported = { ...environment, runtime: 'codex' };
+ assert.throws(() => resolveQualifiedRelease({ component: 'core', host: unsupported, environment: { ...unsupported, functionalConfigSha256: 'f'.repeat(64) }, request: fixture.request }), error => {
+  assert.match(error.skipped[0].reason, /Host platform\/Node\/runtime is outside the published qualification matrix/);
+  return true;
+ });
+});
+
 test('an uncovered host environment needs the explicit newest-qualified policy and is never reported as verified', () => {
  const document = distribution({ target: bundle('8.0.0') });
  const fixture = catalog([document]);
