@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { prepareManifest } from './governance/prepare-release.mjs';
 import { selection, normalizeInstalled, version as installedVersion } from './scope.mjs';
-import { resolveQualifiedRelease, parseVersion, compareVersions, readReleaseHost, qualificationFingerprint, ENVIRONMENT_POLICIES } from './release-channel.mjs';
+import { resolveQualifiedRelease, parseVersion, compareVersions, readReleaseHost, qualificationFingerprint, environmentDescriptor, ENVIRONMENT_POLICIES } from './release-channel.mjs';
 import { attachQualification } from './qualification.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -50,7 +50,8 @@ export function prepare(options, { resolveRelease = resolveQualifiedRelease } = 
   const explicitPreview = Object.values(versions).some(value => value !== 'latest' && parseVersion(value.replace(/^v/, '')).pre);
   const environmentPolicy = options['--environment-policy'] || 'matched';
   if (!ENVIRONMENT_POLICIES.includes(environmentPolicy)) throw new Error('Invalid arguments; use --help');
-  const environment = options['--environment'] ? JSON.parse(fs.readFileSync(options['--environment'], 'utf8')) : undefined;
+  const environment = options['--environment']
+    ? environmentDescriptor(JSON.parse(fs.readFileSync(options['--environment'], 'utf8'))) : undefined;
   if (environmentPolicy === 'newest-qualified' && !environment) throw new Error('--environment-policy newest-qualified needs --environment so the uncovered host can be bound to this preparation');
   const published = resolveRelease({ component: selector, components, installed, versions, environment, host: readReleaseHost(),
     environmentPolicy, requested: versions[selector], channel: options['--channel'] || (explicitPreview ? 'preview' : 'stable') });

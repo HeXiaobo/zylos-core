@@ -72,6 +72,15 @@ export function qualificationFingerprint(environment) {
   if (Object.keys(environment).some(k => !allowed.includes(k))) throw new Error('Qualification environment contains non-portable fields');
   return `sha256:${sha256(canonical(environment))}`;
 }
+// The functional-configuration probe emits a result document that carries the
+// portable environment next to the descriptor. Accept that output directly so a
+// consumer can pass the probe result without reshaping it by hand; a bare
+// descriptor is returned unchanged.
+export function environmentDescriptor(document) {
+  const nested = document?.environment ?? document?.result?.environment;
+  return nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : document;
+}
+
 export function readReleaseHost({ runtimeRoot = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'), runtime } = {}) {
   if (!runtime) {
     const file = path.join(runtimeRoot, '.zylos/config.json');

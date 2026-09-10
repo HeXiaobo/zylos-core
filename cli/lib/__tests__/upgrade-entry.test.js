@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { compareVersions, prepare, describeResolutionFailure } from '../../../tools/upgrade/prepare.mjs';
-import { resolveQualifiedRelease } from '../../../tools/upgrade/release-channel.mjs';
+import { environmentDescriptor, resolveQualifiedRelease } from '../../../tools/upgrade/release-channel.mjs';
 import { bundle, distribution, catalog, environment } from './helpers/qualified-release-fixture.js';
 const root = path.resolve('.');
 test('semantic ordering handles numeric RCs and stable versions', () => {
@@ -100,4 +100,30 @@ test('the blocked-preparation guidance names the supported way forward for an un
   code: 'NO_QUALIFIED_RELEASE', host: environment, skipped: [] }));
  assert.match(text, /--environment-policy newest-qualified/);
  assert.match(text, /complete local canary/);
+});
+test('the probe result document is accepted wherever an environment descriptor is expected', () => {
+ const descriptor = { platform: 'darwin', arch: 'arm64', nodeMajor: 22, runtime: 'claude',
+  functionalConfigSha256: '3dba04fabeca05ab8c1bdb3e7d6a1462d2c2d2c54cf3a74c29080a1010a35613' };
+ assert.deepEqual(environmentDescriptor(descriptor), descriptor);
+ assert.deepEqual(environmentDescriptor({ schema: 'zylos.qualified-config-probe/v3', descriptor: { schema: 'zylos.functional-config/v3' }, environment: descriptor }), descriptor);
+ assert.deepEqual(environmentDescriptor({ result: { environment: descriptor } }), descriptor);
+ // Nothing to unwrap stays untouched, including malformed input.
+ assert.deepEqual(environmentDescriptor({ platform: 'linux' }), { platform: 'linux' });
+ assert.deepEqual(environmentDescriptor({ environment: 'not-an-object' }), { environment: 'not-an-object' });
+ assert.equal(environmentDescriptor(undefined), undefined);
+});
+test('preparation passes the unwrapped descriptor to release resolution', () => {
+ const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-prepare-environment-'));
+ const descriptor = { platform: 'darwin', arch: 'arm64', nodeMajor: 22, runtime: 'claude',
+  functionalConfigSha256: '3dba04fabeca05ab8c1bdb3e7d6a1462d2c2d2c54cf3a74c29080a1010a35613' };
+ const probePath = path.join(directory, 'probe-result.json'), installedPath = path.join(directory, 'installed.json');
+ fs.writeFileSync(probePath, JSON.stringify({ schema: 'zylos.qualified-config-probe/v3', result: { environment: descriptor }, environment: descriptor }));
+ fs.writeFileSync(installedPath, JSON.stringify(bundle()));
+ let observed;
+ try {
+  assert.throws(() => prepare({ '--only': 'all', '--runtime': 'claude', '--out': path.join(directory, 'prepared'),
+   '--authorization-ref': 'fixture', '--installed': installedPath, '--environment': probePath }, {
+   resolveRelease: options => { observed = options.environment; throw new Error('stop after resolution'); } }), /stop after resolution/);
+  assert.deepEqual(observed, descriptor);
+ } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
