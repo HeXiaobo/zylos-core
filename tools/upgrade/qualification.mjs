@@ -53,6 +53,19 @@ export function attachQualification(manifest, { assetPath, assetSha256, environm
 export function assertImportedQualification(manifest, { host = readReleaseHost() } = {}) {
   if (!manifest.distribution) return; // Internal producer candidates use the existing canary workflow.
   const d = manifest.distribution;
+  if (d.environmentVerified === false) {
+    // A host environment no published qualification covers may still install the
+    // verified bundle, but it may not reuse a single piece of the publisher's
+    // evidence: the deployment contract stays on the local canary, the bound host
+    // environment has to be the one preparing, and the local gates must run.
+    if (d.qualificationImported === true) throw new Error('An uncovered host environment must not import published evidence');
+    if (manifest.deploymentContract?.rolloutMode === 'FLEET') throw new Error('FLEET rollout requires a published qualification for this host environment');
+    if (d.localEvidenceRequired !== 'fully-local-canary') throw new Error('An uncovered host environment must require the complete local evidence workflow');
+    if (!d.hostEnvironment || qualificationFingerprint(d.hostEnvironment) !== d.hostEnvironmentFingerprint) throw new Error('Uncovered host environment descriptor is missing or inconsistent');
+    if (!Object.entries(host).every(([key, value]) => d.hostEnvironment[key] === value)) throw new Error('Current host does not match the prepared uncovered environment');
+    if (!manifest.evidence || manifest.evidence.canary !== 'PASS') throw new Error('An uncovered host environment must pass its own local canary before deployment');
+    return;
+  }
   if (d.qualificationImported !== true || manifest.deploymentContract?.rolloutMode !== 'FLEET') throw new Error('Published version qualification must be imported before deployment');
   const bytes = fs.readFileSync(d.assetPath);
   if (sha256(bytes) !== d.assetSha256) throw new Error('Published qualification asset changed');
