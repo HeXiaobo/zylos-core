@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildDistribution, publishDistribution } from '../../../tools/upgrade/publish.mjs';
+import { assertQualificationSuperset, buildDistribution, publishDistribution } from '../../../tools/upgrade/publish.mjs';
 import { attachQualification, assertImportedQualification } from '../../../tools/upgrade/qualification.mjs';
-import { sha256 } from '../../../tools/upgrade/release-channel.mjs';
+import { canonical, qualificationFingerprint, sha256 } from '../../../tools/upgrade/release-channel.mjs';
 import { distribution, environment } from './helpers/qualified-release-fixture.js';
 
 function evidence() {
@@ -148,5 +148,60 @@ test('import reuses only version evidence; host smoke stays RUN and modified evi
   assert.throws(() => assertImportedQualification(result, { host: { ...host, nodeMajor: host.nodeMajor + 1 } }), /Current host/);
   assert.throws(() => attachQualification(manifest, { ...options, environment: { ...environment, functionalConfigSha256: 'a'.repeat(64) } }), /not in/);
   fs.appendFileSync(assetPath, ' '); assert.throws(() => assertImportedQualification(result, { host }), /asset changed/);
+ } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('qualification additions are monotonic: only a strict superset of the published matrix is accepted', () => {
+ const published = distribution();
+ const second = { ...distribution().qualifications[0],
+  environment: { ...environment, runtime: environment.runtime === 'claude' ? 'codex' : 'claude' } };
+ second.environmentFingerprint = qualificationFingerprint(second.environment);
+ const extended = { ...published, qualifications: [published.qualifications[0], second] };
+ extended.qualificationsSha256 = sha256(canonical(extended.qualifications));
+ assert.equal(assertQualificationSuperset(published, extended), extended);
+ for (const mutate of [
+  x => { x.releaseId = 'other-release'; },
+  x => { x.releaseTag = 'bundle-other'; },
+  x => { x.bundle = { ...x.bundle, core: { ...x.bundle.core, sha: 'f'.repeat(40) } }; },
+  x => { x.qualifications = [second]; },
+  x => { x.qualifications = [{ ...x.qualifications[0], checkedAt: '2026-09-10T00:00:00.000Z' }, second]; },
+  x => { x.qualifications = [x.qualifications[0]]; },
+ ]) { const bad = structuredClone(extended); mutate(bad); assert.throws(() => assertQualificationSuperset(published, bad)); }
+});
+test('an appended qualification replaces the published asset and notes without touching the frozen bundle', () => {
+ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-append-fixture-'));
+ try {
+  const published = distribution();
+  const second = { ...published.qualifications[0],
+   environment: { ...environment, runtime: environment.runtime === 'claude' ? 'codex' : 'claude' } };
+  second.environmentFingerprint = qualificationFingerprint(second.environment);
+  const extended = { ...published, qualifications: [published.qualifications[0], second] };
+  extended.qualificationsSha256 = sha256(canonical(extended.qualifications));
+  const assetPath = path.join(root, 'zylos-release.json'), notesPath = path.join(root, 'release-notes.md');
+  const bytes = JSON.stringify(extended); fs.writeFileSync(assetPath, bytes); fs.writeFileSync(notesPath, 'Reviewed notes');
+  let live = JSON.stringify(published);
+  const calls = [];
+  const gh = args => {
+   calls.push(args.join(' '));
+   if (args[0] === 'api' && args[1].includes('/releases/tags/')) return JSON.stringify({ id: 5, tag_name: published.releaseTag, draft: false });
+   if (args[0] === 'release' && args[1] === 'upload') { live = fs.readFileSync(args[3], 'utf8'); return ''; }
+   if (args[0] === 'release' && args[1] === 'edit') return '';
+   throw new Error(`unexpected gh call: ${args.join(' ')}`);
+  };
+  const readDistribution = () => ({ document: JSON.parse(live), assetSha256: sha256(live) });
+  assert.equal(publishDistribution(extended, { assetPath, notesPath, appendQualifications: true, gh, readDistribution }).status, 'PUBLISHED');
+  assert.deepEqual(calls, [`api repos/HeXiaobo/zylos-core/releases/tags/${published.releaseTag}`,
+   `release upload ${published.releaseTag} ${assetPath} --clobber --repo HeXiaobo/zylos-core`,
+   `release edit ${published.releaseTag} --repo HeXiaobo/zylos-core --notes-file ${notesPath}`,
+   `api repos/HeXiaobo/zylos-core/releases/tags/${published.releaseTag}`]);
+  // A non-superset addition is rejected before any mutation reaches GitHub.
+  const conflicting = structuredClone(published); conflicting.qualifications = [second];
+  conflicting.qualificationsSha256 = sha256(canonical(conflicting.qualifications));
+  const conflictPath = path.join(root, 'conflict.json'); fs.writeFileSync(conflictPath, JSON.stringify(conflicting));
+  const before = calls.length;
+  assert.throws(() => publishDistribution(conflicting, { assetPath: conflictPath, notesPath, appendQualifications: true, gh, readDistribution }), /must keep every published qualification/);
+  assert.equal(calls.length, before + 1);
+  const basePath = path.join(root, 'published.json'); fs.writeFileSync(basePath, JSON.stringify(published));
+  assert.throws(() => publishDistribution(published, { assetPath: basePath, appendQualifications: true, gh, readDistribution }), /reviewed notes/);
  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
