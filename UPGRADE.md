@@ -63,9 +63,12 @@ Owner 不需要填写发布台账，也不需要重复为同一个版本做完�
 
 ```sh
 # 探针从当前这份 Core 源码里取，输出的结果文件可直接作为 --environment。
+# --runtime 填本机真实 runtime（claude 或 codex）：探针不会拿它跟主机核对，
+# 而 runtime 参与环境指纹，填错会得到一个匹配不上任何已发布资格的描述符，
+# 静默落到完整本机 canary 路径。
 node tools/upgrade/functional-config-probe.mjs \
   --zylos-dir "$ZYLOS_DIR" --core-source "$CORE_SOURCE" --feishu-source "$FEISHU_SOURCE" \
-  --hxa-source "$HXA_SOURCE" --runtime claude --out /absolute/probe-result.json
+  --hxa-source "$HXA_SOURCE" --runtime "$RUNTIME" --out /absolute/probe-result.json
 
 node tools/upgrade/prepare.mjs --only core --core latest --installed /absolute/installed.json \
   --environment /absolute/probe-result.json \
