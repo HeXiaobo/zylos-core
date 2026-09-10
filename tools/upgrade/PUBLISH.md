@@ -83,6 +83,22 @@ untouched; the strict overwrite rule still applies without the flag. Update the 
 notes in the same call so they describe the enlarged matrix, and keep one index entry per
 qualified environment.
 
+## Repeated component versions
+
+A release identity is the release id plus the three full commit IDs; a version
+label is not an identity, so the same component version can appear on a later
+bundle — for example a Core fix that ships without renumbering Core. Consumers
+resolve a repeated label to the most recently published qualified bundle and
+report the other commits that share the label, so the channel stays open instead
+of refusing every consumer of that component.
+
+Publication refuses to create a *new* release identity that reuses a component
+version for a different commit, because a consumer that pins the label could not
+tell the two bundles apart. Bump that component's version in the release
+workflow and publish under it. Re-publishing an existing release — a
+qualification append or a notes correction — keeps the identity that already
+passed this check, so appending a host environment still works.
+
 The channel defaults to stable, requiring all bundle versions to be stable.
 Preview requires explicit `--channel preview`, CLI `--beta`, or an exact RC
 version. Preview still requires qualification. Consumers verify GitHub's asset

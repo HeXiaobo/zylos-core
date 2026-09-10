@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { assertQualificationSuperset, buildDistribution, publishDistribution } from '../../../tools/upgrade/publish.mjs';
+import { assertNoVersionReuse, assertQualificationSuperset, buildDistribution, publishDistribution } from '../../../tools/upgrade/publish.mjs';
 import { attachQualification, assertImportedQualification } from '../../../tools/upgrade/qualification.mjs';
 import { canonical, qualificationFingerprint, sha256 } from '../../../tools/upgrade/release-channel.mjs';
 import { distribution, environment } from './helpers/qualified-release-fixture.js';
@@ -44,6 +44,41 @@ test('publisher discovers a draft hidden from the tag endpoint without creating 
   const readDistribution = () => ({ document, assetSha256: sha256(assetBytes) });
   assert.equal(publishDistribution(document, { assetPath, notesPath, gh, readDistribution }).status, 'PUBLISHED');
   assert.equal(calls.filter(args => args[0] === 'release' && args[1] === 'create').length, 0);
+ } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+test('a new release may not reuse a published component version for another commit', () => {
+ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-publish-version-reuse-fixture-'));
+ try {
+  const document = buildDistribution(evidence()), assetPath = path.join(root, 'zylos-release.json'), notesPath = path.join(root, 'notes.md');
+  fs.writeFileSync(assetPath, JSON.stringify(document)); fs.writeFileSync(notesPath, 'Fixture');
+  const published = structuredClone(document);
+  published.releaseId = 'earlier-release'; published.releaseTag = 'bundle-earlier-release';
+  published.bundle.core.sha = 'a'.repeat(40);
+  published.qualifications[0].target = published.bundle;
+  const entry = { id: 9, tag_name: published.releaseTag, draft: false, prerelease: false, assets: [{ id: 9, name: 'zylos-release.json' }] };
+  const readDistribution = release => {
+   const doc = release.tag_name === 'bundle-same-commit' ? document : published;
+   return { document: doc, assetSha256: sha256(JSON.stringify(doc)) };
+  };
+  assert.throws(() => assertNoVersionReuse([entry], { releaseTag: document.releaseTag, channel: 'stable', bundle: document.bundle, readDistribution }),
+   /must not reuse a published component version/);
+  // Re-publishing the same commit, an unqualified entry, the release being
+  // updated, and another channel are all allowed.
+  assert.equal(assertNoVersionReuse([{ ...entry, tag_name: 'bundle-same-commit' }], { releaseTag: document.releaseTag, channel: 'stable', bundle: document.bundle, readDistribution }), true);
+  assert.equal(assertNoVersionReuse([entry], { releaseTag: published.releaseTag, channel: 'stable', bundle: published.bundle, readDistribution }), true);
+  assert.equal(assertNoVersionReuse([{ ...entry, assets: [] }], { releaseTag: document.releaseTag, channel: 'stable', bundle: document.bundle, readDistribution }), true);
+  assert.equal(assertNoVersionReuse([{ ...entry, prerelease: true }], { releaseTag: document.releaseTag, channel: 'stable', bundle: document.bundle, readDistribution }), true);
+  // The refusal happens before the first mutation, so no draft is ever created.
+  const releases = [entry]; const calls = [];
+  const gh = args => {
+   calls.push(args.join(' '));
+   if (args[0] === 'api' && args[1].includes('/releases/tags/')) throw new Error('HTTP 404');
+   if (args[0] === 'api' && args[1].includes('/releases?')) return JSON.stringify(releases);
+   throw new Error(`unexpected gh call: ${args.join(' ')}`);
+  };
+  assert.throws(() => publishDistribution(document, { assetPath, notesPath, gh, readDistribution, catalog: () => releases }),
+   /must not reuse a published component version/);
+  assert.deepEqual(calls.filter(call => call.startsWith('release create')), []);
  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 test('publisher continues bounded release pagination before editing the exact draft tag', () => {

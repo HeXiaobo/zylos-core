@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CATALOG_REPOSITORY, RELEASE_ASSET, QUALIFICATION_GATE_VERSION,
   canonical, canonicalBundle, qualificationFingerprint, sha256, parseVersion,
-  validateDistribution, readPublishedDistribution,
+  validateDistribution, readPublishedDistribution, readReleaseCatalog,
 } from './release-channel.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -49,6 +49,32 @@ export function buildDistribution({ manifest, qualificationEntries, releaseTag }
   });
 }
 
+// A version label is not an identity, but a consumer that pins one cannot tell
+// two commits apart, so a consumer resolves a repeated label to the most
+// recently published bundle. A new release must therefore never introduce that
+// ambiguity: if a component version is already published for a different commit,
+// the publisher bumps the version instead. Re-publishing an existing release
+// (a qualification append or a notes correction) keeps the identity that was
+// checked when it was created, so it is exempt.
+export function assertNoVersionReuse(releases, { releaseTag, channel, bundle, readDistribution = readPublishedDistribution }) {
+  const reused = [];
+  for (const candidate of Array.isArray(releases) ? releases : []) {
+    if (!candidate || candidate.draft || candidate.tag_name === releaseTag) continue;
+    if (Boolean(candidate.prerelease) !== (channel === 'preview')) continue;
+    if (!candidate.assets?.some(asset => asset.name === RELEASE_ASSET)) continue;
+    let published;
+    try { published = readDistribution(candidate).document; } catch { continue; }
+    for (const name of ['core', 'feishu', 'hxa']) {
+      const other = published.bundle?.[name], mine = bundle[name];
+      if (other && mine && other.version === mine.version && other.sha !== mine.sha) {
+        reused.push(`${name} ${other.version} is already published for ${other.sha} in ${candidate.tag_name}, this bundle pins ${mine.sha}`);
+      }
+    }
+  }
+  if (reused.length) throw new Error(`A new release must not reuse a published component version for a different commit; bump that version and publish under it (${reused.join('; ')})`);
+  return true;
+}
+
 // A published asset stays immutable except for one monotonic change: adding a
 // newly qualified host environment. The bundle, the release identity and every
 // already-published qualification must remain byte-identical, so a consumer that
@@ -63,7 +89,7 @@ export function assertQualificationSuperset(published, addition) {
   return addition;
 }
 
-export function publishDistribution(document, { assetPath, notesPath, appendQualifications = false, notesCorrection = false, gh = args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), readDistribution = readPublishedDistribution } = {}) {
+export function publishDistribution(document, { assetPath, notesPath, appendQualifications = false, notesCorrection = false, gh = args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), readDistribution = readPublishedDistribution, catalog = readReleaseCatalog } = {}) {
   validateDistribution(document);
   const assetBytes = fs.readFileSync(assetPath, 'utf8');
   if (canonical(JSON.parse(assetBytes)) !== canonical(document)) throw new Error('Prepared publication asset changed');
@@ -109,6 +135,9 @@ export function publishDistribution(document, { assetPath, notesPath, appendQual
   };
   let release = find();
   if (!release) {
+    // A new release identity is the only place the catalog can grow an
+    // ambiguous version label, so the check runs here, before any mutation.
+    assertNoVersionReuse(catalog(), { releaseTag: tag, channel: document.channel, bundle: document.bundle, readDistribution });
     // --verify-tag prevents gh from silently tagging a newer default branch.
     // Create a draft first, upload its asset, verify readback, publish last.
     try {

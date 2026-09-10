@@ -31,6 +31,38 @@ test('all three repository selectors preserve unselected companions', () => {
     assert.deepEqual(all.document.bundle, incompatible);
   }
 });
+test('a repeated component version resolves to the newest published bundle and reports the other commits', () => {
+  const first = bundle(), second = structuredClone(first);
+  second.core.sha = 'f'.repeat(40);
+  const older = distribution({ target: first, releaseId: 'older', releaseTag: 'bundle-older' });
+  const newer = distribution({ target: second, releaseId: 'newer', releaseTag: 'bundle-newer' });
+  const fixture = catalog([older, newer]);
+  const resolved = resolveQualifiedRelease({ request: fixture.request });
+  assert.equal(resolved.source.ref, second.core.sha);
+  assert.equal(resolved.source.releaseId, 'newer');
+  assert.deepEqual(resolved.versionConflicts.map(x => x.releaseTag), ['bundle-older']);
+  assert.equal(resolved.versionConflicts[0].sha, first.core.sha);
+  // An exact version pin follows the same rule: the label is not an identity, so
+  // the newest bundle published under it is the one that is installed.
+  assert.equal(resolveQualifiedRelease({ request: fixture.request, requested: '1.0.0' }).source.ref, second.core.sha);
+  // The rule is per component: a later bundle that changes only the selected
+  // component's commit shadows the earlier one, and only that component's label
+  // is reported as repeated.
+  const third = structuredClone(second);
+  third.feishu.sha = 'e'.repeat(40);
+  const scopedFixture = catalog([older, newer, distribution({ target: third, releaseId: 'newest-feishu', releaseTag: 'bundle-newest-feishu' })]);
+  const scoped = resolveQualifiedRelease({ component: 'feishu', installed: second, request: scopedFixture.request });
+  assert.equal(scoped.source.ref, third.feishu.sha);
+  assert.deepEqual(scoped.versionConflicts.map(x => x.releaseTag), ['bundle-newer']);
+  // A release whose preserved companion commits differ from the installed ones
+  // stays ineligible, so it is neither selected nor reported.
+  const mismatched = structuredClone(second);
+  mismatched.hxa = { ...mismatched.hxa, sha: 'd'.repeat(40) };
+  const narrow = catalog([newer, distribution({ target: mismatched, releaseId: 'mismatched', releaseTag: 'bundle-mismatched' })]);
+  const kept = resolveQualifiedRelease({ component: 'core', installed: second, request: narrow.request });
+  assert.equal(kept.source.releaseId, 'newer');
+  assert.deepEqual(kept.versionConflicts, []);
+});
 test('drafts, failed qualification, bad asset digests and moved tags cannot be selected', () => {
   for (const kind of ['draft', 'failed', 'digest', 'tag']) {
     const document = distribution();
