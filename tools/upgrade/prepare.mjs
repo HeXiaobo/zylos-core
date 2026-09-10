@@ -11,6 +11,25 @@ import { resolveQualifiedRelease, parseVersion, compareVersions, readReleaseHost
 import { attachQualification } from './qualification.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HOST_FIELDS = ['platform', 'arch', 'nodeMajor', 'runtime'];
+const describeHost = environment => HOST_FIELDS.map(field => `${field}=${environment[field]}`).join(' ');
+// A blocked preparation must say why every published release was rejected and
+// which host environments are actually covered, so the operator or Agent can
+// act without re-deriving the qualification matrix by hand.
+export function describeResolutionFailure(error) {
+  const lines = [error.message];
+  if (error.host) lines.push(`Host environment: ${describeHost(error.host)}`);
+  if (error.environmentFingerprint) lines.push(`Host environment fingerprint: ${error.environmentFingerprint}`);
+  if (Array.isArray(error.skipped) && error.skipped.length) lines.push('Reviewed published releases:');
+  for (const item of error.skipped || []) {
+    lines.push(`- ${item.tag}: ${item.reason}`);
+    for (const environment of item.environments || []) lines.push(`  qualified for: ${describeHost(environment)}`);
+  }
+  if (error.code === 'NO_QUALIFIED_RELEASE') {
+    lines.push('Next: qualify and publish a release for this host environment, or run preparation on a host that matches a published qualification.');
+  }
+  return lines.join('\n');
+}
 // Kept as exports for consumers of the original preparation API.
 export { compareVersions } from './release-channel.mjs';
 export function prepare(options, { resolveRelease = resolveQualifiedRelease } = {}) {
@@ -98,5 +117,5 @@ if (process.argv[1] && fs.existsSync(process.argv[1]) && import.meta.url === pat
       }
       console.log(JSON.stringify(prepare(options), null, 2));
     }
-  } catch (error) { console.error(error.message); process.exitCode = 1; }
+  } catch (error) { console.error(describeResolutionFailure(error)); process.exitCode = 1; }
 }

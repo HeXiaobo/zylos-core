@@ -176,12 +176,15 @@ export function resolveQualifiedRelease({ component = 'core', requested = 'lates
       continue;
     }
     const { bundle } = entry.document;
+    // Published qualification environments travel with the skip reason so a
+    // blocked consumer can report which host environments the catalog covers.
+    const environments = entry.document.qualifications.map(q => q.environment);
     if (host && !entry.document.qualifications.some(q => Object.entries(host).every(([key, value]) => q.environment[key] === value))) {
-      skipped.push({ tag: release.tag_name, reason: 'Host platform/Node/runtime is outside the published qualification matrix' });
+      skipped.push({ tag: release.tag_name, reason: 'Host platform/Node/runtime is outside the published qualification matrix', environments });
       continue;
     }
     if (fingerprint && !entry.document.qualifications.some(q => q.environmentFingerprint === fingerprint)) {
-      skipped.push({ tag: release.tag_name, reason: 'Environment is outside the published qualification matrix' });
+      skipped.push({ tag: release.tag_name, reason: 'Environment is outside the published qualification matrix', environments });
       continue;
     }
     if (exact && bundle[component].version !== exact) continue;
@@ -198,6 +201,7 @@ export function resolveQualifiedRelease({ component = 'core', requested = 'lates
   if (!eligible.length) {
     const error = new Error(`No verified ${allowPreview ? 'stable/preview' : 'stable'} release matches ${component} ${requested}${baseline && components.length < 3 ? ' with the installed companions' : ''}. The publisher must qualify a compatible release; no installation or fallback to tags/main was attempted.`);
     error.code = 'NO_QUALIFIED_RELEASE'; error.skipped = skipped;
+    error.host = host || null; error.environmentFingerprint = fingerprint;
     throw error;
   }
   const chosen = eligible[0], target = chosen.document.bundle[component];
