@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { compareVersions, prepare } from '../../../tools/upgrade/prepare.mjs';
+import { spawnSync } from 'node:child_process';
+import { compareVersions, prepare, describeResolutionFailure } from '../../../tools/upgrade/prepare.mjs';
+import { bundle, distribution, catalog, environment } from './helpers/qualified-release-fixture.js';
+const root = path.resolve('.');
 test('semantic ordering handles numeric RCs and stable versions', () => {
  assert.equal(compareVersions('0.7.2-rc.28', '0.7.2-rc.9'), 1);
  assert.equal(compareVersions('0.7.2', '0.7.2-rc.28'), 1);
@@ -25,4 +28,50 @@ test('invalid inputs do not create output', () => {
    assert.equal(fs.existsSync(out), false);
   }
  } finally { fs.rmSync(root, { recursive: true }); }
+});
+
+test('a blocked preparation reports the host environment and the published qualification matrix', () => {
+ const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-prepare-diag-'));
+ const bin = path.join(directory, 'bin'); fs.mkdirSync(bin);
+ // The catalog qualifies codex only; this host runs claude.
+ const document = distribution({ target: bundle('8.0.0'), env: { ...environment, runtime: 'codex' } });
+ const responses = path.join(directory, 'responses.json');
+ const fixture = catalog([document]);
+ fs.writeFileSync(responses, JSON.stringify({ ...fixture.paths,
+  '/repos/HeXiaobo/zylos-core/releases?per_page=100&page=1': JSON.stringify(fixture.releases) }));
+ fs.writeFileSync(path.join(bin, 'curl'), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2), url = args.find(x => /^https:/.test(x)) || '';
+const data = JSON.parse(fs.readFileSync(process.env.RESPONSES));
+const endpoint = url.replace('https://api.github.com', '');
+if (Object.hasOwn(data, endpoint)) { process.stdout.write(data[endpoint]); process.exit(0); }
+process.stderr.write('fixture: download unavailable'); process.exit(22);
+`, { mode: 0o755 });
+ fs.writeFileSync(path.join(bin, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+ try {
+  const child = spawnSync(process.execPath, [path.join(root, 'tools/upgrade/prepare.mjs'), '--only', 'all',
+   '--out', path.join(directory, 'prepared'), '--authorization-ref', 'fixture'], {
+   cwd: root, encoding: 'utf8', timeout: 20000,
+   env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, RESPONSES: responses,
+    ZYLOS_DIR: path.join(directory, 'runtime'), GH_TOKEN: '', GITHUB_TOKEN: '' } });
+  assert.equal(child.status, 1, child.stderr);
+  assert.match(child.stderr, /No verified stable release matches core latest/);
+  assert.match(child.stderr, /Host environment: .*runtime=claude/);
+  assert.match(child.stderr, /bundle-fixture: Host platform\/Node\/runtime is outside the published qualification matrix/);
+  assert.match(child.stderr, /qualified for: .*runtime=codex/);
+  assert.match(child.stderr, /Next: qualify and publish a release for this host environment/);
+ } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+test('resolution failures keep their diagnosis and terminal guidance', () => {
+ const error = Object.assign(new Error('No verified stable release matches core latest.'), {
+  code: 'NO_QUALIFIED_RELEASE', host: { platform: 'darwin', arch: 'arm64', nodeMajor: 22, runtime: 'claude' },
+  environmentFingerprint: 'sha256:ab', skipped: [{ tag: 'bundle-x', reason: 'Host platform/Node/runtime is outside the published qualification matrix',
+   environments: [{ platform: 'linux', arch: 'x64', nodeMajor: 22, runtime: 'codex', functionalConfigSha256: 'ab' }] }] });
+ const text = describeResolutionFailure(error);
+ assert.match(text, /Host environment: platform=darwin arch=arm64 nodeMajor=22 runtime=claude/);
+ for (const expected of ['bundle-x: Host platform/Node/runtime is outside the published qualification matrix',
+  'qualified for: platform=linux arch=x64 nodeMajor=22 runtime=codex', 'Next: qualify and publish a release for this host environment']) {
+  assert.ok(text.includes(expected), expected);
+ }
+ assert.equal(describeResolutionFailure(new Error('plain failure')), 'plain failure');
 });
