@@ -56,12 +56,10 @@ Owner 的明确升级请求授权本次目标解析、准备、正常停服、�
 发布者在发布前完成版本验收并附上凭证，见 [发布流程](tools/upgrade/PUBLISH.md)。
 消费者导入凭证后只执行本机身份、备份、来源、兼容性、数据及通信 smoke；
 Owner 不需要填写发布台账，也不需要重复为同一个版本做完整版本验收。
-已经是覆盖环境时不需要自证指纹：本机平台、架构、Node 大版本与 runtime 命中公开资格即可直接升级，
-不要为了「保险」额外传 `--environment`。
-当前环境或来源组合未覆盖时，先看公开资格矩阵里是不是已经覆盖；没有覆盖也不要伪造指纹、
-不要让 Owner 补授权、更不要回退到 main。用本仓库自带的权威探针生成本机环境描述符
-（`node tools/upgrade/functional-config-probe.mjs --help`；发布说明里可能嵌着更早的描述符版本，
-只以仓库这份为准），然后加 `--environment-policy newest-qualified`：
+本机环境描述符是必需步骤，不是可选保险：平台、架构、Node 大版本与 runtime 命中公开资格只说明矩阵覆盖了本机；
+部署门另外要求「已导入发布方资格」，而资格按本机环境指纹匹配。所以先运行一次仓库自带的权威探针，
+把探针输出的结果文件直接作为 `--environment` 传入（发布说明里可能嵌着更早的描述符版本，只以仓库这份为准；
+漏传会被部署门拒绝，`prepare.mjs` 现在会在准备阶段直接报错并给出这条命令）：
 
 ```sh
 # 探针从当前这份 Core 源码里取，输出的结果文件可直接作为 --environment。
@@ -69,6 +67,18 @@ node tools/upgrade/functional-config-probe.mjs \
   --zylos-dir "$ZYLOS_DIR" --core-source "$CORE_SOURCE" --feishu-source "$FEISHU_SOURCE" \
   --hxa-source "$HXA_SOURCE" --runtime claude --out /absolute/probe-result.json
 
+node tools/upgrade/prepare.mjs --only core --core latest --installed /absolute/installed.json \
+  --environment /absolute/probe-result.json \
+  --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
+```
+
+指纹命中公开资格时这条就是常规路径：导入发布方资格，版本功能测试记为 `REUSED`，
+本机身份、备份、来源、兼容性、数据与通信 smoke 仍须新跑。
+
+当前环境或来源组合未覆盖时，先看公开资格矩阵里是不是已经覆盖；没有覆盖也不要伪造指纹、
+不要让 Owner 补授权、更不要回退到 main。同一份描述符再加 `--environment-policy newest-qualified`：
+
+```sh
 node tools/upgrade/prepare.mjs --only core --core latest --installed /absolute/installed.json \
   --environment /absolute/probe-result.json --environment-policy newest-qualified \
   --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
