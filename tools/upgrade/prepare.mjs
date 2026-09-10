@@ -27,7 +27,7 @@ export function describeResolutionFailure(error) {
   }
   if (error.code === 'NO_QUALIFIED_RELEASE') {
     lines.push('Next: qualify and publish a release for this host environment, or run preparation on a host that matches a published qualification.');
-    lines.push('If no release is qualified for this environment yet, prepare with --environment plus --environment-policy newest-qualified. That keeps the verified bundle but forbids reusing published evidence: this host must run its own complete local canary before deployment.');
+    lines.push('If no release is qualified for this environment yet, generate the descriptor with tools/upgrade/functional-config-probe.mjs and prepare with --environment plus --environment-policy newest-qualified. That keeps the verified bundle but forbids reusing published evidence: this host must run its own complete local canary before deployment.');
   }
   return lines.join('\n');
 }

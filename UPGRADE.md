@@ -57,10 +57,15 @@ Owner 的明确升级请求授权本次目标解析、准备、正常停服、�
 消费者导入凭证后只执行本机身份、备份、来源、兼容性、数据及通信 smoke；
 Owner 不需要填写发布台账，也不需要重复为同一个版本做完整版本验收。
 当前环境或来源组合未覆盖时，先看公开资格矩阵里是不是已经覆盖；没有覆盖也不要伪造指纹、
-不要让 Owner 补授权、更不要回退到 main。按发布说明里的配方生成本机环境描述符，然后加
-`--environment-policy newest-qualified`：
+不要让 Owner 补授权、更不要回退到 main。用本仓库自带的权威探针生成本机环境描述符
+（`node tools/upgrade/functional-config-probe.mjs --help`；发布说明里可能嵌着更早的描述符版本，
+只以仓库这份为准），然后加 `--environment-policy newest-qualified`：
 
 ```sh
+node tools/upgrade/functional-config-probe.mjs \
+  --zylos-dir "$ZYLOS_DIR" --core-source "$CORE_SOURCE" --feishu-source "$FEISHU_SOURCE" \
+  --hxa-source "$HXA_SOURCE" --runtime claude --out /absolute/environment.json
+
 node tools/upgrade/prepare.mjs --only core --core latest --installed /absolute/installed.json \
   --environment /absolute/environment.json --environment-policy newest-qualified \
   --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID

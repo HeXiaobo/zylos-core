@@ -63,11 +63,17 @@ export function assertQualificationSuperset(published, addition) {
   return addition;
 }
 
-export function publishDistribution(document, { assetPath, notesPath, appendQualifications = false, gh = args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), readDistribution = readPublishedDistribution } = {}) {
+export function publishDistribution(document, { assetPath, notesPath, appendQualifications = false, notesCorrection = false, gh = args => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), readDistribution = readPublishedDistribution } = {}) {
   validateDistribution(document);
   const assetBytes = fs.readFileSync(assetPath, 'utf8');
   if (canonical(JSON.parse(assetBytes)) !== canonical(document)) throw new Error('Prepared publication asset changed');
   if (appendQualifications && !notesPath) throw new Error('An appended qualification needs the reviewed notes to stay in sync');
+  // A notes correction is the only other published-metadata change. It never
+  // touches the asset, so a consumer that already froze sources stays valid.
+  if (notesCorrection && appendQualifications) throw new Error('A notes correction cannot add a qualification at the same time');
+  if (notesCorrection && !notesPath) throw new Error('A notes correction needs the reviewed notes');
+  const correctionBytes = notesCorrection ? fs.readFileSync(notesPath, 'utf8') : null;
+  if (notesCorrection && !correctionBytes.trim()) throw new Error('Corrected release notes must document the tested functional configuration');
   const tag = document.releaseTag;
   const isNotFound = error => /\b404\b/.test(String(error.stderr || error.message));
   const parseRelease = bytes => {
@@ -130,18 +136,26 @@ export function publishDistribution(document, { assetPath, notesPath, appendQual
   if (release.draft) {
     try {
       gh(['release', 'edit', tag, '--repo', CATALOG_REPOSITORY, '--draft=false',
-        `--latest=${document.channel === 'stable'}`]);
+        `--latest=${document.channel === 'stable'}`,
+        ...(notesCorrection ? ['--notes-file', notesPath] : [])]);
     } catch { /* inspect the same release below before deciding whether to retry */ }
-  } else if (appendQualifications) {
+  } else if (appendQualifications || notesCorrection) {
+    if (notesCorrection && String(release.body || '').trimEnd() === correctionBytes.trimEnd()) {
+      throw new Error('Corrected release notes are identical to the published notes; nothing to correct');
+    }
     try {
       gh(['release', 'edit', tag, '--repo', CATALOG_REPOSITORY, '--notes-file', notesPath]);
-    } catch { /* the asset verification below decides whether the append landed */ }
+    } catch { /* the asset verification below decides whether the change landed */ }
   }
   const final = find();
   if (!final || final.draft) return { status: 'PUBLICATION_PENDING', releaseId: release.id, tag, runtimeMutation: false };
   const verified = readDistribution(final);
   if (verified.assetSha256 !== sha256(assetBytes)) throw new Error('Published release asset differs from prepared evidence');
+  if (notesCorrection && String(final.body || '').trimEnd() !== correctionBytes.trimEnd()) {
+    throw new Error('Published release notes do not match the reviewed correction; the release asset is unchanged and no runtime was modified');
+  }
   return { status: 'PUBLISHED', releaseId: final.id, tag, channel: document.channel,
+    notesCorrected: notesCorrection || undefined, notesCorrectedSha256: notesCorrection ? sha256(correctionBytes) : undefined,
     url: `https://github.com/${CATALOG_REPOSITORY}/releases/tag/${tag}`, runtimeMutation: false };
 }
 
@@ -160,6 +174,7 @@ export function preparePublication(options) {
   const manifest = read(manifestPath), publication = read(publicationManifestPath);
   if (publication.releaseId !== manifest.releaseId || canonical(canonicalBundle(publication.candidate)) !== canonical(canonicalBundle(manifest.candidate))) throw new Error('Publication authorization belongs to another release');
   const appendQualifications = options['--append-qualifications'] === true;
+  const notesCorrection = options['--correct-notes'] === true;
   const index = read(options['--qualifications']);
   if (!Array.isArray(index)) throw new Error('Qualification index must be an array of report/finalGate absolute paths');
   const entries = index.map(item => {
@@ -176,18 +191,19 @@ export function preparePublication(options) {
   fs.writeFileSync(assetPath, JSON.stringify(document, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   fs.writeFileSync(notesPath, `Qualified ${document.channel} release.\n\n` + Object.entries(document.bundle).map(([name, value]) => `- ${name}: ${value.version} (${value.sha})`).join('\n') + '\n\nInstall or upgrade using the repository link and UPGRADE.md. Host backups and health checks still run locally.\n\n' + reviewedNotes + '\n', { flag: 'wx', mode: 0o600 });
   fs.writeFileSync(path.join(output, 'publication-gate.json'), gateBytes, { flag: 'wx', mode: 0o600 });
-  return { document, assetPath, notesPath, appendQualifications };
+  return { document, assetPath, notesPath, appendQualifications, notesCorrection };
 }
 
 if (process.argv[1] && fs.existsSync(process.argv[1]) && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   try {
     const args = process.argv.slice(2), options = {};
     if (args.includes('--help')) {
-      console.log('node tools/upgrade/publish.mjs --manifest DEPLOYMENT_LEDGER --publication-manifest AUTHORIZED_PUBLICATION_LEDGER --qualifications EVIDENCE_INDEX --notes-file REVIEWED_NOTES --tag BUNDLE_TAG --out NEW_ABSOLUTE_DIRECTORY [--append-qualifications] [--execute]');
+      console.log('node tools/upgrade/publish.mjs --manifest DEPLOYMENT_LEDGER --publication-manifest AUTHORIZED_PUBLICATION_LEDGER --qualifications EVIDENCE_INDEX --notes-file REVIEWED_NOTES --tag BUNDLE_TAG --out NEW_ABSOLUTE_DIRECTORY [--append-qualifications] [--correct-notes] [--execute]');
     } else {
       for (let i = 0; i < args.length; i++) {
         if (args[i] === '--execute') { options[args[i]] = true; continue; }
         if (args[i] === '--append-qualifications') { options[args[i]] = true; continue; }
+        if (args[i] === '--correct-notes') { options[args[i]] = true; continue; }
         if (!['--manifest', '--publication-manifest', '--qualifications', '--notes-file', '--tag', '--out'].includes(args[i]) || !args[i + 1] || args[i + 1].startsWith('--') || options[args[i]]) throw new Error('Invalid arguments; use --help');
         options[args[i]] = args[++i];
       }
