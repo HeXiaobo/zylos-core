@@ -13,6 +13,8 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const read = filename => JSON.parse(fs.readFileSync(filename, 'utf8'));
+const RELEASE_LIST_PAGE_SIZE = 100;
+const RELEASE_LIST_MAX_PAGES = 100;
 function sameBundle(gate, bundle) {
   return ['core', 'feishu', 'hxa'].every(name => gate?.candidateBundle?.[`${name}Sha`] === bundle[name].sha);
 }
@@ -52,10 +54,35 @@ export function publishDistribution(document, { assetPath, notesPath, gh = args 
   const assetBytes = fs.readFileSync(assetPath, 'utf8');
   if (canonical(JSON.parse(assetBytes)) !== canonical(document)) throw new Error('Prepared publication asset changed');
   const tag = document.releaseTag;
+  const isNotFound = error => /\b404\b/.test(String(error.stderr || error.message));
+  const parseRelease = bytes => {
+    const release = JSON.parse(bytes);
+    if (!release || release.tag_name !== tag) throw new Error('GitHub release lookup returned a different tag');
+    return release;
+  };
+  const findFromReleaseList = () => {
+    const matches = [];
+    for (let page = 1; page <= RELEASE_LIST_MAX_PAGES; page++) {
+      let items;
+      try {
+        items = JSON.parse(gh(['api', `repos/${CATALOG_REPOSITORY}/releases?per_page=${RELEASE_LIST_PAGE_SIZE}&page=${page}`]));
+      } catch (error) {
+        throw new Error(`Unable to list GitHub releases while locating ${tag}; no publication attempted: ${error.message}`);
+      }
+      if (!Array.isArray(items)) throw new Error('Invalid GitHub releases response while locating an existing release');
+      matches.push(...items.filter(release => release?.tag_name === tag));
+      if (matches.length > 1) throw new Error(`Multiple GitHub releases found for tag ${tag}; publication aborted`);
+      if (items.length < RELEASE_LIST_PAGE_SIZE) return matches[0] || null;
+    }
+    throw new Error('GitHub release listing pagination limit reached; refusing an incomplete release lookup');
+  };
   const find = () => {
-    try { return JSON.parse(gh(['api', `repos/${CATALOG_REPOSITORY}/releases/tags/${tag}`])); }
+    try { return parseRelease(gh(['api', `repos/${CATALOG_REPOSITORY}/releases/tags/${tag}`])); }
     catch (error) {
-      if (/\b404\b/.test(String(error.stderr || error.message))) return null;
+      // GitHub's tag endpoint hides draft releases. Fall back to the
+      // authenticated, bounded release listing so an existing draft can be
+      // resumed without creating a second release for the same tag.
+      if (isNotFound(error)) return findFromReleaseList();
       throw error;
     }
   };
