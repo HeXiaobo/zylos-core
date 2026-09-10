@@ -47,6 +47,9 @@ const {
   handleConversationDeliveryFailure
 } = mod;
 
+const configMod = await import(new URL(`../c4-config.js?${cacheBuster}`, import.meta.url));
+const { requiresExplicitReply } = configMod;
+
 describe('durable conversation dispatch retry', () => {
   it('keeps a conversation pending after repeated transient runtime delivery failures', async () => {
     const activityMonitorDirectory = path.join(tmpDir, 'activity-monitor');
@@ -582,6 +585,44 @@ describe('getDeliveryContent', () => {
     assert.equal(result.includes('oc_1|type:p2p|msg:om_1'), false);
   });
 
+  it('keeps the explicit send instruction for a channel whose stream adapter does not deliver displayed text', () => {
+    const result = getDeliveryContent({
+      type: 'conversation',
+      channel: 'hxa-connect',
+      endpoint_id: 'org:hxa|mylos|msg:message-1',
+      assistant_request_id: 'assistant.hxa.message-1',
+      content: '[HXA:hxa DM] mylos said: ACK',
+    }, 'claude');
+
+    assert.equal(result.includes('displayed assistant text is delivered automatically'), false);
+    assert.match(result, /---- reply via: node/);
+    assert.match(result, /"hxa-connect" "org:hxa\|mylos\|msg:message-1"/);
+    assert.match(result, /--request-id "assistant\.hxa\.message-1"/);
+    assert.match(result, /before ending this runtime turn, use this command exactly once/i);
+  });
+
+  it('keeps the streamed instruction for the other display-hook channels on Claude', () => {
+    const result = getDeliveryContent({
+      type: 'conversation',
+      channel: 'feishu',
+      endpoint_id: 'oc_1|type:p2p|msg:om_1',
+      assistant_request_id: 'assistant.feishu.om_1',
+      content: 'hello',
+    }, 'claude');
+
+    assert.match(result, /displayed assistant text is delivered automatically/i);
+    assert.equal(result.includes('c4-send.js'), false);
+  });
+
+  it('only opts out the channels listed for explicit completion', () => {
+    assert.equal(requiresExplicitReply('hxa-connect', 'claude'), true);
+    assert.equal(requiresExplicitReply('feishu', 'claude'), false);
+    assert.equal(requiresExplicitReply('telegram', 'claude'), false);
+    assert.equal(requiresExplicitReply(null, 'claude'), false);
+    assert.equal(requiresExplicitReply('hxa-connect', 'codex'), true);
+    assert.equal(requiresExplicitReply('feishu', 'codex'), true);
+  });
+
   it('uses explicit request-scoped c4-send completion on Codex', () => {
     const result = getDeliveryContent({
       type: 'conversation',
@@ -875,5 +916,45 @@ describe('assistant turn admission', () => {
       30,
       130,
     ), false);
+  });
+});
+
+describe('explicit reply channels configuration', () => {
+  it('honours the runtime config override', async () => {
+    const configDir = path.join(tmpDir, '.zylos');
+    const configPath = path.join(configDir, 'config.json');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({
+      runtime: 'claude',
+      explicit_reply_channels: ['telegram', ' hxa-connect '],
+    }));
+    try {
+      const override = await import(
+        new URL(`../c4-config.js?override-${Date.now()}`, import.meta.url)
+      );
+      assert.deepEqual(
+        [...override.EXPLICIT_REPLY_CHANNELS].sort(),
+        ['hxa-connect', 'telegram'],
+      );
+      assert.equal(override.requiresExplicitReply('telegram', 'claude'), true);
+      assert.equal(override.requiresExplicitReply('feishu', 'claude'), false);
+    } finally {
+      fs.rmSync(configPath, { force: true });
+    }
+  });
+
+  it('falls back to the default list when the override is not an array', async () => {
+    const configDir = path.join(tmpDir, '.zylos');
+    const configPath = path.join(configDir, 'config.json');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({ explicit_reply_channels: 'hxa-connect' }));
+    try {
+      const fallback = await import(
+        new URL(`../c4-config.js?fallback-${Date.now()}`, import.meta.url)
+      );
+      assert.deepEqual([...fallback.EXPLICIT_REPLY_CHANNELS], ['hxa-connect']);
+    } finally {
+      fs.rmSync(configPath, { force: true });
+    }
   });
 });

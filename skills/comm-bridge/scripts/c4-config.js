@@ -48,6 +48,37 @@ function _readConfig() {
 const _cfg = _readConfig();
 export const ACTIVE_RUNTIME = _cfg.runtime === 'codex' ? 'codex' : 'claude';
 export const TMUX_SESSION = ACTIVE_RUNTIME === 'codex' ? 'codex-main' : 'claude-main';
+
+// Channels whose `stream.js` adapter reports the assistant terminal event as
+// suppressed instead of delivering the displayed text. HXA 1.7.10 disables
+// terminal auto-delivery by design (`HXA_FINAL_DELIVERY_MODE=off`) and requires
+// an explicit `c4-send --request-id`, so on the Claude display-hook runtime
+// those turns must keep the request-scoped send instruction instead of the
+// streamed one.
+// Override with `explicit_reply_channels` in `$ZYLOS_DIR/.zylos/config.json`.
+const DEFAULT_EXPLICIT_REPLY_CHANNELS = ['hxa-connect'];
+
+function _readExplicitReplyChannels(value) {
+  const names = value === undefined ? DEFAULT_EXPLICIT_REPLY_CHANNELS : value;
+  if (!Array.isArray(names)) return new Set(DEFAULT_EXPLICIT_REPLY_CHANNELS);
+  return new Set(names
+    .filter(name => typeof name === 'string' && name.trim() !== '')
+    .map(name => name.trim()));
+}
+
+export const EXPLICIT_REPLY_CHANNELS = _readExplicitReplyChannels(_cfg.explicit_reply_channels);
+
+/**
+ * True when this turn must complete its assistant request with an explicit
+ * `c4-send --request-id` rather than through the displayed assistant text.
+ * Codex has no display hook at all; on Claude only a channel whose stream
+ * adapter really delivers the displayed text may use the streamed suffix.
+ */
+export function requiresExplicitReply(channel, activeRuntime = ACTIVE_RUNTIME) {
+  if (activeRuntime !== 'claude') return true;
+  const name = typeof channel === 'string' ? channel.trim() : '';
+  return EXPLICIT_REPLY_CHANNELS.has(name);
+}
 export const DATA_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 export const DB_PATH = path.join(DATA_DIR, 'c4.db');
 export const ACTIVITY_MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');

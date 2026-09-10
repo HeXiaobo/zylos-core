@@ -93,6 +93,15 @@ on the existing CardKit card.
 All messages without the streamed marker continue to use `c4-send` exactly as
 described above.
 
+Channels whose adapter does not deliver the displayed text always keep the
+`c4-send` instruction, even on the Claude display-hook runtime. They are listed
+in `explicit_reply_channels` in `$ZYLOS_DIR/.zylos/config.json` (default
+`["hxa-connect"]`): HXA 1.7.10 reports the assistant terminal event as
+`suppressed` instead of delivering it (`HXA_FINAL_DELIVERY_MODE=off`) and
+requires the explicit `c4-send --request-id`, which also terminalizes the
+assistant request. Add a channel to that list when its stream adapter stops
+delivering displayed text; remove it when the adapter delivers again.
+
 ## Database
 
 SQLite at `~/zylos/comm-bridge/c4.db`:

@@ -46,6 +46,7 @@ import {
   REQUIRE_IDLE_EXECUTION_POLL_MS,
   ACTIVE_RUNTIME,
   TMUX_SESSION,
+  requiresExplicitReply,
   ACTIVITY_MONITOR_DIR,
   AGENT_STATUS_FILE,
   PROC_STATE_FILE,
@@ -518,7 +519,12 @@ function hasAckSuffix(content = '') {
 export function getDeliveryContent(item, activeRuntime = ACTIVE_RUNTIME) {
   const rawContent = item.content || '';
   if (item.type === 'conversation') {
-    const replyViaSuffix = item.assistant_request_id && activeRuntime === 'claude'
+    // The streamed suffix is only valid for channels whose stream adapter turns
+    // the displayed text into a real delivery; every other channel keeps the
+    // explicit request-scoped c4-send instruction (see requiresExplicitReply).
+    const streamedReply = item.assistant_request_id
+      && !requiresExplicitReply(item.channel, activeRuntime);
+    const replyViaSuffix = streamedReply
       ? buildStreamedReplySuffix(item.assistant_request_id)
       : (
           item.endpoint_id
