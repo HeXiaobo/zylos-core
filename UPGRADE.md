@@ -62,12 +62,13 @@ Owner 不需要填写发布台账，也不需要重复为同一个版本做完�
 只以仓库这份为准），然后加 `--environment-policy newest-qualified`：
 
 ```sh
+# 探针从当前这份 Core 源码里取，输出的结果文件可直接作为 --environment。
 node tools/upgrade/functional-config-probe.mjs \
   --zylos-dir "$ZYLOS_DIR" --core-source "$CORE_SOURCE" --feishu-source "$FEISHU_SOURCE" \
-  --hxa-source "$HXA_SOURCE" --runtime claude --out /absolute/environment.json
+  --hxa-source "$HXA_SOURCE" --runtime claude --out /absolute/probe-result.json
 
 node tools/upgrade/prepare.mjs --only core --core latest --installed /absolute/installed.json \
-  --environment /absolute/environment.json --environment-policy newest-qualified \
+  --environment /absolute/probe-result.json --environment-policy newest-qualified \
   --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
 ```
 
