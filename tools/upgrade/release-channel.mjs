@@ -199,7 +199,16 @@ export function resolveQualifiedRelease({ component = 'core', requested = 'lates
       if (requireMatchedEnvironment) continue;
     }
     if (fingerprint && !entry.document.qualifications.some(q => q.environmentFingerprint === fingerprint)) {
-      skipped.push({ tag: release.tag_name, reason: 'Environment is outside the published qualification matrix', environments });
+      // A host that matches a published qualification on platform/arch/Node/runtime
+      // but not on the functional configuration is a different situation from an
+      // unsupported host: either the descriptor came from another probe revision
+      // or the configuration genuinely differs. Say which one it is, so a consumer
+      // does not read a covered environment as an unsupported one.
+      const hostCovered = Boolean(host) && entry.document.qualifications.some(q => Object.entries(host).every(([key, value]) => q.environment[key] === value));
+      skipped.push({ tag: release.tag_name, environments,
+        reason: hostCovered
+          ? 'Host platform/Node/runtime is covered, but the supplied functional configuration matches no published qualification (a descriptor from another probe revision produces a different hash)'
+          : 'Environment is outside the published qualification matrix' });
       if (requireMatchedEnvironment) continue;
     }
     if (exact && bundle[component].version !== exact) continue;
